@@ -1,4 +1,4 @@
-# Ultimate File Manager
+# Fable Files
 
 **Working title · v0.1 scaffold · 12 October 2026**
 
@@ -9,7 +9,7 @@ without the usual Linux assembly kit.
 > things with no other software needed.*
 
 The full product/feature specification lives at
-`../your_files/ultimate-file-manager-spec/ultimate-file-manager-spec.pdf`
+`../your_files/fable-files-spec/fable-files-spec.pdf`
 (34 pages, v0.1, 12 Oct 2026). This repo is the **v0.1 code scaffold**: the Rust
 workspace, the Tauri v2 shell, the domain crates, the theme package format with the
 Grizzette theme, and the docs the second-pass reviewer and the black-box QA pass need.

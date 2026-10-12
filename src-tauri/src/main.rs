@@ -6,5 +6,5 @@
 )]
 
 fn main() {
-    ultimate_file_manager_lib::run()
+    fable_files_lib::run()
 }

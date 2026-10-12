@@ -1,6 +1,6 @@
 # Architecture — how the scaffold maps to the spec
 
-Source of truth: `../your_files/ultimate-file-manager-spec/ultimate-file-manager-spec.pdf`
+Source of truth: `../your_files/fable-files-spec/fable-files-spec.pdf`
 (spec §25, "A Rust core owns truth; the shell owns presentation").
 
 ## Crate map

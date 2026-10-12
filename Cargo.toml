@@ -20,7 +20,7 @@ version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"   # GPL-compatible: the MAME emulation path requires it
 authors = ["Richard Garrison <garrisonrichard@gmail.com>"]
-repository = "https://github.com/garrisonr/ultimate-file-manager"
+repository = "https://github.com/garrisonr/fable-files"
 
 [workspace.dependencies]
 # core truth: every crate builds on these, versions pinned once here

@@ -5,7 +5,7 @@ behavior against the spec. That's the whole job — and it's the most important
 QC gate, because you catch what compilers and reviewers can't: *does it feel
 right?*
 
-Spec: `../your_files/ultimate-file-manager-spec/ultimate-file-manager-spec.pdf`
+Spec: `../your_files/fable-files-spec/fable-files-spec.pdf`
 
 ## Per milestone (run on the M2 Mac mini)
 

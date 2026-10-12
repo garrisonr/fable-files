@@ -1,11 +1,11 @@
 [package]
-name = "ultimate-file-manager"
+name = "fable-files"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "ultimate_file_manager_lib"
+name = "fable_files_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

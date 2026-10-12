@@ -1,4 +1,4 @@
-//! Ultimate File Manager — Tauri v2 application entry.
+//! Fable Files — Tauri v2 application entry.
 //!
 //! The Rust core owns truth; this shell owns presentation. The web UI gets
 //! typed commands and domain events, nothing more.
@@ -52,5 +52,5 @@ pub fn run() {
             commands::preview,
         ])
         .run(tauri::generate_context!())
-        .expect("failed to run Ultimate File Manager");
+        .expect("failed to run Fable Files");
 }

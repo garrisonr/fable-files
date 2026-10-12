@@ -1,6 +1,6 @@
 # Grizzette
 
-The built-in example theme for Ultimate File Manager — the peach-paper /
+The built-in example theme for Fable Files — the peach-paper /
 chocolate-ink / orange-red look from the Gazette, Save-A-Tron, and the
 shopping list, shipped as a portable theme package.
 
