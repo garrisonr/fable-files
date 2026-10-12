@@ -274,7 +274,7 @@ pub async fn search(
             .search_fts(&fts_query, limit)
             .map_err(CommandError::from)?
     };
-    let rows: Vec<(Item, f64)> = match scope {
+    let mut rows: Vec<(Item, f64)> = match scope {
         Some(s) => rows
             .into_iter()
             .filter(|(item, _)| item.location == s)
