@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ultimate File Manager</title>
+    <link rel="stylesheet" href="./theme.css" />
+    <!-- Theme variables are installed here by applyTheme(); never hand-edit. -->
+    <style id="ufm-theme-vars"></style>
+  </head>
+  <body>
+    <div id="app">
+      <div class="toolbar">
+        <input class="search-box" placeholder="Search everything — try: super mario" />
+        <button class="accent-button">Jobs</button>
+      </div>
+      <div class="file-list" id="file-list"></div>
+      <div class="status-bar" id="status">booting…</div>
+    </div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

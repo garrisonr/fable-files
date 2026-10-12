@@ -1,0 +1,10 @@
+[package]
+name = "ufm-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ufm-core.workspace = true
+ufm-vfs = { path = "../ufm-vfs" }
+serde.workspace = true

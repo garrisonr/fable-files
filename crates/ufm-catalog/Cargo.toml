@@ -1,0 +1,14 @@
+[package]
+name = "ufm-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ufm-core.workspace = true
+ufm-vfs = { path = "../ufm-vfs" }
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+chrono.workspace = true
+uuid.workspace = true

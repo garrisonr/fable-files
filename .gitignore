@@ -1,0 +1,31 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Tauri
+src-tauri/target/
+src-tauri/WixTools/
+src-tauri/gen/schemas/
+
+# Node / UI
+ui/node_modules/
+ui/dist/
+ui/.vite/
+*.tsbuildinfo
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Local dev data (never commit real catalogs)
+*.db
+*.db-wal
+*.db-shm
+dev-data/
+
+# Theme build artifacts
+themes/*/preview-dist/

@@ -1,0 +1,39 @@
+[workspace]
+members = [
+    "crates/ufm-core",
+    "crates/ufm-vfs",
+    "crates/ufm-jobs",
+    "crates/ufm-catalog",
+    "crates/ufm-search",
+    "crates/ufm-preview",
+    "crates/ufm-themes",
+    "crates/ufm-plugins",
+    "crates/ufm-mcp",
+    "crates/ufm-media",
+    "crates/ufm-emu",
+    "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"   # GPL-compatible: the MAME emulation path requires it
+authors = ["Richard Garrison <garrisonrichard@gmail.com>"]
+repository = "https://github.com/garrisonr/ultimate-file-manager"
+
+[workspace.dependencies]
+# core truth: every crate builds on these, versions pinned once here
+ufm-core = { path = "crates/ufm-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time", "process", "io-util", "io-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+toml = "0.8"
+walkdir = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

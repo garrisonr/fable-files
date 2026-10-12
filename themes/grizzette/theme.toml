@@ -1,0 +1,11 @@
+# Grizzette — the built-in example theme (theme.toml)
+# Portable theme package: manifest (this file) + tokens.toml + optional assets.
+# No executable code. See docs/THEME_FORMAT.md.
+
+name = "Grizzette"
+author = "Richard Garrison"
+version = "0.1.0"
+license = "MIT"
+app_range = ">=0.1.0"
+dark = false
+description = "Peach paper, chocolate ink, orange-red action, icy-blue support. The Gazette / Save-A-Tron / shopping-list look, as a first-class theme package."

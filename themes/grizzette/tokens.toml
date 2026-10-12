@@ -1,0 +1,34 @@
+# Grizzette tokens (tokens.toml)
+# Semantic roles, not raw decoration. Colors are #RRGGBB. Every text role was
+# verified ≥ 4.5:1 against its background by ufm-themes' contrast check (see
+# the grizzette_passes_contrast test). The vivid #FB4E00 stays available as
+# accent_dim for large art where contrast rules don't apply.
+
+surface = "#FFDDB5"          # peachy cream paper
+surface_elevated = "#FFE9D2"
+content_canvas = "#FFF6EA"
+text = "#6B3816"             # chocolate ink
+text_muted = "#8A5A2E"
+border = "#D9B98C"
+selection = "#CAE7FC"        # icy blue
+focus_ring = "#2BA3C7"       # bondi blue
+accent = "#A83500"           # accessible orange-red (contrast-fixed)
+accent_text = "#FFFFFF"
+accent_dim = "#FB4E00"       # vivid accent for large art / highlights
+success = "#2E7D32"
+warning = "#B26A00"
+error = "#B3261E"
+info = "#2BA3C7"
+density = "comfortable"      # compact | comfortable | spacious
+
+[typography]
+family_ui = "system-ui, sans-serif"
+family_mono = "\"Victor Mono\", ui-monospace, monospace"
+base_size_pt = 11.0
+line_height = 1.45
+
+[shape]
+radius_sm = 4.0
+radius_md = 8.0
+radius_lg = 14.0
+shadow_strength = 0.18
