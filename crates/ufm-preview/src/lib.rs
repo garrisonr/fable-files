@@ -146,7 +146,8 @@ impl PreviewProvider for ExtensionProvider {
             Some(
                 "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "svg"
                 | "ico" | "txt" | "md" | "markdown" | "rs" | "ts" | "js" | "json" | "toml"
-                | "yaml" | "yml" | "xml" | "html" | "htm" | "css",
+                | "yaml" | "yml" | "xml" | "html" | "htm" | "css" | "srt" | "vtt"
+                | "sub" | "ssa" | "ass" | "log" | "csv" | "tsv" | "nfo",
             ) => PreviewKind::Native,
             // Media: audio/video playback surface.
             Some(
@@ -208,6 +209,10 @@ mod tests {
             ("notes.txt", PreviewKind::Native),
             ("lib.rs", PreviewKind::Native),
             ("page.html", PreviewKind::Native),
+            ("subs.srt", PreviewKind::Native),
+            ("subs.SRT", PreviewKind::Native), // case-insensitive
+            ("debug.log", PreviewKind::Native),
+            ("data.csv", PreviewKind::Native),
             ("song.flac", PreviewKind::Media),
             ("song.MP3", PreviewKind::Media),
             ("movie.mkv", PreviewKind::Media),

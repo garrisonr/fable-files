@@ -31,6 +31,14 @@ import {
 } from "./tabs";
 import { DEFAULT_THEME, ThemeManager } from "./themes";
 
+/** Where a sidebar favorite navigates: a real location root or a
+ * same-named folder inside the Home location. */
+interface FavoriteTarget {
+  locationId: string;
+  dirId: string;
+  display: string;
+}
+
 export class Shell {
   readonly el = document.createElement("div");
   private tabs: Tab[] = [];
@@ -107,7 +115,7 @@ export class Shell {
     } catch {
       this.locations = [];
     }
-    this.buildSidebar();
+    await this.buildSidebar();
     const first = this.locations[0];
     if (first) {
       this.newTab(first);
@@ -368,7 +376,10 @@ export class Shell {
     if (item.kind === "folder") {
       this.navigateTo(descend(tab, item));
     } else {
-      void this.quickLook.open(item);
+      // Double-click / Enter opens with the OS default app; Spacebar is Quick Look.
+      void api
+        .openItem(item.id)
+        .catch(() => void this.quickLook.open(item));
     }
   }
 
@@ -495,22 +506,25 @@ export class Shell {
 
   // ---------------------------------------------------------------- sidebar
 
-  private buildSidebar(): void {
+  private async buildSidebar(): Promise<void> {
     this.favList.innerHTML = "";
     this.sidebarList.innerHTML = "";
-    for (const name of ["Home", "Documents", "Downloads"]) {
-      const loc = this.findFavorite(name);
+    const targets = await this.resolveFavoriteTargets();
+    const names = ["Home", "Documents", "Downloads"];
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i];
+      const target = targets[i];
       const b = document.createElement("button");
       b.className = "side-item";
       b.textContent = name;
-      b.disabled = !loc;
-      b.title = loc ? loc.display_name : `${name} is not a known location yet`;
-      if (loc) {
+      b.disabled = !target;
+      b.title = target ? target.display : `${name} is not available`;
+      if (target) {
         b.addEventListener("click", () => {
           this.navigateTo({
-            locationId: loc.id,
-            dirId: loc.root_item,
-            crumbs: [{ dirId: loc.root_item, name: loc.display_name }],
+            locationId: target.locationId,
+            dirId: target.dirId,
+            crumbs: [{ dirId: target.dirId, name: target.display }],
           });
         });
       }
@@ -540,6 +554,47 @@ export class Shell {
       p.textContent = "No locations yet.";
       this.sidebarList.appendChild(p);
     }
+  }
+
+  /**
+   * Favorites resolve to real locations first; Documents/Downloads fall back
+   * to same-named folders inside the Home location (the common
+   * single-location setup), so they stay clickable instead of grayed out.
+   */
+  private async resolveFavoriteTargets(): Promise<(FavoriteTarget | null)[]> {
+    const homeLoc =
+      this.locations.find((l) => l.display_name.toLowerCase().includes("home")) ??
+      this.locations.find((l) => l.provider === "local") ??
+      this.locations[0] ??
+      null;
+    const out: (FavoriteTarget | null)[] = [];
+    for (const name of ["Home", "Documents", "Downloads"]) {
+      const direct = this.findFavorite(name);
+      if (direct) {
+        out.push({
+          locationId: direct.id,
+          dirId: direct.root_item,
+          display: direct.display_name,
+        });
+        continue;
+      }
+      let sub: FavoriteTarget | null = null;
+      if (homeLoc && name !== "Home") {
+        try {
+          const kids = await api.listDir(homeLoc.id, homeLoc.root_item);
+          const kid = kids.find(
+            (k) => k.kind === "folder" && k.name.toLowerCase() === name.toLowerCase(),
+          );
+          if (kid) {
+            sub = { locationId: homeLoc.id, dirId: kid.id, display: kid.name };
+          }
+        } catch {
+          sub = null;
+        }
+      }
+      out.push(sub);
+    }
+    return out;
   }
 
   /** Favorites resolve to real locations via list_locations. */

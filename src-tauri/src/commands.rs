@@ -387,8 +387,24 @@ pub async fn start_indexing(
     // The background task re-enters state through the owned AppHandle, so the
     // borrow of `state` never escapes this command.
     tauri::async_runtime::spawn(async move {
+        let progress_app = app.clone();
         let indexed = tauri::async_runtime::spawn_blocking(move || {
             let mut indexer = ufm_search::Indexer::open(&catalog_path, &checkpoint_path)?;
+            indexer.set_progress_callback(Box::new(move |stats| {
+                // Single-lock site: only index_state, never nested — the
+                // canonical lock order is respected.
+                let payload = {
+                    let state = progress_app.state::<AppState>();
+                    let mut index = state.index_state.lock().unwrap();
+                    if index.running {
+                        index.dirs_done = stats.dirs_done;
+                        index.files_done = stats.files_done;
+                        index.bytes_done = stats.bytes_done;
+                    }
+                    index.clone()
+                };
+                let _ = progress_app.emit("index-progress", &payload);
+            }));
             indexer.index_root(&root, &location_rec)
         })
         .await;
@@ -590,6 +606,36 @@ pub async fn preview(
         .previews
         .best_kind(&probe)
         .unwrap_or(ufm_preview::PreviewKind::Hex))
+}
+
+
+/// Open an item with the OS default application (Finder / Explorer /
+/// xdg-open). Only backend-minted item ids resolve through `item_paths`,
+/// so the shell cannot be tricked into opening an arbitrary path.
+#[tauri::command]
+pub async fn open_item(state: State<'_, AppState>, item: ItemId) -> Cmd<()> {
+    let path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    tauri::async_runtime::spawn_blocking(move || open::that(&path))
+        .await
+        .map_err(|e| {
+            CommandError::from(UfmError::Provider {
+                provider: "local".into(),
+                message: format!("open task failed: {e}"),
+            })
+        })?
+        .map_err(|e| {
+            CommandError::from(UfmError::Provider {
+                provider: "local".into(),
+                message: format!("open failed: {e}"),
+            })
+        })?;
+    Ok(())
 }
 
 #[cfg(test)]

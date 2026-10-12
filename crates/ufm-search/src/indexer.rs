@@ -52,6 +52,10 @@ const CHECKPOINT_VERSION: u32 = 1;
 /// Checkpoint cadence: persist after this many newly-completed directories.
 const CHECKPOINT_EVERY_DIRS: u64 = 25;
 
+/// Progress reports during [`Indexer::index_root`]: invoked with cumulative
+/// stats on checkpoint cadence. Must be cheap — it runs on the indexing thread.
+pub type ProgressCallback = Box<dyn Fn(IndexStats) + Send + 'static>;
+
 pub struct Indexer {
     catalog: ufm_catalog::Catalog,
     checkpoint_path: PathBuf,
@@ -59,6 +63,7 @@ pub struct Indexer {
     /// Cumulative totals, restored from the checkpoint and re-persisted.
     files_done: u64,
     bytes_done: u64,
+    progress: Option<ProgressCallback>,
 }
 
 impl Indexer {
@@ -72,9 +77,26 @@ impl Indexer {
             completed_dirs: HashSet::new(),
             files_done: 0,
             bytes_done: 0,
+            progress: None,
         };
         me.load_checkpoint()?;
         Ok(me)
+    }
+
+    /// Install a progress callback invoked with cumulative stats on each
+    /// checkpoint write during `index_root`.
+    pub fn set_progress_callback(&mut self, cb: ProgressCallback) {
+        self.progress = Some(cb);
+    }
+
+    fn report_progress(&self) {
+        if let Some(cb) = &self.progress {
+            cb(IndexStats {
+                dirs_done: self.completed_dirs.len() as u64,
+                files_done: self.files_done,
+                bytes_done: self.bytes_done,
+            });
+        }
     }
 
     /// Index `root` into the catalog under `location`. The location row is
@@ -148,6 +170,7 @@ impl Indexer {
                 completed_this_run += 1;
                 if completed_this_run % CHECKPOINT_EVERY_DIRS == 0 {
                     self.write_checkpoint()?;
+                    self.report_progress();
                 }
             }
             let path = entry.path();
@@ -178,9 +201,11 @@ impl Indexer {
             completed_this_run += 1;
             if completed_this_run % CHECKPOINT_EVERY_DIRS == 0 {
                 self.write_checkpoint()?;
+                self.report_progress();
             }
         }
         self.write_checkpoint()?;
+        self.report_progress();
         Ok(stats)
     }
 
@@ -303,6 +328,38 @@ mod tests {
                 ..Default::default()
             },
             protected: ufm_vfs::ProtectionTier::None,
+        }
+    }
+
+    #[test]
+    fn progress_callback_reports_cumulative_stats() {
+        let work = scratch_dir("progress");
+        let root = fixture_tree();
+        let catalog_path = work.join("catalog.db");
+        let checkpoint_path = work.join("checkpoint.json");
+        let location = test_location();
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<IndexStats>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let stats = {
+            let mut ix = Indexer::open(&catalog_path, &checkpoint_path).unwrap();
+            ix.set_progress_callback(Box::new(move |s| {
+                seen_cb.lock().unwrap().push(s);
+            }));
+            ix.index_root(&root, &location).unwrap()
+        };
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "progress callback never fired");
+        let last = seen.last().unwrap();
+        // Fresh index: cumulative totals equal this run's totals.
+        assert_eq!(last.files_done, stats.files_done);
+        assert_eq!(last.dirs_done, stats.dirs_done);
+        for w in seen.windows(2) {
+            assert!(
+                w[1].files_done >= w[0].files_done,
+                "progress must be monotonic"
+            );
         }
     }
 

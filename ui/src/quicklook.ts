@@ -148,7 +148,7 @@ export class QuickLook {
       ["Size", item.kind === "folder" ? "—" : formatBytes(item.size_bytes)],
       ["Modified", formatDate(item.modified)],
     ];
-    if (item.provider_key) rows.push(["Location key", item.provider_key]);
+    if (item.provider_key) rows.push(["Path", item.provider_key]);
     if (item.starred) rows.push(["Starred", "Yes"]);
     if (item.labels.length > 0) rows.push(["Labels", item.labels.join(", ")]);
 

@@ -84,6 +84,7 @@ export const api = {
   startIndexing: (location: string) =>
     invoke<unknown>("start_indexing", { location }),
   indexStatus: () => invoke<IndexState>("index_status"),
+  openItem: (item: string) => invoke<void>("open_item", { item }),
 };
 
 export function onIndexProgress(cb: (s: IndexState) => void): Promise<UnlistenFn> {
