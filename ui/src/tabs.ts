@@ -108,7 +108,9 @@ export function goToCrumb(tab: Tab, crumbIndex: number): DirState | null {
 export function descend(tab: Tab, item: Item): DirState {
   const dir = currentDir(tab);
   const next: DirState = {
-    locationId: dir.locationId,
+    // The hit's own location, not the tab's: a search hit may belong to a
+    // different location than the tab is browsing.
+    locationId: item.location,
     dirId: item.id,
     crumbs: [...dir.crumbs, { dirId: item.id, name: item.name }],
   };

@@ -29,6 +29,14 @@ pub struct IndexState {
 
 /// Shared application state: the catalog, registries, and services.
 /// Built once at startup; commands borrow it.
+///
+/// LOCK-ORDER DISCIPLINE (deadlock prevention): any code that holds more
+/// than one of `path_ids` / `item_paths` / `item_locations` at the same time
+/// MUST acquire them in the order `path_ids -> item_paths -> item_locations`.
+/// Taking a subset is fine as long as the relative order is preserved
+/// (e.g. `preview` takes `item_paths -> item_locations`). Never introduce a
+/// new multi-lock site that violates this order — Tauri runs commands
+/// concurrently and ABBA locking hangs the app permanently.
 pub struct AppState {
     pub catalog: Mutex<Catalog>,
     /// Kept so background tasks (search reads, the indexer) can open their
@@ -227,8 +235,17 @@ fn seed_themes(themes_dir: &Path) -> Result<(), String> {
         return Ok(());
     }
     let src = repo_themes_dir();
-    let entries =
-        std::fs::read_dir(&src).map_err(|e| format!("read repo themes {}: {e}", src.display()))?;
+    let entries = match std::fs::read_dir(&src) {
+        Ok(entries) => entries,
+        Err(e) => {
+            // Non-fatal: a packaged app whose bundle lacks the themes dir
+            // (or a dev checkout moved after build) must still launch — the
+            // shell falls back to its built-in default styling. Never fail
+            // startup over themes.
+            tracing::warn!(target: "ufm", "no repo themes dir at {} ({e}); continuing without seeding", src.display());
+            return Ok(());
+        }
+    };
     let mut seeded = 0;
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;

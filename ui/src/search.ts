@@ -101,7 +101,7 @@ export class SearchView {
     this.el.innerHTML = "";
     const p = document.createElement("p");
     p.className = "search-status";
-    p.textContent = `Search failed for “${q}”. The search backend is not wired yet.`;
+    p.textContent = `Search failed for “${q}”. Please try again.`;
     this.el.appendChild(p);
   }
 

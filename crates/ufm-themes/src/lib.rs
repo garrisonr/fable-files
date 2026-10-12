@@ -184,6 +184,28 @@ pub struct ThemePackage {
     pub tokens: TokenSet,
 }
 
+/// Sanitize a font-family list for CSS interpolation. Only characters that
+/// cannot break out of the declaration are kept (letters, digits, space,
+/// `-_,'"` and commas); `;{}()/` and friends are stripped. A value that
+/// sanitizes to nothing falls back to `fallback`. Community themes are a
+/// product pillar, so theme-authored strings are untrusted input at this
+/// boundary.
+fn sanitize_font_family(raw: &str, fallback: &str) -> String {
+    let clean: String = raw
+        .chars()
+        .filter(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, ' ' | '_' | '-' | ',' | '\'' | '"')
+        })
+        .collect();
+    let clean = clean.trim();
+    if clean.is_empty() {
+        fallback.to_string()
+    } else {
+        clean.to_string()
+    }
+}
+
 impl ThemePackage {
     /// Load from a theme directory (`theme.toml` + `tokens.toml`).
     pub fn load_from_dir(dir: &std::path::Path) -> Result<Self> {
@@ -197,7 +219,6 @@ impl ThemePackage {
             .map_err(|e| UfmError::Theme(format!("bad tokens.toml: {e}")))?;
         Ok(Self { manifest, tokens })
     }
-
     /// CSS custom properties for the web shell — the ONLY styling input
     /// the UI is allowed to consume.
     pub fn to_css_variables(&self) -> String {
@@ -239,8 +260,8 @@ impl ThemePackage {
             warning = c(&t.warning),
             error = c(&t.error),
             info = c(&t.info),
-            font_ui = t.typography.family_ui,
-            font_mono = t.typography.family_mono,
+            font_ui = sanitize_font_family(&t.typography.family_ui, "system-ui, sans-serif"),
+            font_mono = sanitize_font_family(&t.typography.family_mono, "ui-monospace, monospace"),
             radius = t.shape.radius_md,
         )
     }
@@ -293,6 +314,68 @@ mod tests {
             issues.is_empty(),
             "grizzette must ship contrast-clean: {issues:?}"
         );
+    }
+
+    #[test]
+    fn font_sanitizer_keeps_legitimate_stacks() {
+        assert_eq!(
+            sanitize_font_family("system-ui, sans-serif", "fallback"),
+            "system-ui, sans-serif"
+        );
+        assert_eq!(
+            sanitize_font_family("\"Victor Mono\", ui-monospace, monospace", "fallback"),
+            "\"Victor Mono\", ui-monospace, monospace"
+        );
+        assert_eq!(
+            sanitize_font_family("-apple-system, 'Segoe UI', sans-serif", "fallback"),
+            "-apple-system, 'Segoe UI', sans-serif"
+        );
+    }
+
+    #[test]
+    fn font_sanitizer_neutralizes_css_breakout() {
+        // Every breakout character is stripped; the remainder cannot close
+        // the declaration or open a new rule.
+        let evil = "sans-serif; } body { display:none; } /*";
+        let clean = sanitize_font_family(evil, "fallback");
+        assert!(
+            !clean.chars().any(|c| matches!(c, ';' | '{' | '}' | '(' | ')' | '/')),
+            "breakout survived: {clean:?}"
+        );
+        // And a value that is *only* hostile falls back safely.
+        assert_eq!(sanitize_font_family(";{}()/", "fallback"), "fallback");
+        assert_eq!(sanitize_font_family("   ", "fallback"), "fallback");
+    }
+
+    #[test]
+    fn css_variables_cannot_carry_font_injection() {
+        let mut tokens = grizzette_tokens();
+        tokens.typography.family_ui =
+            "x\"; } .pwned { color:red; } /*".to_string();
+        let pkg = ThemePackage {
+            manifest: ThemeManifest {
+                id: ThemeId::new(),
+                name: "evil".into(),
+                author: "evil".into(),
+                version: "0".into(),
+                license: "evil".into(),
+                app_range: "*".into(),
+                dark: false,
+                description: "evil".into(),
+            },
+            tokens,
+        };
+        let css = pkg.to_css_variables();
+        // The hostile payload must not survive into the stylesheet: strip
+        // the legitimate trailing semicolon, then no rule syntax may remain.
+        for line in css.lines().filter(|l| l.contains("--ufm-font-")) {
+            let body = line.trim_end().strip_suffix(';').unwrap_or(line);
+            assert!(
+                !body.chars().any(|c| matches!(c, ';' | '{' | '}')),
+                "breakout in {line:?}"
+            );
+        }
+        assert!(!css.contains(".pwned"));
     }
 
     #[test]

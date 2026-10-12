@@ -19,6 +19,8 @@ export type ItemKind = "file" | "folder" | string;
 
 export interface Item {
   id: string;
+  /** Location this item belongs to — the backend always sends it. */
+  location: string;
   name: string;
   kind: ItemKind;
   size_bytes: number | null;

@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tauri::{Emitter, Manager, State};
 use ufm_core::{CollectionId, ItemId, JobId, LocationId, UfmError};
 use ufm_vfs::{Item, ItemKind};
@@ -78,8 +79,22 @@ struct DirEntryInfo {
 fn read_dir_entries(path: &Path) -> std::io::Result<Vec<DirEntryInfo>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(path)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
+        // One bad entry must never fail the whole listing (mirrors
+        // LocalProvider::list): skip it and keep going.
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(target: "ufm", "skipping unreadable entry in {}: {e}", path.display());
+                continue;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(e) => {
+                tracing::warn!(target: "ufm", "skipping entry with unreadable file type in {}: {e}", path.display());
+                continue;
+            }
+        };
         let metadata = entry.metadata().ok();
         let kind = if file_type.is_dir() {
             ItemKind::Folder
@@ -158,6 +173,9 @@ pub async fn list_dir(
             })
         })?;
 
+    // Canonical lock order (see AppState): path_ids -> item_paths ->
+    // item_locations. Every command taking more than one of these maps
+    // must acquire them in this order.
     let mut path_ids = state.path_ids.lock().unwrap();
     let mut item_paths = state.item_paths.lock().unwrap();
     let mut item_locations = state.item_locations.lock().unwrap();
@@ -265,16 +283,24 @@ pub async fn search(
     };
 
     // Cache paths so `preview` / `list_dir` can resolve these items.
+    // Canonical lock order (see AppState): path_ids -> item_paths ->
+    // item_locations. `list_dir` takes them in this order; `search` must
+    // too, or the two commands deadlock against each other (ABBA) when
+    // Tauri runs them concurrently.
     {
+        let mut path_ids = state.path_ids.lock().unwrap();
         let mut item_paths = state.item_paths.lock().unwrap();
         let mut item_locations = state.item_locations.lock().unwrap();
-        let mut path_ids = state.path_ids.lock().unwrap();
-        for (item, _) in &rows {
+        for (item, _) in rows.iter_mut() {
             if let Some(key) = item.provider_key.as_deref() {
                 let path = PathBuf::from(key);
-                item_paths.insert(item.id, path.clone());
-                item_locations.insert(item.id, item.location);
-                path_ids.entry(path).or_insert(item.id);
+                // One stable id per path: whoever (list_dir or search) saw
+                // the path first wins; the hit adopts the canonical id so
+                // preview/list_dir resolve the same item either way.
+                let id = *path_ids.entry(path.clone()).or_insert(item.id);
+                item.id = id;
+                item_paths.insert(id, path);
+                item_locations.insert(id, item.location);
             }
         }
     }
@@ -306,6 +332,23 @@ fn location_for_index(state: &AppState, id: LocationId, root: &Path) -> Cmd<ufm_
     Ok(location)
 }
 
+/// Atomically claim the background-indexer runner slot.
+/// Returns `(already_running, snapshot)`: when `already_running` is true the
+/// caller must NOT start a walk and should report the snapshot as-is.
+/// The check and the set happen under a single lock hold, so two rapid
+/// concurrent `start_indexing` calls cannot both claim the slot.
+fn claim_index_slot(index_state: &Mutex<IndexState>) -> (bool, IndexState) {
+    let mut index = index_state.lock().unwrap();
+    if index.running {
+        return (true, index.clone());
+    }
+    index.running = true;
+    index.dirs_done = 0;
+    index.files_done = 0;
+    index.bytes_done = 0;
+    (false, index.clone())
+}
+
 #[tauri::command]
 pub async fn start_indexing(
     state: State<'_, AppState>,
@@ -316,32 +359,28 @@ pub async fn start_indexing(
     // never a duplicate walk. Checkpoint resume inside the Indexer makes a
     // re-run after completion cheap (already-indexed roots return zeroed
     // stats without re-walking).
-    {
-        let index = state.index_state.lock().unwrap();
-        if index.running {
-            return Ok(index.clone());
+    let (already_running, snapshot) = claim_index_slot(&state.index_state);
+    if already_running {
+        return Ok(snapshot);
+    }
+    // The slot is claimed; any early error below must release it, or the
+    // indexer would read as running forever.
+    let root = match state.local_roots.lock().unwrap().get(&location).cloned() {
+        Some(root) => root,
+        None => {
+            state.index_state.lock().unwrap().running = false;
+            return Err(CommandError::from(UfmError::NotFound(format!(
+                "unknown location {location}"
+            ))));
         }
-    }
-    let root = state
-        .local_roots
-        .lock()
-        .unwrap()
-        .get(&location)
-        .cloned()
-        .ok_or_else(|| {
-            CommandError::from(UfmError::NotFound(format!("unknown location {location}")))
-        })?;
-    let location_rec = location_for_index(&state, location, &root)?;
-    {
-        let mut index = state.index_state.lock().unwrap();
-        *index = IndexState {
-            running: true,
-            dirs_done: 0,
-            files_done: 0,
-            bytes_done: 0,
-        };
-    }
-    let snapshot = state.index_state.lock().unwrap().clone();
+    };
+    let location_rec = match location_for_index(&state, location, &root) {
+        Ok(location_rec) => location_rec,
+        Err(e) => {
+            state.index_state.lock().unwrap().running = false;
+            return Err(e);
+        }
+    };
 
     let catalog_path = state.catalog_path.clone();
     let checkpoint_path = state.checkpoint_path.clone();
@@ -551,4 +590,74 @@ pub async fn preview(
         .previews
         .best_kind(&probe)
         .unwrap_or(ufm_preview::PreviewKind::Hex))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn read_dir_entries_lists_and_sorts_folders_first() {
+        // Happy-path contract for read_dir_entries: every entry appears,
+        // folders sort before files, names sort case-insensitively.
+        // (Per-entry I/O failures are skipped via `continue`; those paths
+        // are not portably simulable in a unit test.)
+        let dir = std::env::temp_dir().join(format!("ufm-cmd-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("b.txt"), b"x").unwrap();
+        std::fs::write(dir.join("A.txt"), b"y").unwrap();
+        let entries = read_dir_entries(&dir).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["sub", "A.txt", "b.txt"]);
+        assert!(entries[0].kind == ItemKind::Folder);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_slot_claim_is_atomic() {
+        // Exactly one concurrent claimer wins; everyone else sees running.
+        let slot = Arc::new(Mutex::new(IndexState {
+            running: false,
+            dirs_done: 0,
+            files_done: 0,
+            bytes_done: 0,
+        }));
+        let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let slot = Arc::clone(&slot);
+            let winners = Arc::clone(&winners);
+            handles.push(std::thread::spawn(move || {
+                let (already_running, snapshot) = claim_index_slot(&slot);
+                assert!(snapshot.running);
+                if !already_running {
+                    winners.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn index_slot_releases_and_reclaims() {
+        let slot = Mutex::new(IndexState {
+            running: false,
+            dirs_done: 0,
+            files_done: 0,
+            bytes_done: 0,
+        });
+        let (already, snap) = claim_index_slot(&slot);
+        assert!(!already && snap.running);
+        let (already2, _) = claim_index_slot(&slot);
+        assert!(already2);
+        slot.lock().unwrap().running = false;
+        let (already3, snap3) = claim_index_slot(&slot);
+        assert!(!already3 && snap3.running);
+        assert_eq!(snap3.dirs_done, 0);
+    }
 }

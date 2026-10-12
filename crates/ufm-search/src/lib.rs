@@ -127,14 +127,16 @@ fn split_top_level<'a>(input: &'a str, sep: &str) -> Vec<&'a str> {
 ///   because the FTS tokenizer splits on `.`). Facet-aware filtering
 ///   (size ranges, dates, labels…) is a later milestone.
 /// - `And(parts)` → non-empty parts joined with a space (implicit AND).
-///   `Not` parts are rendered after positive parts so the result is always
-///   of the form `a* b* NOT (c*)`, which FTS5 accepts.
+///   `Not` parts are rendered after positive parts so the result is of the
+///   form `a* b* NOT (c*)`, which FTS5 accepts. An `And` with NO positive
+///   parts renders as the empty string (match nothing) — FTS5's `NOT` is
+///   binary and a bare `NOT (c*)` is a syntax error.
 /// - `Or(parts)` → non-empty parts joined with ` OR `, wrapped in
-///   parentheses: `(a* OR b*)`.
-/// - `Not(q)` → `NOT (<inner>)`. NOTE: FTS5 has no unary `-term` operator
-///   (a leading `-` is parsed as a column filter and fails), so the binary
-///   `NOT` form is used instead. A *bare* `Not` (`NOT (x*)` alone) is not
-///   valid FTS5 — always combine it with a positive term via `And`.
+///   parentheses: `(a* OR b*)`. (`Not` parts render empty and drop out;
+///   OR-negation is a later milestone.)
+/// - `Not(q)` at the top level → the empty string (match nothing): FTS5 has
+///   no unary `-term` operator (a leading `-` is parsed as a column filter
+///   and fails) and no bare `NOT`, so there is nothing valid to render.
 ///
 /// Words are split on whitespace and on every FTS5 special character
 /// (`" * ( ) : { } [ ] ^ + -` and friends); empty fragments are dropped, so
@@ -152,7 +154,22 @@ pub fn to_fts(q: &Query) -> String {
             let (negs, poss): (Vec<&Query>, Vec<&Query>) =
                 parts.iter().partition(|p| matches!(p, Query::Not(_)));
             let mut out: Vec<String> = poss.iter().map(|p| to_fts(p)).filter(|s| !s.is_empty()).collect();
-            out.extend(negs.iter().map(|p| to_fts(p)).filter(|s| !s.is_empty()));
+            if out.is_empty() {
+                // No positive term for NOT to bind to — invalid FTS5.
+                // Match nothing rather than error.
+                return String::new();
+            }
+            out.extend(negs.iter().filter_map(|p| match p {
+                Query::Not(inner) => {
+                    let s = to_fts(inner);
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(format!("NOT ({s})"))
+                    }
+                }
+                _ => None, // unreachable: partitioned above
+            }));
             out.join(" ")
         }
         Query::Or(parts) => {
@@ -167,14 +184,8 @@ pub fn to_fts(q: &Query) -> String {
                 _ => format!("({})", inner.join(" OR ")),
             }
         }
-        Query::Not(inner) => {
-            let s = to_fts(inner);
-            if s.is_empty() {
-                String::new()
-            } else {
-                format!("NOT ({s})")
-            }
-        }
+        // Bare NOT: no left operand exists in FTS5 — match nothing.
+        Query::Not(_) => String::new(),
     }
 }
 
@@ -292,6 +303,59 @@ mod tests {
             Query::Text("snes".into()),
         ]);
         assert_eq!(to_fts(&nested), "(mario* OR zelda*) snes*");
+    }
+
+    #[test]
+    fn to_fts_bare_not_matches_nothing() {
+        // A bare NOT has no left operand — invalid FTS5. It must render as
+        // the empty string (which search_fts treats as "no rows"), never as
+        // `NOT (x*)`, which would make the query fail.
+        let bare = Query::Not(Box::new(Query::Text("draft".into())));
+        assert_eq!(to_fts(&bare), "");
+        // Same for an AND of only negations: nothing for NOT to bind to.
+        let and_only_negs = Query::And(vec![
+            Query::Not(Box::new(Query::Text("a".into()))),
+            Query::Not(Box::new(Query::Text("b".into()))),
+        ]);
+        assert_eq!(to_fts(&and_only_negs), "");
+        // A negation whose inner renders empty is dropped, not emitted bare.
+        let and_empty_neg = Query::And(vec![
+            Query::Text("report".into()),
+            Query::Not(Box::new(Query::Text("***".into()))),
+        ]);
+        assert_eq!(to_fts(&and_empty_neg), "report*");
+    }
+
+    #[test]
+    fn to_fts_bare_not_executes_as_no_rows() {
+        // End-to-end: a bare NOT must not error against a real FTS5 index.
+        let cat = ufm_catalog::Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&ufm_vfs::Location {
+            id: loc,
+            provider: "local".into(),
+            display_name: "t".into(),
+            capabilities: Default::default(),
+            protected: ufm_vfs::ProtectionTier::None,
+        })
+        .unwrap();
+        cat.insert_item(&ufm_vfs::Item {
+            id: ufm_core::ItemId::new(),
+            location: loc,
+            name: "quarterly report.pdf".into(),
+            kind: ufm_vfs::ItemKind::File,
+            size_bytes: None,
+            modified: None,
+            provider_key: Some("/x/quarterly report.pdf".into()),
+            labels: vec![],
+            starred: false,
+        })
+        .unwrap();
+        let bare = Query::Not(Box::new(Query::Text("quarterly".into())));
+        let rendered = to_fts(&bare);
+        assert_eq!(rendered, "");
+        let hits = cat.search_fts(&rendered, 10).unwrap();
+        assert!(hits.is_empty());
     }
 
     /// End-to-end: `parse` → `to_fts` → `Catalog::search_fts` must produce
