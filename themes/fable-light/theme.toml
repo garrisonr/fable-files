@@ -1,0 +1,11 @@
+# Fable Light — theme.toml
+# Portable theme package: manifest (this file) + tokens.toml + optional assets.
+# No executable code. See docs/THEME_FORMAT.md.
+
+name = "Fable Light"
+author = "Richard Garrison"
+version = "0.1.0"
+license = "GPL-3.0-or-later"
+app_range = ">=0.1.0"
+dark = false
+description = "Warm paper light theme: parchment surfaces, warm-ink text, calm blue action. Every text pair verified WCAG AA (4.5:1+)."

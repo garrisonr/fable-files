@@ -1,0 +1,33 @@
+# Fable Light tokens (tokens.toml)
+# Warm paper theme. Semantic roles, not raw decoration. Colors are #RRGGBB.
+# Every text pair verified >= 4.5:1 (WCAG AA) by scripts/contrast_check.py
+# (see the design notes in the UI subagent report of 2026-10-12).
+
+surface = "#FAF4E8"          # parchment chrome
+surface_elevated = "#FFFDF7" # toolbar / status bar
+content_canvas = "#FFFEF9"   # file grid background
+text = "#2B2117"             # warm ink
+text_muted = "#6E5D43"       # secondary warm ink
+border = "#E0D3B9"           # hairlines
+selection = "#D7E8F9"        # soft blue selection wash
+focus_ring = "#1D63D0"       # action blue, focus indicator
+accent = "#1A56C4"           # calm accessible blue
+accent_text = "#FFFFFF"
+accent_dim = "#8FB4EE"       # large art / highlights only
+success = "#1E7E34"
+warning = "#8F5E00"
+error = "#B3261E"
+info = "#1D63D0"
+density = "comfortable"      # compact | comfortable | spacious
+
+[typography]
+family_ui = "system-ui, sans-serif"
+family_mono = "\"Victor Mono\", ui-monospace, SFMono-Regular, Menlo, monospace"
+base_size_pt = 11.0
+line_height = 1.45
+
+[shape]
+radius_sm = 4.0
+radius_md = 8.0
+radius_lg = 14.0
+shadow_strength = 0.18

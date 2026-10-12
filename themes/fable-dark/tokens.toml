@@ -1,0 +1,33 @@
+# Fable Dark tokens (tokens.toml)
+# True-dark neutral theme. Semantic roles, not raw decoration. Colors are
+# #RRGGBB. Every text pair verified >= 4.5:1 (WCAG AA) by
+# scripts/contrast_check.py (see the UI subagent report of 2026-10-12).
+
+surface = "#17171A"          # near-black neutral chrome
+surface_elevated = "#202025" # toolbar / status bar
+content_canvas = "#0D0D0F"   # file grid background
+text = "#F1F1F3"             # near-white neutral
+text_muted = "#A9A9B3"       # secondary gray
+border = "#2E2E35"           # hairlines
+selection = "#2A4468"        # deep blue selection wash
+focus_ring = "#82B9F4"       # luminous blue focus indicator
+accent = "#63A6EE"           # luminous action blue
+accent_text = "#0B1118"      # near-black ink on the luminous accent
+accent_dim = "#2C537F"       # large art / highlights only
+success = "#57B97F"
+warning = "#DDA83C"
+error = "#E57A72"
+info = "#82B9F4"
+density = "comfortable"      # compact | comfortable | spacious
+
+[typography]
+family_ui = "system-ui, sans-serif"
+family_mono = "\"Victor Mono\", ui-monospace, SFMono-Regular, Menlo, monospace"
+base_size_pt = 11.0
+line_height = 1.45
+
+[shape]
+radius_sm = 4.0
+radius_md = 8.0
+radius_lg = 14.0
+shadow_strength = 0.30

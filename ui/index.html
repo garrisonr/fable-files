@@ -3,20 +3,14 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
     <title>Fable Files</title>
-    <link rel="stylesheet" href="./theme.css" />
-    <!-- Theme variables are installed here by applyTheme(); never hand-edit. -->
+    <!-- Theme variables are installed here by the theme manager (apply_theme
+         returns CSS custom properties; the shell applies them verbatim). -->
     <style id="ufm-theme-vars"></style>
   </head>
   <body>
-    <div id="app">
-      <div class="toolbar">
-        <input class="search-box" placeholder="Search everything — try: super mario" />
-        <button class="accent-button">Jobs</button>
-      </div>
-      <div class="file-list" id="file-list"></div>
-      <div class="status-bar" id="status">booting…</div>
-    </div>
-    <script type="module" src="./main.ts"></script>
+    <div id="app-root"></div>
+    <script type="module" src="./src/main.ts"></script>
   </body>
 </html>
