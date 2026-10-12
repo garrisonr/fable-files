@@ -9,8 +9,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use ufm_core::Result;
-use ufm_vfs::Item;
+use ufm_vfs::{Item, ItemKind};
 
 // ---------------------------------------------------------------------------
 // Preview kinds, in preference order. The registry picks the richest kind
@@ -106,5 +107,173 @@ impl PreviewRegistry {
 impl Default for PreviewRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExtensionProvider — the built-in claim router. Maps file extensions (and
+// folders) to the richest PreviewKind the shell can serve for them; real
+// decoders replace the stub render() in later milestones.
+// ---------------------------------------------------------------------------
+
+/// Built-in provider: claims items purely by extension. Folders always map
+/// to [`PreviewKind::Metadata`]; anything unrecognized falls back to
+/// [`PreviewKind::Hex`] so the shell still shows *something*.
+pub struct ExtensionProvider;
+
+impl ExtensionProvider {
+    fn extension(item: &Item) -> Option<String> {
+        Path::new(&item.name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+    }
+}
+
+#[async_trait]
+impl PreviewProvider for ExtensionProvider {
+    fn name(&self) -> &'static str {
+        "extension"
+    }
+
+    fn claims(&self, item: &Item) -> Option<PreviewKind> {
+        if item.kind == ItemKind::Folder {
+            return Some(PreviewKind::Metadata);
+        }
+        let ext = Self::extension(item);
+        Some(match ext.as_deref() {
+            // Native: images and plain text the shell renders directly.
+            Some(
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "svg"
+                | "ico" | "txt" | "md" | "markdown" | "rs" | "ts" | "js" | "json" | "toml"
+                | "yaml" | "yml" | "xml" | "html" | "htm" | "css",
+            ) => PreviewKind::Native,
+            // Media: audio/video playback surface.
+            Some(
+                "mp3" | "flac" | "ogg" | "oga" | "wav" | "m4a" | "opus" | "mp4" | "mkv"
+                | "webm" | "mov" | "avi",
+            ) => PreviewKind::Media,
+            // Document: paginated document / ebook.
+            Some("pdf" | "epub" | "doc" | "docx" | "odt") => PreviewKind::Document,
+            // Archive: browsed like a folder.
+            Some("zip" | "7z" | "rar" | "tar" | "gz" | "bz2" | "xz") => PreviewKind::Archive,
+            // Everything else — unknown or missing extension: hex fallback.
+            _ => PreviewKind::Hex,
+        })
+    }
+
+    async fn render(&self, req: &PreviewRequest) -> Result<Preview> {
+        // MVP stub: real decoders arrive per-kind in later milestones.
+        Ok(Preview {
+            kind: self.claims(&req.item).unwrap_or(PreviewKind::Hex),
+            payload_json: "{}".to_string(),
+            title: req.item.name.clone(),
+        })
+    }
+}
+
+/// Registry pre-loaded with the built-in providers. The shell (and Tauri
+/// commands) should start from this, then register plugin providers on top.
+pub fn registry_with_builtins() -> PreviewRegistry {
+    let mut registry = PreviewRegistry::new();
+    registry.register(Box::new(ExtensionProvider));
+    registry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ufm_core::{ItemId, LocationId};
+
+    fn item(name: &str, kind: ItemKind) -> Item {
+        Item {
+            id: ItemId::new(),
+            location: LocationId::new(),
+            name: name.into(),
+            kind,
+            size_bytes: None,
+            modified: None,
+            provider_key: None,
+            labels: vec![],
+            starred: false,
+        }
+    }
+
+    #[test]
+    fn extension_claims_map_to_expected_kinds() {
+        let p = ExtensionProvider;
+        let cases = [
+            ("photo.png", PreviewKind::Native),
+            ("photo.JPG", PreviewKind::Native), // case-insensitive
+            ("notes.txt", PreviewKind::Native),
+            ("lib.rs", PreviewKind::Native),
+            ("page.html", PreviewKind::Native),
+            ("song.flac", PreviewKind::Media),
+            ("song.MP3", PreviewKind::Media),
+            ("movie.mkv", PreviewKind::Media),
+            ("clip.mov", PreviewKind::Media),
+            ("book.pdf", PreviewKind::Document),
+            ("book.epub", PreviewKind::Document),
+            ("archive.zip", PreviewKind::Archive),
+            ("backup.tar", PreviewKind::Archive),
+            ("data.7z", PreviewKind::Archive),
+            ("weird.xyz", PreviewKind::Hex),
+            ("noextension", PreviewKind::Hex),
+        ];
+        for (name, want) in cases {
+            assert_eq!(
+                p.claims(&item(name, ItemKind::File)),
+                Some(want),
+                "wrong claim for {name}"
+            );
+        }
+        // Folders always get Metadata, regardless of name.
+        assert_eq!(
+            p.claims(&item("some.zip", ItemKind::Folder)),
+            Some(PreviewKind::Metadata)
+        );
+    }
+
+    #[tokio::test]
+    async fn render_returns_minimal_preview() {
+        let p = ExtensionProvider;
+        let req = PreviewRequest {
+            item: item("report.pdf", ItemKind::File),
+            byte_budget: 1024 * 1024,
+            priority: PreviewPriority::Foreground,
+        };
+        let preview = p.render(&req).await.unwrap();
+        assert_eq!(preview.kind, PreviewKind::Document);
+        assert_eq!(preview.title, "report.pdf");
+        assert_eq!(preview.payload_json, "{}");
+        // Unknown type still renders — Hex fallback, never an error.
+        let req = PreviewRequest {
+            item: item("blob.xyz", ItemKind::File),
+            byte_budget: 64,
+            priority: PreviewPriority::Thumbnail,
+        };
+        let preview = p.render(&req).await.unwrap();
+        assert_eq!(preview.kind, PreviewKind::Hex);
+    }
+
+    #[test]
+    fn registry_with_builtins_serves_all_kinds() {
+        let registry = registry_with_builtins();
+        assert_eq!(registry.best_kind(&item("a.png", ItemKind::File)), Some(PreviewKind::Native));
+        assert_eq!(registry.best_kind(&item("a.mp3", ItemKind::File)), Some(PreviewKind::Media));
+        assert_eq!(
+            registry.best_kind(&item("a.pdf", ItemKind::File)),
+            Some(PreviewKind::Document)
+        );
+        assert_eq!(
+            registry.best_kind(&item("a.zip", ItemKind::File)),
+            Some(PreviewKind::Archive)
+        );
+        assert_eq!(
+            registry.best_kind(&item("dir", ItemKind::Folder)),
+            Some(PreviewKind::Metadata)
+        );
+        assert_eq!(registry.best_kind(&item("a.xyz", ItemKind::File)), Some(PreviewKind::Hex));
+        assert!(registry.provider_names().contains_key("extension"));
     }
 }

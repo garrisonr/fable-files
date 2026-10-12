@@ -7,4 +7,7 @@ license.workspace = true
 [dependencies]
 ufm-core.workspace = true
 ufm-vfs = { path = "../ufm-vfs" }
+ufm-catalog = { path = "../ufm-catalog" }
 serde.workspace = true
+serde_json.workspace = true
+walkdir.workspace = true

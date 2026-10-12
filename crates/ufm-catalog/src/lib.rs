@@ -12,6 +12,20 @@ use ufm_core::{CollectionId, ItemId, Result, UfmError};
 /// Schema version. Migrations run in order; downgrades are refused.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Parse the lowercase kind string the catalog stores
+/// (`format!("{:?}", kind).to_lowercase()`). Unknown values degrade to
+/// `File` so one odd row can never fail a whole search.
+fn parse_kind(s: &str) -> ufm_vfs::ItemKind {
+    match s {
+        "file" => ufm_vfs::ItemKind::File,
+        "folder" => ufm_vfs::ItemKind::Folder,
+        "symlink" => ufm_vfs::ItemKind::Symlink,
+        "archive" => ufm_vfs::ItemKind::Archive,
+        "volume" => ufm_vfs::ItemKind::Volume,
+        _ => ufm_vfs::ItemKind::File,
+    }
+}
+
 pub struct Catalog {
     conn: Connection,
 }
@@ -159,6 +173,74 @@ impl Catalog {
         Ok(())
     }
 
+    /// Full-text search over item names via the `items_fts` FTS5 table,
+    /// ranked with `bm25` (lower = better match). Returns `(item, rank)`
+    /// pairs ordered best-first, capped at `limit` rows. Empty or
+    /// whitespace-only queries return no rows instead of erroring.
+    ///
+    /// Items are reconstructed from the `items` rows joined back on
+    /// `rowid`; `labels`/`starred` are not populated here (they come from
+    /// their own tables in a later milestone).
+    pub fn search_fts(&self, fts_query: &str, limit: u32) -> Result<Vec<(ufm_vfs::Item, f64)>> {
+        if fts_query.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes,
+                        i.modified, i.provider_key, bm25(items_fts) AS rank
+                 FROM items_fts
+                 JOIN items AS i ON i.rowid = items_fts.rowid
+                 WHERE items_fts MATCH ?1
+                 ORDER BY rank
+                 LIMIT ?2",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![fts_query, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, f64>(7)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, location_id, name, kind_s, size_bytes, modified_s, provider_key, rank) =
+                row.map_err(|e| UfmError::Database(e.to_string()))?;
+            let parse_id = |s: &str, what: &str| {
+                uuid::Uuid::parse_str(s)
+                    .map_err(|e| UfmError::Database(format!("bad {what} id {s:?}: {e}")))
+            };
+            out.push((
+                ufm_vfs::Item {
+                    id: ufm_core::ItemId(parse_id(&id, "item")?),
+                    location: ufm_core::LocationId(parse_id(&location_id, "location")?),
+                    name,
+                    kind: parse_kind(&kind_s),
+                    size_bytes: size_bytes.map(|s| s as u64),
+                    modified: modified_s.and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&chrono::Utc))
+                    }),
+                    provider_key,
+                    labels: Vec::new(),
+                    starred: false,
+                },
+                rank,
+            ));
+        }
+        Ok(out)
+    }
+
     /// Record a label/tag on an item. Tags are virtual organization —
     /// they never move the file (spec §11).
     pub fn tag(&self, item: &ItemId, label: &str) -> Result<()> {
@@ -289,5 +371,67 @@ mod tests {
     fn integrity_ok_on_fresh_db() {
         let cat = Catalog::open_in_memory().unwrap();
         assert_eq!(cat.integrity_check().unwrap(), "ok");
+    }
+
+    fn named_item(location: LocationId, name: &str, kind: ItemKind) -> Item {
+        Item {
+            id: ItemId::new(),
+            location,
+            name: name.into(),
+            kind,
+            size_bytes: Some(2048),
+            modified: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            provider_key: Some(format!("/fake/{name}")),
+            labels: vec![],
+            starred: false,
+        }
+    }
+
+    #[test]
+    fn search_fts_roundtrip() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        cat.insert_item(&named_item(loc, "quarterly report.pdf", ItemKind::File))
+            .unwrap();
+        cat.insert_item(&named_item(loc, "draft notes.txt", ItemKind::File))
+            .unwrap();
+        cat.insert_item(&named_item(loc, "holiday photos", ItemKind::Folder))
+            .unwrap();
+
+        // Prefix query matching exactly one row.
+        let hits = cat.search_fts("quarter*", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let (item, rank) = &hits[0];
+        assert_eq!(item.name, "quarterly report.pdf");
+        assert_eq!(item.kind, ItemKind::File);
+        assert_eq!(item.size_bytes, Some(2048));
+        assert_eq!(item.location, loc);
+        assert_eq!(item.provider_key.as_deref(), Some("/fake/quarterly report.pdf"));
+        assert_eq!(
+            item.modified,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            )
+        );
+        assert!(rank.is_finite());
+
+        // Results are bm25-ranked; a broader query still orders sanely.
+        let hits = cat.search_fts("report* OR photos*", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+
+        // Empty / whitespace queries return no rows, never an error.
+        assert!(cat.search_fts("", 10).unwrap().is_empty());
+        assert!(cat.search_fts("   ", 10).unwrap().is_empty());
+
+        // Limit is honored (3 rows match, only 1 returned).
+        let hits = cat.search_fts("report* OR photos* OR draft*", 1).unwrap();
+        assert_eq!(hits.len(), 1);
     }
 }
