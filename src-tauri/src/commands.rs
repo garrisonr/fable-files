@@ -852,6 +852,266 @@ pub struct TrashResult {
     pub errors: usize,
 }
 
+
+/// List applications that can open a file, plus the current default.
+/// Reads .desktop files and mimeapps.list (freedesktop spec).
+#[tauri::command]
+pub async fn open_with_apps(
+    state: State<'_, AppState>,
+    item: ItemId,
+) -> Cmd<OpenWithInfo> {
+    let path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mime = guess_mime(&path);
+        let apps = find_apps_for_mime(&mime);
+        let default = get_default_app(&mime);
+        Ok(OpenWithInfo { mime, apps, default })
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("open-with task failed: {e}"))))?
+}
+
+/// Open a file with a specific application (by .desktop ID).
+#[tauri::command]
+pub async fn open_with_app(
+    state: State<'_, AppState>,
+    item: ItemId,
+    desktop_id: String,
+) -> Cmd<()> {
+    let path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    // Sanitize: only allow alphanumeric, dash, underscore, dot
+    if !desktop_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "invalid desktop ID".into(),
+        )));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new("gtk-launch")
+            .arg(&desktop_id)
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("gtk-launch failed: {e}"))
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("launch task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Provider {
+        provider: "local".into(),
+        message: e,
+    }))?;
+    Ok(())
+}
+
+/// Set the default application for a MIME type ("always open with").
+#[tauri::command]
+pub async fn set_default_app(mime: String, desktop_id: String) -> Cmd<()> {
+    if !desktop_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "invalid desktop ID".into(),
+        )));
+    }
+    // Basic MIME validation: type/subtype
+    if !mime.contains('/') || mime.contains(' ') || mime.contains(';') {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "invalid MIME type".into(),
+        )));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+        let mimeapps = format!("{home}/.config/mimeapps.list");
+        // Read existing or create new
+        let mut content = std::fs::read_to_string(&mimeapps).unwrap_or_default();
+        // Ensure [Default Applications] section exists
+        if !content.contains("[Default Applications]") {
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push_str("[Default Applications]\n");
+        }
+        // Remove old entry for this MIME, add new one
+        let mut lines: Vec<String> = Vec::new();
+        let mut in_defaults = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_defaults = trimmed == "[Default Applications]";
+                lines.push(line.to_string());
+                continue;
+            }
+            if in_defaults && trimmed.starts_with(&format!("{mime}=")) {
+                continue; // drop old entry
+            }
+            lines.push(line.to_string());
+        }
+        // Insert new entry after [Default Applications] header
+        let mut out = Vec::new();
+        let mut inserted = false;
+        for line in lines {
+            out.push(line.clone());
+            if !inserted && line.trim() == "[Default Applications]" {
+                out.push(format!("{mime}={desktop_id}"));
+                inserted = true;
+            }
+        }
+        std::fs::write(&mimeapps, out.join("\n") + "\n").map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("set-default task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct OpenWithInfo {
+    pub mime: String,
+    pub apps: Vec<AppInfo>,
+    pub default: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AppInfo {
+    pub id: String,       // e.g. "org.gnome.TextEditor"
+    pub name: String,     // e.g. "Text Editor"
+    pub icon: Option<String>,
+}
+
+/// Guess MIME type from file extension (fast path).
+fn guess_mime(path: &std::path::Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "txt" | "md" | "log" | "srt" | "vtt" | "nfo" => "text/plain",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "json" => "application/json",
+        "xml" | "html" | "htm" => "text/html",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "mp4" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        "avi" => "video/x-msvideo",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "zip" => "application/zip",
+        "tar" => "application/x-tar",
+        "gz" => "application/gzip",
+        "sh" => "application/x-shellscript",
+        "py" => "text/x-python",
+        "rs" => "text/rust",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// Find .desktop apps that claim to handle a MIME type.
+fn find_apps_for_mime(mime: &str) -> Vec<AppInfo> {
+    let mut apps = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    let dirs = vec![
+        format!("{home}/.local/share/applications"),
+        "/usr/local/share/applications".to_string(),
+        "/usr/share/applications".to_string(),
+    ];
+
+    for dir in dirs {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("desktop") {
+                    continue;
+                }
+                let id = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if seen.contains(&id) || id.is_empty() {
+                    continue;
+                }
+                if let Ok(content) = std::fs::read_to_string(&p) {
+                    // Check MimeType= field
+                    let mut handles = false;
+                    let mut name = String::new();
+                    let mut icon = None;
+                    let mut no_display = false;
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if line.starts_with("MimeType=") {
+                            let types: Vec<&str> = line[9..].split(';').collect();
+                            // Match exact or wildcard (e.g. image/* matches image/png)
+                            for t in types {
+                                if t == mime
+                                    || (t.ends_with("/*")
+                                        && mime.starts_with(&t[..t.len() - 1]))
+                                {
+                                    handles = true;
+                                    break;
+                                }
+                            }
+                        } else if line.starts_with("Name=") && name.is_empty() {
+                            name = line[5..].to_string();
+                        } else if line.starts_with("Icon=") {
+                            icon = Some(line[5..].to_string());
+                        } else if line == "NoDisplay=true" {
+                            no_display = true;
+                        }
+                    }
+                    if handles && !no_display && !name.is_empty() {
+                        seen.insert(id.clone());
+                        apps.push(AppInfo { id, name, icon });
+                    }
+                }
+            }
+        }
+    }
+    apps.sort_by(|a, b| a.name.cmp(&b.name));
+    apps
+}
+
+/// Get the default app for a MIME type from mimeapps.list.
+fn get_default_app(mime: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let content = std::fs::read_to_string(format!("{home}/.config/mimeapps.list")).ok()?;
+    let mut in_defaults = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_defaults = trimmed == "[Default Applications]";
+            continue;
+        }
+        if in_defaults && trimmed.starts_with(&format!("{mime}=")) {
+            // Take first app before semicolon
+            let val = &trimmed[mime.len() + 1..];
+            return val.split(';').next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

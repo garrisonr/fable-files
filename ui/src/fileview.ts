@@ -7,6 +7,7 @@ import { formatBytes, formatDate, type Item } from "./api";
 import { animateFromLive, liveOpacity, reducedMotion, fadeTo, rubberBand, springTo, cancelSpring } from "./motion";
 import { sortedItems, type SortDir, type SortKey, type Tab, type ViewMode } from "./tabs";
 import { ContextMenu } from "./contextmenu";
+import { OpenWithDialog } from "./openwith";
 
 export interface FileViewHooks {
   onOpen(item: Item): void; // Enter / double-click on a folder (or file)
@@ -32,6 +33,7 @@ export class FileView {
   private wheelEndTimer = 0;
   private lastSelected: Item | null = null;
   private ctxMenu = new ContextMenu();
+  private openWithDialog = new OpenWithDialog();
 
   constructor(
     private tab: () => Tab,
@@ -228,6 +230,10 @@ export class FileView {
         {
           label: "Open",
           action: () => this.hooks.onOpen(item),
+        },
+        {
+          label: "Open With...",
+          action: () => this.openWithDialog.open(item),
         },
         {
           label: "Quick Look",

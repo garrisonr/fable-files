@@ -331,6 +331,9 @@ pub fn run() {
             commands::trash_path,
             commands::empty_trash,
             commands::secure_empty_trash,
+            commands::open_with_apps,
+            commands::open_with_app,
+            commands::set_default_app,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Fable Files");

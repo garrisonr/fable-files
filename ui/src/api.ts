@@ -84,6 +84,12 @@ export const api = {
   trashPath: () => invoke<string>("trash_path"),
   emptyTrash: () => invoke<{ deleted: number; errors: number }>("empty_trash"),
   secureEmptyTrash: () => invoke<{ deleted: number; errors: number }>("secure_empty_trash"),
+  openWithApps: (item: string) =>
+    invoke<{ mime: string; apps: Array<{ id: string; name: string; icon: string | null }>; default: string | null }>("open_with_apps", { item }),
+  openWithApp: (item: string, desktopId: string) =>
+    invoke<void>("open_with_app", { item, desktopId }),
+  setDefaultApp: (mime: string, desktopId: string) =>
+    invoke<void>("set_default_app", { mime, desktopId }),
   previewText: (item: string, maxLines?: number) =>
     invoke<{ lines: string[]; truncated: boolean }>("preview_text", { item, maxLines }),
   startIndexing: (location: string) =>
