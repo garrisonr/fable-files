@@ -6,6 +6,7 @@
 import { formatBytes, formatDate, type Item } from "./api";
 import { animateFromLive, liveOpacity, reducedMotion, fadeTo, rubberBand, springTo, cancelSpring } from "./motion";
 import { sortedItems, type SortDir, type SortKey, type Tab, type ViewMode } from "./tabs";
+import { ContextMenu } from "./contextmenu";
 
 export interface FileViewHooks {
   onOpen(item: Item): void; // Enter / double-click on a folder (or file)
