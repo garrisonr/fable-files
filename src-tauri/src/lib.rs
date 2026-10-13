@@ -327,6 +327,7 @@ pub fn run() {
             commands::preview,
             commands::open_item,
             commands::set_executable,
+            commands::preview_text,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Fable Files");

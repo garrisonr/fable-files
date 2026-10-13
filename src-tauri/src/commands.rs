@@ -669,6 +669,53 @@ pub async fn set_executable(
     Ok(())
 }
 
+
+/// Read the first N lines of a text file for Quick Look preview.
+/// Only backend-minted item ids resolve through item_paths.
+/// Returns the lines and whether the file was truncated.
+#[tauri::command]
+pub async fn preview_text(
+    state: State<'_, AppState>,
+    item: ItemId,
+    max_lines: Option<usize>,
+) -> Cmd<PreviewTextResult> {
+    let path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    let max = max_lines.unwrap_or(50).min(500);
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::{BufRead, BufReader};
+        let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+        let reader = BufReader::new(file);
+        let mut lines = Vec::new();
+        let mut truncated = false;
+        for (i, line) in reader.lines().enumerate() {
+            if i >= max {
+                truncated = true;
+                break;
+            }
+            // Lossy conversion handles non-UTF8 gracefully
+            let l = line.map(|s| s).unwrap_or_else(|_| "<binary data>".to_string());
+            // Truncate very long lines
+            lines.push(if l.len() > 500 { format!("{}...", &l[..500]) } else { l });
+        }
+        Ok(PreviewTextResult { lines, truncated })
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("preview task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("preview failed: {e}"))))
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct PreviewTextResult {
+    pub lines: Vec<String>,
+    pub truncated: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

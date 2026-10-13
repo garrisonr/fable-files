@@ -81,6 +81,8 @@ export const api = {
   listThemes: () => invoke<ThemeInfo[]>("list_themes"),
   applyTheme: (theme: string) => invoke<string>("apply_theme", { theme }),
   preview: (item: string) => invoke<PreviewKind>("preview", { item }),
+  previewText: (item: string, maxLines?: number) =>
+    invoke<{ lines: string[]; truncated: boolean }>("preview_text", { item, maxLines }),
   startIndexing: (location: string) =>
     invoke<unknown>("start_indexing", { location }),
   indexStatus: () => invoke<IndexState>("index_status"),

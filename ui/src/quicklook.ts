@@ -127,7 +127,7 @@ export class QuickLook {
     return m ? parseFloat(m[1]) : this.closedX();
   }
 
-  private renderCard(item: Item, kind: PreviewKind | null): void {
+  private async renderCard(item: Item, kind: PreviewKind | null): Promise<void> {
     const body = this.el.querySelector(".ql-body")!;
     body.innerHTML = "";
     const card = document.createElement("div");
@@ -172,5 +172,22 @@ export class QuickLook {
     card.appendChild(hint);
 
     body.appendChild(card);
+
+    // Fetch text content for text-like files
+    if (kind === "Native" && item.kind !== "folder") {
+      const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
+      const textExts = ["txt", "md", "csv", "tsv", "log", "srt", "vtt", "sub", "ssa", "ass", "nfo", "json", "xml", "yaml", "yml", "toml", "ini", "cfg", "sh", "py", "rs", "ts", "js"];
+      if (textExts.includes(ext)) {
+        try {
+          const result = await api.previewText(item.id, 50);
+          const pre = document.createElement("pre");
+          pre.className = "ql-text-preview";
+          pre.textContent = result.lines.join("\n") + (result.truncated ? "\n… (truncated)" : "");
+          card.appendChild(pre);
+        } catch {
+          // Text preview failed — metadata card stands alone
+        }
+      }
+    }
   }
 }
