@@ -67,6 +67,7 @@ export class Shell {
   private themeManager: ThemeManager;
   private indexTracker: IndexTracker;
   private ctxMenu = new ContextMenu();
+  private fontScale = 1.0;
 
   constructor() {
     this.el.id = "app";
@@ -691,6 +692,12 @@ export class Shell {
     );
   }
 
+  /** Adjust UI font scale (0.7 to 2.0). Persists for the session. */
+  private setFontScale(scale: number): void {
+    this.fontScale = Math.min(2.0, Math.max(0.7, Math.round(scale * 10) / 10));
+    document.documentElement.style.setProperty("--ufm-font-scale", String(this.fontScale));
+  }
+
   // -------------------------------------------------------------- view mode
 
   private setView(mode: ViewMode): void {
@@ -832,6 +839,24 @@ export class Shell {
       if (sel) {
         api.setExecutable(sel.id, true).catch((err) => console.error("chmod +x failed:", err));
       }
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && (e.key === "=" || e.key === "+")) {
+      // Ctrl+=: increase font size
+      e.preventDefault();
+      this.setFontScale(this.fontScale + 0.1);
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === "-") {
+      // Ctrl+-: decrease font size
+      e.preventDefault();
+      this.setFontScale(this.fontScale - 0.1);
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === "0") {
+      // Ctrl+0: reset font size
+      e.preventDefault();
+      this.setFontScale(1.0);
       return;
     }
     if (inField) return;

@@ -32,6 +32,7 @@ export class FileView {
   private overscroll = 0;
   private wheelEndTimer = 0;
   private lastSelected: Item | null = null;
+  private colWidths: Map<string, number> = new Map();
   private ctxMenu = new ContextMenu();
   private openWithDialog = new OpenWithDialog();
 
@@ -168,6 +169,36 @@ export class FileView {
           e.preventDefault();
           this.sortBy(key);
         }
+      });
+    });
+    // Add resize handles to all headers
+    thead.querySelectorAll<HTMLElement>("th").forEach((th) => {
+      // Apply stored width
+      const colKey = th.dataset.sort || "kind";
+      const saved = this.colWidths.get(colKey);
+      if (saved) th.style.width = `${saved}px`;
+
+      const handle = document.createElement("div");
+      handle.className = "col-resize-handle";
+      th.appendChild(handle);
+      th.style.position = "relative";
+
+      handle.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const startX = e.clientX;
+        const startWidth = th.offsetWidth;
+        const onMove = (ev: MouseEvent) => {
+          const newWidth = Math.max(60, startWidth + (ev.clientX - startX));
+          th.style.width = `${newWidth}px`;
+          this.colWidths.set(colKey, newWidth);
+        };
+        const onUp = () => {
+          document.removeEventListener("mousemove", onMove);
+          document.removeEventListener("mouseup", onUp);
+        };
+        document.addEventListener("mousemove", onMove);
+        document.addEventListener("mouseup", onUp);
       });
     });
     table.appendChild(thead);

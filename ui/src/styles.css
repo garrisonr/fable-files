@@ -1106,3 +1106,36 @@ body[data-layout="tv"] .cell-icon {
   background: var(--ufm-accent);
   color: var(--ufm-on-accent);
 }
+
+/* Column resize handles */
+.col-resize-handle {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
+  z-index: 10;
+}
+
+.col-resize-handle:hover {
+  background: var(--ufm-accent);
+  opacity: 0.5;
+}
+
+/* Font scaling - applied via --ufm-font-scale on :root */
+:root {
+  --ufm-font-scale: 1;
+}
+
+#app {
+  font-size: calc(14px * var(--ufm-font-scale));
+}
+
+.list-table {
+  font-size: calc(13px * var(--ufm-font-scale));
+}
+
+.cell-name {
+  font-size: calc(12px * var(--ufm-font-scale));
+}
