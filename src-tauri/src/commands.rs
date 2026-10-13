@@ -250,7 +250,6 @@ pub struct SearchHit {
     pub rank: f64,
 }
 
-#[tauri::command]
 /// File-type categories for the advanced-search filter.
 fn type_extensions(filter: &str) -> Option<&'static [&'static str]> {
     match filter {
@@ -268,6 +267,7 @@ fn name_in_type(name: &str, exts: &[&str]) -> bool {
     !ext.is_empty() && ext != name.to_lowercase() && exts.contains(&ext.as_str())
 }
 
+#[tauri::command]
 pub async fn search(
     state: State<'_, AppState>,
     query_text: String,
@@ -968,11 +968,33 @@ pub async fn open_with_app(
         )));
     }
     tauri::async_runtime::spawn_blocking(move || {
-        std::process::Command::new("gtk-launch")
+        let launched = std::process::Command::new("gtk-launch")
             .arg(&desktop_id)
             .arg(&path)
-            .spawn()
-            .map_err(|e| format!("gtk-launch failed: {e}"))
+            .spawn();
+        match launched {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Flatpak fallback: gtk-launch can't always resolve
+                // exported desktop ids from inside an AppImage.
+                let app_id = desktop_id.trim_end_matches(".desktop");
+                let home = std::env::var("HOME").unwrap_or_default();
+                let exported = std::path::PathBuf::from(format!(
+                    "{home}/.local/share/flatpak/exports/share/applications/{desktop_id}"
+                ));
+                if exported.exists() {
+                    std::process::Command::new("flatpak")
+                        .arg("run")
+                        .arg(app_id)
+                        .arg(&path)
+                        .spawn()
+                        .map(|_| ())
+                        .map_err(|fe| format!("flatpak run failed: {fe}"))
+                } else {
+                    Err(format!("gtk-launch failed: {e}"))
+                }
+            }
+        }
     })
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("launch task failed: {e}"))))?
@@ -1111,11 +1133,23 @@ fn find_apps_for_mime(mime: &str) -> Vec<AppInfo> {
     let mut seen = std::collections::HashSet::new();
     let home = std::env::var("HOME").unwrap_or_default();
 
-    let dirs = vec![
-        format!("{home}/.local/share/applications"),
-        "/usr/local/share/applications".to_string(),
-        "/usr/share/applications".to_string(),
-    ];
+    // Everywhere .desktop files live: XDG data dirs + Flatpak exports
+    // (ArtCraft & friends are Flatpaks — leaving those dirs out made
+    // installed apps invisible to Open With).
+    let mut dirs: Vec<String> = Vec::new();
+    let data_home = std::env::var("XDG_DATA_HOME")
+        .unwrap_or_else(|_| format!("{home}/.local/share"));
+    dirs.push(format!("{data_home}/applications"));
+    let data_dirs = std::env::var("XDG_DATA_DIRS")
+        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
+    for d in data_dirs.split(':') {
+        if !d.is_empty() {
+            dirs.push(format!("{d}/applications"));
+        }
+    }
+    dirs.push(format!("{home}/.local/share/flatpak/exports/share/applications"));
+    dirs.push("/var/lib/flatpak/exports/share/applications".to_string());
+    dirs.dedup();
 
     for dir in dirs {
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -1687,7 +1721,9 @@ pub async fn move_path_to(src_path: String, dest_dir: String) -> Cmd<String> {
 /// Open one of the project's own web pages (bug reports, feature requests).
 #[tauri::command]
 pub async fn open_url(url: String) -> Cmd<()> {
-    if !url.starts_with("https://github.com/garrisonr/fable-files") {
+    if !url.starts_with("https://github.com/garrisonr/fable-files")
+        && !url.starts_with("https://alternativeto.net/")
+    {
         return Err(CommandError::from(UfmError::InvalidInput(
             "only Fable Files project pages can be opened".into(),
         )));

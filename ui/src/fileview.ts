@@ -33,6 +33,14 @@ function icon(kind: string, cls: string): string {
   return `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="${d}"/></svg>`;
 }
 
+/** AlternativeTo search URL for programs that can open this file type. */
+export function alternativeToUrl(item: Item): string {
+  const ext = item.name.includes(".")
+    ? item.name.split(".").pop()!.toLowerCase()
+    : item.name;
+  return `https://alternativeto.net/browse/search/?q=${encodeURIComponent(ext)}`;
+}
+
 export class FileView {
   readonly el: HTMLElement;
   private scroller: HTMLElement;
@@ -306,6 +314,10 @@ export class FileView {
         {
           label: "Properties",
           action: () => this.hooks.onProperties(item),
+        },
+        {
+          label: "Find More Apps Online…",
+          action: () => void api.openUrl(alternativeToUrl(item)),
         },
         {
           label: "Delete",

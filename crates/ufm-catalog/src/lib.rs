@@ -7,7 +7,7 @@
 //! a restart — the filesystem is never walked live for metadata.
 
 use rusqlite::{params, Connection};
-use ufm_core::{CollectionId, ItemId, Result, UfmError};
+use ufm_core::{CollectionId, ItemId, LocationId, Result, UfmError};
 
 /// Schema version. Migrations run in order; downgrades are refused.
 pub const SCHEMA_VERSION: u32 = 1;

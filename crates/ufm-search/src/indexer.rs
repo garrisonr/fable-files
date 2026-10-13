@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn index_then_resume_indexes_zero_new() {
+    fn index_then_reopen_rewalks_without_duplicates() {
         let work = scratch_dir("resume");
         let root = fixture_tree();
         let catalog_path = work.join("catalog.db");
@@ -412,18 +412,23 @@ mod tests {
         // Checkpoint exists, is valid JSON, and names every completed dir.
         let raw = std::fs::read_to_string(&checkpoint_path).unwrap();
         let ck: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(ck["version"], 1);
+        assert_eq!(ck["version"], 2);
+        assert_eq!(ck["run_complete"], true);
         assert_eq!(ck["files_done"], 4);
         assert_eq!(ck["bytes_done"], 19);
         let dirs = ck["completed_dirs"].as_array().unwrap();
         assert_eq!(dirs.len(), 3);
 
-        // Second run on a NEW Indexer, same paths: nothing new to do.
+        // Second run on a NEW Indexer, same paths: the first run
+        // COMPLETED, so this is a fresh re-walk with identical totals —
+        // files added since the first run must be picked up (that was
+        // the stale-index bug), and upserts keep the catalog deduped.
         let mut ix2 = Indexer::open(&catalog_path, &checkpoint_path).unwrap();
         let s2 = ix2.index_root(&root, &location).unwrap();
-        assert_eq!(s2, IndexStats::default(), "resume must index 0 new dirs/files");
+        assert_eq!(s2, s1, "a completed run licenses a fresh re-walk, not a prune");
 
-        // Third run for good measure — still zero.
+        // Third run on the SAME Indexer: within one session a root is
+        // walked once — the fast path still returns zeroed stats.
         let s3 = ix2.index_root(&root, &location).unwrap();
         assert_eq!(s3, IndexStats::default());
 

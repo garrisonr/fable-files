@@ -8,7 +8,7 @@ import { api, formatBytes, formatDate, type Item } from "./api";
 import { sortedItems, type Tab } from "./tabs";
 import { ContextMenu } from "./contextmenu";
 import { OpenWithDialog } from "./openwith";
-import type { FileViewHooks } from "./fileview";
+import { alternativeToUrl, type FileViewHooks } from "./fileview";
 
 interface Column {
   locationId: string;
@@ -184,6 +184,10 @@ export class ColumnsView {
         action: () => this.hooks.onMakeExecutable(item),
       },
       { label: "Properties", action: () => this.hooks.onProperties(item) },
+      {
+        label: "Find More Apps Online…",
+        action: () => void api.openUrl(alternativeToUrl(item)),
+      },
       { label: "Delete", shortcut: "Del", danger: true, action: () => this.hooks.onDelete(item) },
     ]);
   }
