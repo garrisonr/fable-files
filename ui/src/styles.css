@@ -2019,6 +2019,11 @@ tr.row[style*="--label-color"] {
 }
 
 /* ——— folder picker ——— */
+/* Dialog overlays are display:flex by class, which silently
+   defeats the hidden attribute — guard them explicitly. (This
+   was the Labels-dialog-visible-at-startup bug.) */
+.picker-overlay[hidden], .props-overlay[hidden] { display: none !important; }
+
 .picker-overlay {
   position: fixed; inset: 0;
   background: rgb(0 0 0 / 0.32);
@@ -2138,6 +2143,15 @@ tr.row[style*="--label-color"] {
   color: var(--ufm-text);
 }
 .labels-done { background: var(--ufm-accent); color: var(--ufm-on-accent); border-color: transparent; }
+/* Footer rhythm: the Done row is a separated footer, not a
+   continuation of the add row (they used to touch, y-adjacent).
+   Same min-width on both buttons so the stacked right-aligned
+   pair shares BOTH edges. */
+.labels-add-btn, .labels-done { min-width: 4.75rem; }
+.labels-card .picker-actions {
+  margin-top: 0.75rem; padding-top: 0.75rem;
+  border-top: 1px solid var(--ufm-border);
+}
 
 /* ——— Ctrl+K palette + search save ——— */
 .palette-title { font-size: 0.75rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ufm-text-muted); padding: 0.4rem 0.6rem 0.2rem; }
