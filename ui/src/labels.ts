@@ -18,12 +18,14 @@ export interface LabelDef {
 export const DEFAULT_LABELS: LabelDef[] = [
   { name: "Photos", color: "#8b5cf6" }, // grape — his example
   { name: "Film & Video", color: "#6366f1" },
-  { name: "Music & Media", color: "#ec4899" },
+  { name: "Music", color: "#ec4899" },
+  { name: "Media", color: "#14b8a6" },
   { name: "Gaming", color: "#84cc16" },
   { name: "HR & Hiring", color: "#3b82f6" },
   { name: "Resumes", color: "#06b6d4" },
   { name: "Office & Admin", color: "#64748b" },
-  { name: "Payroll & Money", color: "#10b981" },
+  { name: "Payroll", color: "#10b981" },
+  { name: "Money", color: "#eab308" },
   { name: "Receipts", color: "#f59e0b" },
   { name: "IT & Homelab", color: "#f97316" },
   { name: "Personal", color: "#f43f5e" },
@@ -32,17 +34,73 @@ export const DEFAULT_LABELS: LabelDef[] = [
 
 const KEY = "ff-label-defs";
 
+/** Combined labels Dickles asked to split (2026-10-13): the first
+ * name keeps the old color; the sibling gets its own. */
+export const LABEL_SPLITS: Array<{ old: string; first: string; second: string; secondColor: string }> = [
+  { old: "Music & Media", first: "Music", second: "Media", secondColor: "#14b8a6" },
+  { old: "Payroll & Money", first: "Payroll", second: "Money", secondColor: "#eab308" },
+];
+
 export function loadLabelDefs(): LabelDef[] {
   try {
     const raw = localStorage.getItem(KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as LabelDef[];
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        let changed = false;
+        const out: LabelDef[] = [];
+        for (const d of parsed) {
+          const split = LABEL_SPLITS.find((x) => x.old === d.name);
+          if (split) {
+            changed = true;
+            if (!parsed.some((x) => x.name === split.first)) out.push({ name: split.first, color: d.color });
+            if (!parsed.some((x) => x.name === split.second)) out.push({ name: split.second, color: split.secondColor });
+          } else {
+            out.push(d);
+          }
+        }
+        if (changed) saveLabelDefs(out);
+        return out;
+      }
     }
   } catch {
     // fall through to defaults
   }
   return DEFAULT_LABELS.map((d) => ({ ...d }));
+}
+
+/**
+ * Assignment side of the split, run once at startup: anything filed
+ * under a combined label ends up under BOTH new labels (rename
+ * cascades to the first; the second is then added path by path), so
+ * nothing loses its filing. Idempotent: skips labels that no longer
+ * exist in the defs.
+ */
+export async function migrateLabelAssignments(
+  defs: LabelDef[],
+  api: {
+    renamePathLabel(oldLabel: string, newLabel: string): Promise<void>;
+    listItemsByLabel(label: string): Promise<Array<{ provider_key?: string | null }>>;
+    setPathLabel(path: string, label: string, on: boolean): Promise<unknown>;
+  },
+): Promise<boolean> {
+  let migrated = false;
+  for (const split of LABEL_SPLITS) {
+    if (!defs.some((d) => d.name === split.first) || !defs.some((d) => d.name === split.second)) continue;
+    try {
+      const before = await api.listItemsByLabel(split.old);
+      if (before.length === 0) continue;
+      await api.renamePathLabel(split.old, split.first);
+      const items = await api.listItemsByLabel(split.first);
+      for (const it of items) {
+        if (it.provider_key) await api.setPathLabel(it.provider_key, split.second, true);
+      }
+      migrated = true;
+    } catch {
+      // best effort — a failed split leaves the old label usable
+    }
+  }
+  return migrated;
 }
 
 export function saveLabelDefs(defs: LabelDef[]): void {

@@ -2019,10 +2019,12 @@ tr.row[style*="--label-color"] {
 }
 
 /* ——— folder picker ——— */
-/* Dialog overlays are display:flex by class, which silently
-   defeats the hidden attribute — guard them explicitly. (This
-   was the Labels-dialog-visible-at-startup bug.) */
-.picker-overlay[hidden], .props-overlay[hidden] { display: none !important; }
+/* The hidden attribute must ALWAYS win: this app toggles views,
+   panels and dialogs with el.hidden, and any class-level display
+   rule (flex overlays, .gallery-view, .columns-view…) silently
+   defeats it. One global guard — this was both the Labels-at-
+   startup bug and the Gallery-view-can-never-hide bug. */
+[hidden] { display: none !important; }
 
 .picker-overlay {
   position: fixed; inset: 0;
@@ -2115,32 +2117,45 @@ tr.row[style*="--label-color"] {
   padding: 1rem 1.125rem;
   animation: props-pop 220ms cubic-bezier(0.2, 0.9, 0.25, 1.2);
 }
-.labels-list { display: flex; flex-direction: column; gap: 4px; margin: 0.5rem 0; }
+/* One control geometry for the whole dialog (design law):
+   2rem height, 9px input radius, pill buttons, Finder-style
+   rounded color chips — nothing invents its own size. */
+.labels-list { display: flex; flex-direction: column; gap: 0.375rem; margin: 0.625rem 0; }
 .labels-row { display: flex; align-items: center; gap: 0.5rem; }
-.labels-name {
-  flex: 1; padding: 0.35rem 0.55rem; border-radius: 8px;
+.labels-name, .labels-new-name {
+  flex: 1; height: 2rem; padding: 0 0.6rem; border-radius: 9px;
   border: 1px solid var(--ufm-border);
   background: var(--ufm-content-canvas); color: var(--ufm-text);
-  font-size: 0.875rem;
+  font-size: 0.875rem; box-sizing: border-box; min-width: 0;
 }
+.labels-row input[type="color"], .labels-new-color {
+  -webkit-appearance: none; appearance: none;
+  width: 2rem; height: 2rem; flex: none;
+  border: 1px solid var(--ufm-border); border-radius: 8px;
+  padding: 0; background: none; cursor: pointer; box-sizing: border-box;
+}
+.labels-row input[type="color"]::-webkit-color-swatch-wrapper,
+.labels-new-color::-webkit-color-swatch-wrapper { padding: 2px; }
+.labels-row input[type="color"]::-webkit-color-swatch,
+.labels-new-color::-webkit-color-swatch { border: none; border-radius: 6px; }
+.labels-row input[type="color"]::-moz-color-swatch,
+.labels-new-color::-moz-color-swatch { border: none; border-radius: 6px; }
 .labels-del {
   appearance: none; border: none; background: none; cursor: pointer;
-  color: var(--ufm-text-muted); font-size: 0.9375rem; padding: 0.25rem;
+  width: 2rem; height: 2rem; flex: none; border-radius: 8px;
+  color: var(--ufm-text-muted); font-size: 0.9375rem;
+  display: inline-flex; align-items: center; justify-content: center;
 }
-.labels-add { display: flex; gap: 0.5rem; align-items: center; margin-top: 0.5rem; }
-.labels-new-name {
-  flex: 1; padding: 0.4rem 0.55rem; border-radius: 8px;
-  border: 1px solid var(--ufm-border);
-  background: var(--ufm-content-canvas); color: var(--ufm-text);
-  font-size: 0.875rem;
-}
-.labels-new-color { width: 2.2rem; height: 2rem; border: none; background: none; cursor: pointer; }
+.labels-del:hover { background: color-mix(in srgb, #d70015 12%, transparent); color: #d70015; }
+.labels-add { display: flex; gap: 0.5rem; align-items: center; margin-top: 0.625rem; }
 .labels-add-btn, .labels-done {
-  appearance: none; border-radius: 999px; padding: 0.4rem 0.9rem;
+  appearance: none; height: 2rem; padding: 0 0.95rem;
+  border-radius: 999px; box-sizing: border-box;
   font-size: 0.8125rem; font-weight: 600; cursor: pointer;
   border: 1px solid var(--ufm-border);
   background: color-mix(in srgb, var(--ufm-surface) 82%, var(--ufm-text) 6%);
   color: var(--ufm-text);
+  display: inline-flex; align-items: center; justify-content: center;
 }
 .labels-done { background: var(--ufm-accent); color: var(--ufm-on-accent); border-color: transparent; }
 /* Footer rhythm: the Done row is a separated footer, not a
@@ -2471,4 +2486,129 @@ tr.row[style*="--label-color"] {
 
 @media (prefers-reduced-motion: reduce) {
   .disk-dialog, .print-dialog { animation: none; }
+}
+/* ============================================================
+   ROUND 6 — Create Torrent (shared dialog vocabulary)
+   ============================================================ */
+.torrent-dialog {
+  background: var(--ufm-surface, var(--ufm-content-canvas));
+  color: var(--ufm-text);
+  border: 1px solid var(--ufm-border);
+  border-radius: 16px;
+  box-shadow: 0 24px 70px rgb(0 0 0 / 0.35), 0 4px 16px rgb(0 0 0 / 0.2);
+  width: min(32rem, calc(100vw - 3rem));
+  max-height: calc(100vh - 4rem);
+  overflow-y: auto;
+  padding: 1rem 1.125rem 1.125rem;
+  animation: props-pop 220ms cubic-bezier(0.2, 0.9, 0.25, 1.2);
+}
+.torrent-dialog h2 { margin: 0 0 0.6rem; font-size: 1.05rem; font-weight: 700; }
+.torrent-body { display: flex; flex-direction: column; gap: 0.6rem; font-size: 0.875rem; }
+.torrent-head { font-weight: 700; overflow-wrap: anywhere; }
+.torrent-note {
+  line-height: 1.55; color: var(--ufm-text-muted);
+  white-space: pre-line; overflow-wrap: anywhere;
+}
+.torrent-check {
+  display: flex; gap: 0.55rem; align-items: flex-start;
+  line-height: 1.45; cursor: pointer;
+}
+.torrent-check input[type="checkbox"] {
+  width: 1.05rem; height: 1.05rem; margin-top: 0.15rem; flex: none;
+  accent-color: var(--ufm-accent);
+}
+.torrent-check.disabled { opacity: 0.5; cursor: default; }
+.torrent-label { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.8125rem; color: var(--ufm-text-muted); }
+.torrent-trackers {
+  padding: 0.5rem 0.6rem; border-radius: 9px;
+  border: 1px solid var(--ufm-border);
+  background: var(--ufm-content-canvas); color: var(--ufm-text);
+  font-family: ui-monospace, monospace; font-size: 0.75rem;
+  resize: vertical; box-sizing: border-box; width: 100%;
+}
+.torrent-row { display: flex; gap: 0.5rem; justify-content: flex-end; }
+
+@media (prefers-reduced-motion: reduce) {
+  .torrent-dialog { animation: none; }
+}
+
+/* ——— Round 5.2: font scale unification ———————————————————————————
+   Ctrl +/- now drives the ROOT font size (shell.setFontScale), so
+   every rem-sized text follows. These late rules retire the old
+   three-selector calc approach at scale parity (1.0 = identical). */
+#app { font-size: 0.875rem; }
+.list-table { font-size: 0.8125rem; }
+.cell-name { font-size: 0.75rem; }
+
+/* ——— Distro theme hooks (see distro-themes.css) ———————————————————
+   The rail (sidebar) gets its own token; cards and controls follow
+   the distro's geometry when a theme sets the tokens, and keep the
+   house geometry when it doesn't. */
+.sidebar { background: color-mix(in srgb, var(--ufm-rail, var(--ufm-surface)) 72%, transparent); }
+.picker-card, .props-card, .labels-card, .tools-dialog, .confirm-card {
+  border-radius: var(--ufm-card-radius, 16px);
+}
+.props-input, .cloud-input, .labels-input { border-radius: var(--ufm-radius, 9px); }
+.pill-btn { min-height: var(--ufm-control-h, 0px); }
+.picker-overlay, .props-overlay, .confirm-overlay {
+  -webkit-backdrop-filter: blur(var(--ufm-blur, 6px)) saturate(140%);
+  backdrop-filter: blur(var(--ufm-blur, 6px)) saturate(140%);
+}
+
+/* ——— Labels collapse header ——————————————————————————————————————— */
+.side-head.side-collapse {
+  appearance: none;
+  background: none;
+  border: none;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  padding: inherit;
+}
+.side-chev { transition: transform 160ms ease; font-size: 0.6rem; }
+
+/* ——— Theme menu: preview swatches + separator ———————————————————— */
+.theme-swatch { display: inline-flex; gap: 3px; margin-right: 2px; }
+.theme-swatch i {
+  width: 10px; height: 10px; border-radius: 50%;
+  border: 1px solid rgb(0 0 0 / 0.18); display: block;
+}
+.theme-sep { height: 1px; background: var(--ufm-border); margin: 5px 10px; }
+
+/* ——— Text previews: gallery stage + columns pane ————————————————— */
+.gallery-text {
+  max-width: 44rem;
+  max-height: 100%;
+  overflow: auto;
+  margin: 0 auto;
+  padding: 1rem 1.25rem;
+  background: var(--ufm-surface);
+  border: 1px solid var(--ufm-border);
+  border-radius: var(--ufm-card-radius, 16px);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-align: left;
+}
+.col-preview-text {
+  max-height: 16rem;
+  overflow: auto;
+  padding: 0.625rem 0.75rem;
+  background: color-mix(in srgb, var(--ufm-surface) 70%, transparent);
+  border: 1px solid var(--ufm-border);
+  border-radius: var(--ufm-radius, 9px);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.6875rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-align: left;
+  margin: 0;
 }

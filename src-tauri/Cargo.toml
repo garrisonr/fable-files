@@ -31,6 +31,7 @@ ufm-plugins = { path = "../crates/ufm-plugins" }
 ufm-mcp = { path = "../crates/ufm-mcp" }
 ufm-media = { path = "../crates/ufm-media" }
 ufm-emu = { path = "../crates/ufm-emu" }
+ufm-torrent = { path = "../crates/ufm-torrent" }
 tracing.workspace = true
 base64 = "0.22"
 sha1 = "0.10"

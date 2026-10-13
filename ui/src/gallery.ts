@@ -15,6 +15,7 @@ import {
 } from "./fileview";
 
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff", "ico"];
+const TEXT_EXTS = ["txt", "md", "markdown", "csv", "tsv", "log", "srt", "vtt", "sub", "ssa", "ass", "nfo", "json", "xml", "yaml", "yml", "toml", "ini", "cfg", "sh", "py", "rs", "ts", "js"];
 
 export class GalleryView {
   readonly el: HTMLElement;
@@ -81,6 +82,21 @@ export class GalleryView {
         })
         .catch(() => {});
       this.stage.appendChild(img);
+    } else if (TEXT_EXTS.includes(ext) && item.kind !== "folder") {
+      const pre = document.createElement("pre");
+      pre.className = "gallery-text";
+      pre.textContent = "Loading…";
+      api
+        .previewText(item.id, 60)
+        .then((r) => {
+          if (token === this.renderToken) {
+            pre.textContent = r.lines.join("\n") + (r.truncated ? "\n… (truncated)" : "");
+          }
+        })
+        .catch(() => {
+          pre.textContent = "(couldn't read this file)";
+        });
+      this.stage.appendChild(pre);
     } else {
       const icon = document.createElement("div");
       icon.className = "gallery-bigicon";

@@ -11,6 +11,7 @@ members = [
     "crates/ufm-mcp",
     "crates/ufm-media",
     "crates/ufm-emu",
+    "crates/ufm-torrent",
     "src-tauri",
 ]
 resolver = "2"

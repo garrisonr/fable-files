@@ -25,7 +25,7 @@ import { PropertiesDialog } from "./properties";
 import { FolderPicker, type PickerShortcut } from "./picker";
 import { RenameDialog } from "./rename";
 import { LabelManager } from "./labels";
-import { loadLabelDefs } from "./labels";
+import { loadLabelDefs, migrateLabelAssignments } from "./labels";
 import type { ArchiveEntry } from "./api";
 import { TerminalPanel } from "./terminal";
 import { MetadataDialog } from "./metadata";
@@ -40,6 +40,7 @@ import {
   SyncDialog,
 } from "./tools";
 import { DiskUtility } from "./disks";
+import { TorrentDialog } from "./torrent";
 import type { MenuItem } from "./contextmenu";
 import { PrintDialog } from "./print";
 import { JobsPanel } from "./jobs";
@@ -57,7 +58,7 @@ import {
   type Tab,
   type ViewMode,
 } from "./tabs";
-import { DEFAULT_THEME, ThemeManager } from "./themes";
+import { DEFAULT_THEME, ThemeManager, type MenuThemeItem } from "./themes";
 
 /** Where a sidebar favorite navigates: a real location root or a
  * same-named folder inside the Home location. */
@@ -133,6 +134,7 @@ export class Shell {
   private burnStudio!: BurnStudio;
   private cloudMount!: CloudMount;
   private diskDialog = new DiskUtility();
+  private torrentDialog = new TorrentDialog();
   private printDialog = new PrintDialog();
 
   constructor() {
@@ -162,10 +164,18 @@ export class Shell {
       onCompress: (items) => {
         void api
           .compressItems(items.map((i) => i.id))
-          .then((p) => {
-            Toast.success(`Created ${p.split("/").pop()}`);
+          .then(async (p) => {
+            Toast.success(`Created ${p}`);
             const t = this.activeTab;
-            if (t) void this.loadDir(t);
+            if (t) {
+              await this.loadDir(t);
+              const made = t.items.find((i) => i.provider_key === p);
+              if (made) {
+                t.selection.clear();
+                t.selection.add(made.id);
+                this.renderActiveView();
+              }
+            }
           })
           .catch((err) => Toast.error(`Compress failed: ${err}`));
       },
@@ -259,6 +269,7 @@ export class Shell {
           .catch((err) => Toast.error(`Combine failed: ${err}`));
       },
       onPrint: (item) => void this.printDialog.open(item),
+      onCreateTorrent: (item) => void this.torrentDialog.open(item),
       onNewFolder: () => void this.createFolderHere(),
       onNewFile: (kind) => void this.createFileHere(kind),
       onPasteHere: () => void this.pasteIntoCurrentDir(),
@@ -362,7 +373,9 @@ export class Shell {
       this.cloudMount.element,
       this.diskDialog.element,
       this.printDialog.element,
+      this.torrentDialog.element,
     );
+    this.torrentDialog.onCreated = () => this.refreshActiveDir();
     this.diskDialog.onChanged = () => void this.refreshLocations();
     this.jobsPanel.onJobDone = (output) => {
       Toast.success(`Created ${output.split("/").pop()}`);
@@ -404,6 +417,11 @@ export class Shell {
       this.locations = [];
     }
     await this.buildSidebar();
+    // Label splits (Music/Media, Payroll/Money): assignments follow
+    // the renamed defs so nothing loses its filing.
+    void migrateLabelAssignments(loadLabelDefs(), api).then((did) => {
+      if (did) void this.buildSidebar();
+    });
     const first = this.locations[0];
     if (first) {
       this.newTab(first);
@@ -501,11 +519,36 @@ export class Shell {
     locHead.textContent = "Locations";
     this.sidebarList = document.createElement("div");
     this.sidebarList.className = "side-list";
-    const labelHead = document.createElement("h2");
-    labelHead.className = "side-head";
-    labelHead.textContent = "Labels";
+    const labelHead = document.createElement("button");
+    labelHead.className = "side-head side-collapse";
+    labelHead.setAttribute("aria-label", "Toggle Labels section");
+    const labelHeadText = document.createElement("span");
+    labelHeadText.textContent = "Labels";
+    const labelChev = document.createElement("span");
+    labelChev.className = "side-chev";
+    labelChev.textContent = "▾";
+    labelHead.append(labelHeadText, labelChev);
     this.labelList = document.createElement("div");
     this.labelList.className = "side-list";
+    const labelsCollapsed = (() => {
+      try {
+        return localStorage.getItem("ff-labels-collapsed") === "1";
+      } catch {
+        return false;
+      }
+    })();
+    this.labelList.hidden = labelsCollapsed;
+    labelChev.style.transform = labelsCollapsed ? "rotate(-90deg)" : "";
+    labelHead.addEventListener("click", () => {
+      const nowHidden = !this.labelList.hidden;
+      this.labelList.hidden = nowHidden;
+      labelChev.style.transform = nowHidden ? "rotate(-90deg)" : "";
+      try {
+        localStorage.setItem("ff-labels-collapsed", nowHidden ? "1" : "0");
+      } catch {
+        // persistence is a nicety, not a requirement
+      }
+    });
     const smartHead = document.createElement("h2");
     smartHead.className = "side-head";
     smartHead.textContent = "Smart Folders";
@@ -1504,16 +1547,19 @@ export class Shell {
               {
                 label: "Empty Trash",
                 action: async () => {
+                  const sum = await api.trashSummary().catch(() => null);
                   const ok = await confirmDialog(
                     "Empty Trash?",
-                    "This will permanently delete all items in the trash. This cannot be undone.",
+                    sum
+                      ? `This will permanently delete ${sum.items} item${sum.items === 1 ? "" : "s"} (${sum.files} file${sum.files === 1 ? "" : "s"} including folder contents). This cannot be undone.`
+                      : "This will permanently delete all items in the trash. This cannot be undone.",
                     "Empty Trash",
                     true
                   );
                   if (ok) {
                     try {
                       const r = await api.emptyTrash();
-                      Toast.success(`Trash emptied — ${r.deleted} item${r.deleted === 1 ? "" : "s"} deleted${r.errors > 0 ? ` (${r.errors} errors)` : ""}.`);
+                      Toast.success(`Trash emptied — ${r.items} item${r.items === 1 ? "" : "s"} (${r.files} file${r.files === 1 ? "" : "s"}) deleted${r.errors > 0 ? ` (${r.errors} errors)` : ""}.`);
                       // Refresh the view if we're looking at trash
                       this.renderCrumbs();
                     } catch (err) {
@@ -1525,16 +1571,19 @@ export class Shell {
               {
                 label: "Secure Delete (overwrite)",
                 action: async () => {
+                  const sum = await api.trashSummary().catch(() => null);
                   const ok = await confirmDialog(
                     "Secure Delete?",
-                    "Files will be overwritten with zeros before deletion. This cannot be undone.",
+                    sum
+                      ? `${sum.items} item${sum.items === 1 ? "" : "s"} (${sum.files} file${sum.files === 1 ? "" : "s"} including folder contents) will be overwritten with zeros before deletion. This cannot be undone.`
+                      : "Files will be overwritten with zeros before deletion. This cannot be undone.",
                     "Secure Delete",
                     true
                   );
                   if (ok) {
                     try {
                       const r = await api.secureEmptyTrash();
-                      Toast.success(`Securely deleted ${r.deleted} items${r.errors > 0 ? ` (${r.errors} errors)` : ""}.`);
+                      Toast.success(`Securely deleted ${r.items} item${r.items === 1 ? "" : "s"} (${r.files} file${r.files === 1 ? "" : "s"} overwritten)${r.errors > 0 ? ` (${r.errors} errors)` : ""}.`);
                     } catch (err) {
                       alert(`Failed to secure-delete: ${err}`);
                     }
@@ -1765,6 +1814,11 @@ export class Shell {
   private setFontScale(scale: number): void {
     this.fontScale = Math.min(2.0, Math.max(0.7, Math.round(scale * 10) / 10));
     document.documentElement.style.setProperty("--ufm-font-scale", String(this.fontScale));
+    // Drive the scale from the root font size so ALL rem-sized text
+    // follows — sidebar, dialogs, and every file/folder name in every
+    // view. (The old approach scaled only #app + two selectors, which
+    // is why file labels ignored Ctrl +/-.)
+    document.documentElement.style.fontSize = `${16 * this.fontScale}px`;
   }
 
   // ------------------------------------------------------------ palette
@@ -2016,7 +2070,7 @@ export class Shell {
 
   // ------------------------------------------------------------- theme menu
 
-  private renderThemeMenu(themes: ThemeInfo[], activeId: string, anchor: HTMLElement): void {
+  private renderThemeMenu(themes: MenuThemeItem[], activeId: string, anchor: HTMLElement): void {
     this.closeMenu();
     const menu = document.createElement("div");
     menu.className = "theme-menu";
@@ -2025,15 +2079,31 @@ export class Shell {
     const r = anchor.getBoundingClientRect();
     menu.style.transformOrigin = "top right";
     for (const t of themes) {
+      if (t.separator) {
+        const sep = document.createElement("div");
+        sep.className = "theme-sep";
+        menu.appendChild(sep);
+        continue;
+      }
       const item = document.createElement("button");
       item.className = "theme-item";
       item.setAttribute("role", "menuitemradio");
       item.setAttribute("aria-checked", String(t.id === activeId));
+      if (t.preview) {
+        const sw = document.createElement("span");
+        sw.className = "theme-swatch";
+        for (const c of t.preview) {
+          const dot = document.createElement("i");
+          dot.style.background = c;
+          sw.appendChild(dot);
+        }
+        item.appendChild(sw);
+      }
       const name = document.createElement("span");
       name.textContent = t.name;
       const meta = document.createElement("span");
       meta.className = "theme-meta";
-      meta.textContent = t.dark ? "Dark" : "Light";
+      meta.textContent = t.metaLabel ?? (t.dark ? "Dark" : "Light");
       item.append(name, meta);
       if (t.id === activeId) item.classList.add("active");
       item.addEventListener("click", () => {

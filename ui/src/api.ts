@@ -36,6 +36,13 @@ export interface ResizeInfo {
   note: string;
 }
 
+export interface TorrentOutcome {
+  torrent_path: string;
+  payload_path: string;
+  washed_files: number;
+  cleaned_images: number;
+}
+
 export interface PrinterInfo {
   name: string;
   is_default: boolean;
@@ -94,6 +101,14 @@ export interface Item {
 export interface SearchHit {
   item: Item;
   rank: number;
+}
+
+export interface SyncSchedule {
+  id: string;
+  a: string;
+  b: string;
+  direction: string; // "a2b" | "b2a" | "both"
+  interval_min: number;
 }
 
 export interface ThemeInfo {
@@ -288,6 +303,22 @@ export const api = {
   listPrinters: () => invoke<PrinterInfo[]>("list_printers"),
   printItem: (item: string, printer: string | null, copies: number) =>
     invoke<string>("print_item", { item, printer, copies }),
+  mktorrentStatus: () => invoke<boolean>("mktorrent_status"),
+  installMktorrent: () => invoke<void>("install_mktorrent"),
+  createTorrent: (
+    item: string,
+    wash: boolean,
+    cleanImages: boolean,
+    trackers: string[],
+    privateFlag: boolean,
+  ) =>
+    invoke<TorrentOutcome>("create_torrent", {
+      item,
+      wash,
+      cleanImages,
+      trackers,
+      privateFlag,
+    }),
   movePathTo: (srcPath: string, destDir: string) =>
     invoke<string>("move_path_to", { srcPath, destDir }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
@@ -297,8 +328,16 @@ export const api = {
     invoke<string>("move_item_to", { item, destDir }),
   getItemProperties: (item: string) =>
     invoke<ItemProperties>("get_item_properties", { item }),
-  emptyTrash: () => invoke<{ deleted: number; errors: number }>("empty_trash"),
-  secureEmptyTrash: () => invoke<{ deleted: number; errors: number }>("secure_empty_trash"),
+  emptyTrash: () =>
+    invoke<{ deleted: number; items: number; files: number; errors: number }>("empty_trash"),
+  secureEmptyTrash: () =>
+    invoke<{ deleted: number; items: number; files: number; errors: number }>("secure_empty_trash"),
+  trashSummary: () => invoke<{ items: number; files: number }>("trash_summary"),
+  distroInfo: () => invoke<{ os_id: string; desktop: string }>("distro_info"),
+  listSyncSchedules: () => invoke<SyncSchedule[]>("list_sync_schedules"),
+  saveSyncSchedule: (a: string, b: string, direction: string, intervalMin: number) =>
+    invoke<SyncSchedule>("save_sync_schedule", { a, b, direction, intervalMin }),
+  deleteSyncSchedule: (id: string) => invoke<void>("delete_sync_schedule", { id }),
   openWithApps: (item: string) =>
     invoke<{ mime: string; apps: Array<{ id: string; name: string; icon: string | null }>; default: string | null }>("open_with_apps", { item }),
   openWithApp: (item: string, desktopId: string) =>

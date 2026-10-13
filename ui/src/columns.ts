@@ -22,6 +22,7 @@ interface Column {
 }
 
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff", "ico"];
+const TEXT_EXTS = ["txt", "md", "markdown", "csv", "tsv", "log", "srt", "vtt", "sub", "ssa", "ass", "nfo", "json", "xml", "yaml", "yml", "toml", "ini", "cfg", "sh", "py", "rs", "ts", "js"];
 
 export class ColumnsView {
   readonly el: HTMLElement;
@@ -130,6 +131,20 @@ export class ColumnsView {
           api.getImagePreview(item.id, item.provider_key).then((url) => (img.src = url)).catch(() => {})
         );
       pane.appendChild(img);
+    }
+    if (TEXT_EXTS.includes(ext)) {
+      const pre = document.createElement("pre");
+      pre.className = "col-preview-text";
+      pre.textContent = "Loading…";
+      api
+        .previewText(item.id, 30)
+        .then((r) => {
+          pre.textContent = r.lines.join("\n") + (r.truncated ? "\n… (truncated)" : "");
+        })
+        .catch(() => {
+          pre.textContent = "(couldn't read this file)";
+        });
+      pane.appendChild(pre);
     }
     const name = document.createElement("h3");
     name.className = "col-preview-name";

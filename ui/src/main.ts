@@ -13,6 +13,7 @@ import { Shell } from "./shell";
 import { VideoPlayer } from "./video";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import "./styles.css";
+import "./distro-themes.css";
 
 type LayoutClass = "desktop" | "handheld" | "tv";
 

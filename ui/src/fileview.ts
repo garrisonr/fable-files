@@ -46,6 +46,7 @@ export interface FileViewHooks {
   onJoinFiles?(item: Item): void;
   onBurnAdd?(item: Item): void;
   onPrint?(item: Item): void;
+  onCreateTorrent?(item: Item): void;
   onNewFolder?(): void;
   onNewFile?(kind: string): void;
   onPasteHere?(): void;
@@ -301,6 +302,12 @@ export async function showItemMenu(
         tools.push({
           label: "Cast to…",
           action: () => hooks.onCast!(item),
+        });
+      }
+      if (hooks.onCreateTorrent) {
+        tools.push({
+          label: "Create Torrent…",
+          action: () => hooks.onCreateTorrent!(item),
         });
       }
       const PRINTABLE = [

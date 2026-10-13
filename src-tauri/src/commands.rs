@@ -816,29 +816,31 @@ pub async fn trash_path() -> Cmd<String> {
 pub async fn empty_trash() -> Cmd<TrashResult> {
     let trash = trash_path().await?;
     tauri::async_runtime::spawn_blocking(move || {
-        let mut deleted = 0;
-        let mut errors = 0;
+        let mut items = 0usize;
+        let mut files = 0usize;
+        let mut errors = 0usize;
         // Delete files/
         if let Ok(entries) = std::fs::read_dir(&trash) {
             for entry in entries.flatten() {
                 let p = entry.path();
+                let n = count_tree_files(&p);
                 let r = if p.is_dir() {
                     std::fs::remove_dir_all(&p)
                 } else {
                     std::fs::remove_file(&p)
                 };
-                if r.is_ok() { deleted += 1; } else { errors += 1; }
+                if r.is_ok() { items += 1; files += n; } else { errors += 1; }
             }
         }
-        // Delete info/ (freedesktop trash metadata)
+        // Delete info/ (freedesktop trash metadata) — bookkeeping,
+        // removed silently and never counted as user files.
         let info_dir = trash.replace("/files", "/info");
         if let Ok(entries) = std::fs::read_dir(&info_dir) {
             for entry in entries.flatten() {
-                if std::fs::remove_file(entry.path()).is_ok() { deleted += 1; }
-                else { errors += 1; }
+                let _ = std::fs::remove_file(entry.path());
             }
         }
-        Ok(TrashResult { deleted, errors })
+        Ok(TrashResult { deleted: items, items, files, errors })
     })
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("trash task failed: {e}"))))?
@@ -851,7 +853,6 @@ pub async fn secure_empty_trash() -> Cmd<TrashResult> {
     let trash = trash_path().await?;
     tauri::async_runtime::spawn_blocking(move || {
         use std::io::{Seek, SeekFrom, Write};
-        let mut deleted = 0;
         let mut errors = 0;
 
         // Collect all files (not dirs yet)
@@ -862,30 +863,33 @@ pub async fn secure_empty_trash() -> Cmd<TrashResult> {
             }
         }
 
+        let mut items = 0usize;
+        let mut shredded = 0usize;
         for path in files {
             if path.is_dir() {
                 // Recursively shred files in subdirs, then remove dir
                 if let Ok(walker) = walkdir_files(&path) {
                     for f in walker {
                         shred_file(&f);
+                        shredded += 1;
                     }
                 }
-                if std::fs::remove_dir_all(&path).is_ok() { deleted += 1; }
+                if std::fs::remove_dir_all(&path).is_ok() { items += 1; }
                 else { errors += 1; }
             } else {
                 shred_file(&path);
-                if std::fs::remove_file(&path).is_ok() { deleted += 1; }
+                if std::fs::remove_file(&path).is_ok() { items += 1; shredded += 1; }
                 else { errors += 1; }
             }
         }
-        // Clean info/
+        // Clean info/ — bookkeeping, never counted (see TrashResult).
         let info_dir = trash.replace("/files", "/info");
         if let Ok(entries) = std::fs::read_dir(&info_dir) {
             for entry in entries.flatten() {
-                if std::fs::remove_file(entry.path()).is_ok() { deleted += 1; }
+                let _ = std::fs::remove_file(entry.path());
             }
         }
-        Ok(TrashResult { deleted, errors })
+        Ok(TrashResult { deleted: items, items, files: shredded, errors })
     })
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("secure trash task failed: {e}"))))?
@@ -929,8 +933,50 @@ fn walkdir_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, Strin
 
 #[derive(Debug, serde::Serialize)]
 pub struct TrashResult {
+    /// Top-level trash entries removed (what the user calls "items").
     pub deleted: usize,
+    /// Same as `deleted`, named for the UI.
+    pub items: usize,
+    /// Total real files removed, including files inside trashed
+    /// folders. Trash bookkeeping (.trashinfo) is never counted —
+    /// reporting it confused everyone (2 items read as "4 files").
+    pub files: usize,
     pub errors: usize,
+}
+
+#[derive(serde::Serialize)]
+pub struct TrashSummary {
+    pub items: usize,
+    pub files: usize,
+}
+
+/// Count real files under a path (1 for a file, recursive for a dir).
+fn count_tree_files(p: &std::path::Path) -> usize {
+    if p.is_dir() {
+        walkdir_files(p).map(|v| v.len()).unwrap_or(0)
+    } else {
+        1
+    }
+}
+
+/// Preview counts for the trash confirmation dialogs: how many items,
+/// and how many files including folder contents.
+#[tauri::command]
+pub async fn trash_summary() -> Cmd<TrashSummary> {
+    let trash = trash_path().await?;
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        let mut items = 0usize;
+        let mut files = 0usize;
+        if let Ok(entries) = std::fs::read_dir(&trash) {
+            for entry in entries.flatten() {
+                items += 1;
+                files += count_tree_files(&entry.path());
+            }
+        }
+        TrashSummary { items, files }
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("trash summary failed: {e}"))))?)
 }
 
 
@@ -6019,6 +6065,68 @@ pub async fn print_item(
     .map_err(|e| CommandError::from(UfmError::Internal(e)))
 }
 
+
+// ---------------------------------------------------------------------------
+// Torrent creation — thin wrappers over the ufm-torrent engine
+// ---------------------------------------------------------------------------
+
+/// Is mktorrent available? (The dialog offers a one-click install
+/// when it isn't — no silent degraded modes.)
+#[tauri::command]
+pub async fn mktorrent_status() -> Cmd<bool> {
+    Ok(ufm_torrent::mktorrent_available())
+}
+
+/// Install mktorrent via pacman (polkit prompt).
+#[tauri::command]
+pub async fn install_mktorrent() -> Cmd<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let out = std::process::Command::new("pkexec")
+            .args(["pacman", "-S", "--noconfirm", "--needed", "mktorrent"])
+            .output()
+            .map_err(|e| format!("pkexec: {e}"))?;
+        if out.status.success() {
+            Ok::<(), String>(())
+        } else {
+            Err("install failed (or the password prompt was cancelled)".to_string())
+        }
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("install task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Create a .torrent for a file or folder (see ufm-torrent).
+#[tauri::command]
+pub async fn create_torrent(
+    state: State<'_, AppState>,
+    item: ItemId,
+    wash: bool,
+    clean_images: bool,
+    trackers: Vec<String>,
+    private_flag: bool,
+) -> Cmd<ufm_torrent::TorrentOutcome> {
+    let src = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let opts = ufm_torrent::TorrentOptions {
+            wash,
+            clean_images,
+            trackers,
+            private_flag,
+        };
+        ufm_torrent::create_torrent(&src, &opts)
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("torrent task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -6117,4 +6225,283 @@ mod tests {
         assert!(!already3 && snap3.running);
         assert_eq!(snap3.dirs_done, 0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Distro info — feeds the theme engine's Auto detection (same data the
+// Linux System Profiler GUI uses: /etc/os-release ID + session desktop).
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+pub struct DistroInfo {
+    pub os_id: String,
+    pub desktop: String,
+}
+
+#[tauri::command]
+pub async fn distro_info() -> Cmd<DistroInfo> {
+    let mut os_id = String::new();
+    if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("ID=") {
+                os_id = v.trim().trim_matches('"').to_lowercase();
+            }
+        }
+    }
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    Ok(DistroInfo { os_id, desktop })
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled folder synchronization.
+//
+// A schedule is a saved (A, B, direction, interval) profile. Saving one
+// writes a systemd *user* timer that runs this same binary headless
+// (`--run-sync <id>`); the timer fires whether or not the GUI is open.
+// Because a timer alone can't start a GUI-less run before login, the
+// first schedule also installs an autostart entry — the dialog says so
+// in plain language before the user confirms.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct SyncSchedule {
+    pub id: String,
+    pub a: String,
+    pub b: String,
+    /// "a2b" | "b2a" | "both" (both = newer file wins, per file)
+    pub direction: String,
+    pub interval_min: u32,
+}
+
+fn fable_data_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    std::path::PathBuf::from(home).join(".local/share/fable-files")
+}
+
+fn schedules_path() -> std::path::PathBuf {
+    fable_data_dir().join("sync-schedules.json")
+}
+
+fn load_schedules() -> Vec<SyncSchedule> {
+    std::fs::read_to_string(schedules_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn store_schedules(list: &[SyncSchedule]) -> Result<(), String> {
+    let dir = fable_data_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let tmp = dir.join("sync-schedules.json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(list).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, schedules_path()).map_err(|e| e.to_string())
+}
+
+/// The path systemd should execute: the AppImage (stable across runs),
+/// never the transient mount path of the current process.
+fn appimage_path() -> String {
+    if let Ok(p) = std::env::var("APPIMAGE") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!("{home}/Applications/fable-files.AppImage")
+}
+
+fn sync_unit_names(id: &str) -> (String, String) {
+    (format!("fable-files-sync-{id}.service"), format!("fable-files-sync-{id}.timer"))
+}
+
+fn user_unit_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::PathBuf::from(home).join(".config/systemd/user")
+}
+
+fn write_sync_units(sched: &SyncSchedule) -> Result<(), String> {
+    let dir = user_unit_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let (service, timer) = sync_unit_names(&sched.id);
+    let exe = appimage_path();
+    let service_text = format!(
+        "[Unit]\nDescription=Fable Files scheduled sync {id}\n\n[Service]\nType=oneshot\nExecStart=\"{exe}\" --run-sync {id}\n",
+        id = sched.id, exe = exe
+    );
+    let timer_text = format!(
+        "[Unit]\nDescription=Run Fable Files sync {id} every {mins} minutes\n\n[Timer]\nOnBootSec=3min\nOnUnitActiveSec={mins}min\nPersistent=true\nUnit={service}\n\n[Install]\nWantedBy=timers.target\n",
+        id = sched.id, mins = sched.interval_min, service = service
+    );
+    std::fs::write(dir.join(&service), service_text).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(&timer), timer_text).map_err(|e| e.to_string())?;
+    let _ = systemctl_user(&["daemon-reload"]);
+    let _ = systemctl_user(&["enable", "--now", &timer]);
+    Ok(())
+}
+
+fn remove_sync_units(id: &str) {
+    let (service, timer) = sync_unit_names(id);
+    let _ = systemctl_user(&["disable", "--now", &timer]);
+    let dir = user_unit_dir();
+    let _ = std::fs::remove_file(dir.join(&service));
+    let _ = std::fs::remove_file(dir.join(&timer));
+    let _ = systemctl_user(&["daemon-reload"]);
+}
+
+/// Autostart entry exists exactly while at least one schedule does.
+fn sync_autostart(schedule_count: usize) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = std::path::PathBuf::from(home).join(".config/autostart/fable-files.desktop");
+    if schedule_count > 0 {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let text = format!(
+            "[Desktop Entry]\nType=Application\nName=Fable Files\nComment=Starts with the system so scheduled folder syncs can run\nExec=\"{}\"\nIcon=fable-files\nX-GNOME-Autostart-enabled=true\n",
+            appimage_path()
+        );
+        let _ = std::fs::write(&path, text);
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[tauri::command]
+pub async fn list_sync_schedules() -> Cmd<Vec<SyncSchedule>> {
+    Ok(load_schedules())
+}
+
+#[tauri::command]
+pub async fn save_sync_schedule(
+    a: String,
+    b: String,
+    direction: String,
+    interval_min: u32,
+) -> Cmd<SyncSchedule> {
+    if a.trim().is_empty() || b.trim().is_empty() || a == b {
+        return Err(CommandError::from(UfmError::Internal(
+            "pick two different folders".into(),
+        )));
+    }
+    let id = format!(
+        "{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let sched = SyncSchedule {
+        id: id.clone(),
+        a,
+        b,
+        direction: if ["a2b", "b2a", "both"].contains(&direction.as_str()) {
+            direction
+        } else {
+            "a2b".into()
+        },
+        interval_min: interval_min.clamp(5, 24 * 60),
+    };
+    let mut list = load_schedules();
+    list.push(sched.clone());
+    store_schedules(&list).map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    write_sync_units(&sched).map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    sync_autostart(list.len());
+    Ok(sched)
+}
+
+#[tauri::command]
+pub async fn delete_sync_schedule(id: String) -> Cmd<()> {
+    let mut list = load_schedules();
+    list.retain(|x| x.id != id);
+    store_schedules(&list).map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    remove_sync_units(&id);
+    sync_autostart(list.len());
+    Ok(())
+}
+
+/// Headless scheduled-sync entry point (`fable-files --run-sync <id>`).
+/// Mirrors the dialog's semantics: compare both trees; copy what the
+/// direction demands (for "both", the newer copy of each file wins).
+/// Appends one line per run to sync.log. Returns a process exit code.
+pub fn run_sync_headless(id: &str) -> i32 {
+    let list = load_schedules();
+    let Some(sched) = list.iter().find(|x| x.id == id) else {
+        return 2;
+    };
+    let a_root = std::path::Path::new(&sched.a);
+    let b_root = std::path::Path::new(&sched.b);
+    let map_a = scan_tree(a_root);
+    let map_b = scan_tree(b_root);
+    let mut copied = 0usize;
+    let mut errors = 0usize;
+    let copy_one = |from_root: &std::path::Path, to_root: &std::path::Path, rel: &str,
+                    copied: &mut usize, errors: &mut usize| {
+        let from = from_root.join(rel);
+        let to = to_root.join(rel);
+        if let Some(parent) = to.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::copy(&from, &to) {
+            Ok(_) => {
+                if let Ok(md) = std::fs::metadata(&from) {
+                    if let Ok(mt) = md.modified() {
+                        let _ = filetime::set_file_mtime(
+                            &to,
+                            filetime::FileTime::from_system_time(mt),
+                        );
+                    }
+                }
+                *copied += 1;
+            }
+            Err(_) => *errors += 1,
+        }
+    };
+    let mut rels: std::collections::BTreeSet<&String> = std::collections::BTreeSet::new();
+    rels.extend(map_a.keys());
+    rels.extend(map_b.keys());
+    for rel in rels {
+        let in_a = map_a.get(rel);
+        let in_b = map_b.get(rel);
+        match (sched.direction.as_str(), in_a, in_b) {
+            ("a2b", Some(_), _) => {
+                let same = matches!((in_a, in_b), (Some((sa, ma)), Some((sb, mb))) if sa == sb && (*ma - *mb).abs() <= 2);
+                if !same {
+                    copy_one(a_root, b_root, rel, &mut copied, &mut errors);
+                }
+            }
+            ("b2a", _, Some(_)) => {
+                let same = matches!((in_a, in_b), (Some((sa, ma)), Some((sb, mb))) if sa == sb && (*ma - *mb).abs() <= 2);
+                if !same {
+                    copy_one(b_root, a_root, rel, &mut copied, &mut errors);
+                }
+            }
+            ("both", Some((sa, ma)), Some((sb, mb))) => {
+                if !(sa == sb && (*ma - *mb).abs() <= 2) {
+                    if ma >= mb {
+                        copy_one(a_root, b_root, rel, &mut copied, &mut errors);
+                    } else {
+                        copy_one(b_root, a_root, rel, &mut copied, &mut errors);
+                    }
+                }
+            }
+            ("both", Some(_), None) => copy_one(a_root, b_root, rel, &mut copied, &mut errors),
+            ("both", None, Some(_)) => copy_one(b_root, a_root, rel, &mut copied, &mut errors),
+            _ => {}
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!(
+        "{stamp} sync {id} ({dir}) {a} <-> {b}: {copied} copied, {errors} errors\n",
+        id = sched.id, dir = sched.direction, a = sched.a, b = sched.b
+    );
+    let dir = fable_data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("sync.log")) {
+        use std::io::Write;
+        let _ = f.write_all(line.as_bytes());
+    }
+    if errors > 0 { 1 } else { 0 }
 }

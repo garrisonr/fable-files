@@ -1,0 +1,76 @@
+/* Fable Files — distro themes.
+   The Linux System Profiler's theme set, dressed the same way: each
+   theme restyles the design tokens so the app blends into its host —
+   accent, materials, corner radii, density and type follow the
+   distro's own design language. Cupertino = the app's native
+   language (no [data-theme]; the base tokens in styles.css rule).
+   Token mapping from the Profiler's themes.css:
+     --accent -> --ufm-accent      --ink   -> --ufm-text
+     --ink-2  -> --ufm-text-muted  --paper -> --ufm-surface + canvas
+     --rail   -> --ufm-rail        --line  -> --ufm-border
+     --radius -> --ufm-radius      --card-radius -> --ufm-card-radius
+   Light tokens first, dark under prefers-color-scheme where the
+   distro ships both — identical structure to the Profiler. */
+
+[data-theme] body, [data-theme] #app { font-family: inherit; }
+
+/* — Zorin OS: Zorin Blue, pale panels, Inter — */
+[data-theme="zorin"] { --ufm-accent:#175ddc; --ufm-text:#1b1d21; --ufm-text-muted:#5f6368; --ufm-surface:rgba(255,255,255,.85); --ufm-content-canvas:rgba(255,255,255,.85); --ufm-rail:rgba(242,244,247,.88); --ufm-border:rgba(0,0,0,.09); --ufm-radius:8px; --ufm-card-radius:12px; font-family:"Inter",system-ui,sans-serif; }
+@media (prefers-color-scheme: dark) { [data-theme="zorin"] { --ufm-text:#eef1f5; --ufm-text-muted:#a7adb6; --ufm-surface:rgba(32,34,38,.86); --ufm-content-canvas:rgba(32,34,38,.86); --ufm-rail:rgba(24,25,28,.9); --ufm-border:rgba(255,255,255,.1); } }
+
+/* — Deepin: glassy, deep blur, big soft corners, Deepin blue — */
+[data-theme="deepin"] { --ufm-accent:#0081ff; --ufm-text:#1f2329; --ufm-text-muted:#5e6a77; --ufm-surface:rgba(255,255,255,.62); --ufm-content-canvas:rgba(255,255,255,.62); --ufm-rail:rgba(255,255,255,.55); --ufm-border:rgba(0,0,0,.06); --ufm-radius:10px; --ufm-card-radius:18px; --ufm-blur:34px; }
+@media (prefers-color-scheme: dark) { [data-theme="deepin"] { --ufm-text:#eef3f8; --ufm-text-muted:#9fb0c1; --ufm-surface:rgba(24,28,34,.62); --ufm-content-canvas:rgba(24,28,34,.62); --ufm-rail:rgba(18,22,28,.6); --ufm-border:rgba(255,255,255,.09); } }
+
+/* — Omarchy: Tokyo Night dark, sharp blue accent, mono-flavored — */
+[data-theme="omarchy"] { --ufm-accent:#7aa2f7; --ufm-text:#c0caf5; --ufm-text-muted:#828bb8; --ufm-surface:rgba(26,27,38,.92); --ufm-content-canvas:rgba(26,27,38,.92); --ufm-rail:rgba(19,20,30,.94); --ufm-border:rgba(122,162,247,.16); --ufm-radius:6px; --ufm-card-radius:10px; --ufm-danger:#f7768e; font-family:"JetBrains Mono",ui-monospace,system-ui,sans-serif; }
+
+/* — Fedora / GNOME Adwaita: GNOME blue, warm paper, Cantarell, round — */
+[data-theme="fedora"] { --ufm-accent:#3584e4; --ufm-text:#241f19; --ufm-text-muted:#5e5c51; --ufm-surface:rgba(250,250,249,.9); --ufm-content-canvas:rgba(250,250,249,.9); --ufm-rail:rgba(246,245,244,.92); --ufm-border:rgba(0,0,0,.09); --ufm-radius:9px; --ufm-card-radius:12px; font-family:"Cantarell","Inter",system-ui,sans-serif; }
+@media (prefers-color-scheme: dark) { [data-theme="fedora"] { --ufm-text:#eeeeec; --ufm-text-muted:#a6a49c; --ufm-surface:rgba(36,36,36,.92); --ufm-content-canvas:rgba(36,36,36,.92); --ufm-rail:rgba(30,30,30,.94); --ufm-border:rgba(255,255,255,.1); } }
+
+/* — elementary OS: Blueberry accent, near-flat, airy, Inter — */
+[data-theme="elementary"] { --ufm-accent:#3689e6; --ufm-text:#333333; --ufm-text-muted:#666666; --ufm-surface:rgba(250,250,250,.94); --ufm-content-canvas:rgba(250,250,250,.94); --ufm-rail:rgba(245,245,245,.96); --ufm-border:rgba(0,0,0,.07); --ufm-radius:6px; --ufm-card-radius:8px; font-family:"Inter","Open Sans",system-ui,sans-serif; }
+@media (prefers-color-scheme: dark) { [data-theme="elementary"] { --ufm-accent:#64baff; --ufm-text:#ececec; --ufm-text-muted:#a6a6a6; --ufm-surface:rgba(40,40,40,.94); --ufm-content-canvas:rgba(40,40,40,.94); --ufm-rail:rgba(34,34,34,.96); --ufm-border:rgba(255,255,255,.09); } }
+
+/* — Ubuntu Yaru: Ubuntu orange + aubergine shadows, Ubuntu font — */
+[data-theme="ubuntu"] { --ufm-accent:#e95420; --ufm-text:#2c2c2c; --ufm-text-muted:#666666; --ufm-surface:rgba(247,247,247,.9); --ufm-content-canvas:rgba(247,247,247,.9); --ufm-rail:rgba(240,240,240,.92); --ufm-border:rgba(0,0,0,.1); --ufm-radius:8px; --ufm-card-radius:8px; font-family:"Ubuntu","Inter",system-ui,sans-serif; }
+@media (prefers-color-scheme: dark) { [data-theme="ubuntu"] { --ufm-accent:#f47421; --ufm-text:#f2f2f2; --ufm-text-muted:#a6a6a6; --ufm-surface:rgba(43,10,32,.9); --ufm-content-canvas:rgba(43,10,32,.9); --ufm-rail:rgba(34,8,26,.93); --ufm-border:rgba(255,255,255,.11); } }
+
+/* — Phosh: phone shell rules — big targets, dense dark chrome, GNOME blue — */
+[data-theme="phosh"] { --ufm-accent:#3584e4; --ufm-text:#eeeeec; --ufm-text-muted:#a6a49c; --ufm-surface:rgba(36,36,36,.96); --ufm-content-canvas:rgba(36,36,36,.96); --ufm-rail:rgba(0,0,0,.94); --ufm-border:rgba(255,255,255,.12); --ufm-radius:12px; --ufm-card-radius:16px; --ufm-control-h:2.75rem; font-family:"Cantarell",system-ui,sans-serif; }
+[data-theme="phosh"] .side-item { min-height: 2.75rem; }
+
+/* — Pop!_OS / COSMIC: warm dark slate, Pop orange — */
+[data-theme="pop"] { color-scheme: dark; --ufm-accent:#faa41a; --ufm-text:#f0efed; --ufm-text-muted:#a8a49e; --ufm-surface:rgba(43,43,43,.94); --ufm-content-canvas:rgba(43,43,43,.94); --ufm-rail:rgba(34,34,34,.96); --ufm-border:rgba(255,255,255,.1); --ufm-radius:9px; --ufm-card-radius:12px; font-family:"Fira Sans","Inter",system-ui,sans-serif; }
+
+/* — Linux Mint / Mint-Y: soft gray-green, Mint green accent — */
+[data-theme="mint"] { --ufm-accent:#92b372; --ufm-text:#2e3436; --ufm-text-muted:#5c6660; --ufm-surface:rgba(247,248,245,.92); --ufm-content-canvas:rgba(247,248,245,.92); --ufm-rail:rgba(240,242,238,.94); --ufm-border:rgba(0,0,0,.09); --ufm-radius:8px; --ufm-card-radius:10px; }
+@media (prefers-color-scheme: dark) { [data-theme="mint"] { --ufm-text:#e6eae2; --ufm-text-muted:#a3aca0; --ufm-surface:rgba(43,46,43,.92); --ufm-content-canvas:rgba(43,46,43,.92); --ufm-rail:rgba(36,38,36,.94); --ufm-border:rgba(255,255,255,.1); } }
+
+/* — KDE Breeze: cool light gray, Breeze blue, big airy radii — */
+[data-theme="breeze"] { --ufm-accent:#3daee9; --ufm-text:#232627; --ufm-text-muted:#5d6265; --ufm-surface:rgba(239,240,241,.92); --ufm-content-canvas:rgba(239,240,241,.92); --ufm-rail:rgba(230,231,233,.94); --ufm-border:rgba(0,0,0,.1); --ufm-radius:8px; --ufm-card-radius:12px; font-family:"Noto Sans","Inter",system-ui,sans-serif; }
+@media (prefers-color-scheme: dark) { [data-theme="breeze"] { --ufm-text:#eff0f1; --ufm-text-muted:#a5a8aa; --ufm-surface:rgba(42,46,48,.92); --ufm-content-canvas:rgba(42,46,48,.92); --ufm-rail:rgba(35,38,40,.94); --ufm-border:rgba(255,255,255,.11); } }
+
+/* — openSUSE: fresh green on pale sage — */
+[data-theme="opensuse"] { --ufm-accent:#73ba25; --ufm-text:#26331f; --ufm-text-muted:#5a6b52; --ufm-surface:rgba(248,250,245,.92); --ufm-content-canvas:rgba(248,250,245,.92); --ufm-rail:rgba(241,245,238,.94); --ufm-border:rgba(0,0,0,.09); --ufm-radius:8px; --ufm-card-radius:10px; }
+@media (prefers-color-scheme: dark) { [data-theme="opensuse"] { --ufm-text:#e8efe0; --ufm-text-muted:#a9b8a0; --ufm-surface:rgba(33,40,29,.92); --ufm-content-canvas:rgba(33,40,29,.92); --ufm-rail:rgba(27,33,23,.94); --ufm-border:rgba(255,255,255,.1); } }
+
+/* — Manjaro: dark slate, Maia teal-green — */
+[data-theme="manjaro"] { color-scheme: dark; --ufm-accent:#16a085; --ufm-text:#e8ecef; --ufm-text-muted:#98a2ab; --ufm-surface:rgba(34,38,42,.94); --ufm-content-canvas:rgba(34,38,42,.94); --ufm-rail:rgba(27,30,34,.96); --ufm-border:rgba(255,255,255,.1); --ufm-radius:8px; --ufm-card-radius:10px; }
+
+/* — EndeavourOS: deep purple-dark, lavender accent — */
+[data-theme="endeavour"] { color-scheme: dark; --ufm-accent:#a06cd5; --ufm-text:#f8f8f2; --ufm-text-muted:#a49ec4; --ufm-surface:rgba(40,42,54,.94); --ufm-content-canvas:rgba(40,42,54,.94); --ufm-rail:rgba(32,34,44,.96); --ufm-border:rgba(255,255,255,.1); --ufm-radius:8px; --ufm-card-radius:12px; }
+
+/* — Garuda Dr460nized: near-black plum, hot pink-red accent — */
+[data-theme="garuda"] { color-scheme: dark; --ufm-accent:#e2436b; --ufm-text:#e5e9f0; --ufm-text-muted:#9aa3b8; --ufm-surface:rgba(26,24,36,.94); --ufm-content-canvas:rgba(26,24,36,.94); --ufm-rail:rgba(20,18,29,.96); --ufm-border:rgba(226,67,107,.22); --ufm-radius:8px; --ufm-card-radius:12px; }
+
+/* — Peppermint: charcoal + candy red — */
+[data-theme="peppermint"] { color-scheme: dark; --ufm-accent:#c0392b; --ufm-text:#f2ecec; --ufm-text-muted:#b3a6a6; --ufm-surface:rgba(38,32,34,.94); --ufm-content-canvas:rgba(38,32,34,.94); --ufm-rail:rgba(30,25,27,.96); --ufm-border:rgba(255,255,255,.1); --ufm-radius:8px; --ufm-card-radius:10px; }
+
+/* — MX Linux: Xfce utility gray-blue, flat and honest — */
+[data-theme="mx"] { --ufm-accent:#546e7a; --ufm-text:#263238; --ufm-text-muted:#5f737c; --ufm-surface:rgba(243,245,246,.94); --ufm-content-canvas:rgba(243,245,246,.94); --ufm-rail:rgba(236,239,241,.96); --ufm-border:rgba(0,0,0,.11); --ufm-radius:6px; --ufm-card-radius:8px; }
+@media (prefers-color-scheme: dark) { [data-theme="mx"] { --ufm-text:#e3e9ec; --ufm-text-muted:#9db0b8; --ufm-surface:rgba(38,46,50,.94); --ufm-content-canvas:rgba(38,46,50,.94); --ufm-rail:rgba(31,38,42,.96); --ufm-border:rgba(255,255,255,.11); } }
+
+/* Dark-native engines: keep native controls (selects, scrollbars) legible */
+[data-theme="omarchy"], [data-theme="phosh"] { color-scheme: dark; }

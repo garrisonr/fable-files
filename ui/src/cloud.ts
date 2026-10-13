@@ -204,19 +204,19 @@ export class CloudMount {
     typeLabel.textContent = "Service:";
     this.backendSel = document.createElement("select");
     this.backendSel.className = "cloud-input";
-    const groups = new Map<string, HTMLOptGroupElement>();
+    let currentGroup = "";
     RCLONE_BACKENDS.forEach((b, i) => {
-      let g = groups.get(b.group);
-      if (!g) {
-        g = document.createElement("optgroup");
-        g.label = b.group;
-        groups.set(b.group, g);
-        this.backendSel.appendChild(g);
+      if (b.group !== currentGroup) {
+        currentGroup = b.group;
+        const head = document.createElement("option");
+        head.disabled = true;
+        head.textContent = `—— ${b.group} ——`;
+        this.backendSel.appendChild(head);
       }
       const opt = document.createElement("option");
       opt.value = String(i);
       opt.textContent = b.label;
-      g.appendChild(opt);
+      this.backendSel.appendChild(opt);
     });
     this.backendSel.addEventListener("change", () => this.renderFields());
     this.fieldsEl = document.createElement("div");

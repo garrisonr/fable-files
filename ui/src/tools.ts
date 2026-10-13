@@ -176,6 +176,9 @@ export class SyncDialog {
   private picker = new FolderPicker();
   private rows: SyncRow[] = [];
   private checks = new Map<string, HTMLInputElement>();
+  private schedDir!: HTMLSelectElement;
+  private schedEvery!: HTMLSelectElement;
+  private schedList!: HTMLDivElement;
   onDone: (() => void) | null = null;
 
   constructor() {
@@ -227,13 +230,107 @@ export class SyncDialog {
     this.statusEl.className = "tools-hint";
     this.listEl = document.createElement("div");
     this.listEl.className = "tools-list";
-    dialog.append(cmpRow, this.statusEl, this.listEl);
+    // ——— Scheduled sync ———
+    const schedWrap = document.createElement("div");
+    schedWrap.className = "tools-sched";
+    const schedTitle = document.createElement("h3");
+    schedTitle.textContent = "⏰ Scheduled sync";
+    const schedNote = document.createElement("p");
+    schedNote.className = "tools-hint";
+    schedNote.textContent =
+      "Scheduled syncs run even when Fable Files isn't open. Turning on a schedule also turns on “start with the system” for Fable Files, so the timer can fire after you log in. Removing the last schedule turns autostart back off.";
+    const schedRow = document.createElement("div");
+    schedRow.className = "tools-row";
+    this.schedDir = document.createElement("select");
+    this.schedDir.className = "tools-path";
+    for (const [v, label] of [
+      ["a2b", "A → B"],
+      ["b2a", "B → A"],
+      ["both", "Both ways (newer wins)"],
+    ] as const) {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = label;
+      this.schedDir.appendChild(o);
+    }
+    this.schedEvery = document.createElement("select");
+    this.schedEvery.className = "tools-path";
+    for (const [v, label] of [
+      [15, "Every 15 minutes"],
+      [60, "Every hour"],
+      [360, "Every 6 hours"],
+      [1440, "Every day"],
+    ] as const) {
+      const o = document.createElement("option");
+      o.value = String(v);
+      o.textContent = label;
+      this.schedEvery.appendChild(o);
+    }
+    const schedBtn = document.createElement("button");
+    schedBtn.className = "pill-btn";
+    schedBtn.textContent = "Turn on schedule";
+    schedBtn.addEventListener("click", () => void this.addSchedule());
+    schedRow.append(this.schedDir, this.schedEvery, schedBtn);
+    this.schedList = document.createElement("div");
+    this.schedList.className = "tools-list";
+    schedWrap.append(schedTitle, schedNote, schedRow, this.schedList);
+    dialog.append(cmpRow, schedWrap, this.statusEl, this.listEl);
     dialog.appendChild(this.picker.element);
   }
 
   open(startPath: string): void {
     this.aInput.value = startPath;
     this.element.hidden = false;
+    void this.renderSchedules();
+  }
+
+  private async addSchedule(): Promise<void> {
+    const a = this.aInput.value.trim();
+    const b = this.bInput.value.trim();
+    if (!a || !b) {
+      Toast.error("Set both folders first.");
+      return;
+    }
+    try {
+      await api.saveSyncSchedule(a, b, this.schedDir.value, Number(this.schedEvery.value));
+      Toast.success("Schedule on — Fable Files will start with the system so syncs can run.");
+      await this.renderSchedules();
+    } catch (err) {
+      Toast.error(`Could not schedule: ${err}`);
+    }
+  }
+
+  private async renderSchedules(): Promise<void> {
+    try {
+      const list = await api.listSyncSchedules();
+      this.schedList.replaceChildren();
+      const arrow: Record<string, string> = { a2b: "→", b2a: "←", both: "⇄" };
+      const every = (m: number) =>
+        m >= 1440 ? "daily" : m >= 60 ? `every ${m / 60}h` : `every ${m} min`;
+      for (const sc of list) {
+        const row = document.createElement("div");
+        row.className = "tools-sync-row";
+        const text = document.createElement("span");
+        text.textContent = `${sc.a} ${arrow[sc.direction] ?? "→"} ${sc.b} · ${every(sc.interval_min)}`;
+        const rm = document.createElement("button");
+        rm.className = "pill-btn";
+        rm.textContent = "Remove";
+        rm.addEventListener("click", async () => {
+          await api.deleteSyncSchedule(sc.id);
+          await this.renderSchedules();
+        });
+        row.append(text, rm);
+        this.schedList.appendChild(row);
+      }
+      if (list.length === 0) {
+        const p = document.createElement("p");
+        p.className = "tools-hint";
+        p.textContent = "No schedules yet.";
+        this.schedList.appendChild(p);
+      }
+    } catch {
+      // schedule list is best-effort UI
+    }
   }
 
   private async compare(): Promise<void> {
