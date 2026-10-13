@@ -10,6 +10,8 @@
  * manager. No hard-coded colors anywhere in this tree.
  */
 import { Shell } from "./shell";
+import { VideoPlayer } from "./video";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import "./styles.css";
 
 type LayoutClass = "desktop" | "handheld" | "tv";
@@ -41,7 +43,31 @@ async function boot(): Promise<void> {
   }
 }
 
-if (document.readyState === "loading") {
+/** Pop-out player windows boot here instead of the full shell. */
+function bootPlayer(params: URLSearchParams): void {
+  document.body.classList.add("player-body");
+  const path = params.get("path") ?? "";
+  const name = params.get("name") ?? "Video";
+  document.title = `${name} — Fable Files`;
+  const root = document.getElementById("app-root")!;
+  const player = new VideoPlayer({
+    path,
+    standalone: true,
+    onReturn: () => {
+      void getCurrentWebviewWindow().close();
+    },
+  });
+  root.appendChild(player.el);
+}
+
+const bootParams = new URLSearchParams(location.search);
+if (bootParams.get("mode") === "player") {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => bootPlayer(bootParams));
+  } else {
+    bootPlayer(bootParams);
+  }
+} else if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", () => void boot());
 } else {
   void boot();

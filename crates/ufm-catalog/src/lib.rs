@@ -76,6 +76,11 @@ impl Catalog {
                     label TEXT NOT NULL,
                     PRIMARY KEY (item_id, label)
                 );
+                CREATE TABLE IF NOT EXISTS path_labels (
+                    provider_key TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    PRIMARY KEY (provider_key, label)
+                );
                 CREATE TABLE IF NOT EXISTS collections (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -410,6 +415,122 @@ impl Catalog {
             .map_err(|e| UfmError::Database(e.to_string()))?;
         rows.collect::<std::result::Result<Vec<String>, _>>()
             .map_err(|e| UfmError::Database(e.to_string()))
+    }
+
+    /// Path-keyed label assignment. The VFS mints ephemeral item ids
+    /// per listing, so user-facing tags anchor to the provider key
+    /// (absolute path) — stable across listings and re-indexing.
+    pub fn tag_path(&self, provider_key: &str, label: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO path_labels (provider_key, label) VALUES (?1, ?2)",
+                params![provider_key, label],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn untag_path(&self, provider_key: &str, label: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM path_labels WHERE provider_key = ?1 AND label = ?2",
+                params![provider_key, label],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn labels_for_path(&self, provider_key: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT label FROM path_labels WHERE provider_key = ?1 ORDER BY label")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![provider_key], |row| row.get(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(|e| UfmError::Database(e.to_string()))
+    }
+
+    /// Rename a label everywhere it is assigned (definition renames in
+    /// the UI cascade here).
+    pub fn rename_path_label(&self, old: &str, new: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE OR IGNORE path_labels SET label = ?2 WHERE label = ?1",
+                params![old, new],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        self.conn
+            .execute("DELETE FROM path_labels WHERE label = ?1", params![old])
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Strip a label from every path (definition deleted in the UI).
+    pub fn delete_path_label(&self, label: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM path_labels WHERE label = ?1", params![label])
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// All catalog items carrying a label (sidebar label browsing).
+    pub fn items_by_label(&self, label: &str) -> Result<Vec<ufm_vfs::Item>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes,
+                        i.modified, i.provider_key
+                 FROM items AS i
+                 JOIN path_labels AS pl ON pl.provider_key = i.provider_key
+                 WHERE pl.label = ?1
+                 ORDER BY i.name COLLATE NOCASE",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![label], |row| {
+                let provider_key: Option<String> = row.get(6)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    provider_key,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut items = Vec::new();
+        for row in rows {
+            let (id, location_id, name, kind_s, size_bytes, modified_s, provider_key) =
+                row.map_err(|e| UfmError::Database(e.to_string()))?;
+            let parse_id = |s: &str, what: &str| {
+                uuid::Uuid::parse_str(s)
+                    .map_err(|e| UfmError::Database(format!("bad {what} id {s:?}: {e}")))
+            };
+            let labels = match &provider_key {
+                Some(pk) => self.labels_for_path(pk).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            items.push(ufm_vfs::Item {
+                id: ufm_core::ItemId(parse_id(&id, "item")?),
+                location: ufm_core::LocationId(parse_id(&location_id, "location")?),
+                name,
+                kind: parse_kind(&kind_s),
+                size_bytes: size_bytes.map(|v| v as u64),
+                modified: modified_s.and_then(|m| {
+                    chrono::DateTime::parse_from_rfc3339(&m)
+                        .ok()
+                        .map(|d| d.with_timezone(&chrono::Utc))
+                }),
+                provider_key,
+                labels,
+                starred: false,
+            });
+        }
+        Ok(items)
     }
 
     pub fn create_collection(&self, id: &CollectionId, name: &str, kind: &str) -> Result<()> {

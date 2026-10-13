@@ -104,3 +104,50 @@ export function confirmDialog(title: string, message: string, confirmLabel = "Co
     ok.focus();
   });
 }
+
+/** One-field text prompt in the confirmDialog style. Resolves to the
+ * trimmed value, or null on cancel. */
+export function promptDialog(
+  title: string,
+  placeholder: string,
+  initial = "",
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "confirm-overlay";
+    overlay.innerHTML = `
+      <div class="confirm-card" role="dialog" aria-label="${title}">
+        <h3></h3>
+        <input class="prompt-input" type="text" spellcheck="false" />
+        <div class="confirm-actions">
+          <button class="confirm-cancel">Cancel</button>
+          <button class="confirm-ok primary">OK</button>
+        </div>
+      </div>`;
+    overlay.querySelector("h3")!.textContent = title;
+    const input = overlay.querySelector(".prompt-input") as HTMLInputElement;
+    input.placeholder = placeholder;
+    input.value = initial;
+    document.body.appendChild(overlay);
+    input.focus();
+    input.select();
+    const done = (v: string | null) => {
+      overlay.remove();
+      resolve(v);
+    };
+    overlay
+      .querySelector(".confirm-cancel")!
+      .addEventListener("click", () => done(null));
+    overlay
+      .querySelector(".confirm-ok")!
+      .addEventListener("click", () => done(input.value.trim() || null));
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") done(input.value.trim() || null);
+      if (e.key === "Escape") done(null);
+      e.stopPropagation();
+    });
+    overlay.addEventListener("pointerdown", (e) => {
+      if (e.target === overlay) done(null);
+    });
+  });
+}

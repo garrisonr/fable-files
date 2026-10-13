@@ -12,7 +12,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset", ] }
 tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
 serde.workspace = true
@@ -33,9 +33,14 @@ ufm-media = { path = "../crates/ufm-media" }
 ufm-emu = { path = "../crates/ufm-emu" }
 tracing.workspace = true
 base64 = "0.22"
+sha1 = "0.10"
+crc32fast = "1"
+filetime = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "ico"] }
 md5 = "0.7"
 open = "5"
+portable-pty = "0.8"
+sha2 = "0.10"
 tracing-subscriber.workspace = true
 
 [features]

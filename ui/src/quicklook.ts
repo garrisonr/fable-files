@@ -20,6 +20,8 @@ import {
   type Item,
   type PreviewKind,
 } from "./api";
+import { onPlayerClosed } from "./api";
+import { VideoPlayer, isVideoName } from "./video";
 import { fadeTo, reducedMotion, springTo } from "./motion";
 
 const FALLBACK_PANEL_WIDTH = 340;
@@ -28,6 +30,13 @@ export class QuickLook {
   readonly el: HTMLElement;
   private openItem: Item | null = null;
   private requestToken = 0;
+  /** Path whose video is currently playing in a pop-out window. */
+  private detachedFor: string | null = null;
+  private currentKind: PreviewKind | null = null;
+
+  /** Set by the shell: cast the previewed media item. */
+  onCast: ((item: Item) => void) | null = null;
+  private castBtn: HTMLButtonElement | null = null;
 
   constructor(private onDismiss: () => void) {
     this.el = document.createElement("aside");
@@ -37,12 +46,24 @@ export class QuickLook {
     this.el.innerHTML = `
       <div class="ql-head">
         <span class="ql-title">Preview</span>
+        <button class="ql-cast icon-btn" aria-label="Cast to device" title="Cast to…" hidden>📡</button>
         <button class="ql-close icon-btn" aria-label="Close preview">✕</button>
       </div>
       <div class="ql-body"></div>`;
+    this.castBtn = this.el.querySelector(".ql-cast");
+    this.castBtn?.addEventListener("click", () => {
+      if (this.openItem && this.onCast) this.onCast(this.openItem);
+    });
     this.el
       .querySelector(".ql-close")!
       .addEventListener("click", () => this.close());
+    // When a pop-out player window closes, the video comes home.
+    void onPlayerClosed((path) => {
+      if (this.detachedFor === path) {
+        this.detachedFor = null;
+        if (this.openItem) void this.renderCard(this.openItem, this.currentKind);
+      }
+    }).catch(() => undefined);
   }
 
   get isOpen(): boolean {
@@ -56,6 +77,15 @@ export class QuickLook {
   async open(item: Item): Promise<void> {
     const token = ++this.requestToken;
     this.openItem = item;
+    if (this.castBtn) {
+      const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
+      const AUDIO = ["mp3", "flac", "ogg", "oga", "wav", "m4a", "opus", "aac", "aif", "aiff"];
+      this.castBtn.hidden = !(
+        this.onCast &&
+        (AUDIO.includes(ext) ||
+          ["mp4", "mkv", "webm", "mov", "avi", "m4v", "mpg", "mpeg"].includes(ext))
+      );
+    }
     this.el.hidden = false;
     this.renderCard(item, null);
     // Slide in from the right — from the LIVE offset (interruptible).
@@ -63,6 +93,7 @@ export class QuickLook {
     try {
       const kind = await api.preview(item.id);
       if (token === this.requestToken && this.openItem === item) {
+        this.currentKind = kind;
         this.renderCard(item, kind);
       }
     } catch {
@@ -185,6 +216,40 @@ export class QuickLook {
       }
       // Image preview — the photo IS the preview: hero at the top of
       // the card, as large as the pane allows (full image, not a thumb).
+      // Video: the full player lives at the top of the card —
+      // transport controls on hover, pop-out, fullscreen.
+      if (isVideoName(item.name) && item.provider_key) {
+        const vpath = item.provider_key;
+        if (this.detachedFor === vpath) {
+          const holder = document.createElement("div");
+          holder.className = "ql-detached";
+          const p = document.createElement("p");
+          p.textContent = "🎬 Playing in the pop-out window";
+          const btn = document.createElement("button");
+          btn.textContent = "Bring it back here";
+          btn.addEventListener("click", () => {
+            void api.closePlayerWindow(vpath);
+          });
+          holder.append(p, btn);
+          card.insertBefore(holder, dl);
+        } else {
+          const player = new VideoPlayer({
+            path: vpath,
+            onDetach: () => {
+              void api
+                .openPlayerWindow(vpath, item.name)
+                .then(() => {
+                  this.detachedFor = vpath;
+                  if (this.openItem === item) {
+                    void this.renderCard(item, this.currentKind);
+                  }
+                })
+                .catch(() => undefined);
+            },
+          });
+          card.insertBefore(player.el, dl);
+        }
+      }
       const imgExts = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff", "ico"];
       if (imgExts.includes(ext)) {
         try {

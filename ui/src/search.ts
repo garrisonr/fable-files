@@ -13,6 +13,8 @@ export interface SearchHooks {
   /** Results are showing: the shell should hide the file view. */
   onResults(): void;
   onClear(): void;
+  /** Save the current query + filter as a smart folder. */
+  onSaveSmartFolder?(): void;
 }
 
 const DEBOUNCE_MS = 120;
@@ -53,6 +55,7 @@ export class SearchView {
       const chip = document.createElement("button");
       chip.className = "search-chip" + (f.id === null ? " active" : "");
       chip.textContent = f.label;
+      chip.dataset.filter = f.id ?? "";
       chip.addEventListener("click", () => {
         this.typeFilter = f.id;
         this.chipsEl.querySelectorAll(".search-chip").forEach((c) =>
@@ -64,6 +67,14 @@ export class SearchView {
         void this.run();
       });
       this.chipsEl.appendChild(chip);
+    }
+    if (this.hooks.onSaveSmartFolder) {
+      const save = document.createElement("button");
+      save.className = "search-chip search-save";
+      save.textContent = "☆ Save as Smart Folder";
+      save.title = "Save this search in the sidebar";
+      save.addEventListener("click", () => this.hooks.onSaveSmartFolder!());
+      this.chipsEl.appendChild(save);
     }
     this.el.appendChild(this.chipsEl);
 
@@ -99,6 +110,26 @@ export class SearchView {
         this.input.focus();
       }
     });
+  }
+
+  /** The active query + type filter (smart folders read these). */
+  get currentQuery(): string {
+    return this.input.value.trim();
+  }
+
+  get currentTypeFilter(): string | null {
+    return this.typeFilter;
+  }
+
+  /** Run a search programmatically (smart folders, palette). */
+  async runExternal(query: string, typeFilter: string | null): Promise<void> {
+    this.input.value = query;
+    this.typeFilter = typeFilter;
+    this.chipsEl.querySelectorAll<HTMLElement>(".search-chip").forEach((c) =>
+      c.classList.toggle("active", (c.dataset.filter ?? "") === (typeFilter ?? "")),
+    );
+    this.lastQuery = "\u0000force";
+    await this.run();
   }
 
   get field(): HTMLElement {

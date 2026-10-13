@@ -5,6 +5,12 @@
 
 export interface MenuItem {
   label: string;
+  /** Render as a separator line (label/action ignored). */
+  separator?: boolean;
+  /** Colored dot shown before the label (label/tag menus). */
+  dot?: string;
+  /** Show a check mark (toggle state). */
+  checked?: boolean;
   shortcut?: string;
   action: () => void;
   disabled?: boolean;
@@ -30,13 +36,31 @@ export class ContextMenu {
     menu.setAttribute("role", "menu");
 
     for (const item of items) {
+      if (item.separator) {
+        const hr = document.createElement("div");
+        hr.className = "ctx-sep";
+        menu.appendChild(hr);
+        continue;
+      }
       const b = document.createElement("button");
       b.className = "ctx-item" + (item.danger ? " ctx-danger" : "");
       b.setAttribute("role", "menuitem");
       b.disabled = !!item.disabled;
+      if (item.dot) {
+        const dot = document.createElement("span");
+        dot.className = "ctx-dot";
+        dot.style.background = item.dot;
+        b.appendChild(dot);
+      }
       const label = document.createElement("span");
       label.textContent = item.label;
       b.appendChild(label);
+      if (item.checked) {
+        const check = document.createElement("span");
+        check.className = "ctx-check";
+        check.textContent = "✓";
+        b.appendChild(check);
+      }
       if (item.shortcut) {
         const sc = document.createElement("span");
         sc.className = "ctx-shortcut";

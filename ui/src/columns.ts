@@ -8,7 +8,11 @@ import { api, formatBytes, formatDate, type Item } from "./api";
 import { sortedItems, type Tab } from "./tabs";
 import { ContextMenu } from "./contextmenu";
 import { OpenWithDialog } from "./openwith";
-import { alternativeToUrl, type FileViewHooks } from "./fileview";
+import {
+  alternativeToUrl,
+  showItemMenu,
+  type FileViewHooks,
+} from "./fileview";
 
 interface Column {
   locationId: string;
@@ -174,22 +178,15 @@ export class ColumnsView {
   }
 
   private openMenu(x: number, y: number, item: Item): void {
-    this.ctxMenu.open(x, y, [
-      { label: "Open", action: () => this.hooks.onOpen(item) },
-      { label: "Open With...", action: () => this.openWithDialog.open(item) },
-      { label: "Quick Look", shortcut: "Space", action: () => this.hooks.onTogglePreview() },
-      {
-        label: "Make Executable",
-        shortcut: "Ctrl+E",
-        action: () => this.hooks.onMakeExecutable(item),
-      },
-      { label: "Properties", action: () => this.hooks.onProperties(item) },
-      {
-        label: "Find More Apps Online…",
-        action: () => void api.openUrl(alternativeToUrl(item)),
-      },
-      { label: "Delete", shortcut: "Del", danger: true, action: () => this.hooks.onDelete(item) },
-    ]);
+    void showItemMenu(
+      this.ctxMenu,
+      x,
+      y,
+      item,
+      [item],
+      this.hooks,
+      (i) => this.openWithDialog.open(i),
+    );
   }
 
   private onKey(e: KeyboardEvent): void {

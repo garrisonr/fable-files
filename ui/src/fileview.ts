@@ -6,8 +6,10 @@
 import { api, formatBytes, formatDate, type Item } from "./api";
 import { animateFromLive, liveOpacity, reducedMotion, fadeTo, rubberBand, springTo, cancelSpring } from "./motion";
 import { sortedItems, type SortDir, type SortKey, type Tab, type ViewMode } from "./tabs";
-import { ContextMenu } from "./contextmenu";
+import { ContextMenu, type MenuItem } from "./contextmenu";
 import { OpenWithDialog } from "./openwith";
+import { labelColor, loadLabelDefs } from "./labels";
+import { isVideoName } from "./video";
 
 export interface FileViewHooks {
   onOpen(item: Item): void; // Enter / double-click on a folder (or file)
@@ -16,12 +18,367 @@ export interface FileViewHooks {
   onMakeExecutable(item: Item): void;
   onDelete(item: Item): void; // move to trash
   onProperties(item: Item): void;
+  // Round 4 (Nautilus + Finder parity) — optional so every view can
+  // share one menu builder.
+  onCut?(items: Item[]): void;
+  onCopy?(items: Item[]): void;
+  onMoveTo?(items: Item[]): void;
+  onCopyTo?(items: Item[]): void;
+  onRename?(item: Item): void;
+  onCompress?(items: Item[]): void;
+  onEmail?(items: Item[]): void;
+  onSendLocalSend?(item: Item): void;
+  onDuplicate?(items: Item[]): void;
+  onMakeAlias?(item: Item): void;
+  onConvertImage?(item: Item, format: string): void;
+  onCreatePdf?(items: Item[]): void;
+  onRotateImage?(item: Item): void;
+  onSetWallpaper?(item: Item): void;
+  onToggleLabel?(items: Item[], label: string, on: boolean): void;
+  onManageLabels?(): void;
+  onExtractArchive?(item: Item, toDir: boolean): void;
+  onTranscode?(item: Item, preset: string): void;
+  onMetadata?(item: Item): void;
+  onMountIso?(item: Item): void;
+  onCast?(item: Item): void;
+  onChecksums?(item: Item): void;
+  onSplitFile?(item: Item): void;
+  onJoinFiles?(item: Item): void;
+  onBurnAdd?(item: Item): void;
+}
+
+const AUDIO_EXTS = new Set([
+  "mp3", "flac", "ogg", "oga", "wav", "m4a", "opus", "aac", "aif", "aiff", "wma",
+]);
+
+const ARCHIVE_EXTS = new Set([
+  "zip", "tar", "tgz", "gz", "bz2", "xz", "7z", "rar",
+]);
+
+export function isArchiveItem(item: Item): boolean {
+  if (item.kind === "folder") return false;
+  const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
+  return ARCHIVE_EXTS.has(ext);
+}
+
+/** Color-grade an item element from its first label + render dots
+ * for up to three labels. Shared by grid cells and list rows. */
+export function applyLabelGrade(el: HTMLElement, item: Item): void {
+  if (!item.labels || item.labels.length === 0) return;
+  const defs = loadLabelDefs();
+  const color = labelColor(defs, item.labels[0]);
+  if (color) {
+    el.style.setProperty("--label-color", color);
+    el.classList.add("labeled");
+  }
+  const dots = document.createElement("span");
+  dots.className = "label-dots";
+  for (const name of item.labels.slice(0, 3)) {
+    const d = document.createElement("span");
+    d.className = "label-dot";
+    d.style.background = labelColor(defs, name) ?? "#9ca3af";
+    d.title = name;
+    dots.appendChild(d);
+  }
+  el.appendChild(dots);
+}
+
+const IMAGE_EXTS = new Set([
+  "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "svg", "ico", "avif",
+]);
+
+export function isImageItem(item: Item): boolean {
+  const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
+  return IMAGE_EXTS.has(ext);
+}
+
+const defaultAppCache = new Map<string, { id: string; name: string } | null>();
+let localsendCache: boolean | null = null;
+
+/**
+ * The one right-click menu for file items — Nautilus + Finder parity.
+ * `targets` is the effective selection (the right-clicked item plus any
+ * multi-selection it belongs to).
+ */
+export async function showItemMenu(
+  menu: ContextMenu,
+  x: number,
+  y: number,
+  item: Item,
+  targets: Item[],
+  hooks: FileViewHooks,
+  openWith: (item: Item) => void,
+): Promise<void> {
+  const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
+  if (!defaultAppCache.has(ext)) {
+    try {
+      const info = await api.openWithApps(item.id);
+      if (info.default) {
+        const app = info.apps.find((a) => a.id === info.default);
+        defaultAppCache.set(ext, {
+          id: info.default,
+          name: app ? app.name : info.default.replace(/\.desktop$/, ""),
+        });
+      } else {
+        defaultAppCache.set(ext, null);
+      }
+    } catch {
+      defaultAppCache.set(ext, null);
+    }
+  }
+  if (localsendCache === null) {
+    localsendCache = await api.localsendAvailable().catch(() => false);
+  }
+  const def = defaultAppCache.get(ext);
+  const items: MenuItem[] = [];
+  const sep: MenuItem = { label: "", separator: true, action: () => undefined };
+
+  // Items inside an archive: only Open / Quick Look make sense.
+  if (item.id.startsWith("arc:")) {
+    items.push({ label: "Open", action: () => hooks.onOpen(item) });
+    items.push({
+      label: "Quick Look",
+      shortcut: "Space",
+      action: () => hooks.onTogglePreview(),
+    });
+    menu.open(x, y, items);
+    return;
+  }
+
+  if (def) {
+    items.push({
+      label: `Open With ${def.name}`,
+      shortcut: "Return",
+      action: () => void api.openWithApp(item.id, def.id),
+    });
+  }
+  items.push({ label: "Open", action: () => hooks.onOpen(item) });
+  items.push({ label: "Open With...", action: () => openWith(item) });
+  if (isArchiveItem(item) && hooks.onExtractArchive) {
+    items.push({
+      label: "Browse Archive",
+      action: () => hooks.onOpen(item),
+    });
+    items.push({
+      label: "Extract Here",
+      action: () => hooks.onExtractArchive!(item, false),
+    });
+    items.push({
+      label: "Extract to...",
+      action: () => hooks.onExtractArchive!(item, true),
+    });
+  }
+  items.push({
+    label: "Quick Look",
+    shortcut: "Space",
+    action: () => hooks.onTogglePreview(),
+  });
+  items.push(sep);
+  if (hooks.onCut)
+    items.push({
+      label: "Cut",
+      shortcut: "Ctrl+X",
+      action: () => hooks.onCut!(targets),
+    });
+  if (hooks.onCopy)
+    items.push({
+      label: "Copy",
+      shortcut: "Ctrl+C",
+      action: () => hooks.onCopy!(targets),
+    });
+  if (hooks.onMoveTo)
+    items.push({ label: "Move to...", action: () => hooks.onMoveTo!(targets) });
+  if (hooks.onCopyTo)
+    items.push({ label: "Copy to...", action: () => hooks.onCopyTo!(targets) });
+  items.push(sep);
+  if (hooks.onRename && targets.length === 1)
+    items.push({
+      label: "Rename...",
+      shortcut: "F2",
+      action: () => hooks.onRename!(item),
+    });
+  if (hooks.onDuplicate)
+    items.push({ label: "Duplicate", action: () => hooks.onDuplicate!(targets) });
+  if (hooks.onMakeAlias && targets.length === 1)
+    items.push({ label: "Make Alias", action: () => hooks.onMakeAlias!(item) });
+  if (hooks.onCompress)
+    items.push({
+      label: targets.length === 1 ? `Compress "${item.name}"` : "Compress...",
+      action: () => hooks.onCompress!(targets),
+    });
+  if (hooks.onEmail)
+    items.push({ label: "Email...", action: () => hooks.onEmail!(targets) });
+  if (localsendCache && hooks.onSendLocalSend)
+    items.push({
+      label: "Send via LocalSend",
+      action: () => hooks.onSendLocalSend!(item),
+    });
+  if (isImageItem(item)) {
+    items.push(sep);
+    if (hooks.onConvertImage)
+      items.push({
+        label: "Convert Image...",
+        action: () => {
+          const formats: MenuItem[] = ["png", "jpg", "webp", "bmp"].map(
+            (f) => ({
+              label: `Convert to ${f.toUpperCase()}`,
+              action: () => hooks.onConvertImage!(item, f),
+            }),
+          );
+          menu.open(x, y, formats);
+        },
+      });
+    if (hooks.onCreatePdf)
+      items.push({
+        label: "Create PDF",
+        action: () => hooks.onCreatePdf!(targets.filter(isImageItem)),
+      });
+    if (hooks.onRotateImage)
+      items.push({
+        label: "Rotate Left",
+        action: () => hooks.onRotateImage!(item),
+      });
+    if (hooks.onSetWallpaper)
+      items.push({
+        label: "Set Desktop Picture",
+        action: () => hooks.onSetWallpaper!(item),
+      });
+  }
+  if ((isVideoName(item.name) || AUDIO_EXTS.has(ext)) && hooks.onTranscode) {
+    items.push(sep);
+    if (isVideoName(item.name)) {
+      items.push({
+        label: "Transcode Video…",
+        action: () => {
+          menu.open(x, y, [
+            { label: "MP4 · H.264 — plays everywhere", action: () => hooks.onTranscode!(item, "v_mp4_264") },
+            { label: "MP4 · H.265 — smaller, modern", action: () => hooks.onTranscode!(item, "v_mp4_265") },
+            { label: "WebM · VP9 — for the web", action: () => hooks.onTranscode!(item, "v_webm") },
+            { label: "MKV · H.265 — archive quality", action: () => hooks.onTranscode!(item, "v_mkv_265") },
+            { label: "GIF — short clips", action: () => hooks.onTranscode!(item, "v_gif") },
+            { label: "Extract Audio · MP3", action: () => hooks.onTranscode!(item, "a_mp3") },
+          ]);
+        },
+      });
+    }
+    if (AUDIO_EXTS.has(ext)) {
+      items.push({
+        label: "Transcode Audio…",
+        action: () => {
+          menu.open(x, y, [
+            { label: "MP3 · 320 kbps", action: () => hooks.onTranscode!(item, "a_mp3") },
+            { label: "FLAC · lossless", action: () => hooks.onTranscode!(item, "a_flac") },
+            { label: "M4A · AAC 256", action: () => hooks.onTranscode!(item, "a_m4a") },
+            { label: "Opus · 160 kbps", action: () => hooks.onTranscode!(item, "a_opus") },
+            { label: "WAV · uncompressed", action: () => hooks.onTranscode!(item, "a_wav") },
+          ]);
+        },
+      });
+    }
+  }
+  {
+    // ——— Power tools: metadata, casting, ISO, checksums, split/join, burn
+    const isFile = item.kind !== "folder";
+    const ISO_EXTS = ["iso", "img", "dmg", "cdi", "nrg", "bin"];
+    const MEDIA_EXTS = [
+      "mp4", "mkv", "webm", "mov", "avi", "m4v", "mp3", "flac", "ogg",
+      "wav", "m4a", "opus",
+    ];
+    const tools: MenuItem[] = [];
+    if (!item.id.startsWith("arc:")) {
+      if (hooks.onMetadata) {
+        tools.push({
+          label: "Metadata…",
+          action: () => hooks.onMetadata!(item),
+        });
+      }
+      if (MEDIA_EXTS.includes(ext) && hooks.onCast) {
+        tools.push({
+          label: "Cast to…",
+          action: () => hooks.onCast!(item),
+        });
+      }
+      if (ISO_EXTS.includes(ext) && hooks.onMountIso) {
+        tools.push({
+          label: "Mount Image",
+          action: () => hooks.onMountIso!(item),
+        });
+      }
+      if (isFile && hooks.onChecksums) {
+        tools.push({
+          label: "Checksums…",
+          action: () => hooks.onChecksums!(item),
+        });
+      }
+      if (isFile && hooks.onSplitFile) {
+        tools.push({
+          label: "Split File…",
+          action: () => hooks.onSplitFile!(item),
+        });
+      }
+      if (item.name.toLowerCase().endsWith(".001") && hooks.onJoinFiles) {
+        tools.push({
+          label: "Combine Parts…",
+          action: () => hooks.onJoinFiles!(item),
+        });
+      }
+      if (hooks.onBurnAdd) {
+        tools.push({
+          label: "Add to Burn Project",
+          action: () => hooks.onBurnAdd!(item),
+        });
+      }
+    }
+    if (tools.length > 0) {
+      items.push(sep, ...tools);
+    }
+  }
+  if (hooks.onToggleLabel || hooks.onManageLabels) {
+    items.push(sep);
+    const defs = loadLabelDefs();
+    for (const def of defs) {
+      const applied = targets.every((t) => t.labels.includes(def.name));
+      items.push({
+        label: def.name,
+        dot: def.color,
+        checked: applied,
+        action: () => hooks.onToggleLabel?.(targets, def.name, !applied),
+      });
+    }
+    if (hooks.onManageLabels)
+      items.push({
+        label: "Manage Labels…",
+        action: () => hooks.onManageLabels!(),
+      });
+  }
+  items.push(sep);
+  items.push({
+    label: "Make Executable",
+    shortcut: "Ctrl+E",
+    action: () => hooks.onMakeExecutable(item),
+  });
+  items.push({
+    label: "Find More Apps Online…",
+    action: () => void api.openUrl(alternativeToUrl(item)),
+  });
+  items.push(sep);
+  items.push({ label: "Properties", action: () => hooks.onProperties(item) });
+  items.push({
+    label: "Delete",
+    shortcut: "Del",
+    danger: true,
+    action: () => hooks.onDelete(item),
+  });
+  menu.open(x, y, items);
 }
 
 /** The item currently being dragged out of a file view, if any.
  * HTML5 drag events can't read dataTransfer payloads during dragover,
  * so drop targets consult this shared slot instead. */
-export const dragState: { item: Item | null } = { item: null };
+export const dragState: { item: Item | null; favName: string | null } = {
+  item: null,
+  favName: null,
+};
 
 const KIND_ICON: Record<string, string> = {
   folder: "M3 5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z",
@@ -151,6 +508,7 @@ export class FileView {
       cell.innerHTML = `${icon(item.kind, "cell-icon")}<span class="cell-name"></span>`;
       cell.querySelector(".cell-name")!.textContent = item.name;
       cell.title = item.name;
+      applyLabelGrade(cell, item);
       this.bindCell(cell, item, i);
       frag.appendChild(cell);
       // Photos show real thumbnails (freedesktop cache) instead of an icon.
@@ -249,6 +607,7 @@ export class FileView {
       const label = document.createElement("span");
       label.textContent = item.name;
       nameTd.appendChild(label);
+      applyLabelGrade(tr, item);
       if (item.starred) {
         const star = document.createElement("span");
         star.className = "star";
@@ -292,40 +651,18 @@ export class FileView {
       if (!tab.selection.has(item.id)) {
         this.select(item, index);
       }
-      this.ctxMenu.open(e.clientX, e.clientY, [
-        {
-          label: "Open",
-          action: () => this.hooks.onOpen(item),
-        },
-        {
-          label: "Open With...",
-          action: () => this.openWithDialog.open(item),
-        },
-        {
-          label: "Quick Look",
-          shortcut: "Space",
-          action: () => this.hooks.onTogglePreview(),
-        },
-        {
-          label: "Make Executable",
-          shortcut: "Ctrl+E",
-          action: () => this.hooks.onMakeExecutable(item),
-        },
-        {
-          label: "Properties",
-          action: () => this.hooks.onProperties(item),
-        },
-        {
-          label: "Find More Apps Online…",
-          action: () => void api.openUrl(alternativeToUrl(item)),
-        },
-        {
-          label: "Delete",
-          shortcut: "Del",
-          danger: true,
-          action: () => this.hooks.onDelete(item),
-        },
-      ]);
+      const targets = tab.selection.has(item.id) && tab.selection.size > 1
+        ? sortedItems(tab).filter((i) => tab.selection.has(i.id))
+        : [item];
+      void showItemMenu(
+        this.ctxMenu,
+        e.clientX,
+        e.clientY,
+        item,
+        targets,
+        this.hooks,
+        (it) => this.openWithDialog.open(it),
+      );
     });
     // Drag source: files and folders can be dragged to sidebar favorites
     // (Trash deletes; a folder favorite files the item into it).
@@ -394,6 +731,54 @@ export class FileView {
     this.updateSelection();
     this.scrollIntoView(index);
     this.hooks.onSelect(item);
+  }
+
+  /** Mark commands (Total Commander style): select all / invert /
+   * same extension as the current item. */
+  selectAll(): void {
+    const tab = this.tab();
+    tab.selection = new Set(tab.items.map((i) => i.id));
+    this.rerenderSelection();
+  }
+
+  invertSelection(): void {
+    const tab = this.tab();
+    const next = new Set<string>();
+    for (const i of tab.items) {
+      if (!tab.selection.has(i.id)) next.add(i.id);
+    }
+    tab.selection = next;
+    this.rerenderSelection();
+  }
+
+  selectSameExtension(): void {
+    const tab = this.tab();
+    const anchor = this.selected;
+    if (!anchor) return;
+    const ext = anchor.name.split(".").pop()?.toLowerCase() ?? "";
+    tab.selection = new Set(
+      tab.items
+        .filter((i) => (i.name.split(".").pop()?.toLowerCase() ?? "") === ext)
+        .map((i) => i.id),
+    );
+    this.rerenderSelection();
+  }
+
+  private rerenderSelection(): void {
+    this.render();
+    const first = this.selectionItems()[0];
+    if (first) this.hooks.onSelect(first);
+  }
+
+  /** The effective selection: multi-selection if active, else the
+   * last selected item. */
+  selectionItems(): Item[] {
+    const tab = this.tab();
+    if (tab.selection.size > 0) {
+      const items = sortedItems(tab).filter((i) => tab.selection.has(i.id));
+      if (items.length > 0) return items;
+    }
+    return this.selected ? [this.selected] : [];
   }
 
   get selected(): Item | null {

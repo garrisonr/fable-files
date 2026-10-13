@@ -19,9 +19,27 @@ import { IndexTracker } from "./indexing";
 import { reducedMotion, animateFromLive, liveOpacity } from "./motion";
 import { QuickLook } from "./quicklook";
 import { ContextMenu } from "./contextmenu";
-import { Toast, confirmDialog } from "./toast";
+import { Toast, confirmDialog, promptDialog } from "./toast";
 import { SearchView } from "./search";
 import { PropertiesDialog } from "./properties";
+import { FolderPicker, type PickerShortcut } from "./picker";
+import { RenameDialog } from "./rename";
+import { LabelManager } from "./labels";
+import { loadLabelDefs } from "./labels";
+import type { ArchiveEntry } from "./api";
+import { TerminalPanel } from "./terminal";
+import { MetadataDialog } from "./metadata";
+import { BurnStudio } from "./burn";
+import { CloudMount } from "./cloud";
+import { CastDialog } from "./cast";
+import { AppDeleter } from "./deleter";
+import {
+  ChecksumDialog,
+  DuplicatesDialog,
+  SplitDialog,
+  SyncDialog,
+} from "./tools";
+import { JobsPanel } from "./jobs";
 import {
   canGoBack,
   canGoForward,
@@ -44,6 +62,13 @@ interface FavoriteTarget {
   locationId: string;
   dirId: string;
   display: string;
+}
+
+/** A saved search pinned in the sidebar. */
+interface SmartFolder {
+  name: string;
+  query: string;
+  type: string | null;
 }
 
 export class Shell {
@@ -84,6 +109,26 @@ export class Shell {
   private ctxMenu = new ContextMenu();
   private propertiesDialog = new PropertiesDialog();
   private fontScale = 1.0;
+  private picker = new FolderPicker();
+  private renameDialog = new RenameDialog();
+  private labelManager = new LabelManager();
+  private labelList!: HTMLElement;
+  private smartList!: HTMLElement;
+  /** Archive browsing state: archive item id -> its catalog Item and
+   * cached listing. */
+  private archiveMeta = new Map<string, Item>();
+  private archiveCache = new Map<string, ArchiveEntry[]>();
+  private termPanel = new TerminalPanel();
+  private jobsPanel = new JobsPanel();
+  private metadataDialog = new MetadataDialog();
+  private castDialog = new CastDialog();
+  private appDeleter = new AppDeleter();
+  private checksumDialog = new ChecksumDialog();
+  private syncDialog = new SyncDialog();
+  private splitDialog = new SplitDialog();
+  private dupDialog = new DuplicatesDialog();
+  private burnStudio!: BurnStudio;
+  private cloudMount!: CloudMount;
 
   constructor() {
     this.el.id = "app";
@@ -100,11 +145,174 @@ export class Shell {
       },
       onDelete: (item) => void this.deleteItem(item),
       onProperties: (item) => this.propertiesDialog.open(item),
+      onCut: (items) => void this.clipboardSet(items, true),
+      onCopy: (items) => void this.clipboardSet(items, false),
+      onMoveTo: (items) => void this.moveOrCopyTo(items, "move"),
+      onCopyTo: (items) => void this.moveOrCopyTo(items, "copy"),
+      onRename: (item) =>
+        this.renameDialog.open(item, () => {
+          const t = this.activeTab;
+          if (t) void this.loadDir(t);
+        }),
+      onCompress: (items) => {
+        void api
+          .compressItems(items.map((i) => i.id))
+          .then((p) => {
+            Toast.success(`Created ${p.split("/").pop()}`);
+            const t = this.activeTab;
+            if (t) void this.loadDir(t);
+          })
+          .catch((err) => Toast.error(`Compress failed: ${err}`));
+      },
+      onEmail: (items) => {
+        void api
+          .emailItems(items.map((i) => i.id))
+          .catch((err) => Toast.error(`Email failed: ${err}`));
+      },
+      onSendLocalSend: (item) => {
+        void api
+          .sendViaLocalsend(item.id)
+          .then(() => Toast.success("Sent to LocalSend"))
+          .catch((err) => Toast.error(`LocalSend failed: ${err}`));
+      },
+      onDuplicate: (items) => void this.duplicateItems(items),
+      onMakeAlias: (item) => {
+        void api
+          .makeAlias(item.id)
+          .then((p) => {
+            Toast.success(`Created alias ${p.split("/").pop()}`);
+            const t = this.activeTab;
+            if (t) void this.loadDir(t);
+          })
+          .catch((err) => Toast.error(`Alias failed: ${err}`));
+      },
+      onConvertImage: (item, format) => {
+        void api
+          .convertImage(item.id, format)
+          .then((p) => {
+            Toast.success(`Converted to ${p.split("/").pop()}`);
+            const t = this.activeTab;
+            if (t) void this.loadDir(t);
+          })
+          .catch((err) => Toast.error(`Convert failed: ${err}`));
+      },
+      onCreatePdf: (items) => {
+        if (items.length === 0) return;
+        void api
+          .createPdf(items.map((i) => i.id))
+          .then((p) => {
+            Toast.success(`Created ${p.split("/").pop()}`);
+            const t = this.activeTab;
+            if (t) void this.loadDir(t);
+          })
+          .catch((err) => Toast.error(`PDF failed: ${err}`));
+      },
+      onRotateImage: (item) => {
+        void api
+          .rotateImageLeft(item.id)
+          .then(() => {
+            Toast.success(`Rotated ${item.name}`);
+            const t = this.activeTab;
+            if (t) void this.loadDir(t);
+          })
+          .catch((err) => Toast.error(`Rotate failed: ${err}`));
+      },
+      onSetWallpaper: (item) => {
+        void api
+          .setWallpaper(item.id)
+          .then(() => Toast.success("Desktop picture set"))
+          .catch((err) => Toast.error(`Wallpaper failed: ${err}`));
+      },
+      onToggleLabel: (items, label, on) =>
+        void this.toggleLabel(items, label, on),
+      onManageLabels: () =>
+        this.labelManager.open(() => {
+          void this.buildSidebar();
+          const t = this.activeTab;
+          if (t) void this.loadDir(t);
+        }),
+      onExtractArchive: (item, toDir) => void this.extractArchive(item, toDir),
+      onTranscode: (item, preset) => {
+        void api
+          .transcode(item.id, preset)
+          .then((id) => this.jobsPanel.trackTranscode(id, item.name))
+          .catch((err) => Toast.error(`Transcode failed: ${err}`));
+      },
+      onMetadata: (item) =>
+        void this.metadataDialog.open(item, () => this.refreshActiveDir()),
+      onMountIso: (item) => void this.mountIsoItem(item),
+      onCast: (item) => void this.castDialog.open(item),
+      onChecksums: (item) => void this.checksumDialog.open(item),
+      onSplitFile: (item) => this.splitDialog.open(item),
+      onJoinFiles: (item) => {
+        void api
+          .joinFiles(item.id)
+          .then((out) => {
+            Toast.success(`Combined: ${out.split("/").pop()}`);
+            this.refreshActiveDir();
+          })
+          .catch((err) => Toast.error(`Combine failed: ${err}`));
+      },
+      onBurnAdd: (item) => {
+        const path = item.provider_key;
+        if (!path) {
+          Toast.error("That item has no local path to burn.");
+          return;
+        }
+        void this.burnStudio.openWith([
+          {
+            path,
+            size: item.kind === "folder" ? null : (item.size_bytes ?? null),
+          },
+        ]);
+      },
     };
     this.fileView = new FileView(() => this.requireTab(), viewHooks);
     this.columnsView = new ColumnsView(() => this.requireTab(), viewHooks);
     this.galleryView = new GalleryView(() => this.requireTab(), viewHooks);
     this.quickLook = new QuickLook(() => this.fileView.el.focus({ preventScroll: true }));
+    this.quickLook.onCast = (item) => void this.castDialog.open(item);
+    this.burnStudio = new BurnStudio({
+      getSelectionPaths: async () =>
+        this.activeSelectionItems()
+          .filter((i) => !!i.provider_key)
+          .map((i) => ({
+            path: i.provider_key as string,
+            size: i.kind === "folder" ? null : (i.size_bytes ?? null),
+          })),
+      openPathLocation: async (isoPath) => {
+        const mountPath = await api.mountIsoPath(isoPath);
+        await this.addAndOpenLocation(
+          isoPath.split("/").pop()?.replace(/\.iso$/i, "") || "Disc Image",
+          mountPath,
+        );
+      },
+      refresh: () => this.refreshActiveDir(),
+    });
+    this.cloudMount = new CloudMount({
+      runInTerminal: async (command) => {
+        await this.termPanel.runInFolder(command, await this.homePath());
+      },
+      addLocation: async (path, label) => {
+        await api.addPathLocation(label, path);
+        await this.refreshLocations();
+      },
+      removeLocation: async (path) => {
+        await this.refreshLocations();
+        for (const loc of this.locations) {
+          const rootPath = await api.getItemPath(loc.root_item).catch(() => "");
+          if (rootPath === path) {
+            await api.removePathLocation(loc.id);
+          }
+        }
+        await this.refreshLocations();
+      },
+      refreshSidebar: async () => {
+        await this.buildSidebar();
+      },
+      homePath: () => this.homePath(),
+    });
+    this.splitDialog.onDone = () => this.refreshActiveDir();
     this.searchView = new SearchView({
       onNavigateToItem: (item) => {
         this.searchView.clear(); // back to the file view before navigating
@@ -117,6 +325,7 @@ export class Shell {
         this.galleryView.el.hidden = true;
       },
       onClear: () => this.showFileView(),
+      onSaveSmartFolder: () => void this.saveSmartFolder(),
     });
     this.viewport.append(
       this.fileView.el,
@@ -127,6 +336,28 @@ export class Shell {
     );
     // The search field lives in the toolbar; its results panel is in the viewport.
     this.searchWrap.appendChild(this.searchView.field);
+    this.el.append(
+      this.picker.element,
+      this.renameDialog.element,
+      this.labelManager.element,
+      this.jobsPanel.el,
+      this.metadataDialog.element,
+      this.castDialog.element,
+      this.appDeleter.element,
+      this.checksumDialog.element,
+      this.syncDialog.element,
+      this.splitDialog.element,
+      this.dupDialog.element,
+      this.burnStudio.element,
+      this.cloudMount.element,
+    );
+    this.jobsPanel.onJobDone = (output) => {
+      Toast.success(`Created ${output.split("/").pop()}`);
+      this.refreshActiveDir();
+    };
+    this.jobsPanel.onJobError = (error) => {
+      Toast.error(`Job failed: ${error}`);
+    };
 
     this.themeManager = new ThemeManager({
       renderMenu: (themes, activeId, anchor) => this.renderThemeMenu(themes, activeId, anchor),
@@ -257,7 +488,26 @@ export class Shell {
     locHead.textContent = "Locations";
     this.sidebarList = document.createElement("div");
     this.sidebarList.className = "side-list";
-    sidebar.append(favHead, this.favList, locHead, this.sidebarList);
+    const labelHead = document.createElement("h2");
+    labelHead.className = "side-head";
+    labelHead.textContent = "Labels";
+    this.labelList = document.createElement("div");
+    this.labelList.className = "side-list";
+    const smartHead = document.createElement("h2");
+    smartHead.className = "side-head";
+    smartHead.textContent = "Smart Folders";
+    this.smartList = document.createElement("div");
+    this.smartList.className = "side-list";
+    sidebar.append(
+      favHead,
+      this.favList,
+      labelHead,
+      this.labelList,
+      smartHead,
+      this.smartList,
+      locHead,
+      this.sidebarList,
+    );
 
     const main = document.createElement("main");
     main.className = "main";
@@ -266,7 +516,7 @@ export class Shell {
     this.tabBar.setAttribute("role", "tablist");
     this.viewport = document.createElement("div");
     this.viewport.className = "viewport";
-    main.append(this.tabBar, this.viewport);
+    main.append(this.tabBar, this.viewport, this.termPanel.el);
 
     workarea.append(sidebar, main);
     this.el.append(workarea);
@@ -377,7 +627,13 @@ export class Shell {
   private async loadDir(tab: Tab): Promise<void> {
     const dir = currentDir(tab);
     try {
-      tab.items = await api.listDir(dir.locationId, dir.dirId);
+      if (dir.dirId.startsWith("label:")) {
+        tab.items = await api.listItemsByLabel(dir.dirId.slice("label:".length));
+      } else if (dir.dirId.startsWith("archive:")) {
+        tab.items = await this.archiveItems(dir.dirId);
+      } else {
+        tab.items = await api.listDir(dir.locationId, dir.dirId);
+      }
     } catch {
       tab.items = [];
     }
@@ -423,13 +679,117 @@ export class Shell {
 
   private openItem(item: Item): void {
     const tab = this.requireTab();
+    const dir = currentDir(tab);
+    // Inside an archive: folders descend virtually; files extract+open.
+    if (dir.dirId.startsWith("archive:")) {
+      if (item.kind === "folder") {
+        const entryPath = item.id.split(":").slice(2).join(":");
+        const archiveId = dir.dirId.slice("archive:".length).split(":")[0];
+        const newDirId = `archive:${archiveId}:${entryPath}`;
+        this.navigateTo({
+          locationId: dir.locationId,
+          dirId: newDirId,
+          crumbs: [
+            ...dir.crumbs,
+            { dirId: newDirId, name: item.name },
+          ],
+        });
+      } else {
+        void this.openArchiveEntry(item);
+      }
+      return;
+    }
     if (item.kind === "folder") {
-      this.navigateTo(descend(tab, item));
+      if (dir.dirId.startsWith("label:")) {
+        // A labeled folder opens at its real location.
+        this.navigateTo({
+          locationId: item.location,
+          dirId: item.id,
+          crumbs: [{ dirId: item.id, name: item.name }],
+        });
+      } else {
+        this.navigateTo(descend(tab, item));
+      }
+    } else if (Shell.isArchiveName(item.name)) {
+      this.openArchive(item);
     } else {
       // Double-click / Enter opens with the OS default app; Spacebar is Quick Look.
       void api
         .openItem(item.id)
         .catch(() => void this.quickLook.open(item));
+    }
+  }
+
+  private static isArchiveName(name: string): boolean {
+    const ext = name.split(".").pop()?.toLowerCase() ?? "";
+    return ["zip", "tar", "tgz", "gz", "bz2", "xz", "7z", "rar"].includes(ext);
+  }
+
+  /** Enter archive-browsing mode for an archive file. */
+  private openArchive(item: Item): void {
+    this.archiveMeta.set(item.id, item);
+    const dirId = `archive:${item.id}`;
+    this.navigateTo({
+      locationId: item.location,
+      dirId,
+      crumbs: [{ dirId, name: item.name }],
+    });
+  }
+
+  /** Immediate children of a prefix inside a cached archive listing. */
+  private async archiveItems(dirId: string): Promise<Item[]> {
+    const rest = dirId.slice("archive:".length);
+    const sep = rest.indexOf(":");
+    const archiveId = sep >= 0 ? rest.slice(0, sep) : rest;
+    const sub = sep >= 0 ? rest.slice(sep + 1) : "";
+    const meta = this.archiveMeta.get(archiveId);
+    if (!meta) return [];
+    let entries = this.archiveCache.get(archiveId);
+    if (!entries) {
+      entries = await api.listArchive(archiveId);
+      this.archiveCache.set(archiveId, entries);
+    }
+    const prefix = sub ? `${sub}/` : "";
+    const byName = new Map<string, Item>();
+    for (const e of entries) {
+      if (prefix && !e.path.startsWith(prefix)) continue;
+      const rel = e.path.slice(prefix.length);
+      if (!rel) continue;
+      const seg = rel.split("/")[0];
+      if (byName.has(seg)) continue;
+      const isFolder = rel.includes("/") || (e.is_dir && e.path === prefix + seg);
+      byName.set(seg, {
+        id: `arc:${archiveId}:${prefix}${seg}`,
+        location: meta.location,
+        name: seg,
+        kind: isFolder ? "folder" : "file",
+        size_bytes: isFolder ? null : e.size,
+        modified: meta.modified,
+        provider_key: null,
+        labels: [],
+        starred: false,
+      });
+    }
+    return [...byName.values()].sort((a, b) => {
+      if ((a.kind === "folder") !== (b.kind === "folder")) {
+        return a.kind === "folder" ? -1 : 1;
+      }
+      return a.name.localeCompare(b.name);
+    });
+  }
+
+  /** Extract one archive entry to temp and open it. */
+  private async openArchiveEntry(item: Item): Promise<void> {
+    try {
+      const tab = this.requireTab();
+      const dir = currentDir(tab);
+      const archiveId = dir.dirId.slice("archive:".length).split(":")[0];
+      const entryPath = item.id.split(":").slice(2).join(":");
+      const archivePath = await api.getItemPath(archiveId);
+      const temp = await api.extractArchiveEntry(archivePath, entryPath);
+      await api.openPath(temp);
+    } catch (err) {
+      Toast.error(`Could not open ${item.name}: ${err}`);
     }
   }
 
@@ -463,6 +823,399 @@ export class Shell {
       if (tab) await this.loadDir(tab);
     } catch (err) {
       Toast.error(`Could not delete “${item.name}”: ${err}`);
+    }
+  }
+
+  // ------------------------------------------------------- file actions
+
+  /** Selection of the active view as a list (multi when available). */
+  private activeSelectionItems(): Item[] {
+    const tab = this.activeTab;
+    if (!tab) return [];
+    if (tab.view === "grid" || tab.view === "list") {
+      return this.fileView.selectionItems();
+    }
+    const sel = this.activeSelected();
+    return sel ? [sel] : [];
+  }
+
+  private refreshActiveDir(): void {
+    const t = this.activeTab;
+    if (t) void this.loadDir(t);
+  }
+
+  private async clipboardSet(items: Item[], cut: boolean): Promise<void> {
+    const paths = items
+      .map((i) => i.provider_key)
+      .filter((p): p is string => !!p);
+    if (paths.length === 0) {
+      Toast.error("Nothing to copy — these items have no local path.");
+      return;
+    }
+    try {
+      await api.clipboardWrite(paths, cut);
+      Toast.success(
+        `${cut ? "Cut" : "Copied"} ${paths.length} item${paths.length === 1 ? "" : "s"}`,
+      );
+    } catch (err) {
+      Toast.error(`Clipboard failed: ${err}`);
+    }
+  }
+
+  private async pasteIntoCurrentDir(): Promise<void> {
+    const tab = this.activeTab;
+    if (!tab) return;
+    const dir = currentDir(tab);
+    if (dir.dirId.startsWith("label:") || dir.dirId.startsWith("archive:")) {
+      Toast.error("Can't paste into this view.");
+      return;
+    }
+    try {
+      const destDir = await api.getItemPath(dir.dirId);
+      const clip = await api.clipboardRead();
+      if (clip.paths.length === 0) {
+        Toast.error("Clipboard has no files.");
+        return;
+      }
+      let done = 0;
+      for (const src of clip.paths) {
+        const parent = src.replace(/\/[^/]*$/, "");
+        if (parent === destDir) {
+          if (clip.cut) continue; // cutting into the same folder: no-op
+          // copy into the same folder = duplicate with a suffix (backend)
+        }
+        if (clip.cut) await api.movePathTo(src, destDir);
+        else await api.copyPathTo(src, destDir);
+        done++;
+      }
+      if (done > 0) {
+        Toast.success(
+          `Pasted ${done} item${done === 1 ? "" : "s"}${clip.cut ? " (moved)" : ""}`,
+        );
+        this.refreshActiveDir();
+      }
+    } catch (err) {
+      Toast.error(`Paste failed: ${err}`);
+    }
+  }
+
+  private async duplicateItems(items: Item[]): Promise<void> {
+    let done = 0;
+    for (const item of items) {
+      if (!item.provider_key) continue;
+      const parent = item.provider_key.replace(/\/[^/]*$/, "");
+      try {
+        await api.copyPathTo(item.provider_key, parent);
+        done++;
+      } catch (err) {
+        Toast.error(`Could not duplicate ${item.name}: ${err}`);
+      }
+    }
+    if (done > 0) {
+      Toast.success(`Duplicated ${done} item${done === 1 ? "" : "s"}`);
+      this.refreshActiveDir();
+    }
+  }
+
+  /** Shared destination-picker flow for Move to… / Copy to…. */
+  private async moveOrCopyTo(items: Item[], mode: "move" | "copy"): Promise<void> {
+    const names = ["Home", "Documents", "Downloads", "Videos", "Pictures", "Music", "Trash"];
+    const targets = await this.resolveFavoriteTargets();
+    const shortcuts: PickerShortcut[] = [];
+    names.forEach((n, i) => {
+      const t = targets[i];
+      if (t && n !== "Trash") {
+        shortcuts.push({ label: n, locationId: t.locationId, dirId: t.dirId });
+      }
+    });
+    const tab = this.activeTab;
+    const dir = tab ? currentDir(tab) : null;
+    const start =
+      dir && !dir.dirId.startsWith("label:") && !dir.dirId.startsWith("archive:")
+        ? { locationId: dir.locationId, dirId: dir.dirId }
+        : shortcuts[0];
+    if (!start) {
+      Toast.error("No destination available.");
+      return;
+    }
+    const dest = await this.picker.pick(
+      mode === "move" ? "Move to…" : "Copy to…",
+      shortcuts,
+      start,
+    );
+    if (!dest) return;
+    let done = 0;
+    for (const item of items) {
+      try {
+        if (mode === "move") {
+          const newPath = await api.moveItemTo(item.id, dest);
+          const fromDir = item.provider_key
+            ? item.provider_key.replace(/\/[^/]*$/, "")
+            : "";
+          if (fromDir && fromDir !== dest) {
+            this.undoStack.push({ kind: "move", newPath, fromDir, label: item.name });
+          }
+        } else {
+          if (!item.provider_key) continue;
+          await api.copyPathTo(item.provider_key, dest);
+        }
+        done++;
+      } catch (err) {
+        Toast.error(`Could not ${mode} ${item.name}: ${err}`);
+      }
+    }
+    if (done > 0) {
+      Toast.success(
+        `${mode === "move" ? "Moved" : "Copied"} ${done} item${done === 1 ? "" : "s"}${mode === "move" ? ". Super+Z to undo." : ""}`,
+      );
+      this.refreshActiveDir();
+    }
+  }
+
+  private async toggleLabel(items: Item[], label: string, on: boolean): Promise<void> {
+    let done = 0;
+    for (const item of items) {
+      if (!item.provider_key) continue;
+      try {
+        await api.setPathLabel(item.provider_key, label, on);
+        done++;
+      } catch (err) {
+        Toast.error(`Label failed for ${item.name}: ${err}`);
+      }
+    }
+    if (done > 0) {
+      Toast.success(
+        `${on ? "Labeled" : "Unlabeled"} ${done} item${done === 1 ? "" : "s"}: ${label}`,
+      );
+      this.refreshActiveDir();
+    }
+  }
+
+  private async extractArchive(item: Item, toDir: boolean): Promise<void> {
+    try {
+      let dest: string | null = null;
+      if (toDir) {
+        const names = ["Home", "Documents", "Downloads", "Videos", "Pictures", "Music", "Trash"];
+        const targets = await this.resolveFavoriteTargets();
+        const shortcuts: PickerShortcut[] = [];
+        names.forEach((n, i) => {
+          const t = targets[i];
+          if (t && n !== "Trash") {
+            shortcuts.push({ label: n, locationId: t.locationId, dirId: t.dirId });
+          }
+        });
+        const tab = this.activeTab;
+        const dir = tab ? currentDir(tab) : null;
+        const start = dir
+          ? { locationId: dir.locationId, dirId: dir.dirId }
+          : shortcuts[0];
+        if (!start) return;
+        dest = await this.picker.pick("Extract to…", shortcuts, start);
+        if (!dest) return;
+      }
+      const out = await api.extractArchive(item.id, dest ?? undefined);
+      Toast.success(`Extracted to ${out}`);
+      this.refreshActiveDir();
+    } catch (err) {
+      Toast.error(`Extract failed: ${err}`);
+    }
+  }
+
+  private openLabel(name: string): void {
+    const dirId = `label:${name}`;
+    this.navigateTo({
+      locationId: "",
+      dirId,
+      crumbs: [{ dirId, name: `🏷 ${name}` }],
+    });
+  }
+
+  private static loadSmartFolders(): SmartFolder[] {
+    try {
+      const raw = localStorage.getItem("ff-smart-folders");
+      if (raw) {
+        const parsed = JSON.parse(raw) as SmartFolder[];
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {
+      // no stored folders
+    }
+    return [];
+  }
+
+  private static saveSmartFolders(list: SmartFolder[]): void {
+    try {
+      localStorage.setItem("ff-smart-folders", JSON.stringify(list));
+    } catch {
+      // storage unavailable
+    }
+  }
+
+  private async saveSmartFolder(): Promise<void> {
+    const query = this.searchView.currentQuery;
+    const type = this.searchView.currentTypeFilter;
+    if (!query && !type) {
+      Toast.error("Type a search or pick a type filter first.");
+      return;
+    }
+    const name = await promptDialog(
+      "Name this Smart Folder",
+      "e.g. Movie files",
+      query || type || "",
+    );
+    if (!name) return;
+    const list = Shell.loadSmartFolders();
+    list.push({ name, query, type });
+    Shell.saveSmartFolders(list);
+    void this.buildSidebar();
+    Toast.success(`Smart Folder “${name}” saved`);
+  }
+
+  private static loadFavOrder(): string[] {
+    try {
+      const raw = localStorage.getItem("ff-fav-order");
+      if (raw) {
+        const parsed = JSON.parse(raw) as string[];
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {
+      // no stored order
+    }
+    return [];
+  }
+
+  private reorderFavorite(from: string, to: string): void {
+    const base = ["Home", "Documents", "Downloads", "Videos", "Pictures", "Music", "Trash"];
+    const current = Shell.loadFavOrder();
+    const order = current.length > 0 ? [...current] : [...base];
+    for (const n of [from, to]) {
+      if (!order.includes(n)) order.push(n);
+    }
+    order.splice(order.indexOf(from), 1);
+    order.splice(order.indexOf(to), 0, from);
+    try {
+      localStorage.setItem("ff-fav-order", JSON.stringify(order));
+    } catch {
+      // storage unavailable
+    }
+    void this.buildSidebar();
+  }
+
+  /** The user's home directory path (via the Home location). */
+  private async homePath(): Promise<string> {
+    const home =
+      this.locations.find((l) =>
+        l.display_name.toLowerCase().includes("home"),
+      ) ?? this.locations[0];
+    if (!home) return "";
+    return api.getItemPath(home.root_item).catch(() => "");
+  }
+
+  /** Absolute path of the folder the active tab is browsing. */
+  private async currentDirPath(): Promise<string> {
+    const tab = this.activeTab;
+    if (!tab) return "";
+    const dir = currentDir(tab);
+    if (dir.dirId.startsWith("label:") || dir.dirId.startsWith("archive:")) {
+      return "";
+    }
+    return api.getItemPath(dir.dirId).catch(() => "");
+  }
+
+  private async refreshLocations(): Promise<void> {
+    this.locations = await api.listLocations().catch(() => this.locations);
+    await this.buildSidebar();
+  }
+
+  /** Mount an ISO item and open it as a sidebar location. */
+  private async mountIsoItem(item: Item): Promise<void> {
+    try {
+      const mountPath = await api.mountIso(item.id);
+      await this.addAndOpenLocation(
+        item.name.replace(/\.(iso|img|dmg|cdi|nrg|bin)$/i, ""),
+        mountPath,
+      );
+      Toast.success(`Mounted “${item.name}”.`);
+    } catch (err) {
+      Toast.error(`Mount failed: ${err}`);
+    }
+  }
+
+  /** Register a path as a sidebar location and navigate into it. */
+  private async addAndOpenLocation(
+    name: string,
+    path: string,
+  ): Promise<void> {
+    const summary = await api.addPathLocation(name, path);
+    await this.refreshLocations();
+    this.navigateTo({
+      locationId: summary.id,
+      dirId: summary.root_item,
+      crumbs: [{ dirId: summary.root_item, name: summary.display_name }],
+    });
+  }
+
+  private async openSyncHere(): Promise<void> {
+    const path = (await this.currentDirPath()) || (await this.homePath());
+    this.syncDialog.onDone = () => this.refreshActiveDir();
+    this.syncDialog.open(path);
+  }
+
+  private async openDupHere(): Promise<void> {
+    const path = (await this.currentDirPath()) || (await this.homePath());
+    if (!path) {
+      Toast.error("Open a folder first, then hunt duplicates in it.");
+      return;
+    }
+    this.dupDialog.onDone = () => this.refreshActiveDir();
+    this.dupDialog.open(path);
+  }
+
+  /** Built-in terminal: opens in the folder being browsed. */
+  private async toggleTerminal(): Promise<void> {
+    let cwd = "";
+    const tab = this.activeTab;
+    if (tab) {
+      const dir = currentDir(tab);
+      if (!dir.dirId.startsWith("label:") && !dir.dirId.startsWith("archive:")) {
+        cwd = await api.getItemPath(dir.dirId).catch(() => "");
+      }
+    }
+    if (!cwd) {
+      const home = this.locations.find((l) =>
+        l.display_name.toLowerCase().includes("home"),
+      );
+      if (home) cwd = await api.getItemPath(home.root_item).catch(() => "");
+    }
+    await this.termPanel.toggle(cwd || "/");
+  }
+
+  /** Connect to Server (Finder): gio-mounts sftp/smb/ftp/dav and adds
+   * the mount as a browsable location. */
+  private async connectToServer(): Promise<void> {
+    const url = await promptDialog(
+      "Connect to Server",
+      "sftp://user@server/share · smb://server/share · ftp://… · dav://…",
+    );
+    if (!url) return;
+    try {
+      Toast.success("Mounting… (a sign-in prompt may appear)");
+      const mountPath = await api.mountServer(url);
+      const name = url
+        .replace(/^[a-z]+:\/\//, "")
+        .split("/")[0] || "Server";
+      const summary = await api.addPathLocation(name, mountPath);
+      this.locations = await api.listLocations().catch(() => this.locations);
+      void summary;
+      void this.buildSidebar();
+      this.navigateTo({
+        locationId: summary.id,
+        dirId: summary.root_item,
+        crumbs: [{ dirId: summary.root_item, name: summary.display_name }],
+      });
+      Toast.success(`Connected: ${summary.display_name}`);
+    } catch (err) {
+      Toast.error(`Connect failed: ${err}`);
     }
   }
 
@@ -606,15 +1359,35 @@ export class Shell {
     this.sidebarList.innerHTML = "";
     const targets = await this.resolveFavoriteTargets();
     const names = ["Home", "Documents", "Downloads", "Videos", "Pictures", "Music", "Trash"];
-    for (let i = 0; i < names.length; i++) {
-      const name = names[i];
-      const target = targets[i];
+    // Saved drag order first; favorites whose folder doesn't exist are
+    // OMITTED, never shown disabled (Dickles' rule).
+    const order = Shell.loadFavOrder();
+    const orderIdx = (n: string) => {
+      const i = order.indexOf(n);
+      return i < 0 ? 999 : i;
+    };
+    const pairs = names
+      .map((n, i) => ({ name: n, target: targets[i] }))
+      .filter((p) => p.target)
+      .sort((a, b) => orderIdx(a.name) - orderIdx(b.name));
+    for (const pair of pairs) {
+      const name = pair.name;
+      const target = pair.target!;
       const b = document.createElement("button");
       b.className = "side-item";
       b.textContent = name;
-      b.disabled = !target;
-      b.title = target ? target.display : `${name} is not available`;
-      if (target) {
+      b.title = target.display;
+      {
+        // Drag to rearrange the sidebar (persisted order).
+        b.draggable = true;
+        b.addEventListener("dragstart", (e) => {
+          dragState.favName = name;
+          if (e.dataTransfer) e.dataTransfer.setData("text/plain", name);
+        });
+        b.addEventListener("dragend", () => {
+          dragState.favName = null;
+          b.classList.remove("drop-hover");
+        });
         b.addEventListener("click", () => {
           this.navigateTo({
             locationId: target.locationId,
@@ -624,6 +1397,13 @@ export class Shell {
         });
         // Drop target: drag a file here to file it (or trash it).
         b.addEventListener("dragover", (e) => {
+          if (dragState.favName) {
+            if (dragState.favName !== name) {
+              e.preventDefault();
+              b.classList.add("drop-hover");
+            }
+            return;
+          }
           if (!dragState.item) return;
           e.preventDefault();
           if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
@@ -633,6 +1413,11 @@ export class Shell {
         b.addEventListener("drop", async (e) => {
           e.preventDefault();
           b.classList.remove("drop-hover");
+          if (dragState.favName) {
+            this.reorderFavorite(dragState.favName, name);
+            dragState.favName = null;
+            return;
+          }
           const dragged = dragState.item;
           if (!dragged) return;
           try {
@@ -736,6 +1521,69 @@ export class Shell {
       p.className = "side-empty";
       p.textContent = "No locations yet.";
       this.sidebarList.appendChild(p);
+    }
+    // Labels: click to browse everything carrying the label.
+    this.labelList.innerHTML = "";
+    for (const def of loadLabelDefs()) {
+      const b = document.createElement("button");
+      b.className = "side-item";
+      const dot = document.createElement("span");
+      dot.className = "side-dot";
+      dot.style.background = def.color;
+      const label = document.createElement("span");
+      label.textContent = def.name;
+      b.append(dot, label);
+      b.addEventListener("click", () => this.openLabel(def.name));
+      b.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.ctxMenu.open(e.clientX, e.clientY, [
+          {
+            label: "Manage Labels…",
+            action: () =>
+              this.labelManager.open(() => {
+                void this.buildSidebar();
+                this.refreshActiveDir();
+              }),
+          },
+        ]);
+      });
+      this.labelList.appendChild(b);
+    }
+    // Smart folders: saved searches.
+    this.smartList.innerHTML = "";
+    const folders = Shell.loadSmartFolders();
+    if (folders.length === 0) {
+      const p = document.createElement("p");
+      p.className = "side-empty";
+      p.textContent = "Run a search and save it here.";
+      this.smartList.appendChild(p);
+    }
+    for (const sf of folders) {
+      const b = document.createElement("button");
+      b.className = "side-item";
+      b.textContent = `☆ ${sf.name}`;
+      b.title = sf.query || sf.type || "";
+      b.addEventListener("click", () => {
+        void this.searchView.runExternal(sf.query, sf.type);
+      });
+      b.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.ctxMenu.open(e.clientX, e.clientY, [
+          {
+            label: `Remove "${sf.name}"`,
+            danger: true,
+            action: () => {
+              Shell.saveSmartFolders(
+                Shell.loadSmartFolders().filter((f) => f !== sf),
+              );
+              void this.buildSidebar();
+            },
+          },
+        ]);
+      });
+      this.smartList.appendChild(b);
     }
   }
 
@@ -1002,6 +1850,27 @@ export class Shell {
       sortItem("Date", "modified"),
       { label: "Larger text", shortcut: "Ctrl +", action: () => this.setFontScale(this.fontScale + 0.1) },
       { label: "Smaller text", shortcut: "Ctrl −", action: () => this.setFontScale(this.fontScale - 0.1) },
+      { label: "Terminal", shortcut: "Ctrl `", action: () => void this.toggleTerminal() },
+      { label: "Connect to Server…", action: () => void this.connectToServer() },
+      { label: "Burn Studio…", action: () => this.burnStudio.open() },
+      { label: "Mount Cloud Drive…", action: () => void this.cloudMount.open() },
+      { label: "App Deleter…", action: () => void this.appDeleter.open(() => this.refreshActiveDir()) },
+      {
+        label: "Synchronize Folders…",
+        action: () => void this.openSyncHere(),
+      },
+      {
+        label: "Duplicate Finder…",
+        action: () => void this.openDupHere(),
+      },
+      {
+        label: "Manage Labels…",
+        action: () =>
+          this.labelManager.open(() => {
+            void this.buildSidebar();
+            this.refreshActiveDir();
+          }),
+      },
       { label: "Theme…", action: () => this.themeManager.openMenu(this.menuBtn) },
       { label: "About Fable Files", action: () => this.aboutDialog.open() },
       {
@@ -1205,6 +2074,37 @@ export class Shell {
         void this.undoLast();
       }
       return;
+    }
+    if ((e.ctrlKey || e.metaKey) && !inField) {
+      const k = e.key.toLocaleLowerCase();
+      if (k === "x" || k === "c") {
+        const items = this.activeSelectionItems();
+        if (items.length > 0) {
+          e.preventDefault();
+          void this.clipboardSet(items, k === "x");
+          return;
+        }
+      } else if (k === "v") {
+        e.preventDefault();
+        void this.pasteIntoCurrentDir();
+        return;
+      } else if (k === "a") {
+        e.preventDefault();
+        this.fileView.selectAll();
+        return;
+      } else if (k === "`") {
+        e.preventDefault();
+        void this.toggleTerminal();
+        return;
+      }
+    }
+    if (e.key === "F2" && !inField) {
+      const sel = this.activeSelected();
+      if (sel) {
+        e.preventDefault();
+        this.renameDialog.open(sel, () => this.refreshActiveDir());
+        return;
+      }
     }
     if (inField) return;
     if (e.key === "Delete") {
