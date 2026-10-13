@@ -703,7 +703,7 @@ pub async fn preview_text(
             // Truncate very long lines
             lines.push(if l.len() > 500 { format!("{}...", &l[..500]) } else { l });
         }
-        Ok(PreviewTextResult { lines, truncated })
+        Ok::<PreviewTextResult, String>(PreviewTextResult { lines, truncated })
     })
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("preview task failed: {e}"))))?
@@ -813,6 +813,7 @@ pub async fn secure_empty_trash() -> Cmd<TrashResult> {
 
 /// Overwrite a file with zeros (single pass).
 fn shred_file(path: &std::path::Path) {
+    use std::io::{Seek, SeekFrom, Write};
     if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
         if let Ok(meta) = f.metadata() {
             let len = meta.len();
