@@ -687,6 +687,16 @@ pub async fn preview_text(
         .cloned()
         .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
     let max = max_lines.unwrap_or(50).min(500);
+    // Binary office formats can't be previewed as text — return a friendly message
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let binary_office = ["ods", "xlsx", "xls", "docx", "doc", "pptx", "ppt", "odp", "odg"];
+    if binary_office.contains(&ext.as_str()) {
+        return Ok(PreviewTextResult {
+            lines: vec![format!("Preview not yet supported for .{} files.", ext),
+                        "Rich document preview is on the roadmap.".to_string()],
+            truncated: false,
+        });
+    }
     tauri::async_runtime::spawn_blocking(move || {
         use std::io::{BufRead, BufReader};
         let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
