@@ -766,7 +766,7 @@ export class Shell {
       e.preventDefault();
       const sel = this.fileView.selected;
       if (sel) {
-        api.setExecutable(sel, true).catch((err) => console.error("chmod +x failed:", err));
+        api.setExecutable(sel.id, true).catch((err) => console.error("chmod +x failed:", err));
       }
       return;
     }
