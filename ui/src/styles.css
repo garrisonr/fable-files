@@ -2654,3 +2654,14 @@ tr.row[style*="--label-color"] {
   min-width: 10rem;
   max-width: 100%;
 }
+
+/* ---- 5.4: search selection parity ---- */
+.search-hit.selected {
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.search-hint {
+  margin: 0 0 0.5rem;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}

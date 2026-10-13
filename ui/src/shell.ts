@@ -351,6 +351,9 @@ export class Shell {
         this.openItem(item);
       },
       onPreviewItem: (item) => void this.quickLook.open(item),
+      onTrashItems: (items) => {
+        void this.trashItems(items).then(() => this.searchView.refresh());
+      },
       onResults: () => {
         this.fileView.el.hidden = true;
         this.columnsView.el.hidden = true;
@@ -2316,6 +2319,13 @@ export class Shell {
     }
     if (inField) return;
     if (e.key === "Delete" || e.key === "Backspace") {
+      // Search results carry their own selection — trash it there.
+      // (Reaching here means focus is NOT in a text field: `if
+      // (inField) return` above keeps Backspace for query editing.)
+      if (this.searchView.active && this.searchView.tryTrashSelection()) {
+        e.preventDefault();
+        return;
+      }
       // Del AND Backspace move the selection to the Trash. (Dickles'
       // law, 2026-10-13: Backspace deletes — it NEVER navigates back.)
       if (!this.searchView.field.contains(document.activeElement)) {

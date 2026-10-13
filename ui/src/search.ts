@@ -10,6 +10,8 @@ import { api, formatBytes, type Item, type SearchHit } from "./api";
 export interface SearchHooks {
   onNavigateToItem(item: Item): void;
   onPreviewItem(item: Item): void;
+  /** Trash the selected hits (shell owns the batch + toast + undo). */
+  onTrashItems?(items: Item[]): void;
   /** Results are showing: the shell should hide the file view. */
   onResults(): void;
   onClear(): void;
@@ -39,6 +41,9 @@ export class SearchView {
   private typeFilter: string | null = null;
   private timer = 0;
   private lastQuery = "";
+  private hits: SearchHit[] = [];
+  private selected = new Set<string>();
+  private anchor = -1;
   active = false;
 
   constructor(private hooks: SearchHooks) {
@@ -136,6 +141,88 @@ export class SearchView {
     return this.fieldEl;
   }
 
+  private static keyOf(item: Item): string {
+    return item.provider_key ?? item.id;
+  }
+
+  /** The hits the user has selected (click / Ctrl+click / Shift+click). */
+  selectedItems(): Item[] {
+    return this.hits
+      .filter((h) => this.selected.has(SearchView.keyOf(h.item)))
+      .map((h) => h.item);
+  }
+
+  /**
+   * Fire the trash hook for the current selection, if any. Clears the
+   * selection first so a second routed call in the same event is a
+   * no-op. Returns true when something was trashed.
+   */
+  tryTrashSelection(): boolean {
+    const items = this.selectedItems();
+    if (items.length === 0 || !this.hooks.onTrashItems) return false;
+    this.selected.clear();
+    this.applySelection();
+    this.hooks.onTrashItems(items);
+    return true;
+  }
+
+  /** Re-run the current query (e.g. after trashing hits from it). */
+  refresh(): void {
+    if (!this.active) return;
+    this.lastQuery = "\u0000force";
+    void this.run();
+  }
+
+  private selectHit(index: number, e: MouseEvent): void {
+    const hit = this.hits[index];
+    if (!hit) return;
+    const key = SearchView.keyOf(hit.item);
+    if (e.ctrlKey || e.metaKey) {
+      if (this.selected.has(key)) this.selected.delete(key);
+      else this.selected.add(key);
+      this.anchor = index;
+    } else if (e.shiftKey && this.anchor >= 0) {
+      const [a, b] = this.anchor < index ? [this.anchor, index] : [index, this.anchor];
+      this.selected.clear();
+      for (let i = a; i <= b; i++) this.selected.add(SearchView.keyOf(this.hits[i].item));
+    } else {
+      this.selected.clear();
+      this.selected.add(key);
+      this.anchor = index;
+    }
+    this.applySelection();
+  }
+
+  private applySelection(): void {
+    this.resultsEl.querySelectorAll<HTMLElement>(".search-hit").forEach((row) => {
+      const idx = Number(row.dataset.index ?? "-1");
+      const hit = this.hits[idx];
+      const on = !!hit && this.selected.has(SearchView.keyOf(hit.item));
+      row.classList.toggle("selected", on);
+      row.setAttribute("aria-selected", on ? "true" : "false");
+    });
+  }
+
+  private activate(item: Item): void {
+    if (item.kind === "folder") this.hooks.onNavigateToItem(item);
+    else this.hooks.onPreviewItem(item);
+  }
+
+  private focusHit(index: number): void {
+    const rows = this.resultsEl.querySelectorAll<HTMLElement>(".search-hit");
+    const row = rows[Math.max(0, Math.min(index, rows.length - 1))];
+    if (row) {
+      row.focus();
+      this.selected.clear();
+      const hit = this.hits[Number(row.dataset.index ?? "0")];
+      if (hit) {
+        this.selected.add(SearchView.keyOf(hit.item));
+        this.anchor = Number(row.dataset.index ?? "0");
+      }
+      this.applySelection();
+    }
+  }
+
   focus(): void {
     this.input.focus();
     this.input.select();
@@ -195,6 +282,9 @@ export class SearchView {
   }
 
   private renderResults(q: string, hits: SearchHit[]): void {
+    this.hits = hits;
+    this.selected.clear();
+    this.anchor = -1;
     this.resultsEl.innerHTML = "";
     const head = document.createElement("p");
     head.className = "search-status";
@@ -208,6 +298,13 @@ export class SearchView {
           ? `${hits.length} result${hits.length === 1 ? "" : "s"} for “${q}”.`
           : `${hits.length} ${typeLabel ?? "files"}${hits.length === 50 ? " (first 50)" : ""}.`;
     this.resultsEl.appendChild(head);
+    if (hits.length > 0) {
+      const hint = document.createElement("p");
+      hint.className = "search-hint";
+      hint.textContent =
+        "Click selects · Enter opens · Space previews · Backspace / Delete moves to Trash";
+      this.resultsEl.appendChild(hint);
+    }
     const list = document.createElement("div");
     list.className = "search-results";
     list.setAttribute("role", "listbox");
@@ -232,14 +329,20 @@ export class SearchView {
       }`;
 
       row.append(name, path, meta);
-      row.addEventListener("click", () => {
-        if (hit.item.kind === "folder") this.hooks.onNavigateToItem(hit.item);
-        else this.hooks.onPreviewItem(hit.item);
+      row.addEventListener("click", (e) => {
+        this.selectHit(i, e);
+        row.focus();
       });
+      row.addEventListener("dblclick", () => this.activate(hit.item));
       row.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
-          if (hit.item.kind === "folder") this.hooks.onNavigateToItem(hit.item);
-          else this.hooks.onPreviewItem(hit.item);
+          this.activate(hit.item);
+        } else if (e.key === " ") {
+          e.preventDefault();
+          this.hooks.onPreviewItem(hit.item);
+        } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          this.focusHit(i + (e.key === "ArrowDown" ? 1 : -1));
         }
       });
       list.appendChild(row);
