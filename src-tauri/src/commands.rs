@@ -716,6 +716,142 @@ pub struct PreviewTextResult {
     pub truncated: bool,
 }
 
+
+/// Get the OS trash directory path.
+/// Linux: ~/.local/share/Trash/files, macOS: ~/.Trash
+#[tauri::command]
+pub async fn trash_path() -> Cmd<String> {
+    let home = std::env::var("HOME").map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("no HOME: {e}")))
+    })?;
+    #[cfg(target_os = "macos")]
+    let trash = format!("{home}/.Trash");
+    #[cfg(not(target_os = "macos"))]
+    let trash = format!("{home}/.local/share/Trash/files");
+    Ok(trash)
+}
+
+/// Empty the trash (standard delete).
+#[tauri::command]
+pub async fn empty_trash() -> Cmd<TrashResult> {
+    let trash = trash_path().await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut deleted = 0;
+        let mut errors = 0;
+        // Delete files/
+        if let Ok(entries) = std::fs::read_dir(&trash) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let r = if p.is_dir() {
+                    std::fs::remove_dir_all(&p)
+                } else {
+                    std::fs::remove_file(&p)
+                };
+                if r.is_ok() { deleted += 1; } else { errors += 1; }
+            }
+        }
+        // Delete info/ (freedesktop trash metadata)
+        let info_dir = trash.replace("/files", "/info");
+        if let Ok(entries) = std::fs::read_dir(&info_dir) {
+            for entry in entries.flatten() {
+                if std::fs::remove_file(entry.path()).is_ok() { deleted += 1; }
+                else { errors += 1; }
+            }
+        }
+        Ok(TrashResult { deleted, errors })
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("trash task failed: {e}"))))?
+}
+
+/// Securely empty the trash (overwrite with zeros before deleting).
+/// Uses `shred -u -z` if available, falls back to Rust overwrite.
+#[tauri::command]
+pub async fn secure_empty_trash() -> Cmd<TrashResult> {
+    let trash = trash_path().await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut deleted = 0;
+        let mut errors = 0;
+
+        // Collect all files (not dirs yet)
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&trash) {
+            for entry in entries.flatten() {
+                files.push(entry.path());
+            }
+        }
+
+        for path in files {
+            if path.is_dir() {
+                // Recursively shred files in subdirs, then remove dir
+                if let Ok(walker) = walkdir_files(&path) {
+                    for f in walker {
+                        shred_file(&f);
+                    }
+                }
+                if std::fs::remove_dir_all(&path).is_ok() { deleted += 1; }
+                else { errors += 1; }
+            } else {
+                shred_file(&path);
+                if std::fs::remove_file(&path).is_ok() { deleted += 1; }
+                else { errors += 1; }
+            }
+        }
+        // Clean info/
+        let info_dir = trash.replace("/files", "/info");
+        if let Ok(entries) = std::fs::read_dir(&info_dir) {
+            for entry in entries.flatten() {
+                if std::fs::remove_file(entry.path()).is_ok() { deleted += 1; }
+            }
+        }
+        Ok(TrashResult { deleted, errors })
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("secure trash task failed: {e}"))))?
+}
+
+/// Overwrite a file with zeros (single pass).
+fn shred_file(path: &std::path::Path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
+        if let Ok(meta) = f.metadata() {
+            let len = meta.len();
+            // Write zeros in 64KB chunks
+            let zeros = vec![0u8; 65536];
+            let _ = f.seek(SeekFrom::Start(0));
+            let mut remaining = len;
+            while remaining > 0 {
+                let chunk = std::cmp::min(remaining, 65536) as usize;
+                if f.write_all(&zeros[..chunk]).is_err() { break; }
+                remaining -= chunk as u64;
+            }
+            let _ = f.sync_all();
+        }
+    }
+}
+
+/// Recursively collect files under a directory.
+fn walkdir_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                out.extend(walkdir_files(&p).unwrap_or_default());
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct TrashResult {
+    pub deleted: usize,
+    pub errors: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

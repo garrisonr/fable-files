@@ -14,6 +14,7 @@ import { FileView } from "./fileview";
 import { IndexTracker } from "./indexing";
 import { reducedMotion, animateFromLive, liveOpacity } from "./motion";
 import { QuickLook } from "./quicklook";
+import { ContextMenu } from "./contextmenu";
 import { SearchView } from "./search";
 import {
   canGoBack,
@@ -65,6 +66,7 @@ export class Shell {
   private searchView: SearchView;
   private themeManager: ThemeManager;
   private indexTracker: IndexTracker;
+  private ctxMenu = new ContextMenu();
 
   constructor() {
     this.el.id = "app";
@@ -515,7 +517,7 @@ export class Shell {
     this.favList.innerHTML = "";
     this.sidebarList.innerHTML = "";
     const targets = await this.resolveFavoriteTargets();
-    const names = ["Home", "Documents", "Downloads", "Videos", "Pictures", "Music"];
+    const names = ["Home", "Documents", "Downloads", "Videos", "Pictures", "Music", "Trash"];
     for (let i = 0; i < names.length; i++) {
       const name = names[i];
       const target = targets[i];
@@ -532,6 +534,41 @@ export class Shell {
             crumbs: [{ dirId: target.dirId, name: target.display }],
           });
         });
+        // Trash gets a right-click menu: Empty / Secure Delete
+        if (name === "Trash") {
+          b.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.ctxMenu.open(e.clientX, e.clientY, [
+              {
+                label: "Empty Trash",
+                action: async () => {
+                  if (confirm("Empty the trash? This cannot be undone.")) {
+                    try {
+                      const r = await api.emptyTrash();
+                      alert(`Deleted ${r.deleted} items${r.errors > 0 ? ` (${r.errors} errors)` : ""}.`);
+                    } catch (err) {
+                      alert(`Failed to empty trash: ${err}`);
+                    }
+                  }
+                },
+              },
+              {
+                label: "Secure Delete (overwrite)",
+                action: async () => {
+                  if (confirm("Securely delete trash contents? Files will be overwritten with zeros first. This cannot be undone.")) {
+                    try {
+                      const r = await api.secureEmptyTrash();
+                      alert(`Securely deleted ${r.deleted} items${r.errors > 0 ? ` (${r.errors} errors)` : ""}.`);
+                    } catch (err) {
+                      alert(`Failed to secure-delete: ${err}`);
+                    }
+                  }
+                },
+              },
+            ]);
+          });
+        }
       }
       this.favList.appendChild(b);
     }
@@ -583,7 +620,11 @@ export class Shell {
       this.locations[0] ??
       null;
     const out: (FavoriteTarget | null)[] = [];
-    for (const name of ["Home", "Documents", "Downloads", "Videos", "Pictures", "Music"]) {
+    for (const name of ["Home", "Documents", "Downloads", "Videos", "Pictures", "Music", "Trash"]) {
+      if (name == "Trash") {
+        out.push(await this.resolveTrashTarget(homeLoc));
+        continue;
+      }
       const direct = this.findFavorite(name);
       if (direct) {
         out.push({
@@ -613,6 +654,29 @@ export class Shell {
       out.push(sub);
     }
     return out;
+  }
+
+  /**
+   * Resolve the OS trash folder by traversing from Home:
+   * ~/.local/share/Trash/files (Linux) — no backend changes needed.
+   */
+  private async resolveTrashTarget(homeLoc: LocationSummary | null): Promise<FavoriteTarget | null> {
+    if (!homeLoc) return null;
+    try {
+      const segments = [".local", "share", "Trash", "files"];
+      let dirId = homeLoc.root_item;
+      let display = "Trash";
+      for (const seg of segments) {
+        const kids = await api.listDir(homeLoc.id, dirId);
+        const kid = kids.find((k) => k.kind === "folder" && k.name === seg);
+        if (!kid) return null;
+        dirId = kid.id;
+        if (seg === "files") display = kid.name;
+      }
+      return { locationId: homeLoc.id, dirId, display: "Trash" };
+    } catch {
+      return null;
+    }
   }
 
   /** Favorites resolve to real locations via list_locations. */
