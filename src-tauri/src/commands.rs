@@ -1133,6 +1133,23 @@ fn get_default_app(mime: &str) -> Option<String> {
     None
 }
 
+
+/// Get the full filesystem path for an item (file or directory).
+#[tauri::command]
+pub async fn get_item_path(
+    state: State<'_, AppState>,
+    item: ItemId,
+) -> Cmd<String> {
+    let path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

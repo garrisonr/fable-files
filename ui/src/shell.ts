@@ -443,14 +443,21 @@ export class Shell {
     copyBtn.title = "Copy path";
     copyBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
-      const path = this.displayPath();
       try {
+        const tab = this.activeTab;
+        if (!tab) return;
+        const dir = currentDir(tab);
+        // Get real filesystem path from backend
+        let path = await api.getItemPath(dir.dirId);
+        // Append selected filename if one is selected
+        const sel = this.fileView?.selected;
+        if (sel) path = path + "/" + sel.name;
         await navigator.clipboard.writeText(path);
-        copyBtn.textContent = "\u2713";  // checkmark feedback
+        copyBtn.textContent = "\u2713";
         setTimeout(() => { copyBtn.textContent = "\u29C9"; }, 1000);
-      } catch {
-        // Clipboard API failed — fall back to prompt
-        prompt("Copy path:", path);
+        Toast.success("Path copied");
+      } catch (err) {
+        Toast.error(`Copy failed: ${err}`);
       }
     });
     this.crumbBar.appendChild(copyBtn);

@@ -90,6 +90,8 @@ export const api = {
     invoke<void>("open_with_app", { item, desktopId }),
   setDefaultApp: (mime: string, desktopId: string) =>
     invoke<void>("set_default_app", { mime, desktopId }),
+  getItemPath: (item: string) =>
+    invoke<string>("get_item_path", { item }),
   previewText: (item: string, maxLines?: number) =>
     invoke<{ lines: string[]; truncated: boolean }>("preview_text", { item, maxLines }),
   startIndexing: (location: string) =>
