@@ -14,7 +14,14 @@ export interface FileViewHooks {
   onSelect(item: Item | null): void; // selection changed
   onTogglePreview(): void; // Space handled by shell
   onMakeExecutable(item: Item): void;
+  onDelete(item: Item): void; // move to trash
+  onProperties(item: Item): void;
 }
+
+/** The item currently being dragged out of a file view, if any.
+ * HTML5 drag events can't read dataTransfer payloads during dragover,
+ * so drop targets consult this shared slot instead. */
+export const dragState: { item: Item | null } = { item: null };
 
 const KIND_ICON: Record<string, string> = {
   folder: "M3 5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z",
@@ -276,7 +283,32 @@ export class FileView {
           shortcut: "Ctrl+E",
           action: () => this.hooks.onMakeExecutable(item),
         },
+        {
+          label: "Properties",
+          action: () => this.hooks.onProperties(item),
+        },
+        {
+          label: "Delete",
+          shortcut: "Del",
+          danger: true,
+          action: () => this.hooks.onDelete(item),
+        },
       ]);
+    });
+    // Drag source: files and folders can be dragged to sidebar favorites
+    // (Trash deletes; a folder favorite files the item into it).
+    cell.draggable = true;
+    cell.addEventListener("dragstart", (e) => {
+      dragState.item = item;
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", item.provider_key ?? item.name);
+      }
+      cell.classList.add("dragging");
+    });
+    cell.addEventListener("dragend", () => {
+      dragState.item = null;
+      cell.classList.remove("dragging");
     });
   }
 

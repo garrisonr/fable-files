@@ -208,14 +208,50 @@ th[data-sort]:focus-visible {
   min-width: 8rem;
 }
 
-.search-input {
+/* The search pill: translucent material, magnifier inside — macOS-style. */
+.search-field {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
   width: 100%;
+  background: color-mix(in srgb, var(--ufm-text) 7%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ufm-border) 60%, transparent);
+  border-radius: 999px;
+  padding: 0.3125rem 0.75rem 0.3125rem 0.625rem;
+  transition: background 160ms ease, box-shadow 160ms ease, border-color 160ms ease;
+  cursor: text;
+}
+
+.search-field:focus-within {
+  background: var(--ufm-content-canvas);
+  border-color: transparent;
+  box-shadow: 0 0 0 2px var(--ufm-focus-ring), 0 2px 10px rgb(0 0 0 / 0.12);
+}
+
+.search-field-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--ufm-text-muted);
+  pointer-events: none;
+}
+
+.search-field-icon svg {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+
+.search-input {
+  flex: 1 1 auto;
+  min-width: 0;
   font: inherit;
   color: var(--ufm-text);
-  background: var(--ufm-content-canvas);
-  border: 1px solid var(--ufm-border);
-  border-radius: var(--ufm-radius-md);
-  padding: 0.375rem 0.625rem;
+  background: transparent;
+  border: none;
+  padding: 0;
+  outline: none;
+  appearance: none;
+  -webkit-appearance: none;
 }
 
 .search-input::placeholder {
@@ -223,8 +259,11 @@ th[data-sort]:focus-visible {
 }
 
 .search-input:focus {
-  outline: 2px solid var(--ufm-focus-ring);
-  outline-offset: -1px;
+  outline: none;
+}
+
+.search-input::-webkit-search-cancel-button {
+  cursor: pointer;
 }
 
 /* ---------------------------------------------------------------- workarea */
@@ -1140,17 +1179,10 @@ body[data-layout="tv"] .cell-icon {
   font-size: calc(12px * var(--ufm-font-scale));
 }
 
-/* Search with magnifying glass */
+/* Search wrap in the toolbar */
 .search-wrap {
   display: flex;
   align-items: center;
-  gap: 6px;
-}
-
-.search-icon {
-  font-size: 16px;
-  opacity: 0.7;
-  pointer-events: none;
 }
 
 /* Copy path button */
@@ -1300,4 +1332,134 @@ body[data-layout="tv"] .cell-icon {
   border-radius: 8px;
   margin-top: 12px;
   background: #000;
+}
+
+/* ------------------------------------------------------- breadcrumb file */
+.crumb-file {
+  font-weight: 600;
+  color: var(--ufm-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 22rem;
+}
+
+/* ------------------------------------------------------ context menu */
+.ctx-item.ctx-danger {
+  color: #d70015;
+}
+
+.ctx-item.ctx-danger:hover:not(:disabled) {
+  background: color-mix(in srgb, #d70015 10%, transparent);
+}
+
+/* --------------------------------------------------------- drag & drop */
+[draggable].dragging {
+  opacity: 0.45;
+}
+
+.side-item.drop-hover {
+  background: var(--ufm-accent, #0a84ff);
+  color: #fff;
+  border-radius: var(--ufm-radius-md);
+  transition: background 120ms ease;
+}
+
+/* --------------------------------------------------------- properties */
+.props-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgb(0 0 0 / 0.32);
+  backdrop-filter: blur(6px) saturate(140%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1200;
+  animation: props-fade 180ms ease;
+}
+
+@keyframes props-fade {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.props-dialog {
+  background: var(--ufm-surface, var(--ufm-content-canvas));
+  color: var(--ufm-text);
+  border: 1px solid var(--ufm-border);
+  border-radius: 16px;
+  box-shadow: 0 24px 70px rgb(0 0 0 / 0.35), 0 4px 16px rgb(0 0 0 / 0.2);
+  width: min(26rem, calc(100vw - 3rem));
+  padding: 1rem 1.125rem 1.125rem;
+  animation: props-pop 220ms cubic-bezier(0.2, 0.9, 0.25, 1.2);
+}
+
+@keyframes props-pop {
+  from { opacity: 0; transform: scale(0.96) translateY(6px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.props-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.props-title {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+
+.props-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.props-row {
+  display: flex;
+  gap: 1rem;
+  padding: 0.4375rem 0;
+  border-top: 1px solid color-mix(in srgb, var(--ufm-border) 55%, transparent);
+  font-size: 0.875rem;
+}
+
+.props-key {
+  flex: 0 0 6.5rem;
+  color: var(--ufm-text-muted);
+  font-weight: 600;
+  text-align: right;
+}
+
+.props-val {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.props-exec {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.875rem;
+  padding-top: 0.875rem;
+  border-top: 1px solid color-mix(in srgb, var(--ufm-border) 55%, transparent);
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+
+/* ---------------------------------------------------------- quick look */
+.ql-preview-error {
+  color: #d70015;
+  font-size: 0.8125rem;
+  margin: 0.5rem 0 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .props-overlay, .props-dialog { animation: none; }
 }

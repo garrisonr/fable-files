@@ -173,11 +173,13 @@ export class QuickLook {
 
     body.appendChild(card);
 
-    // Fetch text content for text-like files
-    if (kind === "native" && item.kind !== "folder") {
+    // Rich content preview. Driven by extension (known synchronously from
+    // the item name) rather than the async preview-kind round-trip, with
+    // the item's provider path as a fallback for id resolution.
+    if (item.kind !== "folder") {
       const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
       const textExts = ["txt", "md", "csv", "tsv", "log", "srt", "vtt", "sub", "ssa", "ass", "nfo", "json", "xml", "yaml", "yml", "toml", "ini", "cfg", "sh", "py", "rs", "ts", "js"];
-      if (textExts.includes(ext)) {
+      if (kind === "native" && textExts.includes(ext)) {
         try {
           const result = await api.previewText(item.id, 50);
           const pre = document.createElement("pre");
@@ -188,18 +190,21 @@ export class QuickLook {
           // Text preview failed — metadata card stands alone
         }
       }
-      // Image preview
-      const imgExts = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"];
+      // Image preview — shown for image extensions regardless of kind.
+      const imgExts = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff", "ico"];
       if (imgExts.includes(ext)) {
         try {
-          const dataUrl = await api.getImagePreview(item.id);
+          const dataUrl = await api.getImagePreview(item.id, item.provider_key);
           const img = document.createElement("img");
           img.className = "ql-image-preview";
           img.src = dataUrl;
           img.alt = item.name;
-          card.appendChild(img);
-        } catch {
-          // Image preview failed — metadata card stands alone
+          card.insertBefore(img, card.children[1] ?? null);
+        } catch (err) {
+          const note = document.createElement("p");
+          note.className = "ql-preview-error";
+          note.textContent = `Image preview unavailable: ${err}`;
+          card.appendChild(note);
         }
       }
     }

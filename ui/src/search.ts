@@ -17,9 +17,12 @@ export interface SearchHooks {
 
 const DEBOUNCE_MS = 120;
 
+const SEARCH_ICON_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/></svg>`;
+
 export class SearchView {
   readonly el: HTMLElement;
   private input: HTMLInputElement;
+  private fieldEl: HTMLElement;
   private timer = 0;
   private lastQuery = "";
   active = false;
@@ -28,6 +31,14 @@ export class SearchView {
     this.el = document.createElement("div");
     this.el.className = "searchview";
     this.el.hidden = true;
+
+    // The field: a pill with the magnifier icon INSIDE, Apple-style.
+    this.fieldEl = document.createElement("div");
+    this.fieldEl.className = "search-field";
+    const icon = document.createElement("span");
+    icon.className = "search-field-icon";
+    icon.innerHTML = SEARCH_ICON_SVG;
+    this.fieldEl.appendChild(icon);
 
     this.input = document.createElement("input");
     this.input.className = "search-input";
@@ -41,10 +52,18 @@ export class SearchView {
         this.input.blur();
       }
     });
+    this.fieldEl.appendChild(this.input);
+    // Clicking anywhere on the pill focuses the input.
+    this.fieldEl.addEventListener("mousedown", (e) => {
+      if (e.target !== this.input) {
+        e.preventDefault();
+        this.input.focus();
+      }
+    });
   }
 
-  get field(): HTMLInputElement {
-    return this.input;
+  get field(): HTMLElement {
+    return this.fieldEl;
   }
 
   focus(): void {

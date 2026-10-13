@@ -10,13 +10,14 @@ import {
   type LocationSummary,
   type ThemeInfo,
 } from "./api";
-import { FileView } from "./fileview";
+import { FileView, dragState } from "./fileview";
 import { IndexTracker } from "./indexing";
 import { reducedMotion, animateFromLive, liveOpacity } from "./motion";
 import { QuickLook } from "./quicklook";
 import { ContextMenu } from "./contextmenu";
 import { Toast, confirmDialog } from "./toast";
 import { SearchView } from "./search";
+import { PropertiesDialog } from "./properties";
 import {
   canGoBack,
   canGoForward,
@@ -68,6 +69,7 @@ export class Shell {
   private themeManager: ThemeManager;
   private indexTracker: IndexTracker;
   private ctxMenu = new ContextMenu();
+  private propertiesDialog = new PropertiesDialog();
   private fontScale = 1.0;
 
   constructor() {
@@ -85,6 +87,8 @@ export class Shell {
             console.error("chmod +x failed:", err)
           );
         },
+        onDelete: (item) => void this.deleteItem(item),
+        onProperties: (item) => this.propertiesDialog.open(item),
       },
     );
     this.quickLook = new QuickLook(() => this.fileView.el.focus({ preventScroll: true }));
@@ -167,10 +171,6 @@ export class Shell {
 
     const searchWrap = document.createElement("div");
     searchWrap.className = "search-wrap";
-    const searchIcon = document.createElement("span");
-    searchIcon.className = "search-icon";
-    searchIcon.textContent = "🔍";
-    searchWrap.appendChild(searchIcon);
     // The search field is mounted here in the constructor, once the real
     // SearchView exists (its results panel lives in the viewport).
     this.searchWrap = searchWrap;
@@ -407,6 +407,19 @@ export class Shell {
     this.quickLook.toggle(sel);
   }
 
+  /** Move an item to the Trash, refresh the listing, and say so. */
+  private async deleteItem(item: Item): Promise<void> {
+    try {
+      await api.trashItem(item.id);
+      Toast.success(`Moved “${item.name}” to Trash.`);
+      this.quickLook.close();
+      const tab = this.activeTab;
+      if (tab) await this.loadDir(tab);
+    } catch (err) {
+      Toast.error(`Could not delete “${item.name}”: ${err}`);
+    }
+  }
+
   // ------------------------------------------------------------- breadcrumbs
 
   private renderCrumbs(): void {
@@ -435,6 +448,24 @@ export class Shell {
       });
       this.crumbBar.appendChild(b);
     });
+    // The selected file appears as the final, current breadcrumb element.
+    const selForCrumb = this.fileView.selected;
+    if (selForCrumb) {
+      const sep = document.createElement("span");
+      sep.className = "crumb-sep";
+      sep.textContent = "/";
+      sep.setAttribute("aria-hidden", "true");
+      this.crumbBar.appendChild(sep);
+      const cur = document.createElement("span");
+      cur.className = "crumb crumb-file current";
+      cur.textContent = selForCrumb.name;
+      cur.title = selForCrumb.provider_key ?? selForCrumb.name;
+      this.crumbBar.appendChild(cur);
+      // The last folder crumb is no longer the "current" one.
+      this.crumbBar.querySelectorAll(".crumb.current").forEach((el) => {
+        if (el !== cur) el.classList.remove("current");
+      });
+    }
     // Copy path button (one-click copy)
     const copyBtn = document.createElement("button");
     copyBtn.className = "icon-btn crumb-copy";
@@ -444,14 +475,18 @@ export class Shell {
     copyBtn.addEventListener("click", async (e) => {
       e.stopPropagation();
       try {
-        const tab = this.activeTab;
-        if (!tab) return;
-        const dir = currentDir(tab);
-        // Get real filesystem path from backend
-        let path = await api.getItemPath(dir.dirId);
-        // Append selected filename if one is selected
         const sel = this.fileView?.selected;
-        if (sel) path = path + "/" + sel.name;
+        let path: string;
+        if (sel?.provider_key) {
+          // The selected item carries its own full filesystem path.
+          path = sel.provider_key;
+        } else {
+          const tab = this.activeTab;
+          if (!tab) return;
+          const dir = currentDir(tab);
+          path = await api.getItemPath(dir.dirId);
+          if (sel) path = path.replace(/\/$/, "") + "/" + sel.name;
+        }
         await navigator.clipboard.writeText(path);
         copyBtn.textContent = "\u2713";
         setTimeout(() => { copyBtn.textContent = "\u29C9"; }, 1000);
@@ -570,6 +605,39 @@ export class Shell {
             dirId: target.dirId,
             crumbs: [{ dirId: target.dirId, name: target.display }],
           });
+        });
+        // Drop target: drag a file here to file it (or trash it).
+        b.addEventListener("dragover", (e) => {
+          if (!dragState.item) return;
+          e.preventDefault();
+          if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+          b.classList.add("drop-hover");
+        });
+        b.addEventListener("dragleave", () => b.classList.remove("drop-hover"));
+        b.addEventListener("drop", async (e) => {
+          e.preventDefault();
+          b.classList.remove("drop-hover");
+          const dragged = dragState.item;
+          if (!dragged) return;
+          try {
+            if (name === "Trash") {
+              await api.trashItem(dragged.id);
+              Toast.success(`Moved “${dragged.name}” to Trash.`);
+            } else {
+              const dest = await api.getItemPath(target.dirId);
+              if (dragged.provider_key && dragged.provider_key.replace(/\/[^/]*$/, "") === dest) {
+                return; // already in this folder
+              }
+              const newPath = await api.moveItemTo(dragged.id, dest);
+              Toast.success(`Moved “${dragged.name}” to ${name}.`);
+              void newPath;
+            }
+            this.quickLook.close();
+            const tab = this.activeTab;
+            if (tab) await this.loadDir(tab);
+          } catch (err) {
+            Toast.error(`Could not move “${dragged.name}”: ${err}`);
+          }
         });
         // Trash gets a right-click menu: Empty / Secure Delete
         if (name === "Trash") {
@@ -910,6 +978,15 @@ export class Shell {
       return;
     }
     if (inField) return;
+    if (e.key === "Delete") {
+      // Del: move the selected item to the Trash.
+      const sel = this.fileView.selected;
+      if (sel && !this.searchView.field.contains(document.activeElement)) {
+        e.preventDefault();
+        void this.deleteItem(sel);
+      }
+      return;
+    }
     if (e.key === " " && this.activeTab && !this.searchView.active) {
       // Space toggles Quick Look — never when typing.
       const tag = (e.target as HTMLElement).tagName;

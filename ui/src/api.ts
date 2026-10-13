@@ -17,6 +17,19 @@ export interface LocationSummary {
 
 export type ItemKind = "file" | "folder" | string;
 
+export interface ItemProperties {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size_bytes: number;
+  modified: string;
+  created: string;
+  accessed: string;
+  permissions: string;
+  mode_octal: string;
+  executable: boolean;
+}
+
 export interface Item {
   id: string;
   /** Location this item belongs to — the backend always sends it. */
@@ -77,11 +90,16 @@ export const api = {
   listDir: (location: string, dir: string) =>
     invoke<Item[]>("list_dir", { location, dir }),
   search: (query_text: string, scope: string | null, limit = 50) =>
-    invoke<SearchHit[]>("search", { query_text, scope, limit }),
+    invoke<SearchHit[]>("search", { queryText: query_text, scope, limit }),
   listThemes: () => invoke<ThemeInfo[]>("list_themes"),
   applyTheme: (theme: string) => invoke<string>("apply_theme", { theme }),
   preview: (item: string) => invoke<PreviewKind>("preview", { item }),
   trashPath: () => invoke<string>("trash_path"),
+  trashItem: (item: string) => invoke<string>("trash_item", { item }),
+  moveItemTo: (item: string, destDir: string) =>
+    invoke<string>("move_item_to", { item, destDir }),
+  getItemProperties: (item: string) =>
+    invoke<ItemProperties>("get_item_properties", { item }),
   emptyTrash: () => invoke<{ deleted: number; errors: number }>("empty_trash"),
   secureEmptyTrash: () => invoke<{ deleted: number; errors: number }>("secure_empty_trash"),
   openWithApps: (item: string) =>
@@ -92,8 +110,8 @@ export const api = {
     invoke<void>("set_default_app", { mime, desktopId }),
   getItemPath: (item: string) =>
     invoke<string>("get_item_path", { item }),
-  getImagePreview: (item: string) =>
-    invoke<string>("get_image_preview", { item }),
+  getImagePreview: (item: string, fallbackPath?: string | null) =>
+    invoke<string>("get_image_preview", { item, fallbackPath: fallbackPath ?? null }),
   getRecentFiles: (limit?: number) =>
     invoke<Array<{ path: string; name: string; modified: string }>>("get_recent_files", { limit }),
   previewText: (item: string, maxLines?: number) =>

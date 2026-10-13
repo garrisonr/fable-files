@@ -8,6 +8,8 @@ export interface MenuItem {
   shortcut?: string;
   action: () => void;
   disabled?: boolean;
+  /** Destructive action — rendered in red (Delete, Empty Trash…). */
+  danger?: boolean;
 }
 
 export class ContextMenu {
@@ -29,7 +31,7 @@ export class ContextMenu {
 
     for (const item of items) {
       const b = document.createElement("button");
-      b.className = "ctx-item";
+      b.className = "ctx-item" + (item.danger ? " ctx-danger" : "");
       b.setAttribute("role", "menuitem");
       b.disabled = !!item.disabled;
       const label = document.createElement("span");

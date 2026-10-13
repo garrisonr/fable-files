@@ -1147,14 +1147,22 @@ pub async fn get_item_path(
     state: State<'_, AppState>,
     item: ItemId,
 ) -> Cmd<String> {
-    let path = state
-        .item_paths
-        .lock()
-        .unwrap()
-        .get(&item)
-        .cloned()
-        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
-    Ok(path.to_string_lossy().to_string())
+    // Check item_paths first
+    if let Some(p) = state.item_paths.lock().unwrap().get(&item).cloned() {
+        return Ok(p.to_string_lossy().to_string());
+    }
+    // Fall back: is this item a location root?
+    let root_items = state.root_items.lock().unwrap();
+    for (loc, root_id) in root_items.iter() {
+        if *root_id == item {
+            if let Some(root) = state.local_roots.lock().unwrap().get(loc).cloned() {
+                return Ok(root.to_string_lossy().to_string());
+            }
+        }
+    }
+    Err(CommandError::from(UfmError::NotFound(format!(
+        "unknown item {item}"
+    ))))
 }
 
 
@@ -1249,6 +1257,7 @@ fn url_decode(s: &str) -> String {
 pub async fn get_image_preview(
     state: State<'_, AppState>,
     item: ItemId,
+    fallback_path: Option<String>,
 ) -> Cmd<String> {
     let path = state
         .item_paths
@@ -1256,6 +1265,7 @@ pub async fn get_image_preview(
         .unwrap()
         .get(&item)
         .cloned()
+        .or_else(|| fallback_path.as_ref().map(std::path::PathBuf::from))
         .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
     tauri::async_runtime::spawn_blocking(move || {
         // Only allow image extensions
@@ -1282,6 +1292,241 @@ pub async fn get_image_preview(
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("image task failed: {e}"))))?
     .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+
+/// Move an item (file or folder) to the system Trash.
+/// Follows the freedesktop trash spec: files/ + info/*.trashinfo.
+#[tauri::command]
+pub async fn trash_item(state: State<'_, AppState>, item: ItemId) -> Cmd<String> {
+    let path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+        let trash_root = std::path::PathBuf::from(format!("{home}/.local/share/Trash"));
+        let files_dir = trash_root.join("files");
+        let info_dir = trash_root.join("info");
+        std::fs::create_dir_all(&files_dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&info_dir).map_err(|e| e.to_string())?;
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("invalid file name")?
+            .to_string();
+
+        // Collision-free destination name: name, "name 2", "name 3", ...
+        let mut dest_name = name.clone();
+        let mut n = 2;
+        while files_dir.join(&dest_name).exists() || info_dir.join(format!("{dest_name}.trashinfo")).exists() {
+            dest_name = format!("{name} {n}");
+            n += 1;
+        }
+        let dest = files_dir.join(&dest_name);
+
+        // Write the .trashinfo first, then move (spec order).
+        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let info = format!(
+            "[Trash Info]\nPath={}\nDeletionDate={}\n",
+            path.to_string_lossy(),
+            now
+        );
+        std::fs::write(info_dir.join(format!("{dest_name}.trashinfo")), info)
+            .map_err(|e| e.to_string())?;
+
+        // rename; fall back to copy+remove across filesystems
+        if std::fs::rename(&path, &dest).is_err() {
+            let ty = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+            if ty.is_dir() {
+                copy_dir_recursive(&path, &dest).map_err(|e| e.to_string())?;
+                std::fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
+            } else {
+                std::fs::copy(&path, &dest).map_err(|e| e.to_string())?;
+                std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok::<String, String>(dest_name)
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("trash task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Move an item into a destination directory (used by drag-to-favorite).
+/// Returns the new full path.
+#[tauri::command]
+pub async fn move_item_to(
+    state: State<'_, AppState>,
+    item: ItemId,
+    dest_dir: String,
+) -> Cmd<String> {
+    let path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let dest_root = std::path::PathBuf::from(&dest_dir);
+        if !dest_root.is_dir() {
+            return Err("destination is not a directory".to_string());
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("invalid file name")?
+            .to_string();
+        // Already there? No-op success.
+        if path.parent() == Some(dest_root.as_path()) {
+            return Ok::<String, String>(path.to_string_lossy().to_string());
+        }
+        let mut dest = dest_root.join(&name);
+        let mut n = 2;
+        while dest.exists() {
+            dest = dest_root.join(format!("{name} {n}"));
+            n += 1;
+        }
+        if std::fs::rename(&path, &dest).is_err() {
+            let ty = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+            if ty.is_dir() {
+                copy_dir_recursive(&path, &dest).map_err(|e| e.to_string())?;
+                std::fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
+            } else {
+                std::fs::copy(&path, &dest).map_err(|e| e.to_string())?;
+                std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok::<String, String>(dest.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("move task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Detailed properties for one item (Properties dialog).
+#[tauri::command]
+pub async fn get_item_properties(
+    state: State<'_, AppState>,
+    item: ItemId,
+) -> Cmd<ItemProperties> {
+    let path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        let is_dir = meta.is_dir();
+        // Folder size: walk it (best-effort, capped work).
+        let size = if is_dir {
+            let mut total: u64 = 0;
+            let mut count: u64 = 0;
+            let mut stack = vec![path.clone()];
+            while let Some(d) = stack.pop() {
+                if let Ok(rd) = std::fs::read_dir(&d) {
+                    for e in rd.flatten() {
+                        count += 1;
+                        if let Ok(m) = e.metadata() {
+                            if m.is_dir() {
+                                stack.push(e.path());
+                            } else {
+                                total += m.len();
+                            }
+                        }
+                        if count > 200_000 {
+                            break;
+                        }
+                    }
+                }
+                if count > 200_000 {
+                    break;
+                }
+            }
+            total
+        } else {
+            meta.len()
+        };
+        let fmt_time = |t: std::io::Result<std::time::SystemTime>| -> String {
+            t.ok()
+                .map(|t| {
+                    chrono::DateTime::<chrono::Local>::from(t)
+                        .format("%b %e, %Y at %l:%M %p")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "—".to_string())
+        };
+        let mode = meta.permissions().mode();
+        let perms = format!(
+            "{}{}{}{}{}{}{}{}{}",
+            if mode & 0o400 != 0 { "r" } else { "-" },
+            if mode & 0o200 != 0 { "w" } else { "-" },
+            if mode & 0o100 != 0 { "x" } else { "-" },
+            if mode & 0o040 != 0 { "r" } else { "-" },
+            if mode & 0o020 != 0 { "w" } else { "-" },
+            if mode & 0o010 != 0 { "x" } else { "-" },
+            if mode & 0o004 != 0 { "r" } else { "-" },
+            if mode & 0o002 != 0 { "w" } else { "-" },
+            if mode & 0o001 != 0 { "x" } else { "-" },
+        );
+        Ok::<ItemProperties, String>(ItemProperties {
+            name: path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string(),
+            path: path.to_string_lossy().to_string(),
+            is_dir,
+            size_bytes: size,
+            modified: fmt_time(meta.modified()),
+            created: fmt_time(meta.created()),
+            accessed: fmt_time(meta.accessed()),
+            permissions: perms,
+            mode_octal: format!("{:o}", mode & 0o777),
+            executable: mode & 0o111 != 0,
+        })
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("props task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ItemProperties {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub size_bytes: u64,
+    pub modified: String,
+    pub created: String,
+    pub accessed: String,
+    pub permissions: String,
+    pub mode_octal: String,
+    pub executable: bool,
 }
 
 #[cfg(test)]
