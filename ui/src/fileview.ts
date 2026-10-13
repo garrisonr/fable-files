@@ -17,6 +17,8 @@ export interface FileViewHooks {
   onTogglePreview(): void; // Space handled by shell
   onMakeExecutable(item: Item): void;
   onDelete(item: Item): void; // move to trash
+  onTrash?(items: Item[]): void; // move a whole selection to trash
+  onRenameInline?(item: Item, newName: string): void;
   onProperties(item: Item): void;
   // Round 4 (Nautilus + Finder parity) — optional so every view can
   // share one menu builder.
@@ -196,6 +198,14 @@ export async function showItemMenu(
     items.push({ label: "Move to...", action: () => hooks.onMoveTo!(targets) });
   if (hooks.onCopyTo)
     items.push({ label: "Copy to...", action: () => hooks.onCopyTo!(targets) });
+  if (hooks.onTrash || hooks.onDelete)
+    items.push({
+      label: targets.length > 1 ? `Move ${targets.length} Items to Trash` : "Move to Trash",
+      shortcut: "Del",
+      danger: true,
+      action: () =>
+        hooks.onTrash ? hooks.onTrash(targets) : hooks.onDelete(item),
+    });
   items.push(sep);
   if (hooks.onRename && targets.length === 1)
     items.push({
@@ -386,12 +396,6 @@ export async function showItemMenu(
   });
   items.push(sep);
   items.push({ label: "Properties", action: () => hooks.onProperties(item) });
-  items.push({
-    label: "Delete",
-    shortcut: "Del",
-    danger: true,
-    action: () => hooks.onDelete(item),
-  });
   menu.open(x, y, items);
 }
 
@@ -624,6 +628,16 @@ export class FileView {
     this.scroller.innerHTML = "";
     const table = document.createElement("table");
     table.className = "list-table";
+    const colgroup = document.createElement("colgroup");
+    const colEls: HTMLTableColElement[] = [];
+    for (const [k, defW] of [["name", 0], ["size", 96], ["modified", 184], ["kind", 96]] as Array<[string, number]>) {
+      const col = document.createElement("col");
+      const w = this.colWidths.get(k) ?? defW;
+      if (w > 0) col.style.width = `${w}px`;
+      colgroup.appendChild(col);
+      colEls.push(col);
+    }
+    table.appendChild(colgroup);
     const thead = document.createElement("thead");
     thead.innerHTML =
       `<tr>` +
@@ -649,7 +663,7 @@ export class FileView {
       });
     });
     // Add resize handles to all headers
-    thead.querySelectorAll<HTMLElement>("th").forEach((th) => {
+    thead.querySelectorAll<HTMLElement>("th").forEach((th, thi) => {
       // Apply stored width
       const colKey = th.dataset.sort || "kind";
       const saved = this.colWidths.get(colKey);
@@ -668,6 +682,7 @@ export class FileView {
         const onMove = (ev: MouseEvent) => {
           const newWidth = Math.max(60, startWidth + (ev.clientX - startX));
           th.style.width = `${newWidth}px`;
+          if (colEls[thi]) colEls[thi].style.width = `${newWidth}px`;
           this.colWidths.set(colKey, newWidth);
         };
         const onUp = () => {
@@ -718,13 +733,42 @@ export class FileView {
     this.scroller.appendChild(table);
   }
 
+  private namePress: { id: string; wasOnly: boolean; t: number } | null = null;
+  private renameTimer: number | null = null;
+
   private bindCell(cell: HTMLElement, item: Item, index: number): void {
+    cell.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      e.stopPropagation();
+      const tab = this.tab();
+      this.namePress = {
+        id: item.id,
+        wasOnly: tab.selection.size === 1 && tab.selection.has(item.id),
+        t: Date.now(),
+      };
+      this.select(item, index, e);
+    });
     cell.addEventListener("click", (e) => {
       e.stopPropagation();
-      this.select(item, index, e);
+      // Finder-style rename: a deliberate click on the NAME of the item
+      // that was already the sole selection when the press began arms
+      // an inline rename; a double-click cancels it and opens instead.
+      const np = this.namePress;
+      this.namePress = null;
+      if (!np || np.id !== item.id || !np.wasOnly) return;
+      if (!(e.target as HTMLElement).closest(".row-name, .cell-name")) return;
+      if (this.renameTimer !== null) window.clearTimeout(this.renameTimer);
+      this.renameTimer = window.setTimeout(() => {
+        this.renameTimer = null;
+        this.startInlineRename(cell, item);
+      }, 550);
     });
     cell.addEventListener("dblclick", (e) => {
       e.stopPropagation();
+      if (this.renameTimer !== null) {
+        window.clearTimeout(this.renameTimer);
+        this.renameTimer = null;
+      }
       this.hooks.onOpen(item);
     });
     cell.addEventListener("contextmenu", (e) => {
@@ -763,6 +807,49 @@ export class FileView {
       dragState.item = null;
       cell.classList.remove("dragging");
     });
+  }
+
+  /** Rename in place: swap the name label for an input, Enter/blur
+   * commits through the hook, Esc cancels. Stem pre-selected. */
+  private startInlineRename(cell: HTMLElement, item: Item): void {
+    if (!this.hooks.onRenameInline) return;
+    const tab = this.tab();
+    if (!(tab.selection.size === 1 && tab.selection.has(item.id))) return;
+    const label = cell.querySelector<HTMLElement>(".row-name span:not(.star), .cell-name");
+    if (!label || label.querySelector("input")) return;
+    const original = item.name;
+    const input = document.createElement("input");
+    input.className = "rename-inline";
+    input.value = original;
+    input.setAttribute("aria-label", "Rename");
+    label.textContent = "";
+    label.appendChild(input);
+    input.focus();
+    const dot = original.lastIndexOf(".");
+    if (item.kind !== "folder" && dot > 0) input.setSelectionRange(0, dot);
+    else input.select();
+    let done = false;
+    const commit = (save: boolean) => {
+      if (done) return;
+      done = true;
+      const next = input.value.trim();
+      label.textContent = original;
+      if (save && next && next !== original) this.hooks.onRenameInline!(item, next);
+    };
+    input.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") {
+        e.preventDefault();
+        commit(true);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        commit(false);
+      }
+    });
+    input.addEventListener("blur", () => commit(true));
+    input.addEventListener("mousedown", (e) => e.stopPropagation());
+    input.addEventListener("click", (e) => e.stopPropagation());
+    input.addEventListener("dblclick", (e) => e.stopPropagation());
   }
 
   // ------------------------------------------------------------- selection

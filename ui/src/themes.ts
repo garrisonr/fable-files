@@ -104,6 +104,7 @@ export class ThemeManager {
     } catch {
       // storage unavailable — fall through with whatever we have
     }
+    await this.ensureDetected();
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved === "auto" || (saved && DISTRO_IDS.has(saved))) {
       await this.apply(saved);
@@ -147,6 +148,22 @@ export class ThemeManager {
     return this.resolvedId;
   }
 
+  /** Engine detected from the OS (set at startup, whatever the active
+   * preference is) — the theme menu's "now:" label reads this, so it
+   * never guesses. */
+  private detectedEngineId: string | null = null;
+
+  /** One distroInfo round-trip, cached: fills detectedEngineId. */
+  private async ensureDetected(): Promise<void> {
+    if (this.detectedEngineId) return;
+    try {
+      const info = await api.distroInfo();
+      this.detectedEngineId = detectDistroTheme(info.os_id, info.desktop);
+    } catch {
+      // Backend unreachable: leave null; the menu shows "…" not a lie.
+    }
+  }
+
   async apply(id: string): Promise<void> {
     if (id === "auto" || DISTRO_IDS.has(id)) {
       await this.applyDistro(id);
@@ -173,6 +190,7 @@ export class ThemeManager {
       try {
         const info = await api.distroInfo();
         resolved = detectDistroTheme(info.os_id, info.desktop);
+        this.detectedEngineId = resolved;
       } catch {
         // detection unavailable — native dress
       }
@@ -199,15 +217,16 @@ export class ThemeManager {
   }
 
   openMenu(anchor: HTMLElement): void {
+    const detectedId = this.resolvedId ?? this.detectedEngineId;
     const resolvedName =
-      DISTRO_ENGINES.find((e) => e.id === this.resolvedId)?.name ?? "Cupertino";
+      DISTRO_ENGINES.find((e) => e.id === detectedId)?.name ?? "…";
     const items: MenuThemeItem[] = [
       {
         id: "auto",
         name: "Auto (match my system)",
         dark: this.isDark(),
         metaLabel: `now: ${resolvedName}`,
-        preview: DISTRO_ENGINES.find((e) => e.id === this.resolvedId)?.preview,
+        preview: DISTRO_ENGINES.find((e) => e.id === detectedId)?.preview,
       },
       ...DISTRO_ENGINES.map((e) => ({
         id: e.id,

@@ -151,6 +151,8 @@ export class Shell {
         );
       },
       onDelete: (item) => void this.deleteItem(item),
+      onTrash: (items) => void this.trashItems(items),
+      onRenameInline: (item, name) => void this.renameInline(item, name),
       onProperties: (item) => this.propertiesDialog.open(item),
       onCut: (items) => void this.clipboardSet(items, true),
       onCopy: (items) => void this.clipboardSet(items, false),
@@ -160,8 +162,16 @@ export class Shell {
         this.renameDialog.open(item, () => {
           const t = this.activeTab;
           if (t) void this.loadDir(t);
+          this.refreshQuickLook(item.provider_key);
         }),
       onCompress: (items) => {
+        Toast.show(
+          items.length === 1
+            ? `Compressing “${items[0].name}”…`
+            : `Compressing ${items.length} items…`,
+          "info",
+          8000,
+        );
         void api
           .compressItems(items.map((i) => i.id))
           .then(async (p) => {
@@ -225,10 +235,11 @@ export class Shell {
       onRotateImage: (item) => {
         void api
           .rotateImageLeft(item.id)
-          .then(() => {
+          .then(async () => {
             Toast.success(`Rotated ${item.name}`);
             const t = this.activeTab;
-            if (t) void this.loadDir(t);
+            if (t) await this.loadDir(t);
+            this.refreshQuickLook(item.provider_key);
           })
           .catch((err) => Toast.error(`Rotate failed: ${err}`));
       },
@@ -879,6 +890,51 @@ export class Shell {
       if (tab) await this.loadDir(tab);
     } catch (err) {
       Toast.error(`Could not delete “${item.name}”: ${err}`);
+    }
+  }
+
+  /** Move a whole selection to the Trash: one toast, one refresh. */
+  private async trashItems(items: Item[]): Promise<void> {
+    let ok = 0;
+    for (const it of items) {
+      try {
+        const trashName = await api.trashItem(it.id);
+        this.undoStack.push({ kind: "trash", trashName, label: it.name });
+        ok++;
+      } catch {
+        // counted below
+      }
+    }
+    if (ok === 1)
+      Toast.success(`Moved “${items[0].name}” to Trash. Super+Z to undo.`);
+    else if (ok > 1)
+      Toast.success(`Moved ${ok} items to Trash. Super+Z to undo.`);
+    if (ok < items.length)
+      Toast.error(`Could not trash ${items.length - ok} item(s).`);
+    this.quickLook.close();
+    const t = this.activeTab;
+    if (t) await this.loadDir(t);
+  }
+
+  /** If Quick Look is showing this path, re-open it on the fresh Item
+   * (post rotate/rename) so the pane never displays a stale photo. */
+  private refreshQuickLook(path: string | null | undefined): void {
+    if (!path || !this.quickLook.isOpen) return;
+    if (this.quickLook.item?.provider_key !== path) return;
+    const fresh = this.activeTab?.items.find((i) => i.provider_key === path);
+    if (fresh) void this.quickLook.open(fresh);
+  }
+
+  private async renameInline(item: Item, newName: string): Promise<void> {
+    try {
+      await api.renameItem(item.id, newName);
+      const t = this.activeTab;
+      if (t) await this.loadDir(t);
+      this.refreshQuickLook(item.provider_key);
+    } catch (err) {
+      Toast.error(`Rename failed: ${err}`);
+      const t = this.activeTab;
+      if (t) await this.loadDir(t);
     }
   }
 
@@ -2259,12 +2315,15 @@ export class Shell {
       }
     }
     if (inField) return;
-    if (e.key === "Delete") {
-      // Del: move the selected item to the Trash.
-      const sel = this.activeSelected();
-      if (sel && !this.searchView.field.contains(document.activeElement)) {
-        e.preventDefault();
-        void this.deleteItem(sel);
+    if (e.key === "Delete" || e.key === "Backspace") {
+      // Del AND Backspace move the selection to the Trash. (Dickles'
+      // law, 2026-10-13: Backspace deletes — it NEVER navigates back.)
+      if (!this.searchView.field.contains(document.activeElement)) {
+        const items = this.activeSelectionItems();
+        if (items.length > 0) {
+          e.preventDefault();
+          void this.trashItems(items);
+        }
       }
       return;
     }
@@ -2278,7 +2337,7 @@ export class Shell {
     } else if (e.key === "Escape") {
       if (!this.menuLayer.hidden) this.closeMenu();
       else if (this.quickLook.isOpen) this.quickLook.close();
-    } else if (e.key === "Backspace" || (e.altKey && e.key === "ArrowUp")) {
+    } else if (e.altKey && e.key === "ArrowUp") {
       if (this.activeTab) {
         e.preventDefault();
         this.goUp();

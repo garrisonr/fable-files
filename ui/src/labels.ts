@@ -21,7 +21,7 @@ export const DEFAULT_LABELS: LabelDef[] = [
   { name: "Music", color: "#ec4899" },
   { name: "Media", color: "#14b8a6" },
   { name: "Gaming", color: "#84cc16" },
-  { name: "HR & Hiring", color: "#3b82f6" },
+  { name: "Work", color: "#3b82f6" },
   { name: "Resumes", color: "#06b6d4" },
   { name: "Office & Admin", color: "#64748b" },
   { name: "Payroll", color: "#10b981" },
@@ -30,7 +30,21 @@ export const DEFAULT_LABELS: LabelDef[] = [
   { name: "IT & Homelab", color: "#f97316" },
   { name: "Personal", color: "#f43f5e" },
   { name: "Urgent", color: "#ef4444" },
+  { name: "Taxes", color: "#b45309" },
+  { name: "School", color: "#0ea5e9" },
+  { name: "Health & Fitness", color: "#22c55e" },
 ];
+
+/** Renames Dickles asked for (2026-10-13): defs rename in place;
+ * assignments cascade through the backend. */
+export const LABEL_RENAMES: Array<{ old: string; next: string }> = [
+  { old: "HR & Hiring", next: "Work" },
+];
+
+/** Starter labels added in Round 5.3 — appended ONCE to existing
+ * collections (a flag guards against resurrecting deleted ones). */
+const V53_NEW = ["Taxes", "School", "Health & Fitness"];
+const V53_FLAG = "ff-labels-v53";
 
 const KEY = "ff-label-defs";
 
@@ -59,6 +73,29 @@ export function loadLabelDefs(): LabelDef[] {
             out.push(d);
           }
         }
+        // Round 5.3 renames (def side; assignments cascade separately).
+        for (const r of LABEL_RENAMES) {
+          const at = out.findIndex((d) => d.name === r.old);
+          if (at >= 0) {
+            changed = true;
+            if (out.some((d) => d.name === r.next)) out.splice(at, 1);
+            else out[at] = { ...out[at], name: r.next };
+          }
+        }
+        // Round 5.3 starter labels, appended once only.
+        let v53 = false;
+        try { v53 = !!localStorage.getItem(V53_FLAG); } catch { v53 = true; }
+        if (!v53) {
+          for (const name of V53_NEW) {
+            if (!out.some((d) => d.name === name)) {
+              const def = DEFAULT_LABELS.find((d) => d.name === name);
+              if (def) { out.push({ ...def }); changed = true; }
+            }
+          }
+          try { localStorage.setItem(V53_FLAG, "1"); } catch { /* ignore */ }
+        }
+        // Alphabetical, always (Dickles, 2026-10-13).
+        out.sort((a, b) => a.name.localeCompare(b.name));
         if (changed) saveLabelDefs(out);
         return out;
       }
@@ -66,7 +103,7 @@ export function loadLabelDefs(): LabelDef[] {
   } catch {
     // fall through to defaults
   }
-  return DEFAULT_LABELS.map((d) => ({ ...d }));
+  return DEFAULT_LABELS.map((d) => ({ ...d })).sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /**
@@ -98,6 +135,16 @@ export async function migrateLabelAssignments(
       migrated = true;
     } catch {
       // best effort — a failed split leaves the old label usable
+    }
+  }
+  for (const r of LABEL_RENAMES) {
+    try {
+      const before = await api.listItemsByLabel(r.old);
+      if (before.length === 0) continue;
+      await api.renamePathLabel(r.old, r.next);
+      migrated = true;
+    } catch {
+      // best effort
     }
   }
   return migrated;
@@ -221,6 +268,7 @@ export class LabelManager {
       return;
     }
     this.defs.push({ name, color: colorEl.value });
+    this.defs.sort((a, b) => a.name.localeCompare(b.name));
     nameEl.value = "";
     this.persist();
     this.render();
