@@ -168,7 +168,7 @@ export class Shell {
     searchWrap.className = "search-wrap";
     const searchIcon = document.createElement("span");
     searchIcon.className = "search-icon";
-    searchIcon.textContent = "\U0001F50D";
+    searchIcon.textContent = "🔍";
     searchWrap.appendChild(searchIcon);
     // The search field is mounted here in the constructor, once the real
     // SearchView exists (its results panel lives in the viewport).
@@ -398,6 +398,7 @@ export class Shell {
   private onSelect(item: Item | null): void {
     void item;
     this.renderStatus();
+    this.renderCrumbs();
   }
 
   private togglePreview(): void {
@@ -464,7 +465,11 @@ export class Shell {
   private displayPath(): string {
     const tab = this.activeTab;
     if (!tab) return "";
-    return currentDir(tab).crumbs.map((c) => c.name).join(" / ");
+    const crumbs = currentDir(tab).crumbs.map((c) => c.name).join(" / ");
+    // Append selected file name if one is selected
+    const sel = this.fileView?.selected;
+    if (sel) return crumbs + " / " + sel.name;
+    return crumbs;
   }
 
   private editPath(): void {
