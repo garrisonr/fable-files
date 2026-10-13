@@ -1158,3 +1158,113 @@ body[data-layout="tv"] .cell-icon {
   font-size: 16px;
   padding: 4px 8px;
 }
+
+/* Toast notifications */
+.toast-container {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  padding: 12px 20px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #fff;
+  background: #333;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  opacity: 0;
+  transform: translateY(10px);
+  transition: opacity 0.3s, transform 0.3s;
+  max-width: 320px;
+}
+
+.toast-show {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.toast-hide {
+  opacity: 0;
+  transform: translateY(10px);
+}
+
+.toast-success { background: #2d7d32; }
+.toast-error { background: #c62828; }
+.toast-info { background: #1565c0; }
+
+/* Confirmation dialog */
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1500;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(4px);
+}
+
+.confirm-dialog {
+  background: var(--ufm-surface);
+  border: 1px solid var(--ufm-border);
+  border-radius: 12px;
+  padding: 24px;
+  min-width: 320px;
+  max-width: 420px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4);
+}
+
+.confirm-title {
+  margin: 0 0 8px 0;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--ufm-text);
+}
+
+.confirm-message {
+  margin: 0 0 20px 0;
+  font-size: 14px;
+  color: var(--ufm-text-muted);
+  line-height: 1.5;
+}
+
+.confirm-buttons {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
+
+.confirm-btn {
+  padding: 10px 20px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid var(--ufm-border);
+  background: transparent;
+  color: var(--ufm-text);
+}
+
+.confirm-btn:hover {
+  background: var(--ufm-accent);
+  color: var(--ufm-on-accent);
+  border-color: var(--ufm-accent);
+}
+
+.confirm-danger {
+  background: #c62828;
+  border-color: #c62828;
+  color: #fff;
+}
+
+.confirm-danger:hover {
+  background: #b71c1c;
+  border-color: #b71c1c;
+}

@@ -15,6 +15,7 @@ import { IndexTracker } from "./indexing";
 import { reducedMotion, animateFromLive, liveOpacity } from "./motion";
 import { QuickLook } from "./quicklook";
 import { ContextMenu } from "./contextmenu";
+import { Toast, confirmDialog } from "./toast";
 import { SearchView } from "./search";
 import {
   canGoBack,
@@ -572,12 +573,20 @@ export class Shell {
               {
                 label: "Empty Trash",
                 action: async () => {
-                  if (confirm("Empty the trash? This cannot be undone.")) {
+                  const ok = await confirmDialog(
+                    "Empty Trash?",
+                    "This will permanently delete all items in the trash. This cannot be undone.",
+                    "Empty Trash",
+                    true
+                  );
+                  if (ok) {
                     try {
                       const r = await api.emptyTrash();
-                      alert(`Deleted ${r.deleted} items${r.errors > 0 ? ` (${r.errors} errors)` : ""}.`);
+                      Toast.success(`Trash emptied — ${r.deleted} item${r.deleted === 1 ? "" : "s"} deleted${r.errors > 0 ? ` (${r.errors} errors)` : ""}.`);
+                      // Refresh the view if we're looking at trash
+                      this.renderCrumbs();
                     } catch (err) {
-                      alert(`Failed to empty trash: ${err}`);
+                      Toast.error(`Failed to empty trash: ${err}`);
                     }
                   }
                 },
@@ -585,10 +594,16 @@ export class Shell {
               {
                 label: "Secure Delete (overwrite)",
                 action: async () => {
-                  if (confirm("Securely delete trash contents? Files will be overwritten with zeros first. This cannot be undone.")) {
+                  const ok = await confirmDialog(
+                    "Secure Delete?",
+                    "Files will be overwritten with zeros before deletion. This cannot be undone.",
+                    "Secure Delete",
+                    true
+                  );
+                  if (ok) {
                     try {
                       const r = await api.secureEmptyTrash();
-                      alert(`Securely deleted ${r.deleted} items${r.errors > 0 ? ` (${r.errors} errors)` : ""}.`);
+                      Toast.success(`Securely deleted ${r.deleted} items${r.errors > 0 ? ` (${r.errors} errors)` : ""}.`);
                     } catch (err) {
                       alert(`Failed to secure-delete: ${err}`);
                     }
