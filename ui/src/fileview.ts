@@ -11,6 +11,7 @@ export interface FileViewHooks {
   onOpen(item: Item): void; // Enter / double-click on a folder (or file)
   onSelect(item: Item | null): void; // selection changed
   onTogglePreview(): void; // Space handled by shell
+  onMakeExecutable(item: Item): void;
 }
 
 const KIND_ICON: Record<string, string> = {
@@ -29,6 +30,7 @@ export class FileView {
   private overscroll = 0;
   private wheelEndTimer = 0;
   private lastSelected: Item | null = null;
+  private ctxMenu = new ContextMenu();
 
   constructor(
     private tab: () => Tab,
@@ -212,6 +214,31 @@ export class FileView {
     cell.addEventListener("dblclick", (e) => {
       e.stopPropagation();
       this.hooks.onOpen(item);
+    });
+    cell.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // Select the item first if not already selected
+      const tab = this.tab();
+      if (!tab.selection.has(item.id)) {
+        this.select(item, index);
+      }
+      this.ctxMenu.open(e.clientX, e.clientY, [
+        {
+          label: "Open",
+          action: () => this.hooks.onOpen(item),
+        },
+        {
+          label: "Quick Look",
+          shortcut: "Space",
+          action: () => this.hooks.onTogglePreview(),
+        },
+        {
+          label: "Make Executable",
+          shortcut: "Ctrl+E",
+          action: () => this.hooks.onMakeExecutable(item),
+        },
+      ]);
     });
   }
 

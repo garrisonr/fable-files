@@ -76,6 +76,11 @@ export class Shell {
         onOpen: (item) => this.openItem(item),
         onSelect: (item) => this.onSelect(item),
         onTogglePreview: () => this.togglePreview(),
+        onMakeExecutable: (item) => {
+          api.setExecutable(item.id, true).catch((err) =>
+            console.error("chmod +x failed:", err)
+          );
+        },
       },
     );
     this.quickLook = new QuickLook(() => this.fileView.el.focus({ preventScroll: true }));
@@ -510,7 +515,7 @@ export class Shell {
     this.favList.innerHTML = "";
     this.sidebarList.innerHTML = "";
     const targets = await this.resolveFavoriteTargets();
-    const names = ["Home", "Documents", "Downloads"];
+    const names = ["Home", "Documents", "Downloads", "Videos", "Pictures", "Music"];
     for (let i = 0; i < names.length; i++) {
       const name = names[i];
       const target = targets[i];
@@ -561,6 +566,16 @@ export class Shell {
    * to same-named folders inside the Home location (the common
    * single-location setup), so they stay clickable instead of grayed out.
    */
+  /**
+   * Fuzzy folder name candidates — not everyone names them the same.
+   * First existing match wins.
+   */
+  private static readonly FUZZY_FAVORITES: Record<string, string[]> = {
+    Videos: ["Videos", "Movies", "Video", "Films"],
+    Pictures: ["Pictures", "Photos", "Images", "Pics"],
+    Music: ["Music", "Audio", "Songs"],
+  };
+
   private async resolveFavoriteTargets(): Promise<(FavoriteTarget | null)[]> {
     const homeLoc =
       this.locations.find((l) => l.display_name.toLowerCase().includes("home")) ??
@@ -568,7 +583,7 @@ export class Shell {
       this.locations[0] ??
       null;
     const out: (FavoriteTarget | null)[] = [];
-    for (const name of ["Home", "Documents", "Downloads"]) {
+    for (const name of ["Home", "Documents", "Downloads", "Videos", "Pictures", "Music"]) {
       const direct = this.findFavorite(name);
       if (direct) {
         out.push({
@@ -582,8 +597,11 @@ export class Shell {
       if (homeLoc && name !== "Home") {
         try {
           const kids = await api.listDir(homeLoc.id, homeLoc.root_item);
+          const candidates = Shell.FUZZY_FAVORITES[name] ?? [name];
           const kid = kids.find(
-            (k) => k.kind === "folder" && k.name.toLowerCase() === name.toLowerCase(),
+            (k) =>
+              k.kind === "folder" &&
+              candidates.some((c) => k.name.toLowerCase() === c.toLowerCase()),
           );
           if (kid) {
             sub = { locationId: homeLoc.id, dirId: kid.id, display: kid.name };

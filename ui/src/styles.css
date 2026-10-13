@@ -929,3 +929,48 @@ body[data-layout="tv"] .cell-icon {
     outline-offset: -2px;
   }
 }
+
+/* Context menu */
+.ctx-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 200px;
+  background: var(--ufm-surface);
+  border: 1px solid var(--ufm-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  padding: 4px;
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.ctx-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  padding: 8px 12px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--ufm-text);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.ctx-item:hover:not(:disabled) {
+  background: var(--ufm-accent);
+  color: var(--ufm-on-accent);
+}
+
+.ctx-item:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.ctx-shortcut {
+  margin-left: 24px;
+  font-size: 11px;
+  opacity: 0.6;
+}
