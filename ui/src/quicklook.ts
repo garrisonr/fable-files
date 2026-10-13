@@ -164,13 +164,6 @@ export class QuickLook {
     }
     card.appendChild(dl);
 
-    const hint = document.createElement("p");
-    hint.className = "ql-hint";
-    hint.textContent = kind
-      ? `Preview kind: ${PREVIEW_LABELS[kind]}. Rich renderers arrive with the preview milestone.`
-      : "Preview service unavailable — showing catalog metadata.";
-    card.appendChild(hint);
-
     body.appendChild(card);
 
     // Rich content preview. Driven by extension (known synchronously from
@@ -190,7 +183,8 @@ export class QuickLook {
           // Text preview failed — metadata card stands alone
         }
       }
-      // Image preview — shown for image extensions regardless of kind.
+      // Image preview — the photo IS the preview: hero at the top of
+      // the card, as large as the pane allows (full image, not a thumb).
       const imgExts = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff", "ico"];
       if (imgExts.includes(ext)) {
         try {
@@ -199,7 +193,8 @@ export class QuickLook {
           img.className = "ql-image-preview";
           img.src = dataUrl;
           img.alt = item.name;
-          card.insertBefore(img, card.children[1] ?? null);
+          card.insertBefore(img, card.firstChild);
+          card.classList.add("has-photo");
         } catch (err) {
           const note = document.createElement("p");
           note.className = "ql-preview-error";

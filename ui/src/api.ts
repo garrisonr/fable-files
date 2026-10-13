@@ -89,13 +89,19 @@ export const api = {
   listLocations: () => invoke<LocationSummary[]>("list_locations"),
   listDir: (location: string, dir: string) =>
     invoke<Item[]>("list_dir", { location, dir }),
-  search: (query_text: string, scope: string | null, limit = 50) =>
-    invoke<SearchHit[]>("search", { queryText: query_text, scope, limit }),
+  search: (query_text: string, scope: string | null, limit = 50, typeFilter?: string | null) =>
+    invoke<SearchHit[]>("search", { queryText: query_text, scope, limit, typeFilter: typeFilter ?? null }),
   listThemes: () => invoke<ThemeInfo[]>("list_themes"),
   applyTheme: (theme: string) => invoke<string>("apply_theme", { theme }),
   preview: (item: string) => invoke<PreviewKind>("preview", { item }),
   trashPath: () => invoke<string>("trash_path"),
   trashItem: (item: string) => invoke<string>("trash_item", { item }),
+  untrashItem: (trashName: string) => invoke<string>("untrash_item", { trashName }),
+  movePathTo: (srcPath: string, destDir: string) =>
+    invoke<string>("move_path_to", { srcPath, destDir }),
+  openUrl: (url: string) => invoke<void>("open_url", { url }),
+  getThumbnail: (item: string, fallbackPath?: string | null, large?: boolean) =>
+    invoke<string>("get_thumbnail", { item, fallbackPath: fallbackPath ?? null, large: large ?? false }),
   moveItemTo: (item: string, destDir: string) =>
     invoke<string>("move_item_to", { item, destDir }),
   getItemProperties: (item: string) =>

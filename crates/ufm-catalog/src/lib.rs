@@ -145,13 +145,27 @@ impl Catalog {
     /// before labels, collection memberships, or media identities reference
     /// them (foreign keys are enforced).
     pub fn insert_item(&self, item: &ufm_vfs::Item) -> Result<()> {
+        // Re-walks mint fresh ItemIds; reuse the stored id for the same
+        // (location_id, provider_key) so labels/collections survive a
+        // refresh and the FTS row stays put.
+        let stable_id: String = match item.provider_key.as_deref() {
+            Some(pk) => self
+                .conn
+                .query_row(
+                    "SELECT id FROM items WHERE location_id = ?1 AND provider_key = ?2",
+                    params![item.location.to_string(), pk],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|_| item.id.to_string()),
+            None => item.id.to_string(),
+        };
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO items
                  (id, location_id, name, kind, size_bytes, modified, provider_key)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
-                    item.id.to_string(),
+                    stable_id,
                     item.location.to_string(),
                     item.name,
                     format!("{:?}", item.kind).to_lowercase(),
@@ -167,10 +181,60 @@ impl Catalog {
             .execute(
                 "INSERT OR REPLACE INTO items_fts (rowid, name) VALUES
                  ((SELECT rowid FROM items WHERE id = ?1), ?2)",
-                params![item.id.to_string(), item.name],
+                params![stable_id, item.name],
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    /// Delete every item of `location` whose provider_key is not in
+    /// `seen` — used after a fresh full re-walk to drop rows for files
+    /// that no longer exist. Rows without a provider_key are kept (they
+    /// did not come from the filesystem walk). Returns the delete count.
+    pub fn delete_unseen(
+        &self,
+        location: &LocationId,
+        seen: &std::collections::HashSet<String>,
+    ) -> Result<u64> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rowid, id, name, provider_key FROM items WHERE location_id = ?1")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![location.to_string()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut stale: Vec<(i64, String, String)> = Vec::new();
+        for row in rows {
+            let (rowid, id, name, pk) = row.map_err(|e| UfmError::Database(e.to_string()))?;
+            if let Some(pk) = pk {
+                if !seen.contains(&pk) {
+                    stale.push((rowid, id, name));
+                }
+            }
+        }
+        drop(stmt);
+        let mut deleted = 0u64;
+        for (rowid, id, name) in stale {
+            // External-content FTS5: remove the index entry explicitly.
+            self.conn
+                .execute(
+                    "INSERT INTO items_fts (items_fts, rowid, name) VALUES ('delete', ?1, ?2)",
+                    params![rowid, name],
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            self.conn
+                .execute("DELETE FROM items WHERE id = ?1", params![id])
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            deleted += 1;
+        }
+        Ok(deleted)
     }
 
     /// Full-text search over item names via the `items_fts` FTS5 table,
@@ -237,6 +301,79 @@ impl Catalog {
                 },
                 rank,
             ));
+        }
+        Ok(out)
+    }
+
+    /// Browse items by file extension (advanced-search type filter with
+    /// no text query): files whose name ends in one of `exts`
+    /// (case-insensitive), most recently modified first.
+    pub fn browse_by_extensions(
+        &self,
+        exts: &[&str],
+        limit: u32,
+    ) -> Result<Vec<ufm_vfs::Item>> {
+        if exts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let likes: Vec<String> = exts.iter().map(|e| format!("%.{}", e.to_lowercase())).collect();
+        let where_clause = likes
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("LOWER(i.name) LIKE ?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes, i.modified, i.provider_key
+             FROM items AS i
+             WHERE ({where_clause}) AND i.kind = 'file'
+             ORDER BY i.modified DESC
+             LIMIT ?{}",
+            likes.len() + 1
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut params: Vec<rusqlite::types::Value> =
+            likes.iter().map(|l| rusqlite::types::Value::Text(l.clone())).collect();
+        params.push(rusqlite::types::Value::Integer(limit as i64));
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, location_id, name, kind_s, size_bytes, modified_s, provider_key) =
+                row.map_err(|e| UfmError::Database(e.to_string()))?;
+            let parse_id = |s: &str, what: &str| {
+                uuid::Uuid::parse_str(s)
+                    .map_err(|e| UfmError::Database(format!("bad {what} id {s:?}: {e}")))
+            };
+            out.push(ufm_vfs::Item {
+                id: ufm_core::ItemId(parse_id(&id, "item")?),
+                location: ufm_core::LocationId(parse_id(&location_id, "location")?),
+                name,
+                kind: parse_kind(&kind_s),
+                size_bytes: size_bytes.map(|s| s as u64),
+                modified: modified_s.and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                }),
+                provider_key,
+                labels: Vec::new(),
+                starred: false,
+            });
         }
         Ok(out)
     }

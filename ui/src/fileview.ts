@@ -3,7 +3,7 @@
  * Selection (click, ctrl/shift-click), sort, and rubber-band overscroll.
  * View toggle uses an interruptible WAAPI crossfade from live opacity.
  */
-import { formatBytes, formatDate, type Item } from "./api";
+import { api, formatBytes, formatDate, type Item } from "./api";
 import { animateFromLive, liveOpacity, reducedMotion, fadeTo, rubberBand, springTo, cancelSpring } from "./motion";
 import { sortedItems, type SortDir, type SortKey, type Tab, type ViewMode } from "./tabs";
 import { ContextMenu } from "./contextmenu";
@@ -145,6 +145,26 @@ export class FileView {
       cell.title = item.name;
       this.bindCell(cell, item, i);
       frag.appendChild(cell);
+      // Photos show real thumbnails (freedesktop cache) instead of an icon.
+      const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
+      if (
+        item.kind !== "folder" &&
+        ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "ico"].includes(ext)
+      ) {
+        api
+          .getThumbnail(item.id, item.provider_key, false)
+          .then((url) => {
+            const img = document.createElement("img");
+            img.className = "cell-thumb";
+            img.alt = "";
+            img.src = url;
+            const iconEl = cell.querySelector(".cell-icon");
+            if (iconEl && cell.isConnected) iconEl.replaceWith(img);
+          })
+          .catch(() => {
+            // No thumbnail — the kind icon stays.
+          });
+      }
     });
     this.scroller.appendChild(frag);
   }

@@ -46,9 +46,14 @@ struct Checkpoint {
     completed_dirs: Vec<String>,
     files_done: u64,
     bytes_done: u64,
+    /// True when the run that wrote this checkpoint walked the whole root.
+    /// A completed run must NOT prune the next run: files added since
+    /// would never be indexed. Completion only licenses a fresh re-walk.
+    #[serde(default)]
+    run_complete: bool,
 }
 
-const CHECKPOINT_VERSION: u32 = 1;
+const CHECKPOINT_VERSION: u32 = 2;
 /// Checkpoint cadence: persist after this many newly-completed directories.
 const CHECKPOINT_EVERY_DIRS: u64 = 25;
 
@@ -134,6 +139,14 @@ impl Indexer {
         // loop below needs `&mut self`. Only prior-run completions matter
         // for pruning — this run's dirs are visited exactly once anyway.
         let done_snapshot: HashSet<String> = self.completed_dirs.clone();
+        // A fresh walk (nothing pruned) sees every file: afterwards we can
+        // drop catalog rows for files that no longer exist. A resumed walk
+        // skips completed subtrees, so its seen-set would be a lie.
+        let fresh_walk = done_snapshot.is_empty();
+        let mut seen: HashSet<String> = HashSet::new();
+        if fresh_walk {
+            seen.insert(canon_s.clone());
+        }
 
         // (canonical path, walk depth) of dirs whose subtree is in progress.
         // A dir is complete once walk depth drops back below its own depth.
@@ -169,7 +182,7 @@ impl Indexer {
                 self.completed_dirs.insert(done);
                 completed_this_run += 1;
                 if completed_this_run % CHECKPOINT_EVERY_DIRS == 0 {
-                    self.write_checkpoint()?;
+                    self.write_checkpoint(false)?;
                     self.report_progress();
                 }
             }
@@ -177,6 +190,11 @@ impl Indexer {
             let is_dir = entry.file_type().is_dir();
             match ufm_vfs::item_from_path(location.id, path) {
                 Some(item) => {
+                    if fresh_walk {
+                        if let Some(pk) = &item.provider_key {
+                            seen.insert(pk.clone());
+                        }
+                    }
                     self.catalog.insert_item(&item)?;
                     if is_dir {
                         dir_stack.push((path.to_string_lossy().into_owned(), depth));
@@ -200,11 +218,15 @@ impl Indexer {
             self.completed_dirs.insert(done);
             completed_this_run += 1;
             if completed_this_run % CHECKPOINT_EVERY_DIRS == 0 {
-                self.write_checkpoint()?;
+                self.write_checkpoint(false)?;
                 self.report_progress();
             }
         }
-        self.write_checkpoint()?;
+        if fresh_walk {
+            // The walk saw everything: rows for vanished files go away.
+            let _ = self.catalog.delete_unseen(&location.id, &seen)?;
+        }
+        self.write_checkpoint(true)?;
         self.report_progress();
         Ok(stats)
     }
@@ -241,11 +263,17 @@ impl Indexer {
             Err(_) => return Ok(()),
         };
         if ck.version != CHECKPOINT_VERSION {
-            return Err(UfmError::Database(format!(
-                "unsupported checkpoint version {}",
-                ck.version
-            )));
+            // Older checkpoint format: ignore it and walk fresh rather
+            // than refuse to index.
+            return Ok(());
         }
+        if ck.run_complete {
+            // The last run finished the whole root. Pruning from it would
+            // hide every file added since — start a fresh walk instead
+            // (completed_dirs stays empty, totals reset).
+            return Ok(());
+        }
+        // Interrupted run: resume, pruning the subtrees it completed.
         self.completed_dirs = ck.completed_dirs.into_iter().collect();
         self.files_done = ck.files_done;
         self.bytes_done = ck.bytes_done;
@@ -254,7 +282,7 @@ impl Indexer {
 
     /// Atomic checkpoint write: serialize → `<path>.tmp` + fsync → rename.
     /// Readers only ever see the previous complete checkpoint or the new one.
-    fn write_checkpoint(&self) -> Result<()> {
+    fn write_checkpoint(&self, run_complete: bool) -> Result<()> {
         let mut dirs: Vec<String> = self.completed_dirs.iter().cloned().collect();
         dirs.sort();
         let ck = Checkpoint {
@@ -262,6 +290,7 @@ impl Indexer {
             completed_dirs: dirs,
             files_done: self.files_done,
             bytes_done: self.bytes_done,
+            run_complete,
         };
         let json = serde_json::to_string_pretty(&ck)
             .map_err(|e| UfmError::Database(format!("serialize checkpoint: {e}")))?;

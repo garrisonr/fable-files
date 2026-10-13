@@ -251,12 +251,49 @@ pub struct SearchHit {
 }
 
 #[tauri::command]
+/// File-type categories for the advanced-search filter.
+fn type_extensions(filter: &str) -> Option<&'static [&'static str]> {
+    match filter {
+        "image" => Some(&["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "svg", "ico", "avif"][..]),
+        "video" => Some(&["mp4", "mkv", "webm", "mov", "avi", "m4v", "mpg", "mpeg"][..]),
+        "audio" => Some(&["mp3", "flac", "ogg", "oga", "wav", "m4a", "opus", "aac"][..]),
+        "document" => Some(&["pdf", "doc", "docx", "odt", "epub", "txt", "md", "rtf", "csv", "tsv"][..]),
+        "archive" => Some(&["zip", "7z", "rar", "tar", "gz", "bz2", "xz", "tgz"][..]),
+        _ => None,
+    }
+}
+
+fn name_in_type(name: &str, exts: &[&str]) -> bool {
+    let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+    !ext.is_empty() && ext != name.to_lowercase() && exts.contains(&ext.as_str())
+}
+
 pub async fn search(
     state: State<'_, AppState>,
     query_text: String,
     scope: Option<LocationId>,
     limit: Option<u32>,
+    type_filter: Option<String>,
 ) -> Cmd<Vec<SearchHit>> {
+    let limit = limit.unwrap_or(50).min(500);
+    let exts: Option<&'static [&'static str]> =
+        type_filter.as_deref().and_then(type_extensions);
+
+    // Type-only browsing (no text): list matching files by recency.
+    if query_text.trim().is_empty() {
+        if let Some(exts) = exts {
+            let rows = {
+                let catalog = state.catalog.lock().unwrap();
+                catalog
+                    .browse_by_extensions(exts, limit)
+                    .map_err(CommandError::from)?
+            };
+            let rows: Vec<(Item, f64)> = rows.into_iter().map(|i| (i, 0.0)).collect();
+            return finish_search(state, rows, scope);
+        }
+        return Ok(Vec::new());
+    }
+
     // A query that doesn't parse is not an error — it just matches nothing.
     let query = match ufm_search::parse(&query_text) {
         Ok(q) => q,
@@ -266,14 +303,29 @@ pub async fn search(
     if fts_query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let limit = limit.unwrap_or(50).min(500);
+    // With a type filter, over-fetch so filtering still fills the page.
+    let fetch = if exts.is_some() { (limit * 8).min(400) } else { limit };
     // `search_fts` has no scope parameter in v0.1 — filter by location here.
-    let rows = {
+    let mut rows = {
         let catalog = state.catalog.lock().unwrap();
         catalog
-            .search_fts(&fts_query, limit)
+            .search_fts(&fts_query, fetch)
             .map_err(CommandError::from)?
     };
+    if let Some(exts) = exts {
+        rows.retain(|(item, _)| name_in_type(&item.name, exts));
+        rows.truncate(limit as usize);
+    }
+    finish_search(state, rows, scope)
+}
+
+/// Shared tail of `search`: apply the location scope, cache result paths
+/// so preview/list_dir can resolve the hits, and shape the response.
+fn finish_search(
+    state: State<'_, AppState>,
+    rows: Vec<(Item, f64)>,
+    scope: Option<LocationId>,
+) -> Cmd<Vec<SearchHit>> {
     let mut rows: Vec<(Item, f64)> = match scope {
         Some(s) => rows
             .into_iter()
@@ -1527,6 +1579,206 @@ pub struct ItemProperties {
     pub permissions: String,
     pub mode_octal: String,
     pub executable: bool,
+}
+
+
+/// Restore an item from the Trash to its original location (Undo).
+/// `trash_name` is the name trash_item returned (the files/ entry name).
+/// Returns the restored absolute path.
+#[tauri::command]
+pub async fn untrash_item(trash_name: String) -> Cmd<String> {
+    if trash_name.contains('/') || trash_name.contains("\\") || trash_name == ".." {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "bad trash name".into(),
+        )));
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+        let trash_root = std::path::PathBuf::from(format!("{home}/.local/share/Trash"));
+        let src = trash_root.join("files").join(&trash_name);
+        let info_path = trash_root.join("info").join(format!("{trash_name}.trashinfo"));
+        if !src.exists() {
+            return Err(format!("trashed item {trash_name} no longer exists"));
+        }
+        // Original path from the .trashinfo (written raw, not encoded).
+        let info = std::fs::read_to_string(&info_path).unwrap_or_default();
+        let mut dest = info
+            .lines()
+            .find_map(|l| l.strip_prefix("Path="))
+            .map(|p| std::path::PathBuf::from(p.trim()))
+            .unwrap_or_else(|| std::path::PathBuf::from(format!("{home}/{trash_name}")));
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        if dest.exists() {
+            let base = dest.clone();
+            let mut n = 2;
+            loop {
+                let cand = base.with_file_name(format!("{} {n}", base.file_name().and_then(|x| x.to_str()).unwrap_or("restored")));
+                if !cand.exists() {
+                    dest = cand;
+                    break;
+                }
+                n += 1;
+            }
+        }
+        if std::fs::rename(&src, &dest).is_err() {
+            let ty = std::fs::metadata(&src).map_err(|e| e.to_string())?;
+            if ty.is_dir() {
+                copy_dir_recursive(&src, &dest).map_err(|e| e.to_string())?;
+                std::fs::remove_dir_all(&src).map_err(|e| e.to_string())?;
+            } else {
+                std::fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+                std::fs::remove_file(&src).map_err(|e| e.to_string())?;
+            }
+        }
+        let _ = std::fs::remove_file(&info_path);
+        Ok::<String, String>(dest.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("untrash task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Move a file/folder by absolute paths (the undo of a drag-move).
+/// Returns the new absolute path.
+#[tauri::command]
+pub async fn move_path_to(src_path: String, dest_dir: String) -> Cmd<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let src = std::path::PathBuf::from(&src_path);
+        let dest_root = std::path::PathBuf::from(&dest_dir);
+        if !src.exists() {
+            return Err(format!("source {src_path} no longer exists"));
+        }
+        if !dest_root.is_dir() {
+            return Err(format!("destination {dest_dir} is not a directory"));
+        }
+        let name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or("invalid file name")?
+            .to_string();
+        if src.parent() == Some(dest_root.as_path()) {
+            return Ok::<String, String>(src_path.clone());
+        }
+        let mut dest = dest_root.join(&name);
+        let mut n = 2;
+        while dest.exists() {
+            dest = dest_root.join(format!("{name} {n}"));
+            n += 1;
+        }
+        if std::fs::rename(&src, &dest).is_err() {
+            let ty = std::fs::metadata(&src).map_err(|e| e.to_string())?;
+            if ty.is_dir() {
+                copy_dir_recursive(&src, &dest).map_err(|e| e.to_string())?;
+                std::fs::remove_dir_all(&src).map_err(|e| e.to_string())?;
+            } else {
+                std::fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+                std::fs::remove_file(&src).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok::<String, String>(dest.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("move task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Open one of the project's own web pages (bug reports, feature requests).
+#[tauri::command]
+pub async fn open_url(url: String) -> Cmd<()> {
+    if !url.starts_with("https://github.com/garrisonr/fable-files") {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "only Fable Files project pages can be opened".into(),
+        )));
+    }
+    open::that(&url).map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))
+}
+
+/// Percent-encode a path into a file:// URI (freedesktop thumbnail spec).
+fn file_uri(path: &std::path::Path) -> String {
+    let mut out = String::from("file://");
+    for b in path.to_string_lossy().bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Generate (or reuse) a freedesktop thumbnail for an image file and
+/// return it as a data URL. Cache: ~/.cache/thumbnails/{normal,large}/
+/// named md5(file-uri).png, shared with other Linux file managers.
+/// Freshness: the cached PNG is reused while it is newer than the source.
+#[tauri::command]
+pub async fn get_thumbnail(
+    state: State<'_, AppState>,
+    item: ItemId,
+    fallback_path: Option<String>,
+    large: Option<bool>,
+) -> Cmd<String> {
+    let path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .or_else(|| fallback_path.as_ref().map(std::path::PathBuf::from))
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    let large = large.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico") {
+            return Err("not a thumbnail-able image".to_string());
+        }
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if meta.len() > 64 * 1024 * 1024 {
+            return Err("image too large to thumbnail".to_string());
+        }
+        let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+        let size_dir = if large { "large" } else { "normal" };
+        let max_px: u32 = if large { 256 } else { 128 };
+        let cache_dir = std::path::PathBuf::from(format!("{home}/.cache/thumbnails/{size_dir}"));
+        let digest = format!("{:x}", md5::compute(file_uri(&path).as_bytes()));
+        let cache_file = cache_dir.join(format!("{digest}.png"));
+
+        let src_mtime = meta.modified().ok();
+        let cache_fresh = cache_file
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .zip(src_mtime)
+            .map(|(cm, sm)| cm >= sm)
+            .unwrap_or(false);
+
+        if !cache_fresh {
+            std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+            let img = image::open(&path).map_err(|e| format!("decode: {e}"))?;
+            let thumb = img.thumbnail(max_px, max_px);
+            // Write via a temp file + rename so readers never see a partial PNG.
+            let tmp = cache_dir.join(format!("{digest}.tmp.png"));
+            thumb
+                .save_with_format(&tmp, image::ImageFormat::Png)
+                .map_err(|e| format!("encode: {e}"))?;
+            std::fs::rename(&tmp, &cache_file).map_err(|e| e.to_string())?;
+        }
+        let data = std::fs::read(&cache_file).map_err(|e| e.to_string())?;
+        use base64::Engine;
+        Ok::<String, String>(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&data)
+        ))
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("thumbnail task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
 }
 
 #[cfg(test)]

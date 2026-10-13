@@ -19,10 +19,22 @@ const DEBOUNCE_MS = 120;
 
 const SEARCH_ICON_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/></svg>`;
 
+const TYPE_FILTERS: Array<{ id: string | null; label: string }> = [
+  { id: null, label: "All types" },
+  { id: "image", label: "Images" },
+  { id: "video", label: "Videos" },
+  { id: "audio", label: "Audio" },
+  { id: "document", label: "Documents" },
+  { id: "archive", label: "Archives" },
+];
+
 export class SearchView {
   readonly el: HTMLElement;
   private input: HTMLInputElement;
   private fieldEl: HTMLElement;
+  private resultsEl: HTMLElement;
+  private chipsEl: HTMLElement;
+  private typeFilter: string | null = null;
   private timer = 0;
   private lastQuery = "";
   active = false;
@@ -31,6 +43,33 @@ export class SearchView {
     this.el = document.createElement("div");
     this.el.className = "searchview";
     this.el.hidden = true;
+
+    // Advanced search: file-type filter chips (persistent above results).
+    this.chipsEl = document.createElement("div");
+    this.chipsEl.className = "search-chips";
+    this.chipsEl.setAttribute("role", "group");
+    this.chipsEl.setAttribute("aria-label", "Filter by file type");
+    for (const f of TYPE_FILTERS) {
+      const chip = document.createElement("button");
+      chip.className = "search-chip" + (f.id === null ? " active" : "");
+      chip.textContent = f.label;
+      chip.addEventListener("click", () => {
+        this.typeFilter = f.id;
+        this.chipsEl.querySelectorAll(".search-chip").forEach((c) =>
+          c.classList.toggle("active", c === chip)
+        );
+        // Re-run under the new filter; type-only browsing (empty query)
+        // is a valid search on its own.
+        this.lastQuery = "\u0000force";
+        void this.run();
+      });
+      this.chipsEl.appendChild(chip);
+    }
+    this.el.appendChild(this.chipsEl);
+
+    this.resultsEl = document.createElement("div");
+    this.resultsEl.className = "search-results-wrap";
+    this.el.appendChild(this.resultsEl);
 
     // The field: a pill with the magnifier icon INSIDE, Apple-style.
     this.fieldEl = document.createElement("div");
@@ -77,7 +116,7 @@ export class SearchView {
     this.lastQuery = "";
     this.active = false;
     this.el.hidden = true;
-    this.el.innerHTML = "";
+    this.resultsEl.innerHTML = "";
     this.hooks.onClear();
   }
 
@@ -90,7 +129,7 @@ export class SearchView {
     const q = this.input.value.trim();
     if (q === this.lastQuery) return;
     this.lastQuery = q;
-    if (!q) {
+    if (!q && !this.typeFilter) {
       this.clear();
       return;
     }
@@ -99,7 +138,7 @@ export class SearchView {
     this.hooks.onResults();
     this.renderLoading(q);
     try {
-      const hits = await api.search(q, null, 50);
+      const hits = await api.search(q, null, 50, this.typeFilter);
       if (this.lastQuery !== q) return; // superseded
       this.renderResults(q, hits);
     } catch {
@@ -109,30 +148,35 @@ export class SearchView {
   }
 
   private renderLoading(q: string): void {
-    this.el.innerHTML = "";
+    this.resultsEl.innerHTML = "";
     const p = document.createElement("p");
     p.className = "search-status";
     p.textContent = `Searching for “${q}”…`;
-    this.el.appendChild(p);
+    this.resultsEl.appendChild(p);
   }
 
   private renderError(q: string): void {
-    this.el.innerHTML = "";
+    this.resultsEl.innerHTML = "";
     const p = document.createElement("p");
     p.className = "search-status";
     p.textContent = `Search failed for “${q}”. Please try again.`;
-    this.el.appendChild(p);
+    this.resultsEl.appendChild(p);
   }
 
   private renderResults(q: string, hits: SearchHit[]): void {
-    this.el.innerHTML = "";
+    this.resultsEl.innerHTML = "";
     const head = document.createElement("p");
     head.className = "search-status";
+    const typeLabel = TYPE_FILTERS.find((f) => f.id === this.typeFilter)?.label;
     head.textContent =
       hits.length === 0
-        ? `No results for “${q}”.`
-        : `${hits.length} result${hits.length === 1 ? "" : "s"} for “${q}”.`;
-    this.el.appendChild(head);
+        ? q
+          ? `No results for “${q}”.`
+          : `No ${typeLabel ?? "files"} found.`
+        : q
+          ? `${hits.length} result${hits.length === 1 ? "" : "s"} for “${q}”.`
+          : `${hits.length} ${typeLabel ?? "files"}${hits.length === 50 ? " (first 50)" : ""}.`;
+    this.resultsEl.appendChild(head);
     const list = document.createElement("div");
     list.className = "search-results";
     list.setAttribute("role", "listbox");
@@ -169,6 +213,6 @@ export class SearchView {
       });
       list.appendChild(row);
     });
-    this.el.appendChild(list);
+    this.resultsEl.appendChild(list);
   }
 }

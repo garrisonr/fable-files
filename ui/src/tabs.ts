@@ -4,7 +4,7 @@
  */
 import type { Item, LocationSummary } from "./api";
 
-export type ViewMode = "grid" | "list";
+export type ViewMode = "grid" | "list" | "columns" | "gallery";
 export type SortKey = "name" | "size" | "modified";
 export type SortDir = 1 | -1;
 

@@ -10,7 +10,11 @@ import {
   type LocationSummary,
   type ThemeInfo,
 } from "./api";
-import { FileView, dragState } from "./fileview";
+import { FileView, dragState, type FileViewHooks } from "./fileview";
+import { ColumnsView } from "./columns";
+import { GalleryView } from "./gallery";
+import { AboutDialog } from "./about";
+import { CommandPalette, type PaletteCommand } from "./palette";
 import { IndexTracker } from "./indexing";
 import { reducedMotion, animateFromLive, liveOpacity } from "./motion";
 import { QuickLook } from "./quicklook";
@@ -49,11 +53,10 @@ export class Shell {
   private locations: LocationSummary[] = [];
 
   private crumbBar!: HTMLElement;
+  private crumbsWrap!: HTMLElement;
   private backBtn!: HTMLButtonElement;
   private fwdBtn!: HTMLButtonElement;
   private upBtn!: HTMLButtonElement;
-  private viewGridBtn!: HTMLButtonElement;
-  private viewListBtn!: HTMLButtonElement;
   private tabBar!: HTMLElement;
   private sidebarList!: HTMLElement;
   private favList!: HTMLElement;
@@ -64,6 +67,16 @@ export class Shell {
   private searchWrap!: HTMLElement;
 
   private fileView: FileView;
+  private columnsView: ColumnsView;
+  private galleryView: GalleryView;
+  private aboutDialog = new AboutDialog();
+  private palette = new CommandPalette();
+  private menuBtn!: HTMLButtonElement;
+  /** Undoable file operations (trash / drag-move), newest last. */
+  private undoStack: Array<
+    | { kind: "trash"; trashName: string; label: string }
+    | { kind: "move"; newPath: string; fromDir: string; label: string }
+  > = [];
   private quickLook: QuickLook;
   private searchView: SearchView;
   private themeManager: ThemeManager;
@@ -76,21 +89,21 @@ export class Shell {
     this.el.id = "app";
     this.buildChrome();
 
-    this.fileView = new FileView(
-      () => this.requireTab(),
-      {
-        onOpen: (item) => this.openItem(item),
-        onSelect: (item) => this.onSelect(item),
-        onTogglePreview: () => this.togglePreview(),
-        onMakeExecutable: (item) => {
-          api.setExecutable(item.id, true).catch((err) =>
-            console.error("chmod +x failed:", err)
-          );
-        },
-        onDelete: (item) => void this.deleteItem(item),
-        onProperties: (item) => this.propertiesDialog.open(item),
+    const viewHooks: FileViewHooks = {
+      onOpen: (item) => this.openItem(item),
+      onSelect: (item) => this.onSelect(item),
+      onTogglePreview: () => this.togglePreview(),
+      onMakeExecutable: (item) => {
+        api.setExecutable(item.id, true).catch((err) =>
+          console.error("chmod +x failed:", err)
+        );
       },
-    );
+      onDelete: (item) => void this.deleteItem(item),
+      onProperties: (item) => this.propertiesDialog.open(item),
+    };
+    this.fileView = new FileView(() => this.requireTab(), viewHooks);
+    this.columnsView = new ColumnsView(() => this.requireTab(), viewHooks);
+    this.galleryView = new GalleryView(() => this.requireTab(), viewHooks);
     this.quickLook = new QuickLook(() => this.fileView.el.focus({ preventScroll: true }));
     this.searchView = new SearchView({
       onNavigateToItem: (item) => {
@@ -100,10 +113,18 @@ export class Shell {
       onPreviewItem: (item) => void this.quickLook.open(item),
       onResults: () => {
         this.fileView.el.hidden = true;
+        this.columnsView.el.hidden = true;
+        this.galleryView.el.hidden = true;
       },
       onClear: () => this.showFileView(),
     });
-    this.viewport.append(this.fileView.el, this.searchView.el, this.quickLook.el);
+    this.viewport.append(
+      this.fileView.el,
+      this.columnsView.el,
+      this.galleryView.el,
+      this.searchView.el,
+      this.quickLook.el
+    );
     // The search field lives in the toolbar; its results panel is in the viewport.
     this.searchWrap.appendChild(this.searchView.field);
 
@@ -117,6 +138,16 @@ export class Shell {
     });
 
     document.addEventListener("keydown", (e) => this.onGlobalKey(e));
+    // The native webview context menu (Back / Forward / Stop / Reload)
+    // never appears: our own menus preventDefault at their targets, and
+    // anything unhandled gets suppressed here. Text fields keep the
+    // editing menu (cut/copy/paste).
+    document.addEventListener("contextmenu", (e) => {
+      if (e.defaultPrevented) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA")) return;
+      e.preventDefault();
+    });
   }
 
   // ------------------------------------------------------------------ boot
@@ -160,14 +191,30 @@ export class Shell {
     this.crumbBar = document.createElement("nav");
     this.crumbBar.className = "crumbs";
     this.crumbBar.setAttribute("aria-label", "Location");
-
-    const viewToggle = document.createElement("div");
-    viewToggle.className = "segmented";
-    viewToggle.setAttribute("role", "group");
-    viewToggle.setAttribute("aria-label", "View mode");
-    this.viewGridBtn = this.toggleButton("Grid view", "grid");
-    this.viewListBtn = this.toggleButton("List view", "list");
-    viewToggle.append(this.viewGridBtn, this.viewListBtn);
+    // Right-click the path: Copy Path / Edit Path (never the webview menu).
+    this.crumbBar.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.ctxMenu.open(e.clientX, e.clientY, [
+        { label: "Copy Path", action: () => void this.copyCurrentPath() },
+        { label: "Edit Path", action: () => this.editPath() },
+      ]);
+    });
+    // The copy button lives OUTSIDE the scrolling crumbs so a long path
+    // can never push it off-screen.
+    const crumbsWrap = document.createElement("div");
+    crumbsWrap.className = "crumbs-wrap";
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "icon-btn crumb-copy";
+    copyBtn.textContent = "\u29C9";
+    copyBtn.title = "Copy path";
+    copyBtn.setAttribute("aria-label", "Copy current path");
+    copyBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      void this.copyCurrentPath(copyBtn);
+    });
+    crumbsWrap.append(this.crumbBar, copyBtn);
+    this.crumbsWrap = crumbsWrap;
 
     const searchWrap = document.createElement("div");
     searchWrap.className = "search-wrap";
@@ -175,14 +222,15 @@ export class Shell {
     // SearchView exists (its results panel lives in the viewport).
     this.searchWrap = searchWrap;
 
-    const themeBtn = document.createElement("button");
-    themeBtn.className = "icon-btn";
-    themeBtn.textContent = "Theme";
-    themeBtn.setAttribute("aria-label", "Choose theme");
-    themeBtn.setAttribute("aria-haspopup", "menu");
-    themeBtn.addEventListener("click", () => this.themeManager.openMenu(themeBtn));
+    const menuBtn = document.createElement("button");
+    menuBtn.className = "icon-btn menu-btn";
+    menuBtn.textContent = "☰";
+    menuBtn.setAttribute("aria-label", "Menu");
+    menuBtn.setAttribute("aria-haspopup", "menu");
+    menuBtn.addEventListener("click", () => this.openMainMenu());
+    this.menuBtn = menuBtn;
 
-    toolbar.append(nav, this.crumbBar, this.searchWrap, viewToggle, themeBtn);
+    toolbar.append(nav, this.crumbsWrap, this.searchWrap, menuBtn);
     this.el.append(toolbar);
 
     // Menu layer for anchored popovers (theme menu).
@@ -246,16 +294,6 @@ export class Shell {
     return b;
   }
 
-  private toggleButton(label: string, mode: ViewMode): HTMLButtonElement {
-    const b = document.createElement("button");
-    b.className = "seg-btn";
-    b.textContent = label;
-    b.setAttribute("aria-label", label);
-    b.setAttribute("aria-pressed", "false");
-    b.addEventListener("click", () => this.setView(mode));
-    return b;
-  }
-
   // ---------------------------------------------------------------- tabs
 
   newTab(loc: LocationSummary): Tab {
@@ -273,7 +311,6 @@ export class Shell {
     this.fileView.onTabSwitch();
     this.renderTabBar();
     this.renderCrumbs();
-    this.renderViewToggle();
     void this.loadDir(tab);
   }
 
@@ -345,7 +382,7 @@ export class Shell {
       tab.items = [];
     }
     if (tab === this.activeTab) {
-      this.fileView.render();
+      this.renderActiveView();
       this.renderCrumbs();
       this.renderNavButtons();
       this.renderStatus();
@@ -403,15 +440,24 @@ export class Shell {
   }
 
   private togglePreview(): void {
-    const sel = this.fileView.selected;
-    this.quickLook.toggle(sel);
+    this.quickLook.toggle(this.activeSelected());
+  }
+
+  /** The selection of whichever view is on screen. */
+  private activeSelected(): Item | null {
+    const tab = this.activeTab;
+    if (!tab) return null;
+    if (tab.view === "columns") return this.columnsView.selected;
+    if (tab.view === "gallery") return this.galleryView.selected;
+    return this.fileView.selected;
   }
 
   /** Move an item to the Trash, refresh the listing, and say so. */
   private async deleteItem(item: Item): Promise<void> {
     try {
-      await api.trashItem(item.id);
-      Toast.success(`Moved “${item.name}” to Trash.`);
+      const trashName = await api.trashItem(item.id);
+      this.undoStack.push({ kind: "trash", trashName, label: item.name });
+      Toast.success(`Moved “${item.name}” to Trash. Super+Z to undo.`);
       this.quickLook.close();
       const tab = this.activeTab;
       if (tab) await this.loadDir(tab);
@@ -449,7 +495,7 @@ export class Shell {
       this.crumbBar.appendChild(b);
     });
     // The selected file appears as the final, current breadcrumb element.
-    const selForCrumb = this.fileView.selected;
+    const selForCrumb = this.activeSelected();
     if (selForCrumb) {
       const sep = document.createElement("span");
       sep.className = "crumb-sep";
@@ -466,36 +512,6 @@ export class Shell {
         if (el !== cur) el.classList.remove("current");
       });
     }
-    // Copy path button (one-click copy)
-    const copyBtn = document.createElement("button");
-    copyBtn.className = "icon-btn crumb-copy";
-    copyBtn.textContent = "\u29C9";  // copy square icon
-    copyBtn.setAttribute("aria-label", "Copy current path");
-    copyBtn.title = "Copy path";
-    copyBtn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      try {
-        const sel = this.fileView?.selected;
-        let path: string;
-        if (sel?.provider_key) {
-          // The selected item carries its own full filesystem path.
-          path = sel.provider_key;
-        } else {
-          const tab = this.activeTab;
-          if (!tab) return;
-          const dir = currentDir(tab);
-          path = await api.getItemPath(dir.dirId);
-          if (sel) path = path.replace(/\/$/, "") + "/" + sel.name;
-        }
-        await navigator.clipboard.writeText(path);
-        copyBtn.textContent = "\u2713";
-        setTimeout(() => { copyBtn.textContent = "\u29C9"; }, 1000);
-        Toast.success("Path copied");
-      } catch (err) {
-        Toast.error(`Copy failed: ${err}`);
-      }
-    });
-    this.crumbBar.appendChild(copyBtn);
     // Clicking anywhere on the crumb bar edits the path
     this.crumbBar.addEventListener("click", (e) => {
       // Don't trigger if clicking the copy button or a crumb button
@@ -510,7 +526,7 @@ export class Shell {
     if (!tab) return "";
     const crumbs = currentDir(tab).crumbs.map((c) => c.name).join(" / ");
     // Append selected file name if one is selected
-    const sel = this.fileView?.selected;
+    const sel = this.activeSelected();
     if (sel) return crumbs + " / " + sel.name;
     return crumbs;
   }
@@ -621,16 +637,22 @@ export class Shell {
           if (!dragged) return;
           try {
             if (name === "Trash") {
-              await api.trashItem(dragged.id);
-              Toast.success(`Moved “${dragged.name}” to Trash.`);
+              const trashName = await api.trashItem(dragged.id);
+              this.undoStack.push({ kind: "trash", trashName, label: dragged.name });
+              Toast.success(`Moved “${dragged.name}” to Trash. Super+Z to undo.`);
             } else {
               const dest = await api.getItemPath(target.dirId);
               if (dragged.provider_key && dragged.provider_key.replace(/\/[^/]*$/, "") === dest) {
                 return; // already in this folder
               }
               const newPath = await api.moveItemTo(dragged.id, dest);
-              Toast.success(`Moved “${dragged.name}” to ${name}.`);
-              void newPath;
+              const fromDir = dragged.provider_key
+                ? dragged.provider_key.replace(/\/[^/]*$/, "")
+                : "";
+              if (fromDir) {
+                this.undoStack.push({ kind: "move", newPath, fromDir, label: dragged.name });
+              }
+              Toast.success(`Moved “${dragged.name}” to ${name}. Super+Z to undo.`);
             }
             this.quickLook.close();
             const tab = this.activeTab;
@@ -816,22 +838,215 @@ export class Shell {
     document.documentElement.style.setProperty("--ufm-font-scale", String(this.fontScale));
   }
 
+  // ------------------------------------------------------------ palette
+
+  /** Build the command list and open the palette (spec: launcher sheet). */
+  private async openPalette(): Promise<void> {
+    const commands: PaletteCommand[] = [];
+    // Places: favorites first, then locations.
+    const names = ["Home", "Documents", "Downloads", "Videos", "Pictures", "Music", "Trash"];
+    const targets = await this.resolveFavoriteTargets();
+    names.forEach((name, i) => {
+      const target = targets[i];
+      if (!target) return;
+      commands.push({
+        title: `Go to ${name}`,
+        hint: target.display,
+        run: () =>
+          this.navigateTo({
+            locationId: target.locationId,
+            dirId: target.dirId,
+            crumbs: [{ dirId: target.dirId, name: target.display }],
+          }),
+      });
+    });
+    for (const loc of this.locations) {
+      commands.push({
+        title: `Go to ${loc.display_name}`,
+        hint: loc.provider,
+        run: () =>
+          this.navigateTo({
+            locationId: loc.id,
+            dirId: loc.root_item,
+            crumbs: [{ dirId: loc.root_item, name: loc.display_name }],
+          }),
+      });
+    }
+    // Views.
+    const viewCmd = (label: string, m: ViewMode): PaletteCommand => ({
+      title: `${label} view`,
+      run: () => this.setView(m),
+    });
+    commands.push(
+      viewCmd("Grid", "grid"),
+      viewCmd("List", "list"),
+      viewCmd("Columns", "columns"),
+      viewCmd("Gallery", "gallery")
+    );
+    // Actions.
+    commands.push(
+      { title: "Copy path", run: () => void this.copyCurrentPath() },
+      { title: "Undo last delete or move", hint: "Super+Z", run: () => void this.undoLast() },
+      { title: "Larger text", run: () => this.setFontScale(this.fontScale + 0.1) },
+      { title: "Smaller text", run: () => this.setFontScale(this.fontScale - 0.1) },
+      { title: "About Fable Files", run: () => this.aboutDialog.open() },
+      {
+        title: "Report a bug…",
+        run: () =>
+          void api.openUrl(
+            "https://github.com/garrisonr/fable-files/issues/new?title=" +
+              encodeURIComponent("[Bug] ") +
+              "&labels=bug"
+          ),
+      },
+      {
+        title: "Request a feature…",
+        run: () =>
+          void api.openUrl(
+            "https://github.com/garrisonr/fable-files/issues/new?title=" +
+              encodeURIComponent("[Feature] ") +
+              "&labels=enhancement"
+          ),
+      }
+    );
+    this.palette.open(commands);
+  }
+
   // -------------------------------------------------------------- view mode
 
   private setView(mode: ViewMode): void {
     const tab = this.requireTab();
-    this.fileView.switchView(mode);
-    this.renderViewToggle();
-    void tab;
+    if (mode === "grid" || mode === "list") {
+      // FileView owns the grid<->list crossfade and stamps tab.view itself.
+      tab.view = mode === "grid" ? "list" : "grid"; // force the switch path
+      this.columnsView.el.hidden = true;
+      this.galleryView.el.hidden = true;
+      this.fileView.el.hidden = false;
+      this.fileView.switchView(mode);
+    } else {
+      tab.view = mode;
+      this.fileView.el.hidden = true;
+      this.columnsView.el.hidden = mode !== "columns";
+      this.galleryView.el.hidden = mode !== "gallery";
+      if (mode === "columns") this.columnsView.reset(tab);
+      else this.galleryView.render();
+    }
+    this.renderStatus();
   }
 
-  private renderViewToggle(): void {
+  /** Show + render whichever view the active tab is using. */
+  private renderActiveView(): void {
+    const tab = this.activeTab;
+    if (!tab) return;
+    const mode = tab.view;
+    this.fileView.el.hidden = mode === "columns" || mode === "gallery";
+    this.columnsView.el.hidden = mode !== "columns";
+    this.galleryView.el.hidden = mode !== "gallery";
+    if (mode === "columns") this.columnsView.reset(tab);
+    else if (mode === "gallery") this.galleryView.render();
+    else this.fileView.render();
+  }
+
+  /** Copy the current path (selected file's real path when one is picked). */
+  private async copyCurrentPath(btn?: HTMLButtonElement): Promise<void> {
+    try {
+      const sel = this.activeSelected();
+      let path: string;
+      if (sel?.provider_key) {
+        path = sel.provider_key;
+      } else {
+        const tab = this.activeTab;
+        if (!tab) return;
+        const dir = currentDir(tab);
+        path = await api.getItemPath(dir.dirId);
+        if (sel) path = path.replace(/\/$/, "") + "/" + sel.name;
+      }
+      await navigator.clipboard.writeText(path);
+      if (btn) {
+        btn.textContent = "\u2713";
+        setTimeout(() => {
+          btn.textContent = "\u29C9";
+        }, 1000);
+      }
+      Toast.success("Path copied");
+    } catch (err) {
+      Toast.error(`Copy failed: ${err}`);
+    }
+  }
+
+  /** The hamburger menu: views, sort, text size, theme, help. */
+  private openMainMenu(): void {
     const tab = this.activeTab;
     const mode = tab?.view ?? "grid";
-    this.viewGridBtn.setAttribute("aria-pressed", String(mode === "grid"));
-    this.viewListBtn.setAttribute("aria-pressed", String(mode === "list"));
-    this.viewGridBtn.classList.toggle("active", mode === "grid");
-    this.viewListBtn.classList.toggle("active", mode === "list");
+    const sort = tab?.sort ?? "name";
+    const rect = this.menuBtn.getBoundingClientRect();
+    const check = (on: boolean) => (on ? "✓ " : "   ");
+    const viewItem = (label: string, m: ViewMode) => ({
+      label: check(mode === m) + label,
+      action: () => this.setView(m),
+    });
+    const sortItem = (label: string, key: "name" | "size" | "modified") => ({
+      label: check(sort === key) + `Sort by ${label}`,
+      action: () => {
+        this.fileView.sortBy(key);
+        this.renderActiveView();
+      },
+    });
+    this.ctxMenu.open(rect.left - 140, rect.bottom + 6, [
+      viewItem("Grid view", "grid"),
+      viewItem("List view", "list"),
+      viewItem("Columns view", "columns"),
+      viewItem("Gallery view", "gallery"),
+      sortItem("Name", "name"),
+      sortItem("Size", "size"),
+      sortItem("Date", "modified"),
+      { label: "Larger text", shortcut: "Ctrl +", action: () => this.setFontScale(this.fontScale + 0.1) },
+      { label: "Smaller text", shortcut: "Ctrl −", action: () => this.setFontScale(this.fontScale - 0.1) },
+      { label: "Theme…", action: () => this.themeManager.openMenu(this.menuBtn) },
+      { label: "About Fable Files", action: () => this.aboutDialog.open() },
+      {
+        label: "Report a Bug…",
+        action: () =>
+          void api.openUrl(
+            "https://github.com/garrisonr/fable-files/issues/new?title=" +
+              encodeURIComponent("[Bug] ") +
+              "&labels=bug"
+          ),
+      },
+      {
+        label: "Request a Feature…",
+        action: () =>
+          void api.openUrl(
+            "https://github.com/garrisonr/fable-files/issues/new?title=" +
+              encodeURIComponent("[Feature] ") +
+              "&labels=enhancement"
+          ),
+      },
+    ]);
+  }
+
+  /** Undo the last trash / drag-move (Ctrl+Z or Super+Z). */
+  private async undoLast(): Promise<void> {
+    const entry = this.undoStack.pop();
+    if (!entry) {
+      Toast.error("Nothing to undo.");
+      return;
+    }
+    try {
+      if (entry.kind === "trash") {
+        const restored = await api.untrashItem(entry.trashName);
+        Toast.success(`Restored “${entry.label}”.`);
+        void restored;
+      } else {
+        await api.movePathTo(entry.newPath, entry.fromDir);
+        Toast.success(`Moved “${entry.label}” back.`);
+      }
+      this.quickLook.close();
+      const tab = this.activeTab;
+      if (tab) await this.loadDir(tab);
+    } catch (err) {
+      Toast.error(`Undo failed: ${err}`);
+    }
   }
 
   private renderNavButtons(): void {
@@ -845,7 +1060,7 @@ export class Shell {
 
   private showFileView(): void {
     this.searchView.el.hidden = true;
-    this.fileView.el.hidden = false;
+    this.renderActiveView();
   }
 
   // ------------------------------------------------------------- theme menu
@@ -937,6 +1152,12 @@ export class Shell {
     const inField =
       e.target instanceof HTMLInputElement ||
       e.target instanceof HTMLTextAreaElement;
+    if ((e.ctrlKey || e.metaKey) && e.key.toLocaleLowerCase() === "k") {
+      e.preventDefault();
+      if (this.palette.isOpen) this.palette.close();
+      else void this.openPalette();
+      return;
+    }
     if ((e.ctrlKey || e.metaKey) && e.key.toLocaleLowerCase() === "t") {
       e.preventDefault();
       const loc = this.activeTab
@@ -953,7 +1174,7 @@ export class Shell {
     if ((e.ctrlKey || e.metaKey) && e.key.toLocaleLowerCase() === "e") {
       // Ctrl+E: make the selected file executable (chmod +x).
       e.preventDefault();
-      const sel = this.fileView.selected;
+      const sel = this.activeSelected();
       if (sel) {
         api.setExecutable(sel.id, true).catch((err) => console.error("chmod +x failed:", err));
       }
@@ -977,10 +1198,18 @@ export class Shell {
       this.setFontScale(1.0);
       return;
     }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLocaleLowerCase() === "z" && !e.shiftKey) {
+      // Undo the last trash / move. In text fields, leave text undo alone.
+      if (!inField) {
+        e.preventDefault();
+        void this.undoLast();
+      }
+      return;
+    }
     if (inField) return;
     if (e.key === "Delete") {
       // Del: move the selected item to the Trash.
-      const sel = this.fileView.selected;
+      const sel = this.activeSelected();
       if (sel && !this.searchView.field.contains(document.activeElement)) {
         e.preventDefault();
         void this.deleteItem(sel);
