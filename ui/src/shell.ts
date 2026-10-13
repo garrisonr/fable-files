@@ -166,6 +166,10 @@ export class Shell {
 
     const searchWrap = document.createElement("div");
     searchWrap.className = "search-wrap";
+    const searchIcon = document.createElement("span");
+    searchIcon.className = "search-icon";
+    searchIcon.textContent = "\U0001F50D";
+    searchWrap.appendChild(searchIcon);
     // The search field is mounted here in the constructor, once the real
     // SearchView exists (its results panel lives in the viewport).
     this.searchWrap = searchWrap;
@@ -177,7 +181,7 @@ export class Shell {
     themeBtn.setAttribute("aria-haspopup", "menu");
     themeBtn.addEventListener("click", () => this.themeManager.openMenu(themeBtn));
 
-    toolbar.append(nav, this.crumbBar, viewToggle, themeBtn);
+    toolbar.append(nav, this.crumbBar, this.searchWrap, viewToggle, themeBtn);
     this.el.append(toolbar);
 
     // Menu layer for anchored popovers (theme menu).
@@ -429,13 +433,32 @@ export class Shell {
       });
       this.crumbBar.appendChild(b);
     });
-    // Path edit affordance: click to type a path + Enter to jump.
-    const edit = document.createElement("button");
-    edit.className = "icon-btn crumb-edit";
-    edit.textContent = "Edit path";
-    edit.setAttribute("aria-label", "Type a path to jump to");
-    edit.addEventListener("click", () => this.editPath());
-    this.crumbBar.appendChild(edit);
+    // Copy path button (one-click copy)
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "icon-btn crumb-copy";
+    copyBtn.textContent = "\u29C9";  // copy square icon
+    copyBtn.setAttribute("aria-label", "Copy current path");
+    copyBtn.title = "Copy path";
+    copyBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const path = this.displayPath();
+      try {
+        await navigator.clipboard.writeText(path);
+        copyBtn.textContent = "\u2713";  // checkmark feedback
+        setTimeout(() => { copyBtn.textContent = "\u29C9"; }, 1000);
+      } catch {
+        // Clipboard API failed — fall back to prompt
+        prompt("Copy path:", path);
+      }
+    });
+    this.crumbBar.appendChild(copyBtn);
+    // Clicking anywhere on the crumb bar edits the path
+    this.crumbBar.addEventListener("click", (e) => {
+      // Don't trigger if clicking the copy button or a crumb button
+      const t = e.target as HTMLElement;
+      if (t.closest(".crumb-copy") || t.closest("button")) return;
+      this.editPath();
+    });
   }
 
   private displayPath(): string {

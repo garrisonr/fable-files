@@ -1139,3 +1139,22 @@ body[data-layout="tv"] .cell-icon {
 .cell-name {
   font-size: calc(12px * var(--ufm-font-scale));
 }
+
+/* Search with magnifying glass */
+.search-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.search-icon {
+  font-size: 16px;
+  opacity: 0.7;
+  pointer-events: none;
+}
+
+/* Copy path button */
+.crumb-copy {
+  font-size: 16px;
+  padding: 4px 8px;
+}
