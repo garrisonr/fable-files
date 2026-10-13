@@ -174,7 +174,7 @@ export class QuickLook {
     body.appendChild(card);
 
     // Fetch text content for text-like files
-    if (kind === "Native" && item.kind !== "folder") {
+    if (kind === "native" && item.kind !== "folder") {
       const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
       const textExts = ["txt", "md", "csv", "tsv", "log", "srt", "vtt", "sub", "ssa", "ass", "nfo", "json", "xml", "yaml", "yml", "toml", "ini", "cfg", "sh", "py", "rs", "ts", "js"];
       if (textExts.includes(ext)) {
