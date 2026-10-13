@@ -7,7 +7,7 @@
  * uninterrupted; fullscreen on demand; detach to a pop-out window;
  * one click back from pop-out to the inline preview.
  */
-import { fileSrc } from "./api";
+import { mediaSrc } from "./api";
 
 const VIDEO_EXTS = new Set([
   "mp4", "webm", "mov", "m4v", "ogv", "mkv", "avi", "mpg", "mpeg",
@@ -54,7 +54,11 @@ export class VideoPlayer {
 
     this.video = document.createElement("video");
     this.video.className = "vp-video";
-    this.video.src = fileSrc(opts.path);
+    // Stream from the loopback media server (HTTP Range) — the asset
+    // protocol silently fails on real video in WebKitGTK.
+    void mediaSrc(opts.path).then((url) => {
+      if (!this.failed) this.video.src = url;
+    });
     this.video.preload = "metadata";
     this.video.playsInline = true;
     this.el.appendChild(this.video);

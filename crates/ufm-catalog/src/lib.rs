@@ -123,6 +123,22 @@ impl Catalog {
                 ",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Migration 2: cached media durations (seconds), filled lazily
+        // by ffprobe when duration-based rules / smart folders evaluate.
+        let has_duration: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('items') WHERE name = 'duration_secs'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !has_duration {
+            self.conn
+                .execute("ALTER TABLE items ADD COLUMN duration_secs REAL", [])
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -531,6 +547,103 @@ impl Catalog {
             });
         }
         Ok(items)
+    }
+
+    /// Candidates for extension/duration rules: every item whose name
+    /// ends in one of `exts` (no dot, lowercase), with its cached
+    /// duration (None = not probed yet).
+    pub fn rule_candidates(
+        &self,
+        exts: &[String],
+    ) -> Result<Vec<(ufm_vfs::Item, Option<f64>)>> {
+        if exts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conds: Vec<String> = exts
+            .iter()
+            .map(|_| "lower(i.name) LIKE '%.' || ?".to_string())
+            .collect();
+        let sql = format!(
+            "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes,
+                    i.modified, i.provider_key, i.duration_secs
+             FROM items AS i
+             WHERE ({})
+             ORDER BY i.name COLLATE NOCASE",
+            conds.join(" OR ")
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(exts.iter()), |row| {
+                let provider_key: Option<String> = row.get(6)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    provider_key,
+                    row.get::<_, Option<f64>>(7)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, location_id, name, kind_s, size_bytes, modified_s, provider_key, duration) =
+                row.map_err(|e| UfmError::Database(e.to_string()))?;
+            let parse_id = |s: &str, what: &str| {
+                uuid::Uuid::parse_str(s)
+                    .map_err(|e| UfmError::Database(format!("bad {what} id {s:?}: {e}")))
+            };
+            let labels = match &provider_key {
+                Some(pk) => self.labels_for_path(pk).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            out.push((
+                ufm_vfs::Item {
+                    id: ufm_core::ItemId(parse_id(&id, "item")?),
+                    location: ufm_core::LocationId(parse_id(&location_id, "location")?),
+                    name,
+                    kind: parse_kind(&kind_s),
+                    size_bytes: size_bytes.map(|v| v as u64),
+                    modified: modified_s.and_then(|m| {
+                        chrono::DateTime::parse_from_rfc3339(&m)
+                            .ok()
+                            .map(|d| d.with_timezone(&chrono::Utc))
+                    }),
+                    provider_key,
+                    labels,
+                    starred: false,
+                },
+                duration,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Cache a probed media duration for a path (0.0 = probed, unreadable).
+    pub fn set_duration(&self, provider_key: &str, secs: f64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE items SET duration_secs = ?2 WHERE provider_key = ?1",
+                params![provider_key, secs],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// tag_path that reports whether the assignment is new.
+    pub fn tag_path_counted(&self, provider_key: &str, label: &str) -> Result<bool> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO path_labels (provider_key, label) VALUES (?1, ?2)",
+                params![provider_key, label],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(self.conn.changes() > 0)
     }
 
     pub fn create_collection(&self, id: &CollectionId, name: &str, kind: &str) -> Result<()> {

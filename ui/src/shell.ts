@@ -10,7 +10,7 @@ import {
   type LocationSummary,
   type ThemeInfo,
 } from "./api";
-import { FileView, dragState, type FileViewHooks } from "./fileview";
+import { FileView, dragState, showItemMenu, type FileViewHooks } from "./fileview";
 import { ColumnsView } from "./columns";
 import { GalleryView } from "./gallery";
 import { AboutDialog } from "./about";
@@ -25,7 +25,8 @@ import { PropertiesDialog } from "./properties";
 import { FolderPicker, type PickerShortcut } from "./picker";
 import { RenameDialog } from "./rename";
 import { LabelManager } from "./labels";
-import { loadLabelDefs, migrateLabelAssignments } from "./labels";
+import { loadLabelDefs, migrateLabelAssignments, saveLabelDefs } from "./labels";
+import { OpenWithDialog } from "./openwith";
 import type { ArchiveEntry } from "./api";
 import { TerminalPanel } from "./terminal";
 import { MetadataDialog } from "./metadata";
@@ -73,6 +74,8 @@ interface SmartFolder {
   name: string;
   query: string;
   type: string | null;
+  /** Rule-based folder (Round 5.5): evaluated live by the backend. */
+  rule?: { extensions: string[]; minDurationSecs?: number | null };
 }
 
 export class Shell {
@@ -116,6 +119,7 @@ export class Shell {
   private picker = new FolderPicker();
   private renameDialog = new RenameDialog();
   private labelManager = new LabelManager();
+  private searchOpenWith = new OpenWithDialog();
   private labelList!: HTMLElement;
   private smartList!: HTMLElement;
   /** Archive browsing state: archive item id -> its catalog Item and
@@ -353,6 +357,17 @@ export class Shell {
       onPreviewItem: (item) => void this.quickLook.open(item),
       onTrashItems: (items) => {
         void this.trashItems(items).then(() => this.searchView.refresh());
+      },
+      onContextMenu: (item, targets, x, y) => {
+        void showItemMenu(
+          this.ctxMenu,
+          x,
+          y,
+          item,
+          targets.length > 0 ? targets : [item],
+          viewHooks,
+          (i) => this.searchOpenWith.open(i),
+        );
       },
       onResults: () => {
         this.fileView.el.hidden = true;
@@ -1145,17 +1160,68 @@ export class Shell {
     });
   }
 
+  /** Prepopulated rule folders (Dickles, 2026-10-13). Music keeps
+   * only clips longer than 30 s; Movies only features over 70 min;
+   * Documents excludes .md/.txt by his explicit order. */
+  private static readonly DEFAULT_RULE_FOLDERS: SmartFolder[] = [
+    {
+      name: "Audiobooks",
+      query: "",
+      type: null,
+      rule: { extensions: ["m4b"], minDurationSecs: null },
+    },
+    {
+      name: "Music",
+      query: "",
+      type: null,
+      rule: {
+        extensions: ["mp3", "aac", "flac", "ogg", "oga", "opus", "wav", "m4a", "aif", "aiff"],
+        minDurationSecs: 30,
+      },
+    },
+    {
+      name: "Movies",
+      query: "",
+      type: null,
+      rule: {
+        extensions: ["mkv", "mp4", "avi", "mov", "m4v", "webm", "mpg", "mpeg", "wmv"],
+        minDurationSecs: 70 * 60,
+      },
+    },
+    {
+      name: "Documents",
+      query: "",
+      type: null,
+      rule: {
+        extensions: ["doc", "docx", "odt", "ods", "odp", "pdf", "rtf", "xls", "xlsx", "ppt", "pptx"],
+        minDurationSecs: null,
+      },
+    },
+  ];
+
   private static loadSmartFolders(): SmartFolder[] {
+    let list: SmartFolder[] = [];
     try {
       const raw = localStorage.getItem("ff-smart-folders");
       if (raw) {
         const parsed = JSON.parse(raw) as SmartFolder[];
-        if (Array.isArray(parsed)) return parsed;
+        if (Array.isArray(parsed)) list = parsed;
       }
     } catch {
       // no stored folders
     }
-    return [];
+    // Merge the prepopulated rule folders exactly once; if he deletes
+    // them they stay deleted.
+    let seeded = false;
+    try { seeded = !!localStorage.getItem("ff-smart-v55"); } catch { seeded = true; }
+    if (!seeded) {
+      for (const d of Shell.DEFAULT_RULE_FOLDERS) {
+        if (!list.some((f) => f.name === d.name)) list.push({ ...d });
+      }
+      try { localStorage.setItem("ff-smart-v55", "1"); } catch { /* ignore */ }
+      Shell.saveSmartFolders(list);
+    }
+    return list;
   }
 
   private static saveSmartFolders(list: SmartFolder[]): void {
@@ -1728,12 +1794,34 @@ export class Shell {
         e.stopPropagation();
         this.ctxMenu.open(e.clientX, e.clientY, [
           {
-            label: "Manage Labels…",
+            label: `Manage "${def.name}"…`,
             action: () =>
               this.labelManager.open(() => {
                 void this.buildSidebar();
                 this.refreshActiveDir();
               }),
+          },
+          {
+            label: `Delete "${def.name}"`,
+            danger: true,
+            action: () => {
+              void (async () => {
+                const ok = await confirmDialog(
+                  `Delete label "${def.name}"?`,
+                  "The label is removed from every file that carries it. The files themselves are not touched.",
+                  "Delete Label",
+                  true,
+                );
+                if (!ok) return;
+                await api.deletePathLabel(def.name).catch(() => undefined);
+                saveLabelDefs(
+                  loadLabelDefs().filter((d) => d.name !== def.name),
+                );
+                void this.buildSidebar();
+                this.refreshActiveDir();
+                Toast.success(`Label "${def.name}" deleted.`);
+              })();
+            },
           },
         ]);
       });
@@ -1754,7 +1842,8 @@ export class Shell {
       b.textContent = `☆ ${sf.name}`;
       b.title = sf.query || sf.type || "";
       b.addEventListener("click", () => {
-        void this.searchView.runExternal(sf.query, sf.type);
+        if (sf.rule) void this.searchView.runRule(sf.name, sf.rule);
+        else void this.searchView.runExternal(sf.query, sf.type);
       });
       b.addEventListener("contextmenu", (e) => {
         e.preventDefault();
@@ -2062,6 +2151,14 @@ export class Shell {
         label: "Manage Labels…",
         action: () =>
           this.labelManager.open(() => {
+            void this.buildSidebar();
+            this.refreshActiveDir();
+          }),
+      },
+      {
+        label: "Auto-Label Rules…",
+        action: () =>
+          this.labelManager.openRules(() => {
             void this.buildSidebar();
             this.refreshActiveDir();
           }),

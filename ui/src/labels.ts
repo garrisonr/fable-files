@@ -33,6 +33,12 @@ export const DEFAULT_LABELS: LabelDef[] = [
   { name: "Taxes", color: "#b45309" },
   { name: "School", color: "#0ea5e9" },
   { name: "Health & Fitness", color: "#22c55e" },
+  { name: "Audiobooks", color: "#7c3aed" },
+  { name: "Auto", color: "#6b7280" },
+  { name: "Household", color: "#d97706" },
+  { name: "Legal", color: "#57534e" },
+  { name: "Food", color: "#e11d48" },
+  { name: "Screenshots", color: "#0891b2" },
 ];
 
 /** Renames Dickles asked for (2026-10-13): defs rename in place;
@@ -45,6 +51,10 @@ export const LABEL_RENAMES: Array<{ old: string; next: string }> = [
  * collections (a flag guards against resurrecting deleted ones). */
 const V53_NEW = ["Taxes", "School", "Health & Fitness"];
 const V53_FLAG = "ff-labels-v53";
+const V55_FLAG = "ff-labels-v55";
+
+/** Starter labels added in Round 5.5 (Dickles' list). */
+const V55_NEW = ["Audiobooks", "Auto", "Household", "Legal", "Food", "Screenshots"];
 
 const KEY = "ff-label-defs";
 
@@ -93,6 +103,18 @@ export function loadLabelDefs(): LabelDef[] {
             }
           }
           try { localStorage.setItem(V53_FLAG, "1"); } catch { /* ignore */ }
+        }
+        // Round 5.5 starter labels, appended once only.
+        let v55 = false;
+        try { v55 = !!localStorage.getItem(V55_FLAG); } catch { v55 = true; }
+        if (!v55) {
+          for (const name of V55_NEW) {
+            if (!out.some((d) => d.name === name)) {
+              const def = DEFAULT_LABELS.find((d) => d.name === name);
+              if (def) { out.push({ ...def }); changed = true; }
+            }
+          }
+          try { localStorage.setItem(V55_FLAG, "1"); } catch { /* ignore */ }
         }
         // Alphabetical, always (Dickles, 2026-10-13).
         out.sort((a, b) => a.name.localeCompare(b.name));
@@ -165,9 +187,60 @@ export function labelColor(defs: LabelDef[], name: string): string | null {
 
 /** Manage Labels dialog: rename/recolor/add/delete definitions.
  * Renames and deletes cascade to assignments via the backend. */
+// ---------------------------------------------------------------------------
+// Auto-label rules: extension (+ optional minimum duration) → label.
+// Stored locally; applied by the backend (apply_label_rules), which
+// probes and caches durations. Seeded once with Dickles' examples.
+// ---------------------------------------------------------------------------
+
+import type { LabelRule } from "./api";
+
+const RULES_KEY = "ff-label-rules";
+const RULES_SEED_FLAG = "ff-label-rules-seeded";
+
+export function loadLabelRules(): LabelRule[] {
+  try {
+    const raw = localStorage.getItem(RULES_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as LabelRule[];
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {
+    // fall through to seed
+  }
+  let seeded = false;
+  try { seeded = !!localStorage.getItem(RULES_SEED_FLAG); } catch { seeded = true; }
+  if (!seeded) {
+    const seed: LabelRule[] = [
+      { label: "Photos", extensions: ["jpg", "jpeg"], min_duration_secs: null },
+      {
+        label: "Film & Video",
+        extensions: ["mkv", "avi", "mp4"],
+        min_duration_secs: 70 * 60,
+      },
+    ];
+    saveLabelRules(seed);
+    try { localStorage.setItem(RULES_SEED_FLAG, "1"); } catch { /* ignore */ }
+    return seed;
+  }
+  return [];
+}
+
+export function saveLabelRules(rules: LabelRule[]): void {
+  try {
+    localStorage.setItem(RULES_KEY, JSON.stringify(rules));
+  } catch {
+    // storage unavailable
+  }
+}
+
 export class LabelManager {
   private el: HTMLDivElement;
   private listEl: HTMLDivElement;
+  private rulesListEl!: HTMLDivElement;
+  private rulesStatus!: HTMLSpanElement;
+  private applyBtn!: HTMLButtonElement;
+  private ruleLabelSel!: HTMLSelectElement;
   private defs: LabelDef[] = [];
   private onChanged: (() => void) | null = null;
 
@@ -184,6 +257,21 @@ export class LabelManager {
           <input class="labels-new-name" type="text" placeholder="New label name" />
           <button class="labels-add-btn">Add</button>
         </div>
+        <div class="labels-rules">
+          <h4 class="labels-rules-title">Auto-label rules</h4>
+          <p class="labels-rules-blurb">Files matching a rule get its label when you apply. Duration rules read media lengths once and remember them.</p>
+          <div class="labels-rules-list"></div>
+          <div class="labels-rule-add">
+            <select class="labels-rule-label" aria-label="Label"></select>
+            <input class="labels-rule-exts" type="text" placeholder="Extensions: jpg, png" />
+            <input class="labels-rule-mins" type="number" min="0" placeholder="Min min" title="Only files LONGER than this many minutes (optional)" />
+            <button class="labels-rule-add-btn">Add rule</button>
+          </div>
+          <div class="labels-rules-actions">
+            <button class="labels-apply-rules primary">Apply rules now</button>
+            <span class="labels-rules-status" role="status"></span>
+          </div>
+        </div>
         <div class="picker-actions">
           <button class="labels-done primary">Done</button>
         </div>
@@ -195,6 +283,14 @@ export class LabelManager {
     this.el
       .querySelector(".labels-add-btn")!
       .addEventListener("click", () => void this.addFromInputs());
+    this.rulesListEl = this.el.querySelector(".labels-rules-list")!;
+    this.rulesStatus = this.el.querySelector(".labels-rules-status")!;
+    this.applyBtn = this.el.querySelector(".labels-apply-rules")!;
+    this.ruleLabelSel = this.el.querySelector(".labels-rule-label")!;
+    this.applyBtn.addEventListener("click", () => void this.applyRules());
+    this.el
+      .querySelector(".labels-rule-add-btn")!
+      .addEventListener("click", () => this.addRuleFromInputs());
     this.el.addEventListener("pointerdown", (e) => {
       if (e.target === this.el) this.close();
     });
@@ -208,7 +304,119 @@ export class LabelManager {
     this.defs = loadLabelDefs();
     this.onChanged = onChanged;
     this.render();
+    this.renderRules();
     this.el.hidden = false;
+  }
+
+  /** Open straight at the auto-label rules (hamburger menu entry). */
+  openRules(onChanged: () => void): void {
+    this.open(onChanged);
+    requestAnimationFrame(() => {
+      this.el
+        .querySelector(".labels-rules")
+        ?.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  private renderRules(): void {
+    const rules = loadLabelRules();
+    this.ruleLabelSel.innerHTML = "";
+    for (const d of this.defs) {
+      const opt = document.createElement("option");
+      opt.value = d.name;
+      opt.textContent = d.name;
+      this.ruleLabelSel.appendChild(opt);
+    }
+    this.rulesListEl.innerHTML = "";
+    if (rules.length === 0) {
+      const p = document.createElement("p");
+      p.className = "labels-rules-empty";
+      p.textContent = "No rules yet.";
+      this.rulesListEl.appendChild(p);
+      return;
+    }
+    rules.forEach((rule, idx) => {
+      const row = document.createElement("div");
+      row.className = "labels-rule-row";
+      const text = document.createElement("span");
+      text.className = "labels-rule-text";
+      const exts = rule.extensions.map((e) => `.${e}`).join(" ");
+      text.textContent = rule.min_duration_secs
+        ? `${rule.label} ← ${exts} · longer than ${Math.round(rule.min_duration_secs / 60)} min`
+        : `${rule.label} ← ${exts}`;
+      const del = document.createElement("button");
+      del.textContent = "✕";
+      del.className = "labels-del";
+      del.title = "Delete this rule";
+      del.addEventListener("click", () => {
+        const next = loadLabelRules();
+        next.splice(idx, 1);
+        saveLabelRules(next);
+        this.renderRules();
+      });
+      row.append(text, del);
+      this.rulesListEl.appendChild(row);
+    });
+  }
+
+  private addRuleFromInputs(): void {
+    const extsEl = this.el.querySelector(
+      ".labels-rule-exts",
+    ) as HTMLInputElement;
+    const minsEl = this.el.querySelector(
+      ".labels-rule-mins",
+    ) as HTMLInputElement;
+    const extensions = extsEl.value
+      .split(/[\s,]+/)
+      .map((e) => e.trim().replace(/^\./, "").toLowerCase())
+      .filter(Boolean);
+    const label = this.ruleLabelSel.value;
+    if (!label || extensions.length === 0) {
+      this.rulesStatus.textContent = "Pick a label and at least one extension.";
+      return;
+    }
+    const mins = Number(minsEl.value);
+    const rules = loadLabelRules();
+    rules.push({
+      label,
+      extensions,
+      min_duration_secs: mins > 0 ? mins * 60 : null,
+    });
+    saveLabelRules(rules);
+    extsEl.value = "";
+    minsEl.value = "";
+    this.rulesStatus.textContent = "";
+    this.renderRules();
+  }
+
+  private async applyRules(): Promise<void> {
+    const rules = loadLabelRules();
+    if (rules.length === 0) {
+      this.rulesStatus.textContent = "No rules yet — add one above.";
+      return;
+    }
+    this.applyBtn.disabled = true;
+    try {
+      let totalAdded = 0;
+      for (let pass = 0; pass < 40; pass++) {
+        const outcomes = await api.applyLabelRules(rules);
+        let remaining = 0;
+        for (const o of outcomes) {
+          remaining += o.remaining;
+          totalAdded += o.added;
+        }
+        this.rulesStatus.textContent =
+          remaining > 0
+            ? `Reading media durations… (${totalAdded} labeled so far)`
+            : `Done — ${totalAdded} file${totalAdded === 1 ? "" : "s"} labeled.`;
+        if (remaining === 0) break;
+      }
+      if (this.onChanged) this.onChanged();
+    } catch (err) {
+      this.rulesStatus.textContent = `Apply failed: ${err}`;
+    } finally {
+      this.applyBtn.disabled = false;
+    }
   }
 
   private render(): void {

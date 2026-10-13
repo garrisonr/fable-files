@@ -12,6 +12,8 @@ export interface SearchHooks {
   onPreviewItem(item: Item): void;
   /** Trash the selected hits (shell owns the batch + toast + undo). */
   onTrashItems?(items: Item[]): void;
+  /** Right-click on a hit: the shell shows the full item menu. */
+  onContextMenu?(item: Item, targets: Item[], x: number, y: number): void;
   /** Results are showing: the shell should hide the file view. */
   onResults(): void;
   onClear(): void;
@@ -44,6 +46,11 @@ export class SearchView {
   private hits: SearchHit[] = [];
   private selected = new Set<string>();
   private anchor = -1;
+  /** Delete/Backspace trash the selection ONLY when the user's last
+   * interaction was with a result (click/arrow), never while they are
+   * editing the query — focus alone is unreliable in WebKitGTK, so
+   * this is tracked explicitly. */
+  private deleteArmed = false;
   active = false;
 
   constructor(private hooks: SearchHooks) {
@@ -107,6 +114,11 @@ export class SearchView {
         this.input.blur();
       }
     });
+    this.input.addEventListener("focus", () => {
+      // Typing in the query box disarms result deletion: Backspace
+      // goes back to editing text until a result is clicked again.
+      this.deleteArmed = false;
+    });
     this.fieldEl.appendChild(this.input);
     // Clicking anywhere on the pill focuses the input.
     this.fieldEl.addEventListener("mousedown", (e) => {
@@ -159,7 +171,9 @@ export class SearchView {
    */
   tryTrashSelection(): boolean {
     const items = this.selectedItems();
-    if (items.length === 0 || !this.hooks.onTrashItems) return false;
+    if (!this.deleteArmed || items.length === 0 || !this.hooks.onTrashItems)
+      return false;
+    this.deleteArmed = false;
     this.selected.clear();
     this.applySelection();
     this.hooks.onTrashItems(items);
@@ -190,6 +204,7 @@ export class SearchView {
       this.selected.add(key);
       this.anchor = index;
     }
+    this.deleteArmed = true;
     this.applySelection();
   }
 
@@ -218,6 +233,7 @@ export class SearchView {
       if (hit) {
         this.selected.add(SearchView.keyOf(hit.item));
         this.anchor = Number(row.dataset.index ?? "0");
+        this.deleteArmed = true;
       }
       this.applySelection();
     }
@@ -265,6 +281,70 @@ export class SearchView {
     }
   }
 
+  /** Evaluate a rule smart folder (extensions + optional minimum
+   * duration), looping while the backend is still probing durations. */
+  async runRule(
+    name: string,
+    rule: { extensions: string[]; minDurationSecs?: number | null },
+  ): Promise<void> {
+    this.active = true;
+    this.el.hidden = false;
+    this.hooks.onResults();
+    this.renderStatus(`Gathering “${name}”…`);
+    try {
+      let items: Item[] = [];
+      for (let pass = 0; pass < 40; pass++) {
+        const res = await api.ruleItems(
+          rule.extensions,
+          rule.minDurationSecs ?? null,
+          1000,
+          250,
+        );
+        items = res.items;
+        if (res.remaining === 0) break;
+        this.renderStatus(
+          `Reading media durations for “${name}”… (${items.length} so far)`,
+        );
+      }
+      this.renderItems(name, items);
+    } catch {
+      this.renderStatus(`Could not gather “${name}”. Please try again.`);
+    }
+  }
+
+  private renderStatus(text: string): void {
+    this.resultsEl.innerHTML = "";
+    const p = document.createElement("p");
+    p.className = "search-status";
+    p.textContent = text;
+    this.resultsEl.appendChild(p);
+  }
+
+  /** Render a fixed item list (rule folders) with the results grammar. */
+  private renderItems(heading: string, items: Item[]): void {
+    this.hits = items.map((item) => ({ item, rank: 0 }));
+    this.selected.clear();
+    this.anchor = -1;
+    this.deleteArmed = false;
+    this.resultsEl.innerHTML = "";
+    const head = document.createElement("p");
+    head.className = "search-status";
+    head.textContent = `${items.length} item${items.length === 1 ? "" : "s"} in “${heading}”${items.length >= 1000 ? " (first 1000)" : ""}.`;
+    this.resultsEl.appendChild(head);
+    const hint = document.createElement("p");
+    hint.className = "search-hint";
+    hint.textContent =
+      "Click selects · Enter opens · Space previews · Backspace / Delete moves to Trash";
+    this.resultsEl.appendChild(hint);
+    const list = document.createElement("div");
+    list.className = "search-results";
+    list.setAttribute("role", "listbox");
+    this.hits.forEach((hit, i) => {
+      list.appendChild(this.buildHitRow(hit, i, false));
+    });
+    this.resultsEl.appendChild(list);
+  }
+
   private renderLoading(q: string): void {
     this.resultsEl.innerHTML = "";
     const p = document.createElement("p");
@@ -309,6 +389,16 @@ export class SearchView {
     list.className = "search-results";
     list.setAttribute("role", "listbox");
     hits.forEach((hit, i) => {
+      list.appendChild(this.buildHitRow(hit, i, true));
+    });
+    this.resultsEl.appendChild(list);
+  }
+
+  private buildHitRow(
+    hit: SearchHit,
+    i: number,
+    showRank: boolean,
+  ): HTMLButtonElement {
       const row = document.createElement("button");
       row.className = "search-hit";
       row.setAttribute("role", "option");
@@ -324,14 +414,33 @@ export class SearchView {
 
       const meta = document.createElement("span");
       meta.className = "hit-meta";
-      meta.textContent = `rank ${hit.rank.toFixed(2)} · ${
-        hit.item.kind === "folder" ? "Folder" : formatBytes(hit.item.size_bytes)
-      }`;
+      meta.textContent = showRank
+        ? `rank ${hit.rank.toFixed(2)} · ${hit.item.kind === "folder" ? "Folder" : formatBytes(hit.item.size_bytes)}`
+        : hit.item.kind === "folder"
+          ? "Folder"
+          : formatBytes(hit.item.size_bytes);
 
       row.append(name, path, meta);
       row.addEventListener("click", (e) => {
         this.selectHit(i, e);
         row.focus();
+      });
+      row.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        if (!this.selected.has(SearchView.keyOf(hit.item))) {
+          this.selected.clear();
+          this.selected.add(SearchView.keyOf(hit.item));
+          this.anchor = i;
+          this.applySelection();
+        }
+        this.deleteArmed = true;
+        row.focus();
+        this.hooks.onContextMenu?.(
+          hit.item,
+          this.selectedItems(),
+          e.clientX,
+          e.clientY,
+        );
       });
       row.addEventListener("dblclick", () => this.activate(hit.item));
       row.addEventListener("keydown", (e) => {
@@ -345,8 +454,6 @@ export class SearchView {
           this.focusHit(i + (e.key === "ArrowDown" ? 1 : -1));
         }
       });
-      list.appendChild(row);
-    });
-    this.resultsEl.appendChild(list);
-  }
+      return row;
+    }
 }

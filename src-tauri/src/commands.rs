@@ -2705,6 +2705,205 @@ pub async fn list_items_by_label(
 }
 
 
+// ---------------------------------------------------------------------------
+// Extension/duration rules (auto-labels + rule smart folders) and the
+// loopback media URL. Durations are probed lazily with ffprobe and
+// cached in the catalog; probe budgets keep every call short and the
+// frontend loops while `remaining` > 0 (resume-able by construction).
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct LabelRule {
+    pub label: String,
+    pub extensions: Vec<String>,
+    pub min_duration_secs: Option<f64>,
+}
+
+#[derive(serde::Serialize)]
+pub struct RuleItemsResult {
+    pub items: Vec<Item>,
+    pub probed: u32,
+    pub remaining: u32,
+}
+
+#[derive(serde::Serialize)]
+pub struct RuleOutcome {
+    pub label: String,
+    pub matched: u32,
+    pub added: u32,
+    pub remaining: u32,
+}
+
+const MEDIA_EXTS: &[&str] = &[
+    "mp4", "mkv", "avi", "mov", "m4v", "webm", "mpg", "mpeg", "wmv", "ts", "m2ts",
+    "mp3", "aac", "flac", "ogg", "oga", "opus", "wav", "m4a", "m4b", "aif", "aiff", "wma",
+];
+
+/// (ffprobe ran, duration if readable)
+fn probe_duration(path: &std::path::Path) -> (bool, Option<f64>) {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
+        ])
+        .arg(path)
+        .output();
+    match out {
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            (true, text.trim().parse::<f64>().ok().filter(|d| *d > 0.0))
+        }
+        Err(_) => (false, None),
+    }
+}
+
+fn eval_rule(
+    catalog: &ufm_catalog::Catalog,
+    exts: &[String],
+    min_duration_secs: Option<f64>,
+    probe_budget: u32,
+) -> std::result::Result<(Vec<Item>, u32, u32), CommandError> {
+    let candidates = catalog
+        .rule_candidates(exts)
+        .map_err(CommandError::from)?;
+    let mut probed = 0u32;
+    let mut remaining = 0u32;
+    let mut matched = Vec::new();
+    for (item, dur) in candidates {
+        let Some(pk) = item.provider_key.clone() else {
+            continue;
+        };
+        let mut d = dur;
+        if d.is_none() && min_duration_secs.is_some() {
+            let ext = pk.rsplit('.').next().unwrap_or("").to_lowercase();
+            if MEDIA_EXTS.contains(&ext.as_str()) {
+                if probed < probe_budget {
+                    probed += 1;
+                    let (ran, secs) = probe_duration(std::path::Path::new(&pk));
+                    if ran {
+                        let _ = catalog.set_duration(&pk, secs.unwrap_or(0.0));
+                        d = secs;
+                    } else {
+                        remaining += 1;
+                    }
+                } else {
+                    remaining += 1;
+                }
+            }
+        }
+        let keep = match min_duration_secs {
+            None => true,
+            Some(min) => d.map(|x| x > min).unwrap_or(false),
+        };
+        if keep {
+            matched.push(item);
+        }
+    }
+    Ok((matched, probed, remaining))
+}
+
+/// Re-anchor catalog items to session ids, exactly like
+/// list_items_by_label does, so views can act on them.
+fn remap_session_items(state: &AppState, items: Vec<Item>) -> Vec<Item> {
+    let mut path_ids = state.path_ids.lock().unwrap();
+    let mut item_paths = state.item_paths.lock().unwrap();
+    let mut item_locations = state.item_locations.lock().unwrap();
+    let mut out = Vec::new();
+    for mut item in items {
+        if let Some(pk) = item.provider_key.clone() {
+            let id = *path_ids
+                .entry(std::path::PathBuf::from(&pk))
+                .or_insert(item.id);
+            item.id = id;
+            item_paths.insert(id, std::path::PathBuf::from(&pk));
+            item_locations.insert(id, item.location);
+        }
+        out.push(item);
+    }
+    out
+}
+
+#[tauri::command]
+pub async fn rule_items(
+    state: State<'_, AppState>,
+    extensions: Vec<String>,
+    min_duration_secs: Option<f64>,
+    limit: Option<u32>,
+    probe_budget: Option<u32>,
+) -> Cmd<RuleItemsResult> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let (mut items, probed, remaining) = eval_rule(
+        &catalog,
+        &extensions,
+        min_duration_secs,
+        probe_budget.unwrap_or(250),
+    )?;
+    items.truncate(limit.unwrap_or(1000) as usize);
+    let items = remap_session_items(state.inner(), items);
+    Ok(RuleItemsResult {
+        items,
+        probed,
+        remaining,
+    })
+}
+
+#[tauri::command]
+pub async fn apply_label_rules(
+    state: State<'_, AppState>,
+    rules: Vec<LabelRule>,
+) -> Cmd<Vec<RuleOutcome>> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let mut outcomes = Vec::new();
+    for rule in &rules {
+        let (items, _probed, remaining) = eval_rule(
+            &catalog,
+            &rule.extensions,
+            rule.min_duration_secs,
+            250,
+        )?;
+        let mut added = 0u32;
+        for item in &items {
+            if let Some(pk) = &item.provider_key {
+                if catalog
+                    .tag_path_counted(pk, &rule.label)
+                    .map_err(CommandError::from)?
+                {
+                    added += 1;
+                }
+            }
+        }
+        outcomes.push(RuleOutcome {
+            label: rule.label.clone(),
+            matched: items.len() as u32,
+            added,
+            remaining,
+        });
+    }
+    Ok(outcomes)
+}
+
+/// Register a local file with the built-in media server and return a
+/// loopback URL. WebKit's media stack handles plain HTTP + Range
+/// natively; the Tauri asset protocol is where video goes to die
+/// (proven 2026-10-13: file:// and gst play everything, the asset
+/// protocol plays nothing), so previews stream from here instead.
+#[tauri::command]
+pub async fn media_url_for_path(
+    state: State<'_, AppState>,
+    path: String,
+) -> Cmd<String> {
+    let port = media_server_port(state.inner())
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    let token = format!("{}", ItemId::new());
+    state
+        .media_files
+        .lock()
+        .unwrap()
+        .insert(token.clone(), std::path::PathBuf::from(&path));
+    Ok(format!("http://127.0.0.1:{port}/cast/{token}"))
+}
+
 /// Register a runtime location rooted at an absolute path (cloud
 /// mounts, server mounts). Session-scoped: callers re-register on
 /// boot. Not inserted into the catalog — network roots are browsed,

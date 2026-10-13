@@ -153,6 +153,39 @@ export function fileSrc(path: string): string {
   return convertFileSrc(path);
 }
 
+export interface LabelRule {
+  label: string;
+  extensions: string[];
+  min_duration_secs: number | null;
+}
+
+export interface RuleItemsResult {
+  items: Item[];
+  probed: number;
+  remaining: number;
+}
+
+export interface RuleOutcome {
+  label: string;
+  matched: number;
+  added: number;
+  remaining: number;
+}
+
+/**
+ * Media playback URL: the app's loopback media server (HTTP Range).
+ * WebKit's media stack plays plain HTTP reliably; the asset protocol
+ * fails on real-world video (proven 2026-10-13). Falls back to the
+ * asset protocol if the server cannot start.
+ */
+export async function mediaSrc(path: string): Promise<string> {
+  try {
+    return await api.mediaUrlForPath(path);
+  } catch {
+    return fileSrc(path);
+  }
+}
+
 /** Subscribe to pop-out player windows closing. Returns an unlisten fn. */
 export async function onPlayerClosed(
   cb: (path: string) => void,
@@ -212,6 +245,22 @@ export const api = {
     invoke<void>("delete_path_label", { label }),
   listItemsByLabel: (label: string) =>
     invoke<Item[]>("list_items_by_label", { label }),
+  mediaUrlForPath: (path: string) =>
+    invoke<string>("media_url_for_path", { path }),
+  ruleItems: (
+    extensions: string[],
+    minDurationSecs: number | null,
+    limit?: number,
+    probeBudget?: number,
+  ) =>
+    invoke<RuleItemsResult>("rule_items", {
+      extensions,
+      minDurationSecs,
+      limit,
+      probeBudget,
+    }),
+  applyLabelRules: (rules: LabelRule[]) =>
+    invoke<RuleOutcome[]>("apply_label_rules", { rules }),
   addPathLocation: (name: string, path: string) =>
     invoke<LocationSummary>("add_path_location", { name, path }),
   removePathLocation: (location: string) =>
