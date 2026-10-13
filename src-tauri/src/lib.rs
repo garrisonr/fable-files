@@ -329,6 +329,7 @@ pub fn run() {
             commands::set_executable,
             commands::preview_text,
             commands::get_item_path,
+            commands::get_recent_files,
             commands::trash_path,
             commands::empty_trash,
             commands::secure_empty_trash,

@@ -711,7 +711,14 @@ pub async fn preview_text(
             // Lossy conversion handles non-UTF8 gracefully
             let l = line.map(|s| s).unwrap_or_else(|_| "<binary data>".to_string());
             // Truncate very long lines
-            lines.push(if l.len() > 500 { format!("{}...", &l[..500]) } else { l });
+            // Character-safe truncation (avoid panic on UTF-8 boundary)
+            let truncated_line = if l.chars().count() > 500 {
+                let safe: String = l.chars().take(500).collect();
+                format!("{}...", safe)
+            } else {
+                l
+            };
+            lines.push(truncated_line);
         }
         Ok::<PreviewTextResult, String>(PreviewTextResult { lines, truncated })
     })
@@ -1148,6 +1155,92 @@ pub async fn get_item_path(
         .cloned()
         .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
     Ok(path.to_string_lossy().to_string())
+}
+
+
+/// Get recently used files from ~/.local/share/recently-used.xbel
+#[tauri::command]
+pub async fn get_recent_files(limit: Option<u32>) -> Cmd<Vec<RecentFile>> {
+    let limit = limit.unwrap_or(50).min(200) as usize;
+    tauri::async_runtime::spawn_blocking(move || {
+        let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+        let xbel_path = format!("{home}/.local/share/recently-used.xbel");
+        let content = std::fs::read_to_string(&xbel_path).map_err(|e| e.to_string())?;
+
+        let mut files = Vec::new();
+        // Simple XML parsing: extract href and modified attributes from bookmark tags
+        for line in content.lines() {
+            let line = line.trim();
+            if !line.starts_with("<bookmark href=") {
+                continue;
+            }
+            // Extract href="file:///path"
+            let href = extract_attr(line, "href");
+            let modified = extract_attr(line, "modified");
+            if let Some(href) = href {
+                if let Some(path_str) = href.strip_prefix("file://") {
+                    // URL decode the path
+                    let decoded = url_decode(path_str);
+                    let path = std::path::Path::new(&decoded);
+                    // Only include files that still exist
+                    if path.exists() {
+                        let name = path.file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        files.push(RecentFile {
+                            path: decoded,
+                            name,
+                            modified: modified.unwrap_or_default(),
+                        });
+                        if files.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        Ok::<Vec<RecentFile>, String>(files)
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("recent task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RecentFile {
+    pub path: String,
+    pub name: String,
+    pub modified: String,
+}
+
+fn extract_attr(line: &str, attr: &str) -> Option<String> {
+    let pattern = format!("{attr}=\"");
+    let start = line.find(&pattern)? + pattern.len();
+    let end = line[start..].find('"')? + start;
+    Some(line[start..end].to_string())
+}
+
+fn url_decode(s: &str) -> String {
+    // Simple URL decode for file paths (%20 -> space, etc.)
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let h1 = chars.next().unwrap_or('0');
+            let h2 = chars.next().unwrap_or('0');
+            if let Ok(byte) = u8::from_str_radix(&format!("{h1}{h2}"), 16) {
+                out.push(byte as char);
+            } else {
+                out.push('%');
+                out.push(h1);
+                out.push(h2);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
