@@ -9,6 +9,7 @@
  * office work, IT/homelab, his film archive, media and gaming.
  */
 import { api } from "./api";
+import { Toast, confirmDialog } from "./toast";
 
 export interface LabelDef {
   name: string;
@@ -259,18 +260,22 @@ export class LabelManager {
         </div>
         <div class="labels-rules">
           <h4 class="labels-rules-title">Auto-label rules</h4>
-          <p class="labels-rules-blurb">Files matching a rule get its label when you apply. Duration rules read media lengths once and remember them.</p>
+          <p class="labels-rules-blurb">When you press \u201cApply rules now\u201d, every indexed file whose name ends in one of a rule\u2019s extensions gets that rule\u2019s label. The minutes box is optional: fill it in and only files LONGER than that match \u2014 that\u2019s how Film &amp; Video catches movies but skips short clips. Leave it blank to match files of any length. Lengths are read once and remembered.</p>
           <div class="labels-rules-list"></div>
           <div class="labels-rule-add">
             <select class="labels-rule-label" aria-label="Label"></select>
-            <input class="labels-rule-exts" type="text" placeholder="Extensions: jpg, png" />
-            <input class="labels-rule-mins" type="number" min="0" placeholder="Min min" title="Only files LONGER than this many minutes (optional)" />
+            <input class="labels-rule-exts" type="text" placeholder="File extensions \u2014 e.g. jpg, png" />
+            <span class="labels-rule-mins-wrap"><span class="labels-rule-mins-lab">Only if longer than</span><input class="labels-rule-mins" type="number" min="0" placeholder="min" /><span class="labels-rule-mins-lab">minutes (optional)</span></span>
             <button class="labels-rule-add-btn">Add rule</button>
           </div>
           <div class="labels-rules-actions">
             <button class="labels-apply-rules primary">Apply rules now</button>
             <span class="labels-rules-status" role="status"></span>
           </div>
+        </div>
+        <div class="labels-danger-row">
+          <button class="labels-delete-all">Delete All Labels\u2026</button>
+          <span class="labels-danger-hint">Removes every label and every file\u2019s assignments. Irreversible.</span>
         </div>
         <div class="picker-actions">
           <button class="labels-done primary">Done</button>
@@ -291,9 +296,41 @@ export class LabelManager {
     this.el
       .querySelector(".labels-rule-add-btn")!
       .addEventListener("click", () => this.addRuleFromInputs());
+    this.el
+      .querySelector(".labels-delete-all")!
+      .addEventListener("click", () => void this.deleteAllLabels());
     this.el.addEventListener("pointerdown", (e) => {
       if (e.target === this.el) this.close();
     });
+  }
+
+  /** Delete every label + its file assignments (irreversible). */
+  private async deleteAllLabels(): Promise<void> {
+    if (!this.defs.length) {
+      Toast.info("No labels to delete.");
+      return;
+    }
+    const ok = await confirmDialog(
+      "Delete ALL labels?",
+      `${this.defs.length} labels will be removed, and every file loses its label assignments. This is irreversible.`,
+      "Delete All Labels",
+      true,
+    );
+    if (!ok) return;
+    for (const d of [...this.defs]) {
+      try {
+        await api.deletePathLabel(d.name);
+      } catch {
+        /* keep going */
+      }
+    }
+    this.defs = [];
+    saveLabelDefs([]);
+    saveLabelRules([]);
+    this.render();
+    this.renderRules();
+    Toast.success("All labels deleted.", 6000);
+    this.onChanged?.();
   }
 
   get element(): HTMLElement {

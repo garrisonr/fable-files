@@ -34,9 +34,9 @@ export class Toast {
     }, duration);
   }
 
-  static success(msg: string): void { this.show(msg, 'success'); }
-  static error(msg: string): void { this.show(msg, 'error'); }
-  static info(msg: string): void { this.show(msg, 'info'); }
+  static success(msg: string, duration?: number): void { this.show(msg, 'success', duration); }
+  static error(msg: string, duration?: number): void { this.show(msg, 'error', duration); }
+  static info(msg: string, duration?: number): void { this.show(msg, 'info', duration); }
 }
 
 /**

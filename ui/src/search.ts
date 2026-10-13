@@ -6,9 +6,14 @@
  * the item itself, which is the honest subset for this milestone.
  */
 import { api, formatBytes, type Item, type SearchHit } from "./api";
+import { ContextMenu } from "./contextmenu";
 
 export interface SearchHooks {
   onNavigateToItem(item: Item): void;
+  /** Absolute path of the folder the file view shows (folder scope). */
+  currentDirPath(): string | null | Promise<string | null>;
+  /** Locations for the scope picker (null id = everywhere). */
+  scopes(): Array<{ id: string | null; name: string }>;
   onPreviewItem(item: Item): void;
   /** Trash the selected hits (shell owns the batch + toast + undo). */
   onTrashItems?(items: Item[]): void;
@@ -41,6 +46,15 @@ export class SearchView {
   private resultsEl: HTMLElement;
   private chipsEl: HTMLElement;
   private typeFilter: string | null = null;
+  /** Scope: "all" | "folder" | a location id. Plus modified-date range. */
+  private scopeChoice = "all";
+  private afterDate = "";
+  private beforeDate = "";
+  private filtersEl!: HTMLDivElement;
+  private scopeBtn!: HTMLButtonElement;
+  private afterInput!: HTMLInputElement;
+  private beforeInput!: HTMLInputElement;
+  private scopeMenu = new ContextMenu();
   private timer = 0;
   private lastQuery = "";
   private hits: SearchHit[] = [];
@@ -89,6 +103,47 @@ export class SearchView {
       this.chipsEl.appendChild(save);
     }
     this.el.appendChild(this.chipsEl);
+
+    // Scope + date filters (Round 5.6): where to search, and a
+    // modified-date range. Plain language, always visible.
+    this.filtersEl = document.createElement("div");
+    this.filtersEl.className = "search-filters";
+    const scopeWrap = document.createElement("span");
+    scopeWrap.className = "search-filter-field";
+    const scopeLab = document.createElement("span");
+    scopeLab.className = "search-filter-label";
+    scopeLab.textContent = "Search in:";
+    this.scopeBtn = document.createElement("button");
+    this.scopeBtn.className = "dropdown-btn search-scope-btn";
+    this.scopeBtn.textContent = "Everywhere \u25be";
+    this.scopeBtn.addEventListener("click", () => this.openScopeMenu());
+    scopeWrap.append(scopeLab, this.scopeBtn);
+    const afterWrap = document.createElement("label");
+    afterWrap.className = "search-filter-field";
+    afterWrap.textContent = "Modified after";
+    this.afterInput = document.createElement("input");
+    this.afterInput.type = "date";
+    this.afterInput.className = "search-date";
+    this.afterInput.addEventListener("change", () => {
+      this.afterDate = this.afterInput.value;
+      this.lastQuery = "\u0000force";
+      void this.run();
+    });
+    afterWrap.appendChild(this.afterInput);
+    const beforeWrap = document.createElement("label");
+    beforeWrap.className = "search-filter-field";
+    beforeWrap.textContent = "Modified before";
+    this.beforeInput = document.createElement("input");
+    this.beforeInput.type = "date";
+    this.beforeInput.className = "search-date";
+    this.beforeInput.addEventListener("change", () => {
+      this.beforeDate = this.beforeInput.value;
+      this.lastQuery = "\u0000force";
+      void this.run();
+    });
+    beforeWrap.appendChild(this.beforeInput);
+    this.filtersEl.append(scopeWrap, afterWrap, beforeWrap);
+    this.el.appendChild(this.filtersEl);
 
     this.resultsEl = document.createElement("div");
     this.resultsEl.className = "search-results-wrap";
@@ -248,6 +303,16 @@ export class SearchView {
     window.clearTimeout(this.timer);
     this.input.value = "";
     this.lastQuery = "";
+    this.typeFilter = null;
+    this.chipsEl.querySelectorAll(".search-chip").forEach((c) =>
+      c.classList.toggle("active", (c as HTMLElement).dataset.filter === ""),
+    );
+    this.scopeChoice = "all";
+    this.scopeBtn.textContent = "Everywhere \u25be";
+    this.afterDate = "";
+    this.beforeDate = "";
+    this.afterInput.value = "";
+    this.beforeInput.value = "";
     this.active = false;
     this.el.hidden = true;
     this.resultsEl.innerHTML = "";
@@ -272,7 +337,8 @@ export class SearchView {
     this.hooks.onResults();
     this.renderLoading(q);
     try {
-      const hits = await api.search(q, null, 50, this.typeFilter);
+      const fa = await this.filterArgs();
+      const hits = await api.search(q, fa.scope, 50, this.typeFilter, fa);
       if (this.lastQuery !== q) return; // superseded
       this.renderResults(q, hits);
     } catch {
@@ -310,6 +376,52 @@ export class SearchView {
     } catch {
       this.renderStatus(`Could not gather “${name}”. Please try again.`);
     }
+  }
+
+  private openScopeMenu(): void {
+    const rect = this.scopeBtn.getBoundingClientRect();
+    const options: Array<{ id: string; name: string }> = [
+      { id: "all", name: "Everywhere" },
+      { id: "folder", name: "Current folder" },
+      ...this.hooks.scopes().map((s) => ({ id: s.id ?? "all", name: s.name })),
+    ];
+    const seen = new Set<string>();
+    this.scopeMenu.open(
+      rect.left,
+      rect.bottom + 6,
+      options
+        .filter((o) => (seen.has(o.id) ? false : (seen.add(o.id), true)))
+        .map((o) => ({
+          label: (this.scopeChoice === o.id ? "\u2713 " : "   ") + o.name,
+          action: () => {
+            this.scopeChoice = o.id;
+            this.scopeBtn.textContent = o.name + " \u25be";
+            this.lastQuery = "\u0000force";
+            void this.run();
+          },
+        })),
+    );
+  }
+
+  /** Backend filter args for the current scope/date state. */
+  private async filterArgs(): Promise<{
+    scope: string | null;
+    pathPrefix: string | null;
+    modifiedAfter: string | null;
+    modifiedBefore: string | null;
+  }> {
+    return {
+      scope:
+        this.scopeChoice === "all" || this.scopeChoice === "folder"
+          ? null
+          : this.scopeChoice,
+      pathPrefix:
+        this.scopeChoice === "folder"
+          ? await this.hooks.currentDirPath()
+          : null,
+      modifiedAfter: this.afterDate || null,
+      modifiedBefore: this.beforeDate || null,
+    };
   }
 
   private renderStatus(text: string): void {
@@ -421,8 +533,9 @@ export class SearchView {
           : formatBytes(hit.item.size_bytes);
 
       row.append(name, path, meta);
-      row.addEventListener("click", (e) => {
-        this.selectHit(i, e);
+      row.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
+      this.selectHit(i, e);
         row.focus();
       });
       row.addEventListener("contextmenu", (e) => {

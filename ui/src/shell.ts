@@ -21,10 +21,11 @@ import { QuickLook } from "./quicklook";
 import { ContextMenu } from "./contextmenu";
 import { Toast, confirmDialog, promptDialog } from "./toast";
 import { SearchView } from "./search";
+import { MediaRenameDialog } from "./mediarename";
 import { PropertiesDialog } from "./properties";
 import { FolderPicker, type PickerShortcut } from "./picker";
 import { RenameDialog } from "./rename";
-import { LabelManager } from "./labels";
+import { LabelManager, saveLabelRules } from "./labels";
 import { loadLabelDefs, migrateLabelAssignments, saveLabelDefs } from "./labels";
 import { OpenWithDialog } from "./openwith";
 import type { ArchiveEntry } from "./api";
@@ -120,6 +121,7 @@ export class Shell {
   private renameDialog = new RenameDialog();
   private labelManager = new LabelManager();
   private searchOpenWith = new OpenWithDialog();
+  private mediaRename = new MediaRenameDialog();
   private labelList!: HTMLElement;
   private smartList!: HTMLElement;
   /** Archive browsing state: archive item id -> its catalog Item and
@@ -145,7 +147,12 @@ export class Shell {
     this.el.id = "app";
     this.buildChrome();
 
-    const viewHooks: FileViewHooks = {
+      const viewHooks: FileViewHooks = {
+      onMediaRename: (items: Item[]) =>
+        this.mediaRename.open(items, () => {
+          this.refreshActiveDir();
+          if (this.searchView.active) this.searchView.refresh();
+        }),
       onOpen: (item) => this.openItem(item),
       onSelect: (item) => this.onSelect(item),
       onTogglePreview: () => this.togglePreview(),
@@ -209,7 +216,7 @@ export class Shell {
         void api
           .makeAlias(item.id)
           .then((p) => {
-            Toast.success(`Created alias ${p.split("/").pop()}`);
+            Toast.success(`Created alias ${p.split("/").pop()}`, 9000);
             const t = this.activeTab;
             if (t) void this.loadDir(t);
           })
@@ -350,6 +357,9 @@ export class Shell {
     });
     this.splitDialog.onDone = () => this.refreshActiveDir();
     this.searchView = new SearchView({
+      currentDirPath: () => this.currentDirPath(),
+      scopes: () =>
+        this.locations.map((l) => ({ id: l.id as string | null, name: l.display_name })),
       onNavigateToItem: (item) => {
         this.searchView.clear(); // back to the file view before navigating
         this.openItem(item);
@@ -731,6 +741,7 @@ export class Shell {
   }
 
   private navigateTo(dir: { locationId: string; dirId: string; crumbs: { dirId: string; name: string }[] }): void {
+    if (this.searchView.active) this.searchView.clear();
     const tab = this.requireTab();
     this.quickLook.close();
     navigate(tab, dir);
@@ -1152,6 +1163,7 @@ export class Shell {
   }
 
   private openLabel(name: string): void {
+    if (this.searchView.active) this.searchView.clear();
     const dirId = `label:${name}`;
     this.navigateTo({
       locationId: "",
@@ -1221,6 +1233,15 @@ export class Shell {
       try { localStorage.setItem("ff-smart-v55", "1"); } catch { /* ignore */ }
       Shell.saveSmartFolders(list);
     }
+    try {
+      if (!localStorage.getItem("ff-smart-v56")) {
+        if (!list.some((f) => f.name === "Spreadsheets")) {
+          list.push({ name: "Spreadsheets", query: "", type: null, rule: { extensions: ["csv", "tsv", "xls", "xlsx", "ods", "numbers"] } });
+          Shell.saveSmartFolders(list);
+        }
+        localStorage.setItem("ff-smart-v56", "1");
+      }
+    } catch { /* ignore */ }
     return list;
   }
 
@@ -1823,6 +1844,12 @@ export class Shell {
               })();
             },
           },
+          { separator: true, label: "", action: () => {} },
+          {
+            label: "Delete All Labels\u2026",
+            danger: true,
+            action: () => void this.deleteAllLabels(),
+          },
         ]);
       });
       this.labelList.appendChild(b);
@@ -1850,13 +1877,27 @@ export class Shell {
         e.stopPropagation();
         this.ctxMenu.open(e.clientX, e.clientY, [
           {
-            label: `Remove "${sf.name}"`,
+            label: `Manage "${sf.name}"\u2026`,
+            action: () => this.openSmartEditor(sf),
+          },
+          {
+            label: `Delete "${sf.name}"`,
             danger: true,
             action: () => {
-              Shell.saveSmartFolders(
-                Shell.loadSmartFolders().filter((f) => f !== sf),
-              );
-              void this.buildSidebar();
+              void (async () => {
+                const ok = await confirmDialog(
+                  `Delete "${sf.name}"?`,
+                  "The smart folder is removed from the sidebar. Your files are not touched.",
+                  "Delete",
+                  true,
+                );
+                if (!ok) return;
+                Shell.saveSmartFolders(
+                  Shell.loadSmartFolders().filter((f) => f !== sf),
+                );
+                void this.buildSidebar();
+                Toast.success(`Deleted smart folder "${sf.name}".`);
+              })();
             },
           },
         ]);
@@ -2123,50 +2164,47 @@ export class Shell {
         this.renderActiveView();
       },
     });
-    this.ctxMenu.open(rect.left - 140, rect.bottom + 6, [
+        this.ctxMenu.open(rect.left - 140, rect.bottom + 6, [
       viewItem("Grid view", "grid"),
       viewItem("List view", "list"),
       viewItem("Columns view", "columns"),
       viewItem("Gallery view", "gallery"),
+      { separator: true, label: "", action: () => {} },
       sortItem("Name", "name"),
       sortItem("Size", "size"),
       sortItem("Date", "modified"),
+      { separator: true, label: "", action: () => {} },
       { label: "Larger text", shortcut: "Ctrl +", action: () => this.setFontScale(this.fontScale + 0.1) },
-      { label: "Smaller text", shortcut: "Ctrl −", action: () => this.setFontScale(this.fontScale - 0.1) },
-      { label: "Terminal", shortcut: "Ctrl `", action: () => void this.toggleTerminal() },
-      { label: "Connect to Server…", action: () => void this.connectToServer() },
-      { label: "Disk Utility…", action: () => void this.diskDialog.open() },
-      { label: "Burn Studio…", action: () => this.burnStudio.open() },
-      { label: "Mount Cloud Drive…", action: () => void this.cloudMount.open() },
-      { label: "App Deleter…", action: () => void this.appDeleter.open(() => this.refreshActiveDir()) },
+      { label: "Smaller text", shortcut: "Ctrl \u2212", action: () => this.setFontScale(this.fontScale - 0.1) },
+      { separator: true, label: "", action: () => {} },
+      { label: "About Fable Files", action: () => this.aboutDialog.open() },
+      { label: "App Deleter\u2026", action: () => void this.appDeleter.open(() => this.refreshActiveDir()) },
       {
-        label: "Synchronize Folders…",
-        action: () => void this.openSyncHere(),
-      },
-      {
-        label: "Duplicate Finder…",
-        action: () => void this.openDupHere(),
-      },
-      {
-        label: "Manage Labels…",
-        action: () =>
-          this.labelManager.open(() => {
-            void this.buildSidebar();
-            this.refreshActiveDir();
-          }),
-      },
-      {
-        label: "Auto-Label Rules…",
+        label: "Auto-Label Rules\u2026",
         action: () =>
           this.labelManager.openRules(() => {
             void this.buildSidebar();
             this.refreshActiveDir();
           }),
       },
-      { label: "Theme…", action: () => this.themeManager.openMenu(this.menuBtn) },
-      { label: "About Fable Files", action: () => this.aboutDialog.open() },
+      { label: "Burn Studio\u2026", action: () => this.burnStudio.open() },
+      { label: "Connect to Server\u2026", action: () => void this.connectToServer() },
+      { label: "Disk Utility\u2026", action: () => void this.diskDialog.open() },
       {
-        label: "Report a Bug…",
+        label: "Duplicate Finder\u2026",
+        action: () => void this.openDupHere(),
+      },
+      {
+        label: "Manage Labels\u2026",
+        action: () =>
+          this.labelManager.open(() => {
+            void this.buildSidebar();
+            this.refreshActiveDir();
+          }),
+      },
+      { label: "Mount Cloud Drive\u2026", action: () => void this.cloudMount.open() },
+      {
+        label: "Report a Bug\u2026",
         action: () =>
           void api.openUrl(
             "https://github.com/garrisonr/fable-files/issues/new?title=" +
@@ -2175,7 +2213,7 @@ export class Shell {
           ),
       },
       {
-        label: "Request a Feature…",
+        label: "Request a Feature\u2026",
         action: () =>
           void api.openUrl(
             "https://github.com/garrisonr/fable-files/issues/new?title=" +
@@ -2183,7 +2221,173 @@ export class Shell {
               "&labels=enhancement"
           ),
       },
+      { label: "Restore Defaults\u2026", danger: true, action: () => void this.restoreDefaults() },
+      {
+        label: "Synchronize Folders\u2026",
+        action: () => void this.openSyncHere(),
+      },
+      { label: "Terminal", shortcut: "Ctrl `", action: () => void this.toggleTerminal() },
+      { label: "Theme\u2026", action: () => this.themeManager.openMenu(this.menuBtn) },
     ]);
+  }
+
+  /** Delete EVERY label + its file assignments (irreversible). */
+  private async deleteAllLabels(): Promise<void> {
+    const defs = loadLabelDefs();
+    if (!defs.length) {
+      Toast.info("No labels to delete.");
+      return;
+    }
+    const ok = await confirmDialog(
+      "Delete ALL labels?",
+      `${defs.length} labels will be removed, and every file loses its label assignments. This is irreversible.`,
+      "Delete All Labels",
+      true,
+    );
+    if (!ok) return;
+    for (const d of defs) {
+      try {
+        await api.deletePathLabel(d.name);
+      } catch {
+        /* keep going: partial is still progress */
+      }
+    }
+    saveLabelDefs([]);
+    saveLabelRules([]);
+    void this.buildSidebar();
+    this.refreshActiveDir();
+    Toast.success("All labels deleted.", 6000);
+  }
+
+  /** Factory reset of app settings (never touches files). */
+  private async restoreDefaults(): Promise<void> {
+    const ok = await confirmDialog(
+      "Restore defaults?",
+      "This resets Fable Files to factory defaults:\n\n" +
+        "\u2022 Theme, text size and view settings\n" +
+        "\u2022 Sidebar labels and auto-label rules (label names are removed; files keep their catalog data)\n" +
+        "\u2022 Smart folders (the starter set comes back)\n" +
+        "\u2022 Saved sync jobs \u2014 their scheduled timers are stopped\n\n" +
+        "Your files are never touched. This can\u2019t be undone.",
+      "Restore Defaults",
+      true,
+    );
+    if (!ok) return;
+    try {
+      const schedules = await api.listSyncSchedules();
+      for (const s of schedules) {
+        try {
+          await api.deleteSyncSchedule(s.id);
+        } catch {
+          /* timer may already be gone */
+        }
+      }
+    } catch {
+      /* schedules unavailable */
+    }
+    const keys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && (k.startsWith("ff-") || k.startsWith("fable"))) keys.push(k);
+    }
+    for (const k of keys) localStorage.removeItem(k);
+    Toast.success("Defaults restored \u2014 restarting\u2026", 2500);
+    setTimeout(() => location.reload(), 800);
+  }
+
+  /** Manage a smart folder: edit its name and what it gathers. */
+  private openSmartEditor(sf: SmartFolder): void {
+    const overlay = document.createElement("div");
+    overlay.className = "picker-overlay";
+    const isRule = !!sf.rule;
+    const typeOpts = [
+      ["", "All types"],
+      ["image", "Images"],
+      ["video", "Videos"],
+      ["audio", "Audio"],
+      ["document", "Documents"],
+      ["archive", "Archives"],
+    ]
+      .map(
+        ([v, l]) =>
+          `<option value="${v}"${(sf.type ?? "") === v ? " selected" : ""}>${l}</option>`,
+      )
+      .join("");
+    overlay.innerHTML = `
+      <div class="picker-card labels-card" role="dialog" aria-label="Manage smart folder">
+        <h3 class="picker-title">Smart Folder</h3>
+        <label class="smart-lab">Name
+          <input class="smart-in smart-name" type="text" />
+        </label>
+        ${
+          isRule
+            ? `<label class="smart-lab">File extensions it gathers (comma separated)
+                 <input class="smart-in smart-exts" type="text" placeholder="e.g. mkv, mp4" />
+               </label>
+               <label class="smart-lab">Only files longer than this many minutes (optional)
+                 <input class="smart-in smart-mins" type="number" min="0" placeholder="Leave blank to match any length" />
+               </label>
+               <p class="smart-hint">The minutes box is optional. Fill it in and only media LONGER than that matches \u2014 that\u2019s how Movies skips short clips.</p>`
+            : `<label class="smart-lab">Search text
+                 <input class="smart-in smart-q" type="text" />
+               </label>
+               <label class="smart-lab">File type
+                 <select class="smart-in smart-type">${typeOpts}</select>
+               </label>`
+        }
+        <div class="picker-actions">
+          <button class="smart-cancel">Cancel</button>
+          <button class="smart-save primary">Save</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const q = <T extends HTMLElement>(sel: string) =>
+      overlay.querySelector(sel) as T;
+    q<HTMLInputElement>(".smart-name").value = sf.name;
+    if (isRule) {
+      q<HTMLInputElement>(".smart-exts").value = (sf.rule!.extensions ?? []).join(", ");
+      const mins = sf.rule!.minDurationSecs;
+      q<HTMLInputElement>(".smart-mins").value = mins ? String(Math.round(mins / 60)) : "";
+    } else {
+      q<HTMLInputElement>(".smart-q").value = sf.query ?? "";
+    }
+    q<HTMLButtonElement>(".smart-cancel").addEventListener("click", () => overlay.remove());
+    overlay.addEventListener("pointerdown", (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+    q<HTMLButtonElement>(".smart-save").addEventListener("click", () => {
+      const name = q<HTMLInputElement>(".smart-name").value.trim();
+      if (!name) {
+        Toast.error("Give the smart folder a name.");
+        return;
+      }
+      const list = Shell.loadSmartFolders();
+      const idx = list.findIndex((f) => f.name === sf.name);
+      if (idx < 0) {
+        overlay.remove();
+        return;
+      }
+      const next: SmartFolder = { ...list[idx], name };
+      if (isRule) {
+        const exts = q<HTMLInputElement>(".smart-exts")
+          .value.split(/[,\s]+/)
+          .map((s) => s.replace(/^\./, "").toLowerCase())
+          .filter(Boolean);
+        const mins = parseInt(q<HTMLInputElement>(".smart-mins").value, 10);
+        next.rule = {
+          extensions: exts,
+          minDurationSecs: Number.isFinite(mins) && mins > 0 ? mins * 60 : null,
+        };
+      } else {
+        next.query = q<HTMLInputElement>(".smart-q").value.trim();
+        next.type = q<HTMLSelectElement>(".smart-type").value || null;
+      }
+      list[idx] = next;
+      Shell.saveSmartFolders(list);
+      void this.buildSidebar();
+      overlay.remove();
+      Toast.success(`Saved smart folder \u201c${name}\u201d.`);
+    });
   }
 
   /** Undo the last trash / drag-move (Ctrl+Z or Super+Z). */

@@ -8,6 +8,7 @@
 import { api } from "./api";
 import { FolderPicker } from "./picker";
 import { Toast, promptDialog } from "./toast";
+import { Dropdown } from "./dropdown";
 
 export type BurnTarget = "cd" | "dvd" | "bluray" | "iso" | "usb";
 
@@ -65,7 +66,7 @@ export class BurnStudio {
   private listEl: HTMLDivElement;
   private filesEl: HTMLDivElement;
   private nameInput: HTMLInputElement;
-  private targetSel: HTMLSelectElement;
+  private targetSel!: Dropdown;
   private verifyChk: HTMLInputElement;
   private mountChk: HTMLInputElement;
   private meterEl: HTMLDivElement;
@@ -114,27 +115,24 @@ export class BurnStudio {
     targetRow.className = "burn-targetrow";
     const tLabel = document.createElement("span");
     tLabel.textContent = "Target:";
-    this.targetSel = document.createElement("select");
-    for (const [value, label] of [
-      ["cd", "CD · 700 MB"],
-      ["dvd", "DVD · 4.7 GB"],
-      ["bluray", "Blu-ray · 25 GB"],
-      ["usb", "USB flash drive"],
-      ["iso", "ISO image file"],
-    ] as Array<[BurnTarget, string]>) {
-      const opt = document.createElement("option");
-      opt.value = value;
-      opt.textContent = label;
-      this.targetSel.appendChild(opt);
-    }
-    this.targetSel.addEventListener("change", () => {
-      if (this.current) {
-        this.current.target = this.targetSel.value as BurnTarget;
-        this.save();
-        this.renderMeter();
-      }
-    });
-    targetRow.append(tLabel, this.targetSel);
+    this.targetSel = new Dropdown(
+      [
+        { value: "cd", label: "CD \u00b7 700 MB" },
+        { value: "dvd", label: "DVD \u00b7 4.7 GB" },
+        { value: "bluray", label: "Blu-ray \u00b7 25 GB" },
+        { value: "usb", label: "USB flash drive" },
+        { value: "iso", label: "ISO image file" },
+      ],
+      "dvd",
+      (v) => {
+        if (this.current) {
+          this.current.target = v as BurnTarget;
+          this.save();
+          this.renderMeter();
+        }
+      },
+    );
+    targetRow.append(tLabel, this.targetSel.el);
     this.filesEl = document.createElement("div");
     this.filesEl.className = "burn-files";
     const addRow = document.createElement("div");
@@ -271,7 +269,7 @@ export class BurnStudio {
     this.renderList();
     if (this.current) {
       this.nameInput.value = this.current.name;
-      this.targetSel.value = this.current.target;
+      this.targetSel.setValue(this.current.target);
       this.verifyChk.checked = this.current.verify;
       this.mountChk.checked = this.current.mountAfter;
     }

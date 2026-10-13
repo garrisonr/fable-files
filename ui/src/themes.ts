@@ -41,6 +41,11 @@ export const DISTRO_ENGINES: DistroEngine[] = [
   { id: "peppermint", name: "Peppermint", dark: true, preview: ["#2a2326", "#f2ecec", "#a31f34"] },
   { id: "mx", name: "MX Linux", dark: "auto", preview: ["#eceff1", "#263238", "#546e7a"] },
   { id: "phosh", name: "Phosh (mobile)", dark: true, preview: ["#242424", "#eeeeec", "#3584e4"] },
+  { id: "ereader", name: "E-Reader (B/W high contrast)", dark: false, preview: ["#ffffff", "#000000", "#000000"] },
+  { id: "redmond7", name: "Redmond 7 \u00b7 Aero", dark: false, preview: ["#cfe8f8", "#10243a", "#1f6fb2"] },
+  { id: "redmondxp", name: "Redmond XP \u00b7 Luna", dark: false, preview: ["#ece9de", "#102040", "#0058e6"] },
+  { id: "redmond8", name: "Redmond 8 \u00b7 Metro", dark: true, preview: ["#122028", "#f2f2f2", "#1ba1e2"] },
+  { id: "redmond1011", name: "Redmond 10/11 \u00b7 Fluent", dark: true, preview: ["#202020", "#f5f5f5", "#0067c0"] },
 ];
 const DISTRO_IDS = new Set(DISTRO_ENGINES.map((e) => e.id));
 

@@ -285,6 +285,9 @@ pub async fn search(
     scope: Option<LocationId>,
     limit: Option<u32>,
     type_filter: Option<String>,
+    path_prefix: Option<String>,
+    modified_after: Option<String>,
+    modified_before: Option<String>,
 ) -> Cmd<Vec<SearchHit>> {
     let limit = limit.unwrap_or(50).min(500);
     let exts: Option<&'static [&'static str]> =
@@ -300,7 +303,7 @@ pub async fn search(
                     .map_err(CommandError::from)?
             };
             let rows: Vec<(Item, f64)> = rows.into_iter().map(|i| (i, 0.0)).collect();
-            return finish_search(state, rows, scope);
+            return finish_search(state, rows, scope, path_prefix.as_deref(), modified_after.as_deref(), modified_before.as_deref());
         }
         return Ok(Vec::new());
     }
@@ -327,7 +330,7 @@ pub async fn search(
         rows.retain(|(item, _)| name_in_type(&item.name, exts));
         rows.truncate(limit as usize);
     }
-    finish_search(state, rows, scope)
+    finish_search(state, rows, scope, path_prefix.as_deref(), modified_after.as_deref(), modified_before.as_deref())
 }
 
 /// Shared tail of `search`: apply the location scope, cache result paths
@@ -336,7 +339,35 @@ fn finish_search(
     state: State<'_, AppState>,
     rows: Vec<(Item, f64)>,
     scope: Option<LocationId>,
+    path_prefix: Option<&str>,
+    modified_after: Option<&str>,
+    modified_before: Option<&str>,
 ) -> Cmd<Vec<SearchHit>> {
+    let mut rows: Vec<(Item, f64)> = rows
+        .into_iter()
+        .filter(|(item, _)| {
+            if let Some(p) = path_prefix {
+                let key = item.provider_key.as_deref().unwrap_or("");
+                if !key.starts_with(p) {
+                    return false;
+                }
+            }
+            // Item.modified is RFC 3339: its first 10 chars are the date,
+            // which compares correctly against yyyy-mm-dd filter bounds.
+            let day = item.modified.map(|m| m.format("%Y-%m-%d").to_string()).unwrap_or_default();
+            if let Some(a) = modified_after {
+                if !a.is_empty() && day.as_str() < a {
+                    return false;
+                }
+            }
+            if let Some(b) = modified_before {
+                if !b.is_empty() && day.as_str() > b {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
     let mut rows: Vec<(Item, f64)> = match scope {
         Some(s) => rows
             .into_iter()

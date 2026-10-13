@@ -18,6 +18,7 @@ export interface FileViewHooks {
   onMakeExecutable(item: Item): void;
   onDelete(item: Item): void; // move to trash
   onTrash?(items: Item[]): void; // move a whole selection to trash
+  onMediaRename?(items: Item[]): void; // Plex/Kodi/Emby rename
   onRenameInline?(item: Item, newName: string): void;
   onProperties(item: Item): void;
   // Round 4 (Nautilus + Finder parity) — optional so every view can
@@ -108,6 +109,15 @@ let localsendCache: boolean | null = null;
  * `targets` is the effective selection (the right-clicked item plus any
  * multi-selection it belongs to).
  */
+/** Media files the Plex/Kodi/Emby renamer handles. */
+function isMediaName(name: string): boolean {
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  return [
+    "mkv", "mp4", "avi", "mov", "m4v", "webm", "mpg", "mpeg", "wmv",
+    "mp3", "flac", "m4a", "m4b", "aac", "ogg", "opus", "wav",
+  ].includes(ext);
+}
+
 export async function showItemMenu(
   menu: ContextMenu,
   x: number,
@@ -217,6 +227,18 @@ export async function showItemMenu(
     items.push({ label: "Duplicate", action: () => hooks.onDuplicate!(targets) });
   if (hooks.onMakeAlias && targets.length === 1)
     items.push({ label: "Make Alias", action: () => hooks.onMakeAlias!(item) });
+  if (
+    hooks.onMediaRename &&
+    targets.length >= 1 &&
+    targets.every((t) => t.kind !== "folder" && isMediaName(t.name))
+  )
+    items.push({
+      label:
+        targets.length === 1
+          ? "Rename for Media Player..."
+          : `Rename ${targets.length} for Media Player...`,
+      action: () => hooks.onMediaRename!(targets),
+    });
   if (hooks.onCompress)
     items.push({
       label: targets.length === 1 ? `Compress "${item.name}"` : "Compress...",

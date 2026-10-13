@@ -197,8 +197,8 @@ export const api = {
   listLocations: () => invoke<LocationSummary[]>("list_locations"),
   listDir: (location: string, dir: string) =>
     invoke<Item[]>("list_dir", { location, dir }),
-  search: (query_text: string, scope: string | null, limit = 50, typeFilter?: string | null) =>
-    invoke<SearchHit[]>("search", { queryText: query_text, scope, limit, typeFilter: typeFilter ?? null }),
+  search: (query_text: string, scope: string | null, limit = 50, typeFilter?: string | null, filters?: { pathPrefix?: string | null; modifiedAfter?: string | null; modifiedBefore?: string | null }) =>
+    invoke<SearchHit[]>("search", { queryText: query_text, scope, limit, typeFilter: typeFilter ?? null, pathPrefix: filters?.pathPrefix ?? null, modifiedAfter: filters?.modifiedAfter ?? null, modifiedBefore: filters?.modifiedBefore ?? null }),
   listThemes: () => invoke<ThemeInfo[]>("list_themes"),
   applyTheme: (theme: string) => invoke<string>("apply_theme", { theme }),
   preview: (item: string) => invoke<PreviewKind>("preview", { item }),
