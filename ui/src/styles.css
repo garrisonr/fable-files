@@ -1291,3 +1291,13 @@ body[data-layout="tv"] .cell-icon {
 .toolbar .search-icon {
   font-size: 16px;
 }
+
+/* Image preview in Quick Look */
+.ql-image-preview {
+  max-width: 100%;
+  max-height: 400px;
+  object-fit: contain;
+  border-radius: 8px;
+  margin-top: 12px;
+  background: #000;
+}

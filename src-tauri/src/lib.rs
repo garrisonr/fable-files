@@ -330,6 +330,7 @@ pub fn run() {
             commands::preview_text,
             commands::get_item_path,
             commands::get_recent_files,
+            commands::get_image_preview,
             commands::trash_path,
             commands::empty_trash,
             commands::secure_empty_trash,

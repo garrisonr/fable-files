@@ -188,6 +188,20 @@ export class QuickLook {
           // Text preview failed — metadata card stands alone
         }
       }
+      // Image preview
+      const imgExts = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"];
+      if (imgExts.includes(ext)) {
+        try {
+          const dataUrl = await api.getImagePreview(item.id);
+          const img = document.createElement("img");
+          img.className = "ql-image-preview";
+          img.src = dataUrl;
+          img.alt = item.name;
+          card.appendChild(img);
+        } catch {
+          // Image preview failed — metadata card stands alone
+        }
+      }
     }
   }
 }

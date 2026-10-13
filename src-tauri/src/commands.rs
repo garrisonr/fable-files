@@ -1243,6 +1243,47 @@ fn url_decode(s: &str) -> String {
     out
 }
 
+
+/// Get image file as base64 data URL for preview.
+#[tauri::command]
+pub async fn get_image_preview(
+    state: State<'_, AppState>,
+    item: ItemId,
+) -> Cmd<String> {
+    let path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // Only allow image extensions
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let mime = match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "bmp" => "image/bmp",
+            _ => return Err("not an image".to_string()),
+        };
+        // Limit to 10MB to avoid memory issues
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        if meta.len() > 10 * 1024 * 1024 {
+            return Err("image too large for preview".to_string());
+        }
+        let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+        Ok::<String, String>(format!("data:{mime};base64,{b64}"))
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("image task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

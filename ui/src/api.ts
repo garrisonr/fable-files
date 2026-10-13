@@ -92,6 +92,10 @@ export const api = {
     invoke<void>("set_default_app", { mime, desktopId }),
   getItemPath: (item: string) =>
     invoke<string>("get_item_path", { item }),
+  getImagePreview: (item: string) =>
+    invoke<string>("get_image_preview", { item }),
+  getRecentFiles: (limit?: number) =>
+    invoke<Array<{ path: string; name: string; modified: string }>>("get_recent_files", { limit }),
   previewText: (item: string, maxLines?: number) =>
     invoke<{ lines: string[]; truncated: boolean }>("preview_text", { item, maxLines }),
   startIndexing: (location: string) =>

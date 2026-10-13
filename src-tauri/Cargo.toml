@@ -32,6 +32,7 @@ ufm-mcp = { path = "../crates/ufm-mcp" }
 ufm-media = { path = "../crates/ufm-media" }
 ufm-emu = { path = "../crates/ufm-emu" }
 tracing.workspace = true
+base64 = "0.22"
 open = "5"
 tracing-subscriber.workspace = true
 
