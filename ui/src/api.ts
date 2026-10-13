@@ -85,6 +85,7 @@ export const api = {
     invoke<unknown>("start_indexing", { location }),
   indexStatus: () => invoke<IndexState>("index_status"),
   openItem: (item: string) => invoke<void>("open_item", { item }),
+  setExecutable: (item: string, executable: boolean) => invoke<void>("set_executable", { item, executable }),
 };
 
 export function onIndexProgress(cb: (s: IndexState) => void): Promise<UnlistenFn> {

@@ -638,6 +638,37 @@ pub async fn open_item(state: State<'_, AppState>, item: ItemId) -> Cmd<()> {
     Ok(())
 }
 
+
+/// Toggle the executable bit on a file (chmod +x / chmod -x).
+/// Only backend-minted item ids resolve through item_paths,
+/// so the shell cannot be tricked into chmodding an arbitrary path.
+#[tauri::command]
+pub async fn set_executable(
+    state: State<'_, AppState>,
+    item: ItemId,
+    executable: bool,
+) -> Cmd<()> {
+    let path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+        let mut perms = meta.permissions();
+        let mode = perms.mode();
+        perms.set_mode(if executable { mode | 0o111 } else { mode & !0o111 });
+        std::fs::set_permissions(&path, perms).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("chmod task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::PermissionDenied(format!("chmod failed: {e}"))))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

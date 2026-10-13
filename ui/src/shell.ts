@@ -743,6 +743,15 @@ export class Shell {
       if (this.activeTab) this.closeTab(this.activeTab);
       return;
     }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLocaleLowerCase() === "e") {
+      // Ctrl+E: make the selected file executable (chmod +x).
+      e.preventDefault();
+      const sel = this.fileView.selected;
+      if (sel) {
+        api.setExecutable(sel, true).catch((err) => console.error("chmod +x failed:", err));
+      }
+      return;
+    }
     if (inField) return;
     if (e.key === " " && this.activeTab && !this.searchView.active) {
       // Space toggles Quick Look — never when typing.
