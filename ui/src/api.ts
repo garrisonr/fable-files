@@ -6,6 +6,42 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 /** A mounted root: local dir, cloud account, archive, search… */
+export interface DiskPart {
+  name: string;
+  path: string;
+  size_bytes: number;
+  fstype: string | null;
+  label: string | null;
+  mountpoints: string[];
+  locked: boolean;
+  lock_reason: string | null;
+}
+
+export interface DiskInfo {
+  path: string;
+  model: string;
+  size_bytes: number;
+  removable: boolean;
+  transport: string;
+  partitions: DiskPart[];
+  locked: boolean;
+  lock_reason: string | null;
+}
+
+export interface ResizeInfo {
+  size_bytes: number;
+  free_after_bytes: number;
+  can_grow: boolean;
+  can_shrink: boolean;
+  note: string;
+}
+
+export interface PrinterInfo {
+  name: string;
+  is_default: boolean;
+  state: string;
+}
+
 export interface MetaTag {
   group: string;
   tag: string;
@@ -236,6 +272,22 @@ export const api = {
     invoke<Array<{ path: string; size: number; category: string }>>("find_app_leftovers", { appId, appName }),
   uninstallApp: (app: { name: string; id: string; source: string; desktop_path: string }, leftovers: string[]) =>
     invoke<string>("uninstall_app", { app, leftovers }),
+  listDisks: () => invoke<DiskInfo[]>("list_disks"),
+  availableFilesystems: () => invoke<string[]>("available_filesystems"),
+  formatPartition: (device: string, fstype: string, label: string) =>
+    invoke<void>("format_partition", { device, fstype, label }),
+  eraseDisk: (device: string, fstype: string, label: string) =>
+    invoke<void>("erase_disk", { device, fstype, label }),
+  partitionResizeInfo: (device: string) =>
+    invoke<ResizeInfo>("partition_resize_info", { device }),
+  resizePartition: (device: string, newBytes: number) =>
+    invoke<void>("resize_partition", { device, newBytes }),
+  createFolderIn: (dir: string) => invoke<string>("create_folder", { dir }),
+  createNewFile: (dir: string, kind: string) =>
+    invoke<string>("create_new_file", { dir, kind }),
+  listPrinters: () => invoke<PrinterInfo[]>("list_printers"),
+  printItem: (item: string, printer: string | null, copies: number) =>
+    invoke<string>("print_item", { item, printer, copies }),
   movePathTo: (srcPath: string, destDir: string) =>
     invoke<string>("move_path_to", { srcPath, destDir }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),

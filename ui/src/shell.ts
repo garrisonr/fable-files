@@ -39,6 +39,9 @@ import {
   SplitDialog,
   SyncDialog,
 } from "./tools";
+import { DiskUtility } from "./disks";
+import type { MenuItem } from "./contextmenu";
+import { PrintDialog } from "./print";
 import { JobsPanel } from "./jobs";
 import {
   canGoBack,
@@ -129,6 +132,8 @@ export class Shell {
   private dupDialog = new DuplicatesDialog();
   private burnStudio!: BurnStudio;
   private cloudMount!: CloudMount;
+  private diskDialog = new DiskUtility();
+  private printDialog = new PrintDialog();
 
   constructor() {
     this.el.id = "app";
@@ -253,6 +258,11 @@ export class Shell {
           })
           .catch((err) => Toast.error(`Combine failed: ${err}`));
       },
+      onPrint: (item) => void this.printDialog.open(item),
+      onNewFolder: () => void this.createFolderHere(),
+      onNewFile: (kind) => void this.createFileHere(kind),
+      onPasteHere: () => void this.pasteIntoCurrentDir(),
+      onTerminalHere: () => void this.toggleTerminal(),
       onBurnAdd: (item) => {
         const path = item.provider_key;
         if (!path) {
@@ -350,7 +360,10 @@ export class Shell {
       this.dupDialog.element,
       this.burnStudio.element,
       this.cloudMount.element,
+      this.diskDialog.element,
+      this.printDialog.element,
     );
+    this.diskDialog.onChanged = () => void this.refreshLocations();
     this.jobsPanel.onJobDone = (output) => {
       Toast.success(`Created ${output.split("/").pop()}`);
       this.refreshActiveDir();
@@ -1111,6 +1124,42 @@ export class Shell {
     return api.getItemPath(home.root_item).catch(() => "");
   }
 
+  /** New Folder in the folder being browsed (background menu). */
+  private async createFolderHere(): Promise<void> {
+    const tab = this.activeTab;
+    if (!tab) return;
+    const dir = currentDir(tab);
+    if (dir.dirId.startsWith("label:") || dir.dirId.startsWith("archive:")) {
+      Toast.error("Can't create a folder here — this is a virtual view.");
+      return;
+    }
+    try {
+      const path = await api.createFolderIn(dir.dirId);
+      Toast.success(`Created ${path.split("/").pop()}`);
+      this.refreshActiveDir();
+    } catch (err) {
+      Toast.error(`Create folder failed: ${err}`);
+    }
+  }
+
+  /** New blank file (background menu → New File). */
+  private async createFileHere(kind: string): Promise<void> {
+    const tab = this.activeTab;
+    if (!tab) return;
+    const dir = currentDir(tab);
+    if (dir.dirId.startsWith("label:") || dir.dirId.startsWith("archive:")) {
+      Toast.error("Can't create a file here — this is a virtual view.");
+      return;
+    }
+    try {
+      const path = await api.createNewFile(dir.dirId, kind);
+      Toast.success(`Created ${path.split("/").pop()}`);
+      this.refreshActiveDir();
+    } catch (err) {
+      Toast.error(`Create file failed: ${err}`);
+    }
+  }
+
   /** Absolute path of the folder the active tab is browsing. */
   private async currentDirPath(): Promise<string> {
     const tab = this.activeTab;
@@ -1514,6 +1563,38 @@ export class Shell {
           crumbs: [{ dirId: loc.root_item, name: loc.display_name }],
         });
       });
+      b.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        void (async () => {
+          const rootPath = await api
+            .getItemPath(loc.root_item)
+            .catch(() => "");
+          const menuItems: MenuItem[] = [
+            {
+              label: "Disk Utility…",
+              action: () =>
+                void this.diskDialog.open(rootPath || undefined),
+            },
+          ];
+          const home = await this.homePath().catch(() => "");
+          if (rootPath && rootPath !== "/" && rootPath !== home) {
+            menuItems.push({
+              label: "Unmount / Eject",
+              action: () => {
+                void api
+                  .unmountPath(rootPath)
+                  .then(async () => {
+                    Toast.success(`Unmounted ${loc.display_name}.`);
+                    await this.refreshLocations();
+                  })
+                  .catch((err) => Toast.error(`Unmount failed: ${err}`));
+              },
+            });
+          }
+          this.ctxMenu.open(e.clientX, e.clientY, menuItems);
+        })();
+      });
       this.sidebarList.appendChild(b);
     }
     if (this.locations.length === 0) {
@@ -1852,6 +1933,7 @@ export class Shell {
       { label: "Smaller text", shortcut: "Ctrl −", action: () => this.setFontScale(this.fontScale - 0.1) },
       { label: "Terminal", shortcut: "Ctrl `", action: () => void this.toggleTerminal() },
       { label: "Connect to Server…", action: () => void this.connectToServer() },
+      { label: "Disk Utility…", action: () => void this.diskDialog.open() },
       { label: "Burn Studio…", action: () => this.burnStudio.open() },
       { label: "Mount Cloud Drive…", action: () => void this.cloudMount.open() },
       { label: "App Deleter…", action: () => void this.appDeleter.open(() => this.refreshActiveDir()) },

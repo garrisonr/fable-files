@@ -5170,8 +5170,872 @@ pub async fn uninstall_app(
     .map_err(|e| CommandError::from(UfmError::Internal(e)))
 }
 
+
+// ---------------------------------------------------------------------------
+// Disk Utility: inspect, format, erase, resize — with boot safety
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, Clone)]
+pub struct DiskPart {
+    pub name: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub fstype: Option<String>,
+    pub label: Option<String>,
+    pub mountpoints: Vec<String>,
+    pub locked: bool,
+    pub lock_reason: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct DiskInfo {
+    pub path: String,
+    pub model: String,
+    pub size_bytes: u64,
+    pub removable: bool,
+    pub transport: String,
+    pub partitions: Vec<DiskPart>,
+    pub locked: bool,
+    pub lock_reason: Option<String>,
+}
+
+fn lsblk_json() -> std::result::Result<serde_json::Value, String> {
+    let out = std::process::Command::new("lsblk")
+        .args([
+            "-J", "-b", "-o",
+            "NAME,PATH,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT,MODEL,RM,TRAN",
+        ])
+        .output()
+        .map_err(|e| format!("lsblk: {e}"))?;
+    serde_json::from_slice(&out.stdout).map_err(|e| format!("lsblk json: {e}"))
+}
+
+/// Mount sources of the running system ("/dev/mapper/root" style
+/// paths), subvolume suffixes stripped.
+fn system_mount_sources() -> Vec<String> {
+    let mut sources = Vec::new();
+    for mp in ["/", "/boot", "/boot/efi", "/home"] {
+        if let Ok(out) = std::process::Command::new("findmnt")
+            .args(["-no", "SOURCE", mp])
+            .output()
+        {
+            let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let base = raw.split('[').next().unwrap_or("").trim().to_string();
+            if base.starts_with("/dev/") {
+                sources.push(base);
+            }
+        }
+    }
+    sources
+}
+
+fn active_swap_devices() -> Vec<String> {
+    std::fs::read_to_string("/proc/swaps")
+        .map(|content| {
+            content
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split_whitespace().next())
+                .filter(|p| p.starts_with("/dev/"))
+                .map(|p| p.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn subtree_mountpoints(node: &serde_json::Value, out: &mut Vec<String>) {
+    if let Some(mp) = node.get("mountpoint").and_then(|v| v.as_str()) {
+        if !mp.is_empty() {
+            out.push(mp.to_string());
+        }
+    }
+    // lsblk -o MOUNTPOINT is single; MOUNTPOINTS (plural) unused here.
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        for child in children {
+            subtree_mountpoints(child, out);
+        }
+    }
+}
+
+fn subtree_has_path(node: &serde_json::Value, paths: &[String]) -> bool {
+    if let Some(p) = node.get("path").and_then(|v| v.as_str()) {
+        if paths.iter().any(|x| x == p) {
+            return true;
+        }
+    }
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        return children.iter().any(|c| subtree_has_path(c, paths));
+    }
+    false
+}
+
+const SYSTEM_MOUNTS: [&str; 4] = ["/", "/boot", "/boot/efi", "/home"];
+
+/// Full disk inventory with safety locks computed fresh.
+fn disk_inventory() -> std::result::Result<Vec<DiskInfo>, String> {
+    let parsed = lsblk_json()?;
+    let sys_sources = system_mount_sources();
+    let swaps = active_swap_devices();
+    let mut disks = Vec::new();
+    let Some(list) = parsed.get("blockdevices").and_then(|v| v.as_array()) else {
+        return Ok(disks);
+    };
+    for node in list {
+        if node.get("type").and_then(|v| v.as_str()) != Some("disk") {
+            continue;
+        }
+        let disk_path = node
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut partitions = Vec::new();
+        let mut disk_locked = false;
+        let mut disk_reason: Option<String> = None;
+        if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+            for part in children {
+                if part.get("type").and_then(|v| v.as_str()) != Some("part") {
+                    continue;
+                }
+                let mut mps = Vec::new();
+                subtree_mountpoints(part, &mut mps);
+                let ppath = part
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let mut locked = false;
+                let mut reason: Option<String> = None;
+                if mps.iter().any(|m| SYSTEM_MOUNTS.contains(&m.as_str()))
+                    || subtree_has_path(part, &sys_sources)
+                {
+                    locked = true;
+                    reason = Some(
+                        "This is part of the system you're running right now —                          formatting it isn't possible (or wise) from in here."
+                            .into(),
+                    );
+                } else if swaps.iter().any(|d| d == &ppath) {
+                    locked = true;
+                    reason = Some("This partition is active swap right now.".into());
+                }
+                if locked {
+                    disk_locked = true;
+                    disk_reason = Some(
+                        "This disk holds the system you're running — it can't be erased as a whole.                          Its system partitions are protected; unrelated data partitions on it can still be formatted."
+                            .into(),
+                    );
+                }
+                partitions.push(DiskPart {
+                    name: part
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    path: ppath,
+                    size_bytes: part.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+                    fstype: part
+                        .get("fstype")
+                        .and_then(|v| v.as_str())
+                        .map(|x| x.to_string()),
+                    label: part
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .map(|x| x.to_string()),
+                    mountpoints: mps,
+                    locked,
+                    lock_reason: reason,
+                });
+            }
+        }
+        disks.push(DiskInfo {
+            path: disk_path,
+            model: node
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Disk")
+                .trim()
+                .to_string(),
+            size_bytes: node.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+            removable: node.get("rm").and_then(|v| v.as_bool()).unwrap_or(false),
+            transport: node
+                .get("tran")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            partitions,
+            locked: disk_locked,
+            lock_reason: disk_reason,
+        });
+    }
+    Ok(disks)
+}
+
+#[tauri::command]
+pub async fn list_disks() -> Cmd<Vec<DiskInfo>> {
+    tauri::async_runtime::spawn_blocking(move || disk_inventory())
+        .await
+        .map_err(|e| CommandError::from(UfmError::Internal(format!("disk task failed: {e}"))))?
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Which filesystems this machine can actually create.
+#[tauri::command]
+pub async fn available_filesystems() -> Cmd<Vec<String>> {
+    Ok([
+        "ext4", "btrfs", "exfat", "vfat", "ntfs", "xfs", "f2fs",
+    ]
+    .iter()
+    .filter(|fs| {
+        std::path::Path::new(&format!("/sbin/mkfs.{fs}")).exists()
+            || std::path::Path::new(&format!("/usr/sbin/mkfs.{fs}")).exists()
+    })
+    .map(|fs| fs.to_string())
+    .collect())
+}
+
+fn check_device_operable(
+    device: &str,
+    whole_disk: bool,
+) -> std::result::Result<DiskPart, String> {
+    let inv = disk_inventory()?;
+    for disk in &inv {
+        if whole_disk && disk.path == device {
+            if disk.locked {
+                return Err(disk
+                    .lock_reason
+                    .clone()
+                    .unwrap_or_else(|| "disk is protected".into()));
+            }
+            return Ok(DiskPart {
+                name: disk.path.clone(),
+                path: disk.path.clone(),
+                size_bytes: disk.size_bytes,
+                fstype: None,
+                label: None,
+                mountpoints: vec![],
+                locked: false,
+                lock_reason: None,
+            });
+        }
+        for part in &disk.partitions {
+            if part.path == device {
+                if part.locked {
+                    return Err(part
+                        .lock_reason
+                        .clone()
+                        .unwrap_or_else(|| "partition is protected".into()));
+                }
+                if !part.mountpoints.is_empty() {
+                    return Err(format!(
+                        "still mounted at {} — unmount it first, so nothing is writing while we work",
+                        part.mountpoints.join(", ")
+                    ));
+                }
+                return Ok(part.clone());
+            }
+        }
+    }
+    Err(format!("{device} is not a known disk or partition"))
+}
+
+fn sanitize_label(label: &str) -> String {
+    label
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+        .take(32)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn mkfs_command(fstype: &str, label: &str, device: &str) -> std::result::Result<String, String> {
+    let label = sanitize_label(label);
+    let lflag = if label.is_empty() {
+        String::new()
+    } else {
+        match fstype {
+            "exfat" => format!(" -n '{label}'"),
+            "vfat" => format!(" -n '{}'", label.to_uppercase()),
+            "f2fs" => format!(" -l '{label}'"),
+            _ => format!(" -L '{label}'"),
+        }
+    };
+    Ok(match fstype {
+        "ext4" => format!("mkfs.ext4 -F{lflag} '{device}'"),
+        "btrfs" => format!("mkfs.btrfs -f{lflag} '{device}'"),
+        "exfat" => format!("mkfs.exfat{lflag} '{device}'"),
+        "vfat" => format!("mkfs.vfat -F 32{lflag} '{device}'"),
+        "ntfs" => format!("mkfs.ntfs -f{lflag} '{device}'"),
+        "xfs" => format!("mkfs.xfs -f{lflag} '{device}'"),
+        "f2fs" => format!("mkfs.f2fs -f{lflag} '{device}'"),
+        other => return Err(format!("unsupported filesystem {other}")),
+    })
+}
+
+fn pkexec_sh(script: &str) -> std::result::Result<(), String> {
+    let out = std::process::Command::new("pkexec")
+        .arg("sh")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .map_err(|e| format!("pkexec: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        let last = err.lines().last().unwrap_or("").trim().to_string();
+        return Err(if last.is_empty() {
+            "the operation failed (or the password prompt was cancelled)".into()
+        } else {
+            last
+        });
+    }
+    Ok(())
+}
+
+/// Format one partition. Safety is re-verified server-side at call
+/// time: protected (system/swap) or mounted partitions are refused.
+#[tauri::command]
+pub async fn format_partition(
+    device: String,
+    fstype: String,
+    label: String,
+) -> Cmd<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        check_device_operable(&device, false)?;
+        let cmd = mkfs_command(&fstype, &label, &device)?;
+        pkexec_sh(&cmd)?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("format task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Erase a whole disk: wipe signatures, fresh GPT, one partition
+/// filling the disk, formatted. Refused for the boot disk.
+#[tauri::command]
+pub async fn erase_disk(device: String, fstype: String, label: String) -> Cmd<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        check_device_operable(&device, true)?;
+        let part_dev = if device
+            .chars()
+            .last()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
+            format!("{device}p1")
+        } else {
+            format!("{device}1")
+        };
+        let mkfs = mkfs_command(&fstype, &label, &part_dev)?;
+        let script = format!(
+            "wipefs -a '{device}' && parted -s '{device}' mklabel gpt mkpart primary 1MiB 100% && partprobe '{device}' && udevadm settle && {mkfs}"
+        );
+        pkexec_sh(&script)?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("erase task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+#[derive(serde::Serialize)]
+pub struct ResizeInfo {
+    pub size_bytes: u64,
+    pub free_after_bytes: u64,
+    pub can_grow: bool,
+    pub can_shrink: bool,
+    pub note: String,
+}
+
+/// Resize feasibility for a partition: contiguous free space after
+/// it (parted), plus per-filesystem rules.
+#[tauri::command]
+pub async fn partition_resize_info(device: String) -> Cmd<ResizeInfo> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let inv = disk_inventory()?;
+        let mut found: Option<(DiskPart, String)> = None;
+        for disk in &inv {
+            for part in &disk.partitions {
+                if part.path == device {
+                    found = Some((part.clone(), disk.path.clone()));
+                }
+            }
+        }
+        let (part, disk_path) = found.ok_or("unknown partition")?;
+        // parted machine-readable free-space scan
+        let out = std::process::Command::new("parted")
+            .args(["-m", &disk_path, "unit", "B", "print", "free"])
+            .output()
+            .map_err(|e| format!("parted: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let part_num: String = device
+            .trim_start_matches(&disk_path)
+            .trim_start_matches('p')
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        let mut part_end: u64 = 0;
+        let mut free_after: u64 = 0;
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() < 5 {
+                continue;
+            }
+            let parse_b = |v: &str| v.trim_end_matches('B').parse::<u64>().unwrap_or(0);
+            if fields[0] == part_num {
+                part_end = parse_b(fields[2]);
+            }
+        }
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() < 5 {
+                continue;
+            }
+            let parse_b = |v: &str| v.trim_end_matches('B').parse::<u64>().unwrap_or(0);
+            let is_free = fields[4].contains("free");
+            if is_free && part_end > 0 {
+                let start = parse_b(fields[1]);
+                if start >= part_end && start.saturating_sub(part_end) < 4 * 1024 * 1024 {
+                    free_after = parse_b(fields[3]);
+                }
+            }
+        }
+        let fs = part.fstype.clone().unwrap_or_default();
+        let mounted = !part.mountpoints.is_empty();
+        let (can_grow, can_shrink, note) = match fs.as_str() {
+            "ext4" => (
+                free_after > 0 && !part.locked,
+                !mounted && !part.locked,
+                if mounted {
+                    "ext4 can grow while mounted; shrinking needs the partition unmounted."
+                } else {
+                    "ext4 can grow into the free space after it, or shrink (the filesystem is shrunk first, then the partition)."
+                }
+                .to_string(),
+            ),
+            "btrfs" => (
+                free_after > 0 && mounted && !part.locked,
+                false,
+                "btrfs grows online while mounted. Shrinking btrfs from here isn't offered — it's the riskiest resize there is."
+                    .to_string(),
+            ),
+            "xfs" => (
+                free_after > 0 && mounted && !part.locked,
+                false,
+                "XFS can only grow, and only while mounted.".to_string(),
+            ),
+            _ => (
+                false,
+                false,
+                format!("Resizing {fs} isn't supported here — formatting is the honest option for this one."),
+            ),
+        };
+        Ok::<ResizeInfo, String>(ResizeInfo {
+            size_bytes: part.size_bytes,
+            free_after_bytes: free_after,
+            can_grow,
+            can_shrink,
+            note,
+        })
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("resize info failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Resize a partition (+ its filesystem) to `new_bytes`.
+/// Grow: parted first, then the filesystem. Shrink (ext4,
+/// unmounted only): filesystem first, then parted.
+#[tauri::command]
+pub async fn resize_partition(device: String, new_bytes: u64) -> Cmd<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let inv = disk_inventory()?;
+        let mut found: Option<(DiskPart, String, u32)> = None;
+        for disk in &inv {
+            for part in &disk.partitions {
+                if part.path == device {
+                    let num: u32 = device
+                        .trim_start_matches(&disk.path)
+                        .trim_start_matches('p')
+                        .chars()
+                        .filter(|c| c.is_ascii_digit())
+                        .collect::<String>()
+                        .parse()
+                        .unwrap_or(0);
+                    found = Some((part.clone(), disk.path.clone(), num));
+                }
+            }
+        }
+        let (part, disk_path, part_num) = found.ok_or("unknown partition")?;
+        if part.locked {
+            return Err(part
+                .lock_reason
+                .clone()
+                .unwrap_or_else(|| "partition is protected".into()));
+        }
+        if part_num == 0 {
+            return Err("could not determine the partition number".into());
+        }
+        let fs = part.fstype.clone().unwrap_or_default();
+        let mounted = !part.mountpoints.is_empty();
+        let mp = part.mountpoints.first().cloned().unwrap_or_default();
+        let growing = new_bytes > part.size_bytes;
+        let script = if growing {
+            match fs.as_str() {
+                "ext4" => format!(
+                    "yes | parted -s '{disk}' resizepart {num} {new}B && resize2fs '{dev}'",
+                    disk = disk_path, num = part_num, new = new_bytes, dev = device
+                ),
+                "btrfs" => {
+                    if !mounted {
+                        return Err("mount the btrfs filesystem first — it resizes online".into());
+                    }
+                    format!(
+                        "yes | parted -s '{disk}' resizepart {num} {new}B && btrfs filesystem resize {new} '{mp}'",
+                        disk = disk_path, num = part_num, new = new_bytes, mp = mp
+                    )
+                }
+                "xfs" => {
+                    if !mounted {
+                        return Err("mount the XFS filesystem first — it grows online".into());
+                    }
+                    format!(
+                        "yes | parted -s '{disk}' resizepart {num} {new}B && xfs_growfs '{mp}'",
+                        disk = disk_path, num = part_num, new = new_bytes, mp = mp
+                    )
+                }
+                _ => return Err(format!("growing {fs} isn't supported")),
+            }
+        } else {
+            // shrink
+            if fs != "ext4" {
+                return Err(format!("shrinking {fs} isn't supported here"));
+            }
+            if mounted {
+                return Err("unmount the partition first — ext4 can't shrink while mounted".into());
+            }
+            format!(
+                "resize2fs '{dev}' {new}B && yes | parted -s '{disk}' resizepart {num} {new}B",
+                dev = device, new = new_bytes, disk = disk_path, num = part_num
+            )
+        };
+        // parted asks before shrinking a partition; the `yes |`
+        // prefixes inside the script answer just that prompt.
+        pkexec_sh(&script)?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("resize task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+// ---------------------------------------------------------------------------
+// New files (right-click → New) + folders
+// ---------------------------------------------------------------------------
+
+/// Create a folder in a directory item ("Untitled Folder", numbered
+/// on collision). Returns the new folder's path.
+#[tauri::command]
+pub async fn create_folder(state: State<'_, AppState>, dir: ItemId) -> Cmd<String> {
+    let dir_path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&dir)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown dir {dir}"))))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut dest = dir_path.join("Untitled Folder");
+        let mut n = 2;
+        while dest.exists() {
+            dest = dir_path.join(format!("Untitled Folder {n}"));
+            n += 1;
+        }
+        std::fs::create_dir(&dest).map_err(|e| format!("mkdir: {e}"))?;
+        Ok::<String, String>(dest.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("mkdir task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Where generated office templates are cached (per-user data dir).
+fn template_dir() -> std::result::Result<std::path::PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    let dir = std::path::PathBuf::from(home)
+        .join(".local/share/fable-files/templates");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+/// Ensure a blank office template of `kind` exists in the cache,
+/// generated with LibreOffice from an empty seed file.
+fn office_template(kind: &str) -> std::result::Result<std::path::PathBuf, String> {
+    let dir = template_dir()?;
+    let ext = kind;
+    let template = dir.join(format!("blank.{ext}"));
+    if template.exists()
+        && std::fs::metadata(&template).map(|m| m.len() > 500).unwrap_or(false)
+    {
+        return Ok(template);
+    }
+    let staging = dir.join(format!("stage-{kind}"));
+    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+    // Seed: documents/spreadsheets come from a text/csv seed;
+    // presentations/impress formats from an empty text seed.
+    let (seed_name, seed_content) = match kind {
+        "xlsx" | "ods" => ("seed.csv", ""),
+        _ => ("seed.txt", ""),
+    };
+    let seed = staging.join(seed_name);
+    std::fs::write(&seed, seed_content).map_err(|e| e.to_string())?;
+    let out = std::process::Command::new("soffice")
+        .args(["--headless", "--norestore", "--convert-to", kind, "--outdir"])
+        .arg(&staging)
+        .arg(&seed)
+        .output()
+        .map_err(|e| format!("soffice: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "LibreOffice could not create a blank .{kind}: {}",
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .last()
+                .unwrap_or("")
+                .trim()
+        ));
+    }
+    let produced = staging.join(format!("seed.{kind}"));
+    if !produced.exists() {
+        return Err(format!("LibreOffice did not produce a blank .{kind}"));
+    }
+    std::fs::rename(&produced, &template).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(&staging);
+    Ok(template)
+}
+
+/// Create a new blank file of `kind` in a directory. Text kinds get
+/// honest starter content; office kinds come from real LibreOffice
+/// templates. Returns the new file's path.
+#[tauri::command]
+pub async fn create_new_file(
+    state: State<'_, AppState>,
+    dir: ItemId,
+    kind: String,
+) -> Cmd<String> {
+    let dir_path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&dir)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown dir {dir}"))))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let (base_name, text_content): (&str, Option<&str>) = match kind.as_str() {
+            "txt" => ("Untitled.txt", Some("")),
+            "md" => ("Untitled.md", Some("# Untitled\n\n")),
+            "csv" => ("Untitled.csv", Some("")),
+            "json" => ("Untitled.json", Some("{}\n")),
+            "html" => (
+                "Untitled.html",
+                Some("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Untitled</title>\n</head>\n<body>\n\n</body>\n</html>\n"),
+            ),
+            "sh" => ("Untitled.sh", Some("#!/bin/bash\n")),
+            "py" => ("Untitled.py", Some("#!/usr/bin/env python3\n\n")),
+            "docx" | "xlsx" | "pptx" | "odt" | "ods" | "odp" => {
+                let template = office_template(&kind)?;
+                let file_name = format!("Untitled.{kind}");
+                let mut dest = dir_path.join(&file_name);
+                let mut n = 2;
+                while dest.exists() {
+                    dest = dir_path.join(format!("Untitled {n}.{kind}"));
+                    n += 1;
+                }
+                std::fs::copy(&template, &dest).map_err(|e| format!("copy: {e}"))?;
+                return Ok::<String, String>(dest.to_string_lossy().to_string());
+            }
+            other => return Err(format!("unknown file kind {other}")),
+        };
+        let mut dest = dir_path.join(base_name);
+        let mut n = 2;
+        while dest.exists() {
+            let stem = base_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(base_name);
+            let ext = base_name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+            dest = dir_path.join(format!("{stem} {n}.{ext}"));
+            n += 1;
+        }
+        std::fs::write(&dest, text_content.unwrap_or("")).map_err(|e| format!("write: {e}"))?;
+        if kind == "sh" || kind == "py" {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &dest,
+                std::fs::Permissions::from_mode(0o755),
+            );
+        }
+        Ok::<String, String>(dest.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("create task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+// ---------------------------------------------------------------------------
+// Printing (CUPS lp; office docs converted to PDF first)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+pub struct Printer {
+    pub name: String,
+    pub is_default: bool,
+    pub state: String,
+}
+
+#[tauri::command]
+pub async fn list_printers() -> Cmd<Vec<Printer>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let default_name = std::process::Command::new("lpstat")
+            .arg("-d")
+            .output()
+            .ok()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .split(':')
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let out = std::process::Command::new("lpstat")
+            .arg("-p")
+            .output()
+            .map_err(|e| format!("lpstat: {e}"))?;
+        let mut printers = Vec::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            // "printer NAME is idle.  enabled since ..."
+            if let Some(rest) = line.strip_prefix("printer ") {
+                let mut parts = rest.splitn(2, char::is_whitespace);
+                let name = parts.next().unwrap_or("").to_string();
+                let state = if line.contains("is idle") {
+                    "idle"
+                } else if line.contains("disabled") {
+                    "disabled"
+                } else if line.contains("now printing") {
+                    "printing"
+                } else {
+                    "unknown"
+                }
+                .to_string();
+                if !name.is_empty() {
+                    printers.push(Printer {
+                        is_default: name == default_name,
+                        name,
+                        state,
+                    });
+                }
+            }
+        }
+        Ok::<Vec<Printer>, String>(printers)
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("printers task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Print a file. Office documents go through LibreOffice to a temp
+/// PDF (CUPS speaks PDF natively); everything else prints as-is.
+/// Returns the CUPS request id line.
+#[tauri::command]
+pub async fn print_item(
+    state: State<'_, AppState>,
+    item: ItemId,
+    printer: Option<String>,
+    copies: u32,
+) -> Cmd<String> {
+    let path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let office = [
+            "doc", "docx", "odt", "rtf", "xls", "xlsx", "ods", "ppt", "pptx", "odp",
+        ];
+        let printable_path;
+        let _temp_dir;
+        if office.contains(&ext.as_str()) {
+            let td = std::env::temp_dir().join(format!("fable-print-{}", ItemId::new()));
+            std::fs::create_dir_all(&td).map_err(|e| e.to_string())?;
+            let out = std::process::Command::new("soffice")
+                .args(["--headless", "--norestore", "--convert-to", "pdf", "--outdir"])
+                .arg(&td)
+                .arg(&path)
+                .output()
+                .map_err(|e| format!("soffice: {e}"))?;
+            if !out.status.success() {
+                return Err("LibreOffice could not convert the document for printing".into());
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("document")
+                .to_string();
+            printable_path = td.join(format!("{stem}.pdf"));
+            if !printable_path.exists() {
+                return Err("the print conversion produced no PDF".into());
+            }
+            _temp_dir = td;
+        } else {
+            printable_path = path.clone();
+        }
+        let mut cmd = std::process::Command::new("lp");
+        if let Some(p) = &printer {
+            cmd.arg("-d").arg(p);
+        }
+        if copies > 1 {
+            cmd.arg("-n").arg(copies.to_string());
+        }
+        cmd.arg(&printable_path);
+        let out = cmd.output().map_err(|e| format!("lp: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "printing failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok::<String, String>(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        )
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("print task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mkfs_commands_are_well_formed() {
+        // Labels are sanitized before they ever reach a shell string:
+        // quotes and shell metacharacters must not survive.
+        assert_eq!(sanitize_label("My Disk; rm -rf /"), "My Disk rm -rf");
+        assert_eq!(sanitize_label("  spaced  "), "spaced");
+        let cmd = mkfs_command("ext4", "Photos", "/dev/sdb1").unwrap();
+        assert_eq!(cmd, "mkfs.ext4 -F -L 'Photos' '/dev/sdb1'");
+        let cmd = mkfs_command("vfat", "usb stick", "/dev/sdb1").unwrap();
+        assert_eq!(cmd, "mkfs.vfat -F 32 -n 'USB STICK' '/dev/sdb1'");
+        let cmd = mkfs_command("exfat", "", "/dev/sdb1").unwrap();
+        assert_eq!(cmd, "mkfs.exfat '/dev/sdb1'");
+        assert!(mkfs_command("zfs", "", "/dev/sdb1").is_err());
+    }
+
     /// Rotate Left must be counter-clockwise: a 2x1 [red, green]
     /// strip becomes 1x2 with green on TOP (the right edge rotates
     /// up). If rotate270 were clockwise, red would be on top.

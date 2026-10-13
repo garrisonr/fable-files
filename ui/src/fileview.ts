@@ -45,6 +45,11 @@ export interface FileViewHooks {
   onSplitFile?(item: Item): void;
   onJoinFiles?(item: Item): void;
   onBurnAdd?(item: Item): void;
+  onPrint?(item: Item): void;
+  onNewFolder?(): void;
+  onNewFile?(kind: string): void;
+  onPasteHere?(): void;
+  onTerminalHere?(): void;
 }
 
 const AUDIO_EXTS = new Set([
@@ -298,6 +303,17 @@ export async function showItemMenu(
           action: () => hooks.onCast!(item),
         });
       }
+      const PRINTABLE = [
+        "pdf", "ps", "txt", "jpg", "jpeg", "png", "gif", "tif", "tiff",
+        "doc", "docx", "odt", "rtf", "xls", "xlsx", "ods", "ppt", "pptx",
+        "odp", "html",
+      ];
+      if (PRINTABLE.includes(ext) && hooks.onPrint) {
+        tools.push({
+          label: "Print…",
+          action: () => hooks.onPrint!(item),
+        });
+      }
       if (ISO_EXTS.includes(ext) && hooks.onMountIso) {
         tools.push({
           label: "Mount Image",
@@ -421,6 +437,67 @@ export class FileView {
     this.el.appendChild(this.scroller);
     this.el.addEventListener("wheel", (e) => this.onWheel(e), { passive: false });
     this.el.addEventListener("keydown", (e) => this.onKey(e));
+    // Background (empty-space) menu: cells/rows stopPropagation on
+    // their own contextmenu, so anything reaching here is background.
+    this.el.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      this.showBackgroundMenu(e.clientX, e.clientY);
+    });
+  }
+
+  /** Right-click on empty space: New Folder / New File / Paste / Terminal. */
+  private showBackgroundMenu(x: number, y: number): void {
+    const hooks = this.hooks;
+    const items: MenuItem[] = [];
+    if (hooks.onNewFolder) {
+      items.push({
+        label: "New Folder",
+        action: () => hooks.onNewFolder!(),
+      });
+    }
+    if (hooks.onNewFile) {
+      const kinds: Array<[string, string]> = [
+        ["Text File", "txt"],
+        ["Markdown", "md"],
+        ["Word Document", "docx"],
+        ["Spreadsheet", "xlsx"],
+        ["Presentation", "pptx"],
+        ["OpenDocument Text", "odt"],
+        ["OpenDocument Spreadsheet", "ods"],
+        ["OpenDocument Presentation", "odp"],
+        ["CSV", "csv"],
+        ["HTML Page", "html"],
+        ["JSON", "json"],
+        ["Shell Script", "sh"],
+        ["Python Script", "py"],
+      ];
+      items.push({
+        label: "New File",
+        action: () => {
+          this.ctxMenu.open(
+            x,
+            y,
+            kinds.map(([label, kind]) => ({
+              label: `${label} (.${kind})`,
+              action: () => hooks.onNewFile!(kind),
+            })),
+          );
+        },
+      });
+    }
+    if (hooks.onPasteHere) {
+      items.push({
+        label: "Paste",
+        action: () => hooks.onPasteHere!(),
+      });
+    }
+    if (hooks.onTerminalHere) {
+      items.push({
+        label: "Open Terminal Here",
+        action: () => hooks.onTerminalHere!(),
+      });
+    }
+    if (items.length > 0) this.ctxMenu.open(x, y, items);
   }
 
   setTab(t: Tab): void {
