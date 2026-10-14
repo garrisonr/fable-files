@@ -59,11 +59,286 @@ pub struct LocationSummary {
     /// Item id of the location's root — pass this as `dir` to `list_dir` to
     /// open the top level.
     pub root_item: ItemId,
+    /// Absolute root path when the backend knows it (Round 7.2: mounted
+    /// volumes carry it so the shell can eject by path).
+    pub path: Option<String>,
+    /// Removable media (USB / SD card) — the sidebar offers eject.
+    pub removable: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Mounted volumes (Round 7.2): the sidebar Locations list used to be only
+// the persisted set — a freshly plugged drive never appeared. Volumes are
+// now enumerated from lsblk on every list_locations call and merged in as
+// provider="volume" runtime locations (registered in the browse maps so
+// list_dir resolves them, never written to the catalog or the sidecar).
+// ---------------------------------------------------------------------------
+
+struct MountedVolume {
+    name: String,
+    path: String,
+    removable: bool,
+}
+
+/// One mounted-filesystem candidate collected from the lsblk tree.
+struct MountCandidate {
+    device: String,
+    mountpoint: String,
+    label: Option<String>,
+    removable: bool,
+}
+
+fn collect_mounts(
+    node: &serde_json::Value,
+    inherited_rm: bool,
+    inherited_usb: bool,
+    under_loop: bool,
+    out: &mut Vec<MountCandidate>,
+) {
+    let ty = node.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let rm = node
+        .get("rm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(inherited_rm);
+    let usb = node.get("tran").and_then(|v| v.as_str()) == Some("usb") || inherited_usb;
+    let loopish = under_loop || ty == "loop" || ty == "rom";
+    let fstype = node.get("fstype").and_then(|v| v.as_str()).unwrap_or("");
+    if !loopish && fstype != "squashfs" {
+        if let Some(points) = node.get("mountpoints").and_then(|v| v.as_array()) {
+            for mp in points.iter().filter_map(|v| v.as_str()) {
+                out.push(MountCandidate {
+                    device: node
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    mountpoint: mp.to_string(),
+                    label: node
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                    removable: rm || usb,
+                });
+            }
+        }
+    }
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        for child in children {
+            collect_mounts(child, rm, usb, loopish, out);
+        }
+    }
+}
+
+fn enumerate_mounted_volumes() -> Vec<MountedVolume> {
+    let out = match std::process::Command::new("lsblk")
+        .args([
+            "-J",
+            "-o",
+            "NAME,TYPE,RM,TRAN,MOUNTPOINTS,LABEL,FSTYPE",
+        ])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let parsed: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut candidates = Vec::new();
+    if let Some(list) = parsed.get("blockdevices").and_then(|v| v.as_array()) {
+        for d in list {
+            collect_mounts(d, false, false, false, &mut candidates);
+        }
+    }
+    // Drop system / pseudo mounts: the sidebar is for browsable volumes.
+    candidates.retain(|c| {
+        let mp = c.mountpoint.as_str();
+        mp != "/"
+            && mp != "/boot"
+            && mp != "/boot/efi"
+            && !mp.starts_with("/snap/")
+            && !mp.starts_with("/var/lib/snapd")
+            && !mp.starts_with("/sys")
+            && !mp.starts_with("/proc")
+            && !mp.starts_with("/dev")
+    });
+    // One entry per device: prefer the top-level (shortest) mountpoint,
+    // which collapses btrfs subvolume duplicates of the same device.
+    let mut by_device: std::collections::HashMap<String, MountCandidate> =
+        std::collections::HashMap::new();
+    for c in candidates {
+        match by_device.get(&c.device) {
+            Some(existing)
+                if existing.mountpoint.matches('/').count()
+                    <= c.mountpoint.matches('/').count() => {}
+            _ => {
+                by_device.insert(c.device.clone(), c);
+            }
+        }
+    }
+    let mut volumes: Vec<MountedVolume> = by_device
+        .into_values()
+        .map(|c| {
+            let name = c.label.clone().unwrap_or_else(|| {
+                std::path::Path::new(&c.mountpoint)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| c.mountpoint.clone())
+            });
+            MountedVolume {
+                name,
+                path: c.mountpoint,
+                removable: c.removable,
+            }
+        })
+        .collect();
+    volumes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    volumes
+}
+
+/// Deterministic UUID for a volume seed string (FNV-1a 128-bit): the
+/// same mount path must yield the same location / root-item ids on every
+/// enumeration, or sidebar refresh would churn ids under open tabs.
+fn volume_uuid(seed: &str) -> uuid::Uuid {
+    let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in seed.bytes() {
+        h1 = (h1 ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut h2: u64 = 0x8422_2325_cbf2_9ce4;
+    for b in seed.bytes().rev() {
+        h2 = (h2 ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&h1.to_be_bytes());
+    bytes[8..].copy_from_slice(&h2.to_be_bytes());
+    uuid::Uuid::from_bytes(bytes)
 }
 
 #[tauri::command]
 pub async fn list_locations(state: State<'_, AppState>) -> Cmd<Vec<LocationSummary>> {
+    let volumes = tauri::async_runtime::spawn_blocking(enumerate_mounted_volumes)
+        .await
+        .unwrap_or_default();
+    let vol_paths: std::collections::HashSet<String> =
+        volumes.iter().map(|v| v.path.clone()).collect();
+
+    // Prune volume locations whose mount vanished (unplugged/unmounted).
+    let stale: Vec<LocationId> = {
+        let locs = state.locations.lock().unwrap();
+        locs.iter()
+            .filter(|l| {
+                l.provider == "volume"
+                    && l.path
+                        .as_deref()
+                        .map(|p| !vol_paths.contains(p))
+                        .unwrap_or(true)
+            })
+            .map(|l| l.id)
+            .collect()
+    };
+    for id in stale {
+        state
+            .locations
+            .lock()
+            .unwrap()
+            .retain(|l| l.id != id);
+        if let Some(root_item) = state.root_items.lock().unwrap().remove(&id) {
+            state.item_paths.lock().unwrap().remove(&root_item);
+        }
+        if let Some(root) = state.local_roots.lock().unwrap().remove(&id) {
+            state.path_ids.lock().unwrap().remove(&root);
+        }
+    }
+
+    // Root paths already covered by a non-volume location win (dedupe).
+    let volume_ids: std::collections::HashSet<LocationId> = {
+        let locs = state.locations.lock().unwrap();
+        locs.iter()
+            .filter(|l| l.provider == "volume")
+            .map(|l| l.id)
+            .collect()
+    };
+    let covered: std::collections::HashSet<std::path::PathBuf> = {
+        let roots = state.local_roots.lock().unwrap();
+        roots
+            .iter()
+            .filter(|(id, _)| !volume_ids.contains(id))
+            .map(|(_, p)| p.clone())
+            .collect()
+    };
+
+    for v in &volumes {
+        let root = std::path::PathBuf::from(&v.path);
+        if covered.contains(&root) {
+            continue;
+        }
+        let id = LocationId(volume_uuid(&format!("volume:{}", v.path)));
+        let root_item = ItemId(volume_uuid(&format!("volume-root:{}", v.path)));
+        let already = state
+            .local_roots
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|p| *p == root)
+            .unwrap_or(false);
+        if !already {
+            state.local_roots.lock().unwrap().insert(id, root.clone());
+            state.root_items.lock().unwrap().insert(id, root_item);
+            state
+                .item_paths
+                .lock()
+                .unwrap()
+                .insert(root_item, root.clone());
+            state.path_ids.lock().unwrap().insert(root.clone(), root_item);
+        }
+        let mut locs = state.locations.lock().unwrap();
+        if let Some(existing) = locs.iter_mut().find(|l| l.id == id) {
+            existing.display_name = v.name.clone();
+            existing.removable = v.removable;
+            existing.path = Some(v.path.clone());
+        } else {
+            locs.push(LocationSummary {
+                id,
+                provider: "volume".into(),
+                display_name: v.name.clone(),
+                root_item,
+                path: Some(v.path.clone()),
+                removable: v.removable,
+            });
+        }
+    }
+
     Ok(state.locations.lock().unwrap().clone())
+}
+
+/// Durable UI preferences (Round 7.2): a small JSON sidecar in the app
+/// data dir, next to locations.json. Sidebar collapse state lives here
+/// because WebKit localStorage proved unreliable across the AppImage's
+/// launch contexts (state written in one session was missing in the
+/// next); the shell keeps localStorage only as a pre-paint fast path.
+#[tauri::command]
+pub fn get_ui_prefs(state: State<'_, AppState>) -> Cmd<serde_json::Value> {
+    let data = std::fs::read(&state.ui_prefs_path).unwrap_or_default();
+    Ok(serde_json::from_slice(&data).unwrap_or_else(|_| serde_json::json!({})))
+}
+
+#[tauri::command]
+pub fn set_ui_prefs(state: State<'_, AppState>, prefs: serde_json::Value) -> Cmd<()> {
+    let json = serde_json::to_string_pretty(&prefs).map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("ui prefs encode: {e}")))
+    })?;
+    // Atomic write: temp file + rename, never truncate the good copy
+    // (same discipline as the locations sidecar).
+    let tmp = state.ui_prefs_path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("ui prefs write: {e}")))
+    })?;
+    std::fs::rename(&tmp, &state.ui_prefs_path).map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("ui prefs rename: {e}")))
+    })?;
+    Ok(())
 }
 
 struct DirEntryInfo {
@@ -1641,7 +1916,9 @@ fn extract_document_text(path: &std::path::Path) -> std::result::Result<String, 
             30,
         ),
         "docx" => Ok(xml_to_text(&bsdtar_extract(path, "word/document.xml")?)),
-        "odt" => Ok(xml_to_text(&bsdtar_extract(path, "content.xml")?)),
+        // ODF family (Writer / Calc / Impress) all carry body text in
+        // content.xml — one mechanism serves all three (Round 7.2).
+        "odt" | "ods" | "odp" => Ok(xml_to_text(&bsdtar_extract(path, "content.xml")?)),
         "epub" => {
             // XHTML members in archive order (the spine order for
             // practical purposes); container metadata is skipped.
@@ -1695,7 +1972,8 @@ pub async fn preview_text(
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
     // Round 7.1: formats with extractable text (docx/odt/epub/pdf) get
     // a real text preview instead of the metadata-only card.
-    if ["docx", "odt", "epub", "pdf"].contains(&ext.as_str()) {
+    // Round 7.2: ods/odp join via the same ODF content.xml mechanism.
+    if ["docx", "odt", "ods", "odp", "epub", "pdf"].contains(&ext.as_str()) {
         let doc_path = path.clone();
         let extracted = tauri::async_runtime::spawn_blocking(move || {
             extract_document_text(&doc_path)
@@ -1740,7 +2018,7 @@ pub async fn preview_text(
         }
     }
     // Binary office formats can't be previewed as text — return a friendly message
-    let binary_office = ["ods", "xlsx", "xls", "doc", "pptx", "ppt", "odp", "odg"];
+    let binary_office = ["xlsx", "xls", "doc", "pptx", "ppt", "odg"];
     if binary_office.contains(&ext.as_str()) {
         return Ok(PreviewTextResult {
             lines: vec![format!("Preview not yet supported for .{} files.", ext),
@@ -3954,6 +4232,8 @@ pub async fn add_path_location(
         provider: "cloud".into(),
         display_name: name,
         root_item: root_item.id,
+        path: Some(path),
+        removable: false,
     };
     state.locations.lock().unwrap().push(summary.clone());
     Ok(summary)

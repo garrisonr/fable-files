@@ -43,6 +43,9 @@ pub struct AppState {
     /// own short-lived connections instead of borrowing the managed one.
     pub catalog_path: PathBuf,
     pub checkpoint_path: PathBuf,
+    /// Durable UI prefs sidecar (Round 7.2): ui-prefs.json in the app
+    /// data dir — sidebar collapse state and future shell preferences.
+    pub ui_prefs_path: PathBuf,
     pub previews: PreviewRegistry,
     pub themes_dir: PathBuf,
     pub active_theme: Mutex<String>,
@@ -114,6 +117,7 @@ impl AppState {
             catalog: Mutex::new(catalog),
             catalog_path,
             checkpoint_path,
+            ui_prefs_path: base.join("ui-prefs.json"),
             previews: ufm_preview::registry_with_builtins(),
             themes_dir: themes_dir.clone(),
             active_theme: Mutex::new("grizzette".to_string()),
@@ -204,6 +208,8 @@ impl AppState {
                         provider: loc.provider.clone(),
                         display_name: loc.display_name.clone(),
                         root_item,
+                        path: Some(loc.root.clone()),
+                        removable: false,
                     });
                     restored += 1;
                 }
@@ -268,6 +274,8 @@ impl AppState {
             provider: location.provider.clone(),
             display_name: location.display_name.clone(),
             root_item: root_item.id,
+            path: Some(home.to_string_lossy().into_owned()),
+            removable: false,
         });
 
         let saved = vec![PersistedLocation {
@@ -372,6 +380,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::list_locations,
+            commands::get_ui_prefs,
+            commands::set_ui_prefs,
             commands::list_dir,
             commands::start_copy,
             commands::pause_job,

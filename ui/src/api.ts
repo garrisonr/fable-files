@@ -68,6 +68,11 @@ export interface LocationSummary {
   /** Item id of the location's root — pass as `dir` to `listDir` to open it.
    *  Real UUID minted by the backend; never synthesize ids on the shell side. */
   root_item: string;
+  /** Absolute root path when the backend knows it (Round 7.2: mounted
+   *  volumes carry it so the sidebar can eject by path). */
+  path: string | null;
+  /** Removable media (USB / SD) — the sidebar offers eject. */
+  removable: boolean;
 }
 
 export type ItemKind = "file" | "folder" | string;
@@ -216,6 +221,11 @@ export async function onPlayerClosed(
 
 export const api = {
   listLocations: () => invoke<LocationSummary[]>("list_locations"),
+  /** Durable UI prefs (Round 7.2): backend sidecar, survives where
+   *  WebKit localStorage did not. Values are plain JSON. */
+  getUiPrefs: () => invoke<Record<string, unknown>>("get_ui_prefs"),
+  setUiPrefs: (prefs: Record<string, unknown>) =>
+    invoke<void>("set_ui_prefs", { prefs }),
   listDir: (location: string, dir: string) =>
     invoke<Item[]>("list_dir", { location, dir }),
   search: (query_text: string, scope: string | null, limit = 50, typeFilter?: string | null, filters?: { pathPrefix?: string | null; modifiedAfter?: string | null; modifiedBefore?: string | null }) =>

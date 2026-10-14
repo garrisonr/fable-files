@@ -141,6 +141,12 @@ export class Shell {
   private smartList!: HTMLElement;
   private romsHead!: HTMLElement;
   private romsList!: HTMLElement;
+  /** Chevron spans of the collapsible sidebar sections (Round 7.2:
+   * kept so boot can re-apply durable collapse prefs to the DOM). */
+  private labelChevEl: HTMLElement | null = null;
+  private romsChevEl: HTMLElement | null = null;
+  /** Durable UI prefs (backend sidecar via api.getUiPrefs). */
+  private uiPrefs: Record<string, unknown> = {};
   /** Archive browsing state: archive item id -> its catalog Item and
    * cached listing. */
   private archiveMeta = new Map<string, Item>();
@@ -423,6 +429,16 @@ export class Shell {
     );
     // The search field lives in the toolbar; its results panel is in the viewport.
     this.searchWrap.appendChild(this.searchView.field);
+    // Re-index also rides beside the search field (Round 7.2): it is
+    // in the hamburger menu and the results header too — an important
+    // feature earns the duplication (Dickles).
+    const reindexBtn = document.createElement("button");
+    reindexBtn.className = "icon-btn reindex-btn";
+    reindexBtn.textContent = "↻";
+    reindexBtn.title = "Re-index Library";
+    reindexBtn.setAttribute("aria-label", "Re-index Library");
+    reindexBtn.addEventListener("click", () => this.reindexLibrary());
+    this.searchWrap.appendChild(reindexBtn);
     this.el.append(
       this.picker.element,
       this.renameDialog.element,
@@ -490,6 +506,46 @@ export class Shell {
       this.locations = [];
     }
     await this.buildSidebar();
+    // Durable UI prefs (Round 7.2): hydrate sidebar collapse state
+    // from the backend sidecar — WebKit localStorage alone lost it
+    // across sessions. Adopt any localStorage-only values once so
+    // existing users keep their layout.
+    try {
+      const prefs = await api.getUiPrefs();
+      if (prefs && typeof prefs === "object") {
+        this.uiPrefs = prefs;
+        let migrated = false;
+        for (const key of ["ff-labels-collapsed", "ff-roms-collapsed"]) {
+          if (typeof this.uiPrefs[key] !== "boolean") {
+            try {
+              const ls = localStorage.getItem(key);
+              if (ls !== null) {
+                this.uiPrefs[key] = ls === "1";
+                migrated = true;
+              }
+            } catch {
+              // no fast path available
+            }
+          }
+        }
+        if (migrated) {
+          void api.setUiPrefs({ ...this.uiPrefs }).catch(() => undefined);
+        }
+        this.applyCollapsePrefs();
+      }
+    } catch {
+      // prefs are a nicety — the localStorage fast path already ran
+    }
+    // Volumes come and go while the app runs (Round 7.2): refresh the
+    // locations list when the window regains focus, throttled so a
+    // burst of focus events doesn't rebuild the sidebar repeatedly.
+    let lastLocRefresh = Date.now();
+    window.addEventListener("focus", () => {
+      const now = Date.now();
+      if (now - lastLocRefresh < 3000) return;
+      lastLocRefresh = now;
+      void this.refreshLocations();
+    });
     // Label splits (Music/Media, Payroll/Money): assignments follow
     // the renamed defs so nothing loses its filing.
     void migrateLabelAssignments(loadLabelDefs(), api).then((did) => {
@@ -501,7 +557,14 @@ export class Shell {
     } else {
       this.renderEmptyState();
     }
-    void this.indexTracker.boot(this.locations.map((l) => l.id));
+    // Auto volumes are browsable immediately but are NOT walked at
+    // boot (a multi-TB USB drive would stall the chain); Re-index
+    // Library still covers them on demand.
+    void this.indexTracker.boot(
+      this.locations
+        .filter((l) => l.provider !== "volume")
+        .map((l) => l.id),
+    );
   }
 
   private requireTab(): Tab {
@@ -601,6 +664,7 @@ export class Shell {
     labelChev.className = "side-chev";
     labelChev.textContent = "▾";
     labelHead.append(labelHeadText, labelChev);
+    this.labelChevEl = labelChev;
     this.labelList = document.createElement("div");
     this.labelList.className = "side-list";
     const labelsCollapsed = (() => {
@@ -616,11 +680,7 @@ export class Shell {
       const nowHidden = !this.labelList.hidden;
       this.labelList.hidden = nowHidden;
       labelChev.style.transform = nowHidden ? "rotate(-90deg)" : "";
-      try {
-        localStorage.setItem("ff-labels-collapsed", nowHidden ? "1" : "0");
-      } catch {
-        // persistence is a nicety, not a requirement
-      }
+      this.setCollapsedPref("ff-labels-collapsed", nowHidden);
     });
     const smartHead = document.createElement("h2");
     smartHead.className = "side-head";
@@ -639,6 +699,7 @@ export class Shell {
     romsChev.className = "side-chev";
     romsChev.textContent = "▾";
     romsHead.append(romsHeadText, romsChev);
+    this.romsChevEl = romsChev;
     romsHead.title = "Right-click to add a system";
     romsHead.addEventListener("contextmenu", (e) => {
       e.preventDefault();
@@ -663,11 +724,7 @@ export class Shell {
       const nowHidden = !this.romsList.hidden;
       this.romsList.hidden = nowHidden;
       romsChev.style.transform = nowHidden ? "rotate(-90deg)" : "";
-      try {
-        localStorage.setItem("ff-roms-collapsed", nowHidden ? "1" : "0");
-      } catch {
-        // persistence is a nicety, not a requirement
-      }
+      this.setCollapsedPref("ff-roms-collapsed", nowHidden);
     });
     sidebar.append(
       favHead,
@@ -1527,6 +1584,47 @@ export class Shell {
     await this.buildSidebar();
   }
 
+  /** Effective collapse state for a sidebar section (Round 7.2): the
+   * durable backend prefs win; localStorage is only the pre-paint
+   * fast path the layout build reads before boot finishes. */
+  private prefCollapsed(key: string): boolean {
+    const v = this.uiPrefs[key];
+    if (typeof v === "boolean") return v;
+    try {
+      return localStorage.getItem(key) === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  /** Persist a sidebar collapse toggle to BOTH stores: localStorage
+   * for the next pre-paint read, the backend sidecar for durability
+   * (localStorage alone lost this state across sessions in 7.1 QA). */
+  private setCollapsedPref(key: string, hidden: boolean): void {
+    this.uiPrefs[key] = hidden;
+    try {
+      localStorage.setItem(key, hidden ? "1" : "0");
+    } catch {
+      // fast path only — the sidecar below is the durable copy
+    }
+    void api.setUiPrefs({ ...this.uiPrefs }).catch(() => undefined);
+  }
+
+  /** Re-apply collapse prefs to the built sidebar sections (called
+   * from boot once the durable prefs have loaded). */
+  private applyCollapsePrefs(): void {
+    const labels = this.prefCollapsed("ff-labels-collapsed");
+    this.labelList.hidden = labels;
+    if (this.labelChevEl) {
+      this.labelChevEl.style.transform = labels ? "rotate(-90deg)" : "";
+    }
+    const roms = this.prefCollapsed("ff-roms-collapsed");
+    this.romsList.hidden = roms;
+    if (this.romsChevEl) {
+      this.romsChevEl.style.transform = roms ? "rotate(-90deg)" : "";
+    }
+  }
+
   /** Mount an ISO item and open it as a sidebar location. */
   private async mountIsoItem(item: Item): Promise<void> {
     try {
@@ -1927,6 +2025,30 @@ export class Shell {
       prov.className = "side-provider";
       prov.textContent = loc.provider;
       b.append(name, prov);
+      // Removable volumes get an inline eject (Round 7.2), the way
+      // Nautilus renders it — the right-click Unmount stays as well.
+      if (loc.provider === "volume" && loc.removable && loc.path) {
+        const eject = document.createElement("span");
+        eject.className = "side-eject";
+        eject.textContent = "⏏";
+        eject.title = `Eject ${loc.display_name}`;
+        eject.setAttribute("role", "button");
+        eject.setAttribute("aria-label", `Eject ${loc.display_name}`);
+        eject.addEventListener("click", (e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          void (async () => {
+            try {
+              await api.unmountPath(loc.path!);
+              Toast.success(`Ejected ${loc.display_name}.`);
+            } catch (err) {
+              Toast.error(`Eject failed: ${err}`);
+            }
+            await this.refreshLocations();
+          })();
+        });
+        b.appendChild(eject);
+      }
       b.addEventListener("click", () => {
         this.navigateTo({
           locationId: loc.id,

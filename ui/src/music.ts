@@ -125,6 +125,38 @@ export class MusicPlayer {
       : null;
   }
 
+  /** List a folder given its absolute path. `list_dir` resolves
+   * directory IDS, not paths — passing the raw path here silently
+   * failed and folder art never loaded (Round 7.2 fix). Mirror the
+   * shell's resolution (openItemInNewTab): start at the item's
+   * location root and walk the path segments, matching child folders
+   * by name, until the final segment's id can be listed. */
+  private async listFolderByPath(
+    first: Item,
+    folderPath: string,
+  ): Promise<Item[] | null> {
+    const locations = await api.listLocations();
+    const loc = locations.find((l) => l.id === first.location) ?? locations[0];
+    if (!loc) return null;
+    const rootPath = await api.getItemPath(loc.root_item);
+    if (folderPath === rootPath) {
+      return api.listDir(loc.id, loc.root_item);
+    }
+    if (!folderPath.startsWith(rootPath + "/")) return null;
+    const segments = folderPath
+      .slice(rootPath.length + 1)
+      .split("/")
+      .filter((s) => s.length > 0);
+    let curDirId = loc.root_item;
+    for (const seg of segments) {
+      const entries = await api.listDir(loc.id, curDirId);
+      const next = entries.find((e) => e.kind === "folder" && e.name === seg);
+      if (!next) return null;
+      curDirId = next.id;
+    }
+    return api.listDir(loc.id, curDirId);
+  }
+
   /** A saved custom order (drag-reorder) wins over name order.
    * Round 7: orders persist by item id (`ff-music-order-id:<folder>`);
    * the legacy provider_key order (`ff-music-order:<folder>`) is read
@@ -249,8 +281,8 @@ export class MusicPlayer {
               "folder.jpg", "folder.jpeg", "folder.png", "cover.jpg", "cover.jpeg",
               "cover.png", "front.jpg", "front.jpeg", "front.png", "albumart.jpg",
             ]);
-            const entries = await api.listDir(first.location, folder);
-            const art = entries.find((e) => names.has(e.name.toLowerCase()));
+            const entries = await this.listFolderByPath(first, folder);
+            const art = entries?.find((e) => names.has(e.name.toLowerCase()));
             if (art?.provider_key) {
               show(await mediaSrc(art.provider_key));
               return;

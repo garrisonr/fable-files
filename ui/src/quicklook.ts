@@ -226,7 +226,8 @@ export class QuickLook {
       const textExts = ["txt", "md", "csv", "tsv", "log", "srt", "vtt", "sub", "ssa", "ass", "nfo", "json", "xml", "yaml", "yml", "toml", "ini", "cfg", "sh", "py", "rs", "ts", "js"];
       // Round 7.1: documents get a text preview too — the backend
       // extracts readable text from docx/odt/epub/pdf in preview_text.
-      const docExts = ["docx", "odt", "epub", "pdf"];
+      // Round 7.2: ods/odp join (same ODF content.xml mechanism).
+      const docExts = ["docx", "odt", "ods", "odp", "epub", "pdf"];
       if (
         (kind === "native" && textExts.includes(ext)) ||
         (kind === "document" && docExts.includes(ext))

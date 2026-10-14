@@ -154,8 +154,9 @@ impl PreviewProvider for ExtensionProvider {
                 "mp3" | "flac" | "ogg" | "oga" | "wav" | "m4a" | "m4b" | "opus" | "mp4"
                 | "mkv" | "webm" | "mov" | "avi",
             ) => PreviewKind::Media,
-            // Document: paginated document / ebook.
-            Some("pdf" | "epub" | "doc" | "docx" | "odt") => PreviewKind::Document,
+            // Document: paginated document / ebook. The ODF family
+            // (odt/ods/odp) shares the content.xml text mechanism.
+            Some("pdf" | "epub" | "doc" | "docx" | "odt" | "ods" | "odp") => PreviewKind::Document,
             // Archive: browsed like a folder.
             Some("zip" | "7z" | "rar" | "tar" | "gz" | "bz2" | "xz") => PreviewKind::Archive,
             // Everything else — unknown or missing extension: hex fallback.
@@ -221,6 +222,11 @@ mod tests {
             ("clip.mov", PreviewKind::Media),
             ("book.pdf", PreviewKind::Document),
             ("book.epub", PreviewKind::Document),
+            ("report.docx", PreviewKind::Document),
+            ("letter.odt", PreviewKind::Document),
+            ("sheet.ods", PreviewKind::Document),
+            ("slides.odp", PreviewKind::Document),
+            ("sheet.ODS", PreviewKind::Document), // case-insensitive
             ("archive.zip", PreviewKind::Archive),
             ("backup.tar", PreviewKind::Archive),
             ("data.7z", PreviewKind::Archive),

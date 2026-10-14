@@ -343,6 +343,23 @@ th[data-sort]:focus-visible {
   color: var(--ufm-text-muted);
 }
 
+/* Inline eject on removable volume rows (Round 7.2). */
+.side-eject {
+  margin-left: 0.25rem;
+  color: var(--ufm-text-muted);
+  font-size: 0.75rem;
+  line-height: 1;
+  padding: 0.125rem 0.25rem;
+  border-radius: calc(var(--ufm-radius-md) / 2);
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.side-eject:hover {
+  color: var(--ufm-text);
+  background: color-mix(in srgb, var(--ufm-text) 10%, transparent);
+}
+
 .side-empty {
   color: var(--ufm-text-muted);
   font-size: 0.75rem;
@@ -799,6 +816,10 @@ td.muted {
   box-shadow: 0 0.75rem 2rem color-mix(in srgb, var(--ufm-text) 16%, transparent);
   padding: 0.25rem;
   will-change: transform, opacity;
+  /* Round 7.2: the theme list outgrew short windows — cap the panel
+   * below its toolbar anchor and scroll, like every popup menu. */
+  max-height: calc(100vh - 4rem);
+  overflow-y: auto;
 }
 
 .theme-item {
@@ -981,6 +1002,11 @@ body[data-layout="tv"] .cell-icon {
   padding: 4px;
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
+  /* Round 7.2: long menus (the ~30-item hamburger) ran off the
+   * bottom of the window with no way to reach the last entries.
+   * Every popup menu now caps at the viewport and scrolls. */
+  max-height: calc(100vh - 1rem);
+  overflow-y: auto;
 }
 
 .ctx-item {
@@ -1183,6 +1209,18 @@ body[data-layout="tv"] .cell-icon {
 .search-wrap {
   display: flex;
   align-items: center;
+  gap: 0.25rem;
+}
+
+.search-wrap .search-field {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Re-index button beside the search field (Round 7.2). */
+.reindex-btn {
+  flex: 0 0 auto;
+  font-size: 15px;
 }
 
 /* Copy path button */
