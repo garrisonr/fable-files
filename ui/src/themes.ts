@@ -24,6 +24,7 @@ export interface DistroEngine {
   preview: [string, string, string];
 }
 export const DISTRO_ENGINES: DistroEngine[] = [
+  { id: "bondi", name: "Bondi", dark: true, preview: ["#232326", "#e8e8ea", "#2ba3c7"] },
   { id: "cupertino", name: "Cupertino", dark: true, preview: ["#f5f5f7", "#1d1d1f", "#2ba3c7"] },
   { id: "omarchy", name: "Omarchy", dark: true, preview: ["#1a1b26", "#c0caf5", "#7aa2f7"] },
   { id: "ubuntu", name: "Ubuntu · Yaru", dark: "auto", preview: ["#f7f7f7", "#2c2c2c", "#e95420"] },

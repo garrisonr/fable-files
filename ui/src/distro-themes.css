@@ -14,6 +14,9 @@
 
 [data-theme] body, [data-theme] #app { font-family: inherit; }
 
+/* — Bondi: Dickles' own theme — candy iMac era, smoke graphite + Bondi blue — */
+[data-theme="bondi"] { color-scheme: dark; --ufm-accent:#2ba3c7; --ufm-text:#e8e8ea; --ufm-text-muted:#a8a8b0; --ufm-surface:rgba(35,35,38,.94); --ufm-content-canvas:rgba(35,35,38,.94); --ufm-rail:rgba(27,27,30,.96); --ufm-border:rgba(255,255,255,.1); --ufm-radius:9px; --ufm-card-radius:12px; --ufm-blur:18px; --ufm-danger:#e05a4e; font-family:system-ui,"Inter",sans-serif; }
+
 /* — Zorin OS: Zorin Blue, pale panels, Inter — */
 [data-theme="zorin"] { --ufm-accent:#175ddc; --ufm-text:#1b1d21; --ufm-text-muted:#5f6368; --ufm-surface:rgba(255,255,255,.85); --ufm-content-canvas:rgba(255,255,255,.85); --ufm-rail:rgba(242,244,247,.88); --ufm-border:rgba(0,0,0,.09); --ufm-radius:8px; --ufm-card-radius:12px; font-family:"Inter",system-ui,sans-serif; }
 @media (prefers-color-scheme: dark) { [data-theme="zorin"] { --ufm-text:#eef1f5; --ufm-text-muted:#a7adb6; --ufm-surface:rgba(32,34,38,.86); --ufm-content-canvas:rgba(32,34,38,.86); --ufm-rail:rgba(24,25,28,.9); --ufm-border:rgba(255,255,255,.1); } }
