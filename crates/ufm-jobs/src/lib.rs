@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use ufm_core::{now_utc, JobId, Result, UfmError};
 use ufm_vfs::Item;
 
@@ -173,25 +174,76 @@ pub struct JournalEntry {
     pub note: Option<String>,
 }
 
+/// Persistence target for journal entries. Implemented by ufm-catalog
+/// (SQLite, the `job_journal` table) and by tests (in-memory). A trait so
+/// ufm-jobs stays storage-agnostic: the engine defines WHAT is journaled,
+/// the catalog owns WHERE it lands.
+pub trait JournalSink: Send + Sync {
+    fn record(&self, entry: &JournalEntry) -> Result<()>;
+}
+
 pub struct JobJournal {
     entries: Vec<JournalEntry>,
+    sink: Option<Arc<dyn JournalSink>>,
 }
 
 impl JobJournal {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+            sink: None,
+        }
+    }
+
+    /// A journal that also persists every record through `sink`
+    /// (spec §25: the journal is durable, fsync'd by the store).
+    /// Persistence is best-effort — a sink failure never kills an
+    /// operation mid-flight; the executor additionally rewrites the
+    /// whole-job snapshot in the catalog on every transition, so a lost
+    /// journal row can never strand a job.
+    pub fn with_sink(sink: Arc<dyn JournalSink>) -> Self {
+        Self {
+            entries: Vec::new(),
+            sink: Some(sink),
+        }
+    }
+
+    /// A journal pre-loaded with persisted entries, for crash replay.
+    pub fn from_entries(entries: Vec<JournalEntry>) -> Self {
+        Self {
+            entries,
+            sink: None,
+        }
+    }
+
+    pub fn entries(&self) -> &[JournalEntry] {
+        &self.entries
     }
 
     pub fn record(&mut self, job: JobId, step: &str, from: StepState, to: StepState) {
-        self.entries.push(JournalEntry {
+        self.record_with_note(job, step, from, to, None);
+    }
+
+    pub fn record_with_note(
+        &mut self,
+        job: JobId,
+        step: &str,
+        from: StepState,
+        to: StepState,
+        note: Option<String>,
+    ) {
+        let entry = JournalEntry {
             job,
             step: step.to_string(),
             from,
             to,
             at: now_utc(),
-            note: None,
-        });
-        // TODO(spec §25): persist to the catalog DB (jobs table) with fsync.
+            note,
+        };
+        if let Some(sink) = &self.sink {
+            let _ = sink.record(&entry);
+        }
+        self.entries.push(entry);
     }
 
     /// Rebuild step states after a restart. Steps left `Running` at crash time
@@ -211,5 +263,130 @@ impl JobJournal {
 impl Default for JobJournal {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use ufm_core::{ItemId, LocationId};
+    use ufm_vfs::ItemKind;
+
+    #[derive(Default)]
+    struct VecSink {
+        entries: Mutex<Vec<JournalEntry>>,
+    }
+
+    impl JournalSink for VecSink {
+        fn record(&self, entry: &JournalEntry) -> Result<()> {
+            self.entries.lock().unwrap().push(entry.clone());
+            Ok(())
+        }
+    }
+
+    fn item(name: &str, kind: ItemKind) -> Item {
+        Item {
+            id: ItemId::new(),
+            location: LocationId::new(),
+            name: name.into(),
+            kind,
+            size_bytes: Some(10),
+            modified: None,
+            provider_key: Some(format!("/tmp/{name}")),
+            labels: vec![],
+            starred: false,
+        }
+    }
+
+    fn step(id: &str, op: StepOp, deps: &[&str]) -> Step {
+        Step {
+            id: id.into(),
+            label: id.into(),
+            op,
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            state: StepState::Pending,
+            compensation: None,
+        }
+    }
+
+    fn sample_job() -> Job {
+        let mut job = Job::new("test", JobPreview::default());
+        let dir = item("dest", ItemKind::Folder);
+        let src = item("a.txt", ItemKind::File);
+        job.add_step(step(
+            "s1",
+            StepOp::Mkdir {
+                parent: dir.clone(),
+                name: "sub".into(),
+            },
+            &[],
+        ));
+        job.add_step(step(
+            "s2",
+            StepOp::VerifyCopy {
+                src: src.clone(),
+                dst: item("a.txt", ItemKind::File),
+            },
+            &[],
+        ));
+        job.add_step(step(
+            "s3",
+            StepOp::Copy {
+                src,
+                dst_parent: dir,
+                new_name: "a.txt".into(),
+            },
+            &["s1", "s2"],
+        ));
+        job
+    }
+
+    #[test]
+    fn runnable_order_respects_dependencies() {
+        let job = sample_job();
+        let order = job.runnable_order().unwrap();
+        let pos = |id: &str| order.iter().position(|s| s == id).unwrap();
+        assert!(pos("s1") < pos("s3"));
+        assert!(pos("s2") < pos("s3"));
+        assert_eq!(order.len(), 3);
+    }
+
+    #[test]
+    fn journal_forwards_to_sink_and_keeps_entries() {
+        let sink = Arc::new(VecSink::default());
+        let mut journal = JobJournal::with_sink(sink.clone());
+        let job = JobId::new();
+        journal.record(job, "s1", StepState::Pending, StepState::Running);
+        journal.record_with_note(
+            job,
+            "s1",
+            StepState::Running,
+            StepState::Failed,
+            Some("disk full".into()),
+        );
+        assert_eq!(journal.entries().len(), 2);
+        let sunk = sink.entries.lock().unwrap();
+        assert_eq!(sunk.len(), 2);
+        assert_eq!(sunk[1].note.as_deref(), Some("disk full"));
+        assert_eq!(sunk[0].to, StepState::Running);
+    }
+
+    #[test]
+    fn replay_restores_done_and_resets_running() {
+        let mut journal = JobJournal::new();
+        let mut job = sample_job();
+        let id = job.id;
+        journal.record(id, "s1", StepState::Pending, StepState::Running);
+        journal.record(id, "s1", StepState::Running, StepState::Done);
+        journal.record(id, "s2", StepState::Pending, StepState::Running);
+        // "Crash" here: s2 was Running, s3 never started.
+        let replayed = JobJournal::from_entries(journal.entries().to_vec());
+        let mut restored = sample_job();
+        restored.id = id;
+        replayed.replay_into(&mut restored);
+        assert_eq!(restored.steps["s1"].state, StepState::Done);
+        assert_eq!(restored.steps["s2"].state, StepState::Pending); // reset
+        assert_eq!(restored.steps["s3"].state, StepState::Pending);
     }
 }

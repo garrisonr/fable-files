@@ -223,30 +223,831 @@ pub struct CopyRequest {
     pub dst_parent: ItemId,
 }
 
+/// Live control block for one job: the shared snapshot the executor
+/// mutates, plus the pause/cancel flags the job commands flip. Mirrors
+/// the `transcode_cancels` pattern, one entry per job. The catalog holds
+/// the durable copy; this is the control surface.
+#[derive(Clone)]
+pub struct JobHandle {
+    pub job: std::sync::Arc<Mutex<ufm_jobs::Job>>,
+    pub pause: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// True while an executor task owns this job.
+    pub live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl JobHandle {
+    pub fn new(job: ufm_jobs::Job, paused: bool) -> Self {
+        use std::sync::atomic::AtomicBool;
+        Self {
+            job: std::sync::Arc::new(Mutex::new(job)),
+            pause: std::sync::Arc::new(AtomicBool::new(paused)),
+            cancel: std::sync::Arc::new(AtomicBool::new(false)),
+            live: std::sync::Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn snapshot(&self) -> ufm_jobs::Job {
+        self.job.lock().unwrap().clone()
+    }
+}
+
+fn flag(b: &std::sync::atomic::AtomicBool) -> bool {
+    b.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn job_state_name(state: ufm_jobs::JobState) -> &'static str {
+    match state {
+        ufm_jobs::JobState::Queued => "queued",
+        ufm_jobs::JobState::Running => "running",
+        ufm_jobs::JobState::Paused => "paused",
+        ufm_jobs::JobState::Completed => "completed",
+        ufm_jobs::JobState::Cancelled => "cancelled",
+        ufm_jobs::JobState::Failed => "failed",
+    }
+}
+
+/// Bytes attributable to finished copy steps (Done or verify-Skipped).
+/// Recomputed from the snapshot so progress survives pause/resume.
+fn job_bytes_done(job: &ufm_jobs::Job) -> u64 {
+    job.steps
+        .values()
+        .filter(|s| {
+            matches!(
+                s.state,
+                ufm_jobs::StepState::Done | ufm_jobs::StepState::Skipped
+            )
+        })
+        .filter_map(|s| match &s.op {
+            ufm_jobs::StepOp::Copy { src, .. } => src.size_bytes,
+            _ => None,
+        })
+        .sum()
+}
+
+/// The `job-progress` event — the Transfer Center contract. Mirrors the
+/// `index-progress` / `transcode-progress` payload style.
+fn emit_job_progress(
+    app: &tauri::AppHandle,
+    job: &ufm_jobs::Job,
+    bytes_done: u64,
+    current: Option<&str>,
+    error: Option<&str>,
+) {
+    let steps_done = job
+        .steps
+        .values()
+        .filter(|s| {
+            matches!(
+                s.state,
+                ufm_jobs::StepState::Done | ufm_jobs::StepState::Skipped
+            )
+        })
+        .count();
+    let _ = app.emit(
+        "job-progress",
+        serde_json::json!({
+            "job_id": job.id.to_string(),
+            "title": job.title,
+            "state": job_state_name(job.state),
+            "steps_done": steps_done,
+            "steps_total": job.steps.len(),
+            "bytes_done": bytes_done,
+            "bytes_total": job.preview.bytes_to_move,
+            "current": current,
+            "done": matches!(
+                job.state,
+                ufm_jobs::JobState::Completed
+                    | ufm_jobs::JobState::Cancelled
+                    | ufm_jobs::JobState::Failed
+            ),
+            "error": error,
+        }),
+    );
+}
+
+fn job_item(
+    id: ItemId,
+    location: LocationId,
+    path: &Path,
+    kind: ItemKind,
+    size: Option<u64>,
+) -> Item {
+    Item {
+        id,
+        location,
+        name: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        kind,
+        size_bytes: size,
+        modified: None,
+        provider_key: Some(path.to_string_lossy().into_owned()),
+        labels: Vec::new(),
+        starred: false,
+    }
+}
+
+/// Resolve a destination file name inside `dst_dir`. On collision, record
+/// a preview conflict and fall back to the app's paste idiom
+/// (`name`, `name 2`, `name 3`, …) — a job never silently overwrites.
+fn resolve_dest_name(
+    dst_dir: &Path,
+    name: &str,
+    preview: &mut ufm_jobs::JobPreview,
+) -> String {
+    if !dst_dir.join(name).exists() {
+        return name.to_string();
+    }
+    preview.conflicts.push(ufm_jobs::Conflict {
+        path: dst_dir.join(name).to_string_lossy().into_owned(),
+        kind: ufm_jobs::ConflictKind::NameCollision,
+    });
+    let mut n = 2;
+    loop {
+        let candidate = format!("{name} {n}");
+        if !dst_dir.join(&candidate).exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Builds the step DAG for a copy. Deterministic step ids (`s0001`, …)
+/// keep journal rows stable and greppable.
+struct CopyPlanner {
+    job: ufm_jobs::Job,
+    seq: u32,
+    location: LocationId,
+}
+
+impl CopyPlanner {
+    fn next_id(&mut self) -> String {
+        self.seq += 1;
+        format!("s{:04}", self.seq)
+    }
+
+    fn add_mkdir(
+        &mut self,
+        parent: &Path,
+        name: &str,
+        depends_on: Option<String>,
+    ) -> String {
+        let id = self.next_id();
+        self.job.add_step(ufm_jobs::Step {
+            id: id.clone(),
+            label: format!("create folder {name}"),
+            op: ufm_jobs::StepOp::Mkdir {
+                parent: job_item(
+                    ItemId::new(),
+                    self.location,
+                    parent,
+                    ItemKind::Folder,
+                    None,
+                ),
+                name: name.to_string(),
+            },
+            depends_on: depends_on.into_iter().collect(),
+            state: ufm_jobs::StepState::Pending,
+            compensation: None,
+        });
+        id
+    }
+
+    fn add_file(
+        &mut self,
+        src_path: &Path,
+        dst_dir: &Path,
+        new_name: &str,
+        size: u64,
+        mkdir_dep: Option<String>,
+    ) {
+        let src_item = job_item(
+            ItemId::new(),
+            self.location,
+            src_path,
+            ItemKind::File,
+            Some(size),
+        );
+        let dst_item = job_item(
+            ItemId::new(),
+            self.location,
+            &dst_dir.join(new_name),
+            ItemKind::File,
+            Some(size),
+        );
+        let verify_id = self.next_id();
+        self.job.add_step(ufm_jobs::Step {
+            id: verify_id.clone(),
+            label: format!("verify {}", src_path.display()),
+            op: ufm_jobs::StepOp::VerifyCopy {
+                src: src_item.clone(),
+                dst: dst_item,
+            },
+            depends_on: vec![],
+            state: ufm_jobs::StepState::Pending,
+            compensation: None,
+        });
+        let mut deps = vec![verify_id];
+        if let Some(m) = mkdir_dep {
+            deps.push(m);
+        }
+        let copy_id = self.next_id();
+        self.job.add_step(ufm_jobs::Step {
+            id: copy_id,
+            label: format!("copy {}", src_path.display()),
+            op: ufm_jobs::StepOp::Copy {
+                src: src_item,
+                dst_parent: job_item(
+                    ItemId::new(),
+                    self.location,
+                    dst_dir,
+                    ItemKind::Folder,
+                    None,
+                ),
+                new_name: new_name.to_string(),
+            },
+            depends_on: deps,
+            state: ufm_jobs::StepState::Pending,
+            compensation: None,
+        });
+        self.job.preview.files_affected += 1;
+        self.job.preview.bytes_to_move += size;
+    }
+
+    /// Plan the contents of `src_dir` into `dst_dir`. `mkdir_dep` is the
+    /// step that creates `dst_dir` (None when `dst_dir` already exists).
+    fn plan_dir(
+        &mut self,
+        src_dir: &Path,
+        dst_dir: &Path,
+        mkdir_dep: Option<String>,
+    ) -> Cmd<()> {
+        let io_err = |e: std::io::Error| CommandError::from(UfmError::Internal(e.to_string()));
+        let mut entries: Vec<std::fs::DirEntry> = Vec::new();
+        for entry in std::fs::read_dir(src_dir).map_err(io_err)? {
+            entries.push(entry.map_err(io_err)?);
+        }
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let ty = entry.file_type().map_err(io_err)?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if ty.is_dir() {
+                let mid = self.add_mkdir(dst_dir, &name, mkdir_dep.clone());
+                self.plan_dir(&path, &dst_dir.join(&name), Some(mid))?;
+            } else {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                self.add_file(&path, dst_dir, &name, size, mkdir_dep.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Build (but do not run) the copy job for a request. Ids resolve through
+/// the live-browse caches: `item_paths` for paths, `item_locations` for
+/// the location stamped onto step items.
+fn build_copy_job(state: &AppState, req: &CopyRequest) -> Cmd<ufm_jobs::Job> {
+    if req.sources.is_empty() {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "nothing to copy".into(),
+        )));
+    }
+    let (dst_dir, dst_location, src_paths) = {
+        let paths = state.item_paths.lock().unwrap();
+        let locs = state.item_locations.lock().unwrap();
+        let dst_dir = paths
+            .get(&req.dst_parent)
+            .cloned()
+            .ok_or_else(|| {
+                CommandError::from(UfmError::NotFound("unknown destination".into()))
+            })?;
+        let mut srcs = Vec::new();
+        for id in &req.sources {
+            let p = paths.get(id).cloned().ok_or_else(|| {
+                CommandError::from(UfmError::NotFound("unknown source item".into()))
+            })?;
+            srcs.push(p);
+        }
+        (dst_dir, locs.get(&req.dst_parent).copied(), srcs)
+    };
+    if !dst_dir.is_dir() {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "destination is not a folder".into(),
+        )));
+    }
+    let location = dst_location.unwrap_or_default();
+    let title = if src_paths.len() == 1 {
+        let name = src_paths[0]
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "item".into());
+        format!("Copy {name}")
+    } else {
+        format!("Copy {} items", src_paths.len())
+    };
+    let mut planner = CopyPlanner {
+        job: ufm_jobs::Job::new(title, ufm_jobs::JobPreview::default()),
+        seq: 0,
+        location,
+    };
+    for src_path in &src_paths {
+        let meta = std::fs::metadata(src_path).map_err(|e| {
+            CommandError::from(UfmError::Internal(format!(
+                "source {}: {e}",
+                src_path.display()
+            )))
+        })?;
+        let name = src_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                CommandError::from(UfmError::InvalidInput("source has no name".into()))
+            })?;
+        if meta.is_dir() {
+            let resolved =
+                resolve_dest_name(&dst_dir, &name, &mut planner.job.preview);
+            let mid = planner.add_mkdir(&dst_dir, &resolved, None);
+            planner.plan_dir(src_path, &dst_dir.join(&resolved), Some(mid))?;
+        } else {
+            let resolved =
+                resolve_dest_name(&dst_dir, &name, &mut planner.job.preview);
+            planner.add_file(src_path, &dst_dir, &resolved, meta.len(), None);
+        }
+    }
+    Ok(planner.job)
+}
+
+/// Record one step transition everywhere it must land: the in-memory
+/// snapshot, the durable journal, and the jobs-table snapshot.
+fn transition_step(
+    handle: &JobHandle,
+    catalog: &ufm_catalog::Catalog,
+    journal: &mut ufm_jobs::JobJournal,
+    step_id: &str,
+    to: ufm_jobs::StepState,
+    note: Option<String>,
+) -> ufm_jobs::Job {
+    let (snap, from) = {
+        let mut j = handle.job.lock().unwrap();
+        let from = j
+            .steps
+            .get(step_id)
+            .map(|s| s.state)
+            .unwrap_or(ufm_jobs::StepState::Pending);
+        if let Some(s) = j.steps.get_mut(step_id) {
+            s.state = to;
+        }
+        (j.clone(), from)
+    };
+    journal.record_with_note(snap.id, step_id, from, to, note);
+    let _ = catalog.upsert_job(&snap);
+    snap
+}
+
+/// Set the job-level state and persist the snapshot.
+fn transition_job(
+    handle: &JobHandle,
+    catalog: &ufm_catalog::Catalog,
+    to: ufm_jobs::JobState,
+) -> ufm_jobs::Job {
+    let snap = {
+        let mut j = handle.job.lock().unwrap();
+        j.state = to;
+        j.clone()
+    };
+    let _ = catalog.upsert_job(&snap);
+    snap
+}
+
+/// Block while the job is paused. Returns false if cancellation landed
+/// meanwhile (the caller must finalize the job as Cancelled).
+fn wait_while_paused(handle: &JobHandle) -> bool {
+    while flag(&handle.pause) && !flag(&handle.cancel) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    !flag(&handle.cancel)
+}
+
+enum StepOutcome {
+    Done,
+    Skipped,
+    Failed(String),
+    Cancelled,
+}
+
+/// Execute one step. Copy is chunked (1 MiB) so pause/cancel land
+/// between chunks, not just between files; progress emits are throttled.
+fn execute_step(
+    op: &ufm_jobs::StepOp,
+    handle: &JobHandle,
+    app: &tauri::AppHandle,
+    job_snapshot: &ufm_jobs::Job,
+    bytes_done: &mut u64,
+) -> StepOutcome {
+    use std::io::{Read, Write};
+    match op {
+        ufm_jobs::StepOp::Mkdir { parent, name } => {
+            let base = parent.provider_key.as_deref().unwrap_or_default();
+            match std::fs::create_dir_all(Path::new(base).join(name)) {
+                Ok(()) => StepOutcome::Done,
+                Err(e) => StepOutcome::Failed(e.to_string()),
+            }
+        }
+        ufm_jobs::StepOp::VerifyCopy { src, dst } => {
+            // Verify-then-skip: an equal-length destination file counts
+            // as already copied (size-level in this increment; hash
+            // verification is a follow-up).
+            let src_path = Path::new(src.provider_key.as_deref().unwrap_or_default());
+            let dst_path = Path::new(dst.provider_key.as_deref().unwrap_or_default());
+            match std::fs::metadata(src_path) {
+                Ok(sm) => match std::fs::metadata(dst_path) {
+                    Ok(dm) if dm.is_file() && dm.len() == sm.len() => {
+                        StepOutcome::Skipped
+                    }
+                    _ => StepOutcome::Done,
+                },
+                Err(e) => StepOutcome::Failed(e.to_string()),
+            }
+        }
+        ufm_jobs::StepOp::Copy {
+            src,
+            dst_parent,
+            new_name,
+        } => {
+            let src_path = Path::new(src.provider_key.as_deref().unwrap_or_default());
+            let dst_path =
+                Path::new(dst_parent.provider_key.as_deref().unwrap_or_default())
+                    .join(new_name);
+            let mut input = match std::fs::File::open(src_path) {
+                Ok(f) => f,
+                Err(e) => return StepOutcome::Failed(e.to_string()),
+            };
+            let mut output = match std::fs::File::create(&dst_path) {
+                Ok(f) => f,
+                Err(e) => return StepOutcome::Failed(e.to_string()),
+            };
+            let mut buf = vec![0u8; 1024 * 1024];
+            let mut last_emit = std::time::Instant::now();
+            let result: std::result::Result<(), StepOutcome> = loop {
+                if flag(&handle.cancel) {
+                    break Err(StepOutcome::Cancelled);
+                }
+                if flag(&handle.pause) && !wait_while_paused(handle) {
+                    break Err(StepOutcome::Cancelled);
+                }
+                match input.read(&mut buf) {
+                    Ok(0) => break Ok(()),
+                    Ok(n) => {
+                        if let Err(e) = output.write_all(&buf[..n]) {
+                            break Err(StepOutcome::Failed(e.to_string()));
+                        }
+                        *bytes_done += n as u64;
+                        if last_emit.elapsed() >= std::time::Duration::from_millis(150)
+                        {
+                            emit_job_progress(
+                                app,
+                                job_snapshot,
+                                *bytes_done,
+                                Some(&format!("copy {}", src_path.display())),
+                                None,
+                            );
+                            last_emit = std::time::Instant::now();
+                        }
+                    }
+                    Err(e) => break Err(StepOutcome::Failed(e.to_string())),
+                }
+            };
+            match result {
+                Ok(()) => {
+                    // Match std::fs::copy: carry the source permissions.
+                    if let Ok(meta) = std::fs::metadata(src_path) {
+                        let _ = std::fs::set_permissions(
+                            &dst_path,
+                            meta.permissions(),
+                        );
+                    }
+                    StepOutcome::Done
+                }
+                Err(outcome) => {
+                    // Compensating action: never leave a partial file
+                    // behind to be mistaken for a finished copy.
+                    drop(output);
+                    let _ = std::fs::remove_file(&dst_path);
+                    outcome
+                }
+            }
+        }
+        _ => StepOutcome::Failed(
+            "step type is not supported by the copy executor yet".into(),
+        ),
+    }
+}
+
+/// The executor: one blocking task per running job. Replays the durable
+/// journal over the snapshot first (crash leftovers normalize Running ->
+/// Pending), then runs every unfinished step in DAG order.
+fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
+    let job_id = handle.snapshot().id;
+    let catalog = match ufm_catalog::Catalog::open(&catalog_path) {
+        Ok(c) => c,
+        Err(e) => {
+            let snap = {
+                let mut j = handle.job.lock().unwrap();
+                j.state = ufm_jobs::JobState::Failed;
+                j.clone()
+            };
+            emit_job_progress(
+                &app,
+                &snap,
+                0,
+                None,
+                Some(&format!("catalog open failed: {e}")),
+            );
+            handle
+                .live
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+    };
+    let mut journal = ufm_jobs::JobJournal::with_sink(std::sync::Arc::new(
+        ufm_catalog::CatalogJournalSink::new(catalog_path.clone()),
+    ));
+    if let Ok(entries) = catalog.journal_entries(&job_id) {
+        let replay = ufm_jobs::JobJournal::from_entries(entries);
+        let mut j = handle.job.lock().unwrap();
+        replay.replay_into(&mut j);
+    }
+    let mut bytes_done = job_bytes_done(&handle.snapshot());
+    let snap = transition_job(&handle, &catalog, ufm_jobs::JobState::Running);
+    emit_job_progress(&app, &snap, bytes_done, None, None);
+
+    let order = match handle.snapshot().runnable_order() {
+        Ok(o) => o,
+        Err(e) => {
+            let snap = transition_job(&handle, &catalog, ufm_jobs::JobState::Failed);
+            emit_job_progress(&app, &snap, bytes_done, None, Some(&e.to_string()));
+            handle
+                .live
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+    };
+
+    for step_id in &order {
+        let step = {
+            let j = handle.job.lock().unwrap();
+            j.steps.get(step_id).cloned()
+        };
+        let Some(step) = step else { continue };
+        if matches!(
+            step.state,
+            ufm_jobs::StepState::Done
+                | ufm_jobs::StepState::Skipped
+                | ufm_jobs::StepState::Failed
+        ) {
+            continue;
+        }
+        if !wait_while_paused(&handle) {
+            break; // cancelled while paused; finalize below
+        }
+        // A copy whose verify step was Skipped is itself Skipped:
+        // the destination already holds the right bytes.
+        if let ufm_jobs::StepOp::Copy { .. } = &step.op {
+            let verify_skipped = {
+                let j = handle.job.lock().unwrap();
+                step.depends_on.iter().any(|d| {
+                    matches!(
+                        j.steps.get(d),
+                        Some(s) if matches!(s.op, ufm_jobs::StepOp::VerifyCopy { .. })
+                            && s.state == ufm_jobs::StepState::Skipped
+                    )
+                })
+            };
+            if verify_skipped {
+                let snap = transition_step(
+                    &handle,
+                    &catalog,
+                    &mut journal,
+                    step_id,
+                    ufm_jobs::StepState::Skipped,
+                    None,
+                );
+                bytes_done = job_bytes_done(&snap);
+                emit_job_progress(&app, &snap, bytes_done, None, None);
+                continue;
+            }
+        }
+        let snap = transition_step(
+            &handle,
+            &catalog,
+            &mut journal,
+            step_id,
+            ufm_jobs::StepState::Running,
+            None,
+        );
+        emit_job_progress(&app, &snap, bytes_done, Some(&step.label), None);
+        let outcome = execute_step(&step.op, &handle, &app, &snap, &mut bytes_done);
+        match outcome {
+            StepOutcome::Done => {
+                let snap = transition_step(
+                    &handle,
+                    &catalog,
+                    &mut journal,
+                    step_id,
+                    ufm_jobs::StepState::Done,
+                    None,
+                );
+                bytes_done = job_bytes_done(&snap);
+                emit_job_progress(&app, &snap, bytes_done, None, None);
+            }
+            StepOutcome::Skipped => {
+                let snap = transition_step(
+                    &handle,
+                    &catalog,
+                    &mut journal,
+                    step_id,
+                    ufm_jobs::StepState::Skipped,
+                    None,
+                );
+                bytes_done = job_bytes_done(&snap);
+                emit_job_progress(&app, &snap, bytes_done, None, None);
+            }
+            StepOutcome::Failed(msg) => {
+                transition_step(
+                    &handle,
+                    &catalog,
+                    &mut journal,
+                    step_id,
+                    ufm_jobs::StepState::Failed,
+                    Some(msg.clone()),
+                );
+                let snap =
+                    transition_job(&handle, &catalog, ufm_jobs::JobState::Failed);
+                emit_job_progress(&app, &snap, bytes_done, None, Some(&msg));
+                handle
+                    .live
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+            StepOutcome::Cancelled => {
+                // The partial file is already removed by execute_step;
+                // the step goes back to Pending so a later resume can
+                // redo it cleanly.
+                transition_step(
+                    &handle,
+                    &catalog,
+                    &mut journal,
+                    step_id,
+                    ufm_jobs::StepState::Pending,
+                    Some("cancelled mid-step; partial output removed".into()),
+                );
+                break;
+            }
+        }
+        if flag(&handle.cancel) {
+            break;
+        }
+    }
+
+    let final_state = if flag(&handle.cancel) {
+        ufm_jobs::JobState::Cancelled
+    } else {
+        ufm_jobs::JobState::Completed
+    };
+    let snap = transition_job(&handle, &catalog, final_state);
+    emit_job_progress(&app, &snap, job_bytes_done(&snap), None, None);
+    handle
+        .live
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Spawn the executor for a registered job, unless one is already live.
+fn spawn_executor(app: tauri::AppHandle, state: &AppState, job: JobId) {
+    let handle = {
+        let jobs = state.jobs.lock().unwrap();
+        jobs.get(&job).cloned()
+    };
+    let Some(handle) = handle else { return };
+    if flag(&handle.live) {
+        return;
+    }
+    handle
+        .live
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let catalog_path = state.catalog_path.clone();
+    tauri::async_runtime::spawn_blocking(move || run_job(app, handle, catalog_path));
+}
+
+fn job_handle(state: &AppState, job: JobId) -> Cmd<JobHandle> {
+    state
+        .jobs
+        .lock()
+        .unwrap()
+        .get(&job)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound("unknown job".into())))
+}
+
 #[tauri::command]
 pub async fn start_copy(
-    _state: State<'_, AppState>,
-    _req: CopyRequest,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    req: CopyRequest,
 ) -> Cmd<JobId> {
-    // TODO: build the DAG (verify-then-skip steps), journal it, queue it.
-    Err(CommandError {
-        code: "not_implemented".into(),
-        message: "job engine wiring comes with the first feature milestone".into(),
-    })
+    let job = build_copy_job(&state, &req)?;
+    let id = job.id;
+    // Journal first (spec §25): the snapshot is durable before any
+    // step runs, so even a crash mid-copy leaves a resumable record.
+    state.catalog.lock().unwrap().upsert_job(&job)?;
+    state
+        .jobs
+        .lock()
+        .unwrap()
+        .insert(id, JobHandle::new(job, false));
+    spawn_executor(app, &state, id);
+    Ok(id)
 }
 
 #[tauri::command]
-pub async fn pause_job(_state: State<'_, AppState>, _job: JobId) -> Cmd<()> {
+pub async fn pause_job(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    job: JobId,
+) -> Cmd<()> {
+    let handle = job_handle(&state, job)?;
+    handle
+        .pause
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let snap = {
+        let mut j = handle.job.lock().unwrap();
+        if matches!(
+            j.state,
+            ufm_jobs::JobState::Running | ufm_jobs::JobState::Queued
+        ) {
+            j.state = ufm_jobs::JobState::Paused;
+        }
+        j.clone()
+    };
+    state.catalog.lock().unwrap().upsert_job(&snap)?;
+    emit_job_progress(&app, &snap, job_bytes_done(&snap), None, None);
     Ok(())
 }
 
 #[tauri::command]
-pub async fn resume_job(_state: State<'_, AppState>, _job: JobId) -> Cmd<()> {
+pub async fn resume_job(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    job: JobId,
+) -> Cmd<()> {
+    let handle = job_handle(&state, job)?;
+    {
+        let j = handle.job.lock().unwrap();
+        if matches!(
+            j.state,
+            ufm_jobs::JobState::Completed
+                | ufm_jobs::JobState::Cancelled
+                | ufm_jobs::JobState::Failed
+        ) {
+            return Ok(()); // terminal jobs stay terminal
+        }
+    }
+    handle
+        .pause
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    // If an executor is live it sees the cleared flag; if not (paused
+    // at shutdown, recovered at startup), spawn one — it skips every
+    // step already Done, so resume is just "run what's left".
+    spawn_executor(app, &state, job);
     Ok(())
 }
 
 #[tauri::command]
-pub async fn cancel_job(_state: State<'_, AppState>, _job: JobId) -> Cmd<()> {
+pub async fn cancel_job(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    job: JobId,
+) -> Cmd<()> {
+    let handle = job_handle(&state, job)?;
+    handle
+        .cancel
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    handle
+        .pause
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    if !flag(&handle.live) {
+        // No executor to finalize it (e.g. a recovered job): cancel
+        // in place.
+        let snap = {
+            let mut j = handle.job.lock().unwrap();
+            j.state = ufm_jobs::JobState::Cancelled;
+            j.clone()
+        };
+        state.catalog.lock().unwrap().upsert_job(&snap)?;
+        emit_job_progress(&app, &snap, job_bytes_done(&snap), None, None);
+    }
     Ok(())
 }
 

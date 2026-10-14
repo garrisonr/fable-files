@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::Manager;
 use ufm_catalog::Catalog;
-use ufm_core::{ItemId, LocationId};
+use ufm_core::{ItemId, JobId, LocationId};
 use ufm_preview::PreviewRegistry;
 
 /// Progress snapshot for the background indexer. Serialized to the UI on the
@@ -74,6 +74,10 @@ pub struct AppState {
             std::sync::Arc<std::sync::atomic::AtomicBool>,
         >,
     >,
+    /// Live transfer-center jobs: running executors plus jobs recovered
+    /// at startup awaiting resume. The catalog holds the durable copies
+    /// (jobs + job_journal tables); this registry is the control surface.
+    pub jobs: Mutex<HashMap<JobId, commands::JobHandle>>,
 }
 
 /// One row of the `locations.json` sidecar. The catalog persists locations but
@@ -131,9 +135,44 @@ impl AppState {
                 std::collections::HashMap::new(),
             )),
             transcode_cancels: Mutex::new(std::collections::HashMap::new()),
+            jobs: Mutex::new(HashMap::new()),
         };
 
         seed_themes(&themes_dir)?;
+
+        // Crash recovery (spec §25): re-register jobs a previous run
+        // left unfinished. Jobs caught mid-Running are normalized to
+        // Paused — their steps are idempotent and resume_job re-runs
+        // only what's left. Recovery must never block startup, so
+        // failures here are swallowed deliberately.
+        if let Ok(unfinished) = state.catalog.lock().unwrap().unfinished_jobs() {
+            let mut recovered = Vec::new();
+            for mut job in unfinished {
+                if job.state == ufm_jobs::JobState::Running {
+                    job.state = ufm_jobs::JobState::Paused;
+                    let cat = state.catalog.lock().unwrap();
+                    let _ = cat.upsert_job(&job);
+                    let _ = cat.record_journal_entry(&ufm_jobs::JournalEntry {
+                        job: job.id,
+                        step: "__job__".into(),
+                        from: ufm_jobs::StepState::Running,
+                        to: ufm_jobs::StepState::Pending,
+                        at: ufm_core::now_utc(),
+                        note: Some(
+                            "recovered after restart; awaiting resume".into(),
+                        ),
+                    });
+                    drop(cat);
+                }
+                recovered.push(job);
+            }
+            let mut jobs = state.jobs.lock().unwrap();
+            for job in recovered {
+                let paused = job.state != ufm_jobs::JobState::Queued;
+                jobs.insert(job.id, commands::JobHandle::new(job, paused));
+            }
+        }
+
         state.restore_or_seed_locations(&base)?;
         Ok(state)
     }

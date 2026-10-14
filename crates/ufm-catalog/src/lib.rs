@@ -7,7 +7,7 @@
 //! a restart — the filesystem is never walked live for metadata.
 
 use rusqlite::{params, Connection};
-use ufm_core::{CollectionId, ItemId, LocationId, Result, UfmError};
+use ufm_core::{CollectionId, ItemId, JobId, LocationId, Result, UfmError};
 
 /// Schema version. Migrations run in order; downgrades are refused.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -121,6 +121,21 @@ impl Catalog {
                 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(name, content='items', content_rowid='rowid');
                 INSERT OR IGNORE INTO schema_version (version) VALUES (1);
                 ",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Migration 3: job snapshots for the transfer center (spec §25).
+        // Step-level transitions live in job_journal (migration 1); this
+        // table holds the whole-Job snapshot the executor rewrites on
+        // every transition and crash recovery loads at startup.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS jobs (
+                    job_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    created TEXT NOT NULL,
+                    job_json TEXT NOT NULL
+                );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
         // Migration 2: cached media durations (seconds), filled lazily
@@ -689,6 +704,118 @@ impl Catalog {
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
             .map_err(|e| UfmError::Database(e.to_string()))
     }
+
+    // ------------------------------------------------------------------
+    // Jobs — snapshots + journal (spec §25). Step transitions land in
+    // job_journal (migration 1); whole-Job snapshots in jobs (migration 3).
+    // ------------------------------------------------------------------
+
+    /// Insert or replace the whole-Job snapshot. The executor calls this
+    /// on every transition; crash recovery loads from here.
+    pub fn upsert_job(&self, job: &ufm_jobs::Job) -> Result<()> {
+        let json =
+            serde_json::to_string(job).map_err(|e| UfmError::Database(e.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO jobs (job_id, title, state, created, job_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    job.id.to_string(),
+                    job.title,
+                    state_name(&job.state),
+                    job.created.to_rfc3339(),
+                    json
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn load_job(&self, id: &JobId) -> Result<Option<ufm_jobs::Job>> {
+        use rusqlite::OptionalExtension;
+        let json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT job_json FROM jobs WHERE job_id = ?1",
+                params![id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        match json {
+            None => Ok(None),
+            Some(json) => Ok(Some(
+                serde_json::from_str(&json).map_err(|e| UfmError::Database(e.to_string()))?,
+            )),
+        }
+    }
+
+    /// Jobs a previous run left behind: queued, running, or paused.
+    /// Crash recovery re-registers these at startup.
+    pub fn unfinished_jobs(&self) -> Result<Vec<ufm_jobs::Job>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT job_json FROM jobs
+                 WHERE state IN ('queued', 'running', 'paused') ORDER BY created",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            let json = row.map_err(|e| UfmError::Database(e.to_string()))?;
+            jobs.push(
+                serde_json::from_str(&json).map_err(|e| UfmError::Database(e.to_string()))?,
+            );
+        }
+        Ok(jobs)
+    }
+
+    /// Append one step transition to the durable journal.
+    pub fn record_journal_entry(&self, entry: &ufm_jobs::JournalEntry) -> Result<()> {
+        insert_journal_entry(&self.conn, entry)
+    }
+
+    /// All journal entries for one job, oldest first (seq order).
+    pub fn journal_entries(&self, job: &JobId) -> Result<Vec<ufm_jobs::JournalEntry>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT step_id, from_state, to_state, at, note FROM job_journal
+                 WHERE job_id = ?1 ORDER BY seq",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![job.to_string()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut entries = Vec::new();
+        for row in rows {
+            let (step, from_s, to_s, at_s, note) =
+                row.map_err(|e| UfmError::Database(e.to_string()))?;
+            let at = chrono::DateTime::parse_from_rfc3339(&at_s)
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            entries.push(ufm_jobs::JournalEntry {
+                job: *job,
+                step,
+                from: parse_state(&from_s)?,
+                to: parse_state(&to_s)?,
+                at,
+                note,
+            });
+        }
+        Ok(entries)
+    }
 }
 
 #[cfg(test)]
@@ -804,5 +931,184 @@ mod tests {
         // Limit is honored (3 rows match, only 1 returned).
         let hits = cat.search_fts("report* OR photos* OR draft*", 1).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Job persistence helpers (spec §25)
+// ---------------------------------------------------------------------------
+
+/// Serialize a state enum the same way serde does (snake_case), so stored
+/// strings always match the JSON representation of the job itself.
+fn state_name<T: serde::Serialize>(state: &T) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn parse_state<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .map_err(|e| UfmError::Database(format!("bad stored state {s:?}: {e}")))
+}
+
+fn insert_journal_entry(conn: &Connection, entry: &ufm_jobs::JournalEntry) -> Result<()> {
+    conn.execute(
+        "INSERT INTO job_journal (job_id, step_id, from_state, to_state, at, note)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            entry.job.to_string(),
+            entry.step,
+            state_name(&entry.from),
+            state_name(&entry.to),
+            entry.at.to_rfc3339(),
+            entry.note
+        ],
+    )
+    .map_err(|e| UfmError::Database(e.to_string()))?;
+    Ok(())
+}
+
+/// `ufm_jobs::JournalSink` backed by the catalog database file. Opens a
+/// short-lived connection per record — the same idiom the app uses for
+/// background catalog work; WAL mode keeps it cheap.
+pub struct CatalogJournalSink {
+    path: std::path::PathBuf,
+}
+
+impl CatalogJournalSink {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl ufm_jobs::JournalSink for CatalogJournalSink {
+    fn record(&self, entry: &ufm_jobs::JournalEntry) -> Result<()> {
+        let conn =
+            Connection::open(&self.path).map_err(|e| UfmError::Database(e.to_string()))?;
+        insert_journal_entry(&conn, entry)
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::*;
+    use ufm_jobs::{Job, JobPreview, JobState, JournalEntry, Step, StepOp, StepState};
+
+    fn item(name: &str) -> ufm_vfs::Item {
+        ufm_vfs::Item {
+            id: ItemId::new(),
+            location: LocationId::new(),
+            name: name.into(),
+            kind: ufm_vfs::ItemKind::File,
+            size_bytes: Some(42),
+            modified: None,
+            provider_key: Some(format!("/tmp/{name}")),
+            labels: vec![],
+            starred: false,
+        }
+    }
+
+    fn sample_job(state: JobState) -> Job {
+        let mut job = Job::new("copy test", JobPreview::default());
+        job.state = state;
+        job.add_step(Step {
+            id: "s0001".into(),
+            label: "copy a.txt".into(),
+            op: StepOp::Copy {
+                src: item("a.txt"),
+                dst_parent: item("dest"),
+                new_name: "a.txt".into(),
+            },
+            depends_on: vec![],
+            state: StepState::Pending,
+            compensation: None,
+        });
+        job
+    }
+
+    fn entry(job: JobId, step: &str, from: StepState, to: StepState) -> JournalEntry {
+        JournalEntry {
+            job,
+            step: step.into(),
+            from,
+            to,
+            at: ufm_core::now_utc(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn job_snapshot_roundtrip_and_unfinished_filter() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let running = sample_job(JobState::Running);
+        let done = sample_job(JobState::Completed);
+        cat.upsert_job(&running).unwrap();
+        cat.upsert_job(&done).unwrap();
+
+        let loaded = cat.load_job(&running.id).unwrap().unwrap();
+        assert_eq!(loaded.id, running.id);
+        assert_eq!(loaded.title, "copy test");
+        assert_eq!(loaded.steps.len(), 1);
+        assert_eq!(loaded.state, JobState::Running);
+
+        let unfinished = cat.unfinished_jobs().unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].id, running.id);
+
+        // Transition to a terminal state: no longer unfinished.
+        let mut finished = running.clone();
+        finished.state = JobState::Completed;
+        cat.upsert_job(&finished).unwrap();
+        assert!(cat.unfinished_jobs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn journal_entries_roundtrip_in_order() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let job = sample_job(JobState::Running);
+        cat.record_journal_entry(&entry(
+            job.id,
+            "s0001",
+            StepState::Pending,
+            StepState::Running,
+        ))
+        .unwrap();
+        let mut done = entry(job.id, "s0001", StepState::Running, StepState::Done);
+        done.note = Some("ok".into());
+        cat.record_journal_entry(&done).unwrap();
+
+        let entries = cat.journal_entries(&job.id).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].to, StepState::Running);
+        assert_eq!(entries[1].to, StepState::Done);
+        assert_eq!(entries[1].note.as_deref(), Some("ok"));
+        assert!(cat.journal_entries(&JobId::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn catalog_journal_sink_persists_to_file() {
+        let path = std::env::temp_dir().join(format!(
+            "ufm-catalog-sink-test-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let job = sample_job(JobState::Running);
+        {
+            let _cat = Catalog::open(&path).unwrap(); // creates schema
+            let sink = CatalogJournalSink::new(path.clone());
+            ufm_jobs::JournalSink::record(
+                &sink,
+                &entry(job.id, "s0001", StepState::Pending, StepState::Running),
+            )
+            .unwrap();
+        }
+        let cat = Catalog::open(&path).unwrap();
+        let entries = cat.journal_entries(&job.id).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].step, "s0001");
+        drop(cat);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 }
