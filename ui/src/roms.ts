@@ -12,7 +12,26 @@ export interface RomSystem {
 
 const STORE_KEY = "ff-rom-systems";
 const SEED_FLAG = "ff-roms-v1";
+const SEED_FLAG_V2 = "ff-roms-v2";
 const ENABLED_KEY = "ff-roms-enabled";
+
+/** Round 7.1 additions (Dickles): modern consoles + arcade. Applied as a
+ * ONE-TIME additive merge (ff-roms-v2) so existing installs gain them
+ * without resurrecting anything the user later deletes. "Arcade" also
+ * matches the v1 name "Arcade (MAME)" — its extensions are extended
+ * instead of adding a duplicate entry. */
+export const ROM_SEED_V2: Array<{
+  name: string;
+  extensions: string[];
+  aliases?: string[];
+}> = [
+  { name: "Nintendo Switch", extensions: ["nsp", "xci", "nsz", "xcz"] },
+  { name: "Xbox 360", extensions: ["iso", "xex"] },
+  { name: "PlayStation 3", extensions: ["iso", "pkg"] },
+  { name: "PlayStation 4", extensions: ["pkg"] },
+  { name: "PlayStation 5", extensions: ["pkg"] },
+  { name: "Arcade", extensions: ["zip", "7z", "chd"], aliases: ["Arcade (MAME)"] },
+];
 
 export const ROM_SEED: RomSystem[] = [
   { name: "3DO", extensions: ["iso", "cue"] },
@@ -81,6 +100,33 @@ export function loadRomSystems(): RomSystem[] {
     list.sort((a, b) => a.name.localeCompare(b.name));
     try { localStorage.setItem(SEED_FLAG, "1"); } catch { /* ignore */ }
     saveRomSystems(list);
+  }
+  // Round 7.1: one-time additive merge of the v2 systems. Runs exactly
+  // once per install; deletions made after this merge are never undone.
+  let mergedV2 = false;
+  try { mergedV2 = !!localStorage.getItem(SEED_FLAG_V2); } catch { mergedV2 = true; }
+  if (!mergedV2) {
+    let changed = false;
+    for (const d of ROM_SEED_V2) {
+      const names = [d.name, ...(d.aliases ?? [])];
+      const found = list.find((s) => names.includes(s.name));
+      if (found) {
+        for (const ext of d.extensions) {
+          if (!found.extensions.includes(ext)) {
+            found.extensions.push(ext);
+            changed = true;
+          }
+        }
+      } else {
+        list.push({ name: d.name, extensions: [...d.extensions] });
+        changed = true;
+      }
+    }
+    if (changed) {
+      list.sort((a, b) => a.name.localeCompare(b.name));
+      saveRomSystems(list);
+    }
+    try { localStorage.setItem(SEED_FLAG_V2, "1"); } catch { /* ignore */ }
   }
   return list;
 }

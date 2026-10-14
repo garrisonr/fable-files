@@ -2191,9 +2191,18 @@ tr.row[style*="--label-color"] {
   appearance: none; border: none; background: rgb(255 255 255 / 0.14);
   color: #fff; border-radius: 8px; padding: 0.3rem 0.55rem;
   font-size: 0.8125rem; cursor: pointer; backdrop-filter: blur(6px);
+  /* Design law (Round 7.1): shared control geometry — transport
+     buttons get full 2rem hit targets (the mute button was fiddly). */
+  min-width: 2rem; min-height: 2rem;
+  display: inline-flex; align-items: center; justify-content: center;
 }
 .vp-btn:hover { background: rgb(255 255 255 / 0.28); }
-.vp-seek { flex: 1; accent-color: var(--ufm-accent, #f5c518); cursor: pointer; }
+.vp-seek { flex: 1; accent-color: var(--ufm-accent, #f5c518); cursor: pointer; min-height: 2rem; }
+.vp-transcode-btn {
+  background: var(--ufm-accent, #f5c518); color: #16130a; font-weight: 600;
+  border-radius: 999px; padding: 0.45rem 1rem; margin-top: 0.75rem;
+}
+.vp-transcode-btn:hover { background: var(--ufm-accent, #f5c518); filter: brightness(1.08); }
 .vp-time { color: #fff; font-size: 0.75rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .vp-fallback {
   color: #eee; padding: 2rem 1.25rem; text-align: center; font-size: 0.9rem; line-height: 1.5;
@@ -2203,6 +2212,14 @@ tr.row[style*="--label-color"] {
   padding: 2rem 1rem; color: var(--ufm-text-muted); text-align: center;
 }
 .ql-cast { font-size: 0.95rem; }
+/* Quick Look audio player (Round 7.1) */
+.ql-audio { display: flex; flex-direction: column; gap: 0.6rem; margin-bottom: 0.85rem; }
+.ql-audio-art { width: 100%; border-radius: 12px; }
+.ql-audio-glyph { font-size: 3rem; text-align: center; padding: 1.1rem 0 0.3rem; }
+.ql-audio-player { width: 100%; height: 2rem; }
+/* Search / smart-folder results header row (Round 7.1) */
+.search-head-row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.search-head-row .search-status { margin: 0; }
 
 /* ——— terminal panel ——— */
 .term-panel {

@@ -186,6 +186,27 @@ export async function mediaSrc(path: string): Promise<string> {
   }
 }
 
+/**
+ * Streaming-transcode URL (Round 7.1): the same media server serves
+ * /transcode/<token>?t=<startSecs> — ffmpeg re-encodes on the fly to
+ * H.264 for formats WebKit can't render (HEVC 10-bit etc.). Returns
+ * null when the media server URL is unavailable (asset-protocol
+ * fallback has no transcode route).
+ */
+export async function transcodeSrc(
+  path: string,
+  startSecs: number,
+): Promise<string | null> {
+  try {
+    const url = await api.mediaUrlForPath(path);
+    if (!url.includes("/cast/")) return null;
+    const t = Math.max(0, Math.floor(startSecs));
+    return url.replace("/cast/", "/transcode/") + `?t=${t}`;
+  } catch {
+    return null;
+  }
+}
+
 /** Subscribe to pop-out player windows closing. Returns an unlisten fn. */
 export async function onPlayerClosed(
   cb: (path: string) => void,

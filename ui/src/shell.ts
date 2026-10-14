@@ -175,6 +175,7 @@ export class Shell {
         }),
       onPlayMusic: (items: Item[]) => this.musicPlayer.open(items),
       onOpen: (item) => this.openItem(item),
+      onOpenInNewTab: (item) => void this.openItemInNewTab(item),
       onSelect: (item) => this.onSelect(item),
       onTogglePreview: () => this.togglePreview(),
       onMakeExecutable: (item) => {
@@ -404,8 +405,13 @@ export class Shell {
         this.fileView.el.hidden = true;
         this.columnsView.el.hidden = true;
         this.galleryView.el.hidden = true;
+        this.renderCrumbs();
       },
-      onClear: () => this.showFileView(),
+      onClear: () => {
+        this.showFileView();
+        this.renderCrumbs();
+      },
+      onReindex: () => this.reindexLibrary(),
       onSaveSmartFolder: () => void this.saveSmartFolder(),
     });
     this.viewport.append(
@@ -449,10 +455,17 @@ export class Shell {
       renderMenu: (themes, activeId, anchor) => this.renderThemeMenu(themes, activeId, anchor),
       closeMenu: () => this.closeMenu(),
     });
-    this.indexTracker = new IndexTracker((text) => {
-      this.statusRight.textContent = text ?? "";
-      this.statusRight.hidden = !text;
-    });
+    this.indexTracker = new IndexTracker(
+      (text) => {
+        this.statusRight.textContent = text ?? "";
+        this.statusRight.hidden = !text;
+      },
+      () => {
+        // A full re-index pass finished: refresh the visible smart
+        // folder / search results so new files appear live.
+        if (this.searchView.active) this.searchView.rerunAfterIndex();
+      },
+    );
 
     document.addEventListener("keydown", (e) => this.onGlobalKey(e));
     // The native webview context menu (Back / Forward / Stop / Reload)
@@ -488,7 +501,7 @@ export class Shell {
     } else {
       this.renderEmptyState();
     }
-    void this.indexTracker.boot(first ? first.id : null);
+    void this.indexTracker.boot(this.locations.map((l) => l.id));
   }
 
   private requireTab(): Tab {
@@ -614,19 +627,48 @@ export class Shell {
     smartHead.textContent = "Smart Folders";
     this.smartList = document.createElement("div");
     this.smartList.className = "side-list";
-    this.romsHead = document.createElement("h2");
-    this.romsHead.className = "side-head";
-    this.romsHead.textContent = "Roms Collection";
-    this.romsHead.title = "Right-click to add a system";
-    this.romsHead.addEventListener("contextmenu", (e) => {
+    // Round 7.1: collapsible, mirroring the Labels section exactly —
+    // chevron, list visibility toggle, persisted ff-roms-collapsed.
+    // The right-click Add-a-System menu is preserved.
+    const romsHead = document.createElement("button");
+    romsHead.className = "side-head side-collapse";
+    romsHead.setAttribute("aria-label", "Toggle Roms Collection section");
+    const romsHeadText = document.createElement("span");
+    romsHeadText.textContent = "Roms Collection";
+    const romsChev = document.createElement("span");
+    romsChev.className = "side-chev";
+    romsChev.textContent = "▾";
+    romsHead.append(romsHeadText, romsChev);
+    romsHead.title = "Right-click to add a system";
+    romsHead.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       e.stopPropagation();
       this.ctxMenu.open(e.clientX, e.clientY, [
         { label: "Add a System\u2026", action: () => this.openRomEditor(null) },
       ]);
     });
+    this.romsHead = romsHead;
     this.romsList = document.createElement("div");
     this.romsList.className = "side-list";
+    const romsCollapsed = (() => {
+      try {
+        return localStorage.getItem("ff-roms-collapsed") === "1";
+      } catch {
+        return false;
+      }
+    })();
+    this.romsList.hidden = romsCollapsed;
+    romsChev.style.transform = romsCollapsed ? "rotate(-90deg)" : "";
+    romsHead.addEventListener("click", () => {
+      const nowHidden = !this.romsList.hidden;
+      this.romsList.hidden = nowHidden;
+      romsChev.style.transform = nowHidden ? "rotate(-90deg)" : "";
+      try {
+        localStorage.setItem("ff-roms-collapsed", nowHidden ? "1" : "0");
+      } catch {
+        // persistence is a nicety, not a requirement
+      }
+    });
     sidebar.append(
       favHead,
       this.favList,
@@ -865,6 +907,64 @@ export class Shell {
       void api
         .openItem(item.id)
         .catch(() => void this.quickLook.open(item));
+    }
+  }
+
+  /**
+   * Open in New Tab (Round 7.1): folders open a tab AT the folder;
+   * files open a tab at their parent folder with the file selected.
+   * Item ids are path-stable but there is no path→id lookup, so the
+   * target directory is reached by walking from the location root,
+   * listing each level and building real crumbs on the way down.
+   */
+  private async openItemInNewTab(item: Item): Promise<void> {
+    const loc =
+      this.locations.find((l) => l.id === item.location) ?? this.locations[0];
+    if (!loc) return;
+    const tab = this.newTab(loc);
+    if (!item.provider_key) return; // non-local item: root tab is the best available
+    const targetDirPath =
+      item.kind === "folder"
+        ? item.provider_key
+        : dirname(item.provider_key);
+    let rootPath: string;
+    try {
+      rootPath = await api.getItemPath(loc.root_item);
+    } catch {
+      return;
+    }
+    if (targetDirPath !== rootPath) {
+      if (!targetDirPath.startsWith(rootPath + "/")) return;
+      const segments = targetDirPath
+        .slice(rootPath.length + 1)
+        .split("/")
+        .filter((s) => s.length > 0);
+      const crumbs: { dirId: string; name: string }[] = [
+        { dirId: loc.root_item, name: loc.display_name },
+      ];
+      let curDirId = loc.root_item;
+      for (const seg of segments) {
+        let entries: Item[];
+        try {
+          entries = await api.listDir(loc.id, curDirId);
+        } catch {
+          return;
+        }
+        const next = entries.find(
+          (e) => e.kind === "folder" && e.name === seg,
+        );
+        if (!next) return; // path moved on — the root tab still serves
+        crumbs.push({ dirId: next.id, name: next.name });
+        curDirId = next.id;
+      }
+      navigate(tab, { locationId: loc.id, dirId: curDirId, crumbs });
+      tab.title = crumbs[crumbs.length - 1].name;
+    }
+    await this.loadDir(tab);
+    if (item.kind !== "folder" && tab.items.some((i) => i.id === item.id)) {
+      tab.selection.clear();
+      tab.selection.add(item.id);
+      if (tab === this.activeTab) this.renderActiveView();
     }
   }
 
@@ -1525,6 +1625,20 @@ export class Shell {
     this.crumbBar.innerHTML = "";
     const tab = this.activeTab;
     if (!tab) return;
+    // Round 7.1: while a smart folder / search view is up, the path bar
+    // shows that view as a single static crumb — the previous folder's
+    // breadcrumb lingered and no longer described what was on screen.
+    if (this.searchView.active) {
+      const s = document.createElement("span");
+      s.className = "crumb current";
+      s.textContent =
+        this.searchView.titleHint ??
+        (this.searchView.currentQuery
+          ? `Search: ${this.searchView.currentQuery}`
+          : "Search");
+      this.crumbBar.appendChild(s);
+      return;
+    }
     const crumbs = currentDir(tab).crumbs;
     crumbs.forEach((c, i) => {
       if (i > 0) {
@@ -1931,6 +2045,9 @@ export class Shell {
       b.textContent = `☆ ${sf.name}`;
       b.title = sf.query || sf.type || "";
       b.addEventListener("click", () => {
+        // The path bar names the view while it is up (Round 7.1);
+        // runRule sets the hint itself, saved queries need it set here.
+        this.searchView.titleHint = sf.name;
         if (sf.rule) void this.searchView.runRule(sf.name, sf.rule);
         else void this.searchView.runExternal(sf.query, sf.type);
       });
@@ -2210,6 +2327,16 @@ export class Shell {
   }
 
   /** The hamburger menu: views, sort, text size, theme, help. */
+  /** Re-index every location (Round 7.1): files downloaded while the
+   * app runs become visible to smart folders/search without a restart.
+   * Progress rides the status bar via IndexTracker; completion refreshes
+   * the visible smart folder/search view. */
+  private reindexLibrary(): void {
+    if (this.locations.length === 0) return;
+    Toast.show("Re-indexing the library…", "info");
+    void this.indexTracker.reindexAll(this.locations.map((l) => l.id));
+  }
+
   private openMainMenu(): void {
     const tab = this.activeTab;
     const mode = tab?.view ?? "grid";
@@ -2266,6 +2393,7 @@ export class Shell {
           }),
       },
       { label: "Mount Cloud Drive\u2026", action: () => void this.cloudMount.open() },
+      { label: "Re-index Library", action: () => this.reindexLibrary() },
       {
         label: "Report a Bug\u2026",
         action: () =>

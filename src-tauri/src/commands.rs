@@ -1067,7 +1067,7 @@ fn type_extensions(filter: &str) -> Option<&'static [&'static str]> {
     match filter {
         "image" => Some(&["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "svg", "ico", "avif"][..]),
         "video" => Some(&["mp4", "mkv", "webm", "mov", "avi", "m4v", "mpg", "mpeg"][..]),
-        "audio" => Some(&["mp3", "flac", "ogg", "oga", "wav", "m4a", "opus", "aac"][..]),
+        "audio" => Some(&["mp3", "flac", "ogg", "oga", "wav", "m4a", "m4b", "opus", "aac"][..]),
         "document" => Some(&["pdf", "doc", "docx", "odt", "epub", "txt", "md", "rtf", "csv", "tsv"][..]),
         "archive" => Some(&["zip", "7z", "rar", "tar", "gz", "bz2", "xz", "tgz"][..]),
         _ => None,
@@ -1565,6 +1565,116 @@ pub async fn set_executable(
 }
 
 
+/// Extract one member of a zip-based file (docx/odt/epub) as text,
+/// via the bsdtar the app already shells to for archive browsing.
+fn bsdtar_extract(path: &std::path::Path, member: &str) -> std::result::Result<String, String> {
+    let out = run_with_timeout(
+        "bsdtar",
+        &["-xOf", &path.to_string_lossy(), member],
+        20,
+    )?;
+    if out.is_empty() {
+        return Err(format!("{member} not found"));
+    }
+    Ok(out)
+}
+
+/// Strip XML/HTML markup down to readable text: block-level closing
+/// tags (paragraphs, headings, list items, table rows) become line
+/// breaks, tab elements become tabs, entities are unescaped.
+fn xml_to_text(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len() / 2);
+    let mut in_tag = false;
+    let mut tag = String::new();
+    for ch in xml.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                tag.clear();
+            }
+            '>' => {
+                in_tag = false;
+                let t = tag.trim_start();
+                if t.starts_with("/p")
+                    || t.starts_with("/h")
+                    || t.starts_with("/li")
+                    || t.starts_with("/tr")
+                    || t.starts_with("/w:p")
+                    || t.starts_with("/text:p")
+                    || t.starts_with("/text:h")
+                    || t.starts_with("br")
+                {
+                    out.push('\n');
+                } else if t.starts_with("w:tab") {
+                    out.push('\t');
+                }
+            }
+            _ => {
+                if in_tag {
+                    tag.push(ch);
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    // Unescape (&amp; last so one level survives: &amp;lt; → &lt;).
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Readable-text extraction for office / ebook formats (Round 7.1).
+fn extract_document_text(path: &std::path::Path) -> std::result::Result<String, String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "pdf" => run_with_timeout(
+            "pdftotext",
+            &["-layout", &path.to_string_lossy(), "-"],
+            30,
+        ),
+        "docx" => Ok(xml_to_text(&bsdtar_extract(path, "word/document.xml")?)),
+        "odt" => Ok(xml_to_text(&bsdtar_extract(path, "content.xml")?)),
+        "epub" => {
+            // XHTML members in archive order (the spine order for
+            // practical purposes); container metadata is skipped.
+            let listing = run_with_timeout(
+                "bsdtar",
+                &["-tf", &path.to_string_lossy()],
+                20,
+            )?;
+            let mut text = String::new();
+            for member in listing.lines() {
+                let m = member.trim();
+                let lower = m.to_lowercase();
+                if (lower.ends_with(".xhtml")
+                    || lower.ends_with(".html")
+                    || lower.ends_with(".htm"))
+                    && !lower.starts_with("meta-inf/")
+                {
+                    if let Ok(x) = bsdtar_extract(path, m) {
+                        text.push_str(&xml_to_text(&x));
+                        text.push('\n');
+                    }
+                }
+            }
+            if text.trim().is_empty() {
+                Err("no readable XHTML in epub".to_string())
+            } else {
+                Ok(text)
+            }
+        }
+        _ => Err(format!("no text extractor for .{ext}")),
+    }
+}
+
 /// Read the first N lines of a text file for Quick Look preview.
 /// Only backend-minted item ids resolve through item_paths.
 /// Returns the lines and whether the file was truncated.
@@ -1582,9 +1692,55 @@ pub async fn preview_text(
         .cloned()
         .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
     let max = max_lines.unwrap_or(50).min(500);
-    // Binary office formats can't be previewed as text — return a friendly message
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    let binary_office = ["ods", "xlsx", "xls", "docx", "doc", "pptx", "ppt", "odp", "odg"];
+    // Round 7.1: formats with extractable text (docx/odt/epub/pdf) get
+    // a real text preview instead of the metadata-only card.
+    if ["docx", "odt", "epub", "pdf"].contains(&ext.as_str()) {
+        let doc_path = path.clone();
+        let extracted = tauri::async_runtime::spawn_blocking(move || {
+            extract_document_text(&doc_path)
+        })
+        .await;
+        match extracted {
+            Ok(Ok(text)) if !text.trim().is_empty() => {
+                let mut lines: Vec<String> = Vec::new();
+                let mut truncated = false;
+                for raw in text.lines() {
+                    if lines.len() >= max {
+                        truncated = true;
+                        break;
+                    }
+                    let l = raw.trim_end();
+                    // XML spacing leaves blank runs — collapse them.
+                    if l.trim().is_empty()
+                        && (lines.is_empty()
+                            || lines.last().map(|p: &String| p.trim().is_empty())
+                                == Some(true))
+                    {
+                        continue;
+                    }
+                    let l = if l.chars().count() > 500 {
+                        format!("{}...", l.chars().take(500).collect::<String>())
+                    } else {
+                        l.to_string()
+                    };
+                    lines.push(l);
+                }
+                return Ok(PreviewTextResult { lines, truncated });
+            }
+            _ => {
+                return Ok(PreviewTextResult {
+                    lines: vec![format!(
+                        "No readable text could be extracted from this .{} file.",
+                        ext
+                    )],
+                    truncated: false,
+                });
+            }
+        }
+    }
+    // Binary office formats can't be previewed as text — return a friendly message
+    let binary_office = ["ods", "xlsx", "xls", "doc", "pptx", "ppt", "odp", "odg"];
     if binary_office.contains(&ext.as_str()) {
         return Ok(PreviewTextResult {
             lines: vec![format!("Preview not yet supported for .{} files.", ext),
@@ -5714,7 +5870,13 @@ pub fn media_server_port(
                     .nth(1)
                     .unwrap_or("")
                     .to_string();
-                let token = path_part.trim_start_matches("/cast/");
+                let is_transcode = path_part.starts_with("/transcode/");
+                let token_raw = if is_transcode {
+                    path_part.trim_start_matches("/transcode/")
+                } else {
+                    path_part.trim_start_matches("/cast/")
+                };
+                let token = token_raw.split(['?', '&']).next().unwrap_or("");
                 let file_path = files.lock().unwrap().get(token).cloned();
                 let Some(file_path) = file_path else {
                     let _ = stream.write_all(
@@ -5722,6 +5884,29 @@ pub fn media_server_port(
                     );
                     return;
                 };
+                if is_transcode {
+                    // Round 7.1: live H.264 transcode stream for formats
+                    // WebKitGTK can't render (HEVC 10-bit). ?t=<secs>
+                    // is the input-seek start offset.
+                    let start = path_part
+                        .split('?')
+                        .nth(1)
+                        .and_then(|q| {
+                            q.split('&').find_map(|kv| {
+                                kv.strip_prefix("t=")
+                                    .and_then(|v| v.parse::<u64>().ok())
+                            })
+                        })
+                        .unwrap_or(0);
+                    if is_head {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 0\r\n\r\n",
+                        );
+                    } else {
+                        serve_transcode(stream, &file_path, start);
+                    }
+                    return;
+                }
                 let Ok(mut file) = std::fs::File::open(&file_path) else {
                     let _ = stream.write_all(
                         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
@@ -5770,6 +5955,176 @@ pub fn media_server_port(
         }
     });
     Ok(port)
+}
+
+/// Whether VA-API hardware transcode works on this machine (probed
+/// once with a synthetic clip, then cached for the process lifetime).
+fn vaapi_works() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        if !std::path::Path::new("/dev/dri/renderD128").exists() {
+            return false;
+        }
+        std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-vaapi_device",
+                "/dev/dri/renderD128",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=0.1:size=128x72:rate=1",
+                "-vf",
+                "format=nv12,hwupload",
+                "-c:v",
+                "h264_vaapi",
+                "-f",
+                "null",
+                "-",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Video dimensions via ffprobe (first stream that reports any).
+fn probe_video_dims(path: &std::path::Path) -> Option<(u32, u32)> {
+    let out = run_with_timeout(
+        "ffprobe",
+        &[
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            &path.to_string_lossy(),
+        ],
+        15,
+    )
+    .ok()?;
+    for line in out.lines() {
+        let mut it = line.trim().split(',');
+        let w: u32 = it.next()?.trim().parse().ok()?;
+        let h: u32 = it.next()?.trim().parse().ok()?;
+        if w > 0 && h > 0 {
+            return Some((w, h));
+        }
+    }
+    None
+}
+
+/// Stream a live H.264 transcode of `path` (from `start` seconds) to
+/// the socket as fragmented MP4 (Round 7.1): the playback fallback
+/// for formats WebKitGTK cannot render (HEVC 10-bit). VA-API hardware
+/// pipeline when the probe passes, software libx264 otherwise. No
+/// temp file; when the client goes away the copy loop breaks and
+/// ffmpeg is killed.
+fn serve_transcode(mut stream: std::net::TcpStream, path: &std::path::Path, start: u64) {
+    use std::io::{Read, Write};
+    let path_str = path.to_string_lossy().to_string();
+    // Fit inside 1920x1080 preserving aspect, even dimensions, never
+    // upscale. Unknown dimensions fall back to filter expressions.
+    let (sw, sh) = match probe_video_dims(path) {
+        Some((w, h)) => {
+            let scale = ((1920.0 / w as f64).min(1080.0 / h as f64)).min(1.0);
+            let tw = (((w as f64 * scale) as u32) & !1).max(2);
+            let th = (((h as f64 * scale) as u32) & !1).max(2);
+            (tw.to_string(), th.to_string())
+        }
+        None => ("min(1920,iw)".to_string(), "-2".to_string()),
+    };
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-loglevel", "error"]);
+    if start > 0 {
+        cmd.args(["-ss", &start.to_string()]);
+    }
+    if vaapi_works() && sw != "min(1920,iw)" {
+        cmd.args([
+            "-hwaccel",
+            "vaapi",
+            "-hwaccel_device",
+            "/dev/dri/renderD128",
+            "-hwaccel_output_format",
+            "vaapi",
+            "-i",
+            &path_str,
+            "-vf",
+            &format!("scale_vaapi=w={sw}:h={sh}:format=nv12"),
+            "-c:v",
+            "h264_vaapi",
+            "-b:v",
+            "8M",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+        ]);
+    } else {
+        cmd.args([
+            "-i",
+            &path_str,
+            "-vf",
+            &format!("scale=w={sw}:h={sh},format=yuv420p"),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "21",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+        ]);
+    }
+    cmd.args([
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof",
+        "-f",
+        "mp4",
+        "pipe:1",
+    ]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = stream.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+            );
+            return;
+        }
+    };
+    if stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        )
+        .is_err()
+    {
+        let _ = child.kill();
+        return;
+    }
+    let mut stdout = child.stdout.take().unwrap();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        match stdout.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if stream.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Register a file with the media server; returns its LAN URL.

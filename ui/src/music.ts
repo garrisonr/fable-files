@@ -10,7 +10,7 @@ import { api, mediaSrc, type Item } from "./api";
 import { Toast } from "./toast";
 
 const AUDIO_EXTS = new Set([
-  "mp3", "flac", "m4a", "aac", "ogg", "oga", "opus", "wav", "aif", "aiff",
+  "mp3", "flac", "m4a", "m4b", "aac", "ogg", "oga", "opus", "wav", "aif", "aiff",
   "dsf", "dff", "ape", "wv", "wma",
 ]);
 

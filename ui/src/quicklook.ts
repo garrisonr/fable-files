@@ -16,6 +16,7 @@ import {
   api,
   formatBytes,
   formatDate,
+  mediaSrc,
   PREVIEW_LABELS,
   type Item,
   type PreviewKind,
@@ -33,6 +34,22 @@ export class QuickLook {
   /** Path whose video is currently playing in a pop-out window. */
   private detachedFor: string | null = null;
   private currentKind: PreviewKind | null = null;
+  /** Live Quick Look audio element (Round 7.1): tracked so playback
+   * can be stopped deterministically — a detached <audio> element
+   * keeps playing in WebKit after its card is replaced. */
+  private audioEl: HTMLAudioElement | null = null;
+
+  private stopAudio(): void {
+    if (!this.audioEl) return;
+    try {
+      this.audioEl.pause();
+      this.audioEl.removeAttribute("src");
+      this.audioEl.load();
+    } catch {
+      // element already detached — nothing left to stop
+    }
+    this.audioEl = null;
+  }
 
   /** Set by the shell: cast the previewed media item. */
   onCast: ((item: Item) => void) | null = null;
@@ -105,6 +122,7 @@ export class QuickLook {
 
   close(): void {
     if (!this.openItem) return;
+    this.stopAudio();
     this.requestToken++;
     this.openItem = null;
     this.slideTo(this.closedX(), () => {
@@ -159,6 +177,9 @@ export class QuickLook {
   }
 
   private async renderCard(item: Item, kind: PreviewKind | null): Promise<void> {
+    // A re-render replaces the card: stop any audio the old card was
+    // playing before its element is discarded.
+    this.stopAudio();
     const body = this.el.querySelector(".ql-body")!;
     body.innerHTML = "";
     const card = document.createElement("div");
@@ -203,7 +224,13 @@ export class QuickLook {
     if (item.kind !== "folder") {
       const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
       const textExts = ["txt", "md", "csv", "tsv", "log", "srt", "vtt", "sub", "ssa", "ass", "nfo", "json", "xml", "yaml", "yml", "toml", "ini", "cfg", "sh", "py", "rs", "ts", "js"];
-      if (kind === "native" && textExts.includes(ext)) {
+      // Round 7.1: documents get a text preview too — the backend
+      // extracts readable text from docx/odt/epub/pdf in preview_text.
+      const docExts = ["docx", "odt", "epub", "pdf"];
+      if (
+        (kind === "native" && textExts.includes(ext)) ||
+        (kind === "document" && docExts.includes(ext))
+      ) {
         try {
           const result = await api.previewText(item.id, 50);
           const pre = document.createElement("pre");
@@ -249,6 +276,49 @@ export class QuickLook {
           });
           card.insertBefore(player.el, dl);
         }
+      }
+      // Audio (Round 7.1): cover art + a real player at the top of the
+      // card, mirroring the video treatment — previously audio items
+      // got the metadata card and silence. Art comes from the
+      // thumbnailer (embedded cover art); playback streams over the
+      // same loopback media server as the Music Player.
+      const audioExts = [
+        "mp3", "flac", "ogg", "oga", "wav", "m4a", "m4b", "opus", "aac",
+        "aif", "aiff", "wma", "dsf", "dff",
+      ];
+      if (audioExts.includes(ext) && item.provider_key) {
+        const apath = item.provider_key;
+        const holder = document.createElement("div");
+        holder.className = "ql-audio";
+        const art = document.createElement("img");
+        art.className = "ql-audio-art";
+        art.alt = "";
+        art.hidden = true;
+        const glyph = document.createElement("div");
+        glyph.className = "ql-audio-glyph";
+        glyph.textContent = "🎵";
+        const audio = document.createElement("audio");
+        audio.className = "ql-audio-player";
+        audio.controls = true;
+        audio.preload = "metadata";
+        holder.append(art, glyph, audio);
+        card.insertBefore(holder, dl);
+        this.audioEl = audio;
+        void mediaSrc(apath).then((url) => {
+          audio.src = url;
+        });
+        void (async () => {
+          try {
+            const url = await api.getThumbnail(item.id, item.provider_key, true);
+            if (url) {
+              art.src = url;
+              art.hidden = false;
+              glyph.hidden = true;
+            }
+          } catch {
+            // no embedded art — the glyph stays
+          }
+        })();
       }
       const imgExts = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff", "ico"];
       if (imgExts.includes(ext)) {

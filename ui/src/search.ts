@@ -22,6 +22,8 @@ export interface SearchHooks {
   /** Results are showing: the shell should hide the file view. */
   onResults(): void;
   onClear(): void;
+  /** "Re-index" button in the results header (Round 7.1). */
+  onReindex?(): void;
   /** Save the current query + filter as a smart folder. */
   onSaveSmartFolder?(): void;
 }
@@ -66,6 +68,18 @@ export class SearchView {
    * this is tracked explicitly. */
   private deleteArmed = false;
   active = false;
+  /** Display name for the path bar while this view is up (smart folder /
+   * ROM system name). Set by runRule and by the shell for saved-query
+   * smart folders; null for plain typed searches. */
+  titleHint: string | null = null;
+  /** Last rule view shown, so a completed re-index can refresh it. */
+  private lastRule: {
+    name: string;
+    rule: { extensions: string[]; minDurationSecs?: number | null };
+  } | null = null;
+  /** Set by runExternal so run() can tell a smart-folder invocation
+   * (keep titleHint) from a hand-typed search (clear titleHint). */
+  private externalRun = false;
 
   constructor(private hooks: SearchHooks) {
     this.el = document.createElement("div");
@@ -195,6 +209,7 @@ export class SearchView {
 
   /** Run a search programmatically (smart folders, palette). */
   async runExternal(query: string, typeFilter: string | null): Promise<void> {
+    this.externalRun = true;
     this.input.value = query;
     this.typeFilter = typeFilter;
     this.chipsEl.querySelectorAll<HTMLElement>(".search-chip").forEach((c) =>
@@ -314,9 +329,37 @@ export class SearchView {
     this.afterInput.value = "";
     this.beforeInput.value = "";
     this.active = false;
+    this.titleHint = null;
     this.el.hidden = true;
     this.resultsEl.innerHTML = "";
     this.hooks.onClear();
+  }
+
+  /** A library re-index just finished: refresh what the user is
+   * looking at so newly downloaded files appear without a restart. */
+  rerunAfterIndex(): void {
+    if (!this.active) return;
+    if (this.lastRule) void this.runRule(this.lastRule.name, this.lastRule.rule);
+    else this.refresh();
+  }
+
+  /** Results header: status line + the Re-index button (Round 7.1). */
+  private resultsHeader(text: string): HTMLDivElement {
+    const row = document.createElement("div");
+    row.className = "search-head-row";
+    const head = document.createElement("p");
+    head.className = "search-status";
+    head.textContent = text;
+    row.appendChild(head);
+    if (this.hooks.onReindex) {
+      const b = document.createElement("button");
+      b.className = "search-chip search-reindex";
+      b.textContent = "↻ Re-index";
+      b.title = "Re-index the library so newly added files appear";
+      b.addEventListener("click", () => this.hooks.onReindex!());
+      row.appendChild(b);
+    }
+    return row;
   }
 
   private onInput(): void {
@@ -328,6 +371,8 @@ export class SearchView {
     const q = this.input.value.trim();
     if (q === this.lastQuery) return;
     this.lastQuery = q;
+    if (!this.externalRun) this.titleHint = null;
+    this.externalRun = false;
     if (!q && !this.typeFilter) {
       this.clear();
       return;
@@ -355,6 +400,8 @@ export class SearchView {
   ): Promise<void> {
     this.active = true;
     this.el.hidden = false;
+    this.titleHint = name;
+    this.lastRule = { name, rule };
     this.hooks.onResults();
     this.renderStatus(`Gathering “${name}”…`);
     try {
@@ -439,10 +486,11 @@ export class SearchView {
     this.anchor = -1;
     this.deleteArmed = false;
     this.resultsEl.innerHTML = "";
-    const head = document.createElement("p");
-    head.className = "search-status";
-    head.textContent = `${items.length} item${items.length === 1 ? "" : "s"} in “${heading}”${items.length >= 1000 ? " (first 1000)" : ""}.`;
-    this.resultsEl.appendChild(head);
+    this.resultsEl.appendChild(
+      this.resultsHeader(
+        `${items.length} item${items.length === 1 ? "" : "s"} in “${heading}”${items.length >= 1000 ? " (first 1000)" : ""}.`,
+      ),
+    );
     const hint = document.createElement("p");
     hint.className = "search-hint";
     hint.textContent =
@@ -478,18 +526,18 @@ export class SearchView {
     this.selected.clear();
     this.anchor = -1;
     this.resultsEl.innerHTML = "";
-    const head = document.createElement("p");
-    head.className = "search-status";
     const typeLabel = TYPE_FILTERS.find((f) => f.id === this.typeFilter)?.label;
-    head.textContent =
-      hits.length === 0
-        ? q
-          ? `No results for “${q}”.`
-          : `No ${typeLabel ?? "files"} found.`
-        : q
-          ? `${hits.length} result${hits.length === 1 ? "" : "s"} for “${q}”.`
-          : `${hits.length} ${typeLabel ?? "files"}${hits.length === 50 ? " (first 50)" : ""}.`;
-    this.resultsEl.appendChild(head);
+    this.resultsEl.appendChild(
+      this.resultsHeader(
+        hits.length === 0
+          ? q
+            ? `No results for “${q}”.`
+            : `No ${typeLabel ?? "files"} found.`
+          : q
+            ? `${hits.length} result${hits.length === 1 ? "" : "s"} for “${q}”.`
+            : `${hits.length} ${typeLabel ?? "files"}${hits.length === 50 ? " (first 50)" : ""}.`,
+      ),
+    );
     if (hits.length > 0) {
       const hint = document.createElement("p");
       hint.className = "search-hint";

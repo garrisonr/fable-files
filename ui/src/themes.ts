@@ -235,13 +235,19 @@ export class ThemeManager {
         metaLabel: `now: ${resolvedName}`,
         preview: DISTRO_ENGINES.find((e) => e.id === detectedId)?.preview,
       },
-      ...DISTRO_ENGINES.map((e) => ({
-        id: e.id,
-        name: e.name,
-        dark: e.dark === true,
-        metaLabel: "Distro theme",
-        preview: e.preview,
-      })),
+      // Round 7.1 (Dickles): alphabetical by display name — Auto stays
+      // pinned first above, the built-in themes stay pinned last below.
+      ...[...DISTRO_ENGINES]
+        .sort((a, b) =>
+          a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+        )
+        .map((e) => ({
+          id: e.id,
+          name: e.name,
+          dark: e.dark === true,
+          metaLabel: "Distro theme",
+          preview: e.preview,
+        })),
     ];
     const backend =
       this.themes.length > 0

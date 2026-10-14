@@ -14,6 +14,7 @@ import { isAudioName } from "./music";
 
 export interface FileViewHooks {
   onOpen(item: Item): void; // Enter / double-click on a folder (or file)
+  onOpenInNewTab?(item: Item): void; // right-click: open in a new tab
   onSelect(item: Item | null): void; // selection changed
   onTogglePreview(): void; // Space handled by shell
   onMakeExecutable(item: Item): void;
@@ -59,7 +60,7 @@ export interface FileViewHooks {
 }
 
 const AUDIO_EXTS = new Set([
-  "mp3", "flac", "ogg", "oga", "wav", "m4a", "opus", "aac", "aif", "aiff", "wma",
+  "mp3", "flac", "ogg", "oga", "wav", "m4a", "m4b", "opus", "aac", "aif", "aiff", "wma",
 ]);
 
 const ARCHIVE_EXTS = new Set([
@@ -173,6 +174,11 @@ export async function showItemMenu(
     });
   }
   items.push({ label: "Open", action: () => hooks.onOpen(item) });
+  if (hooks.onOpenInNewTab)
+    items.push({
+      label: "Open in New Tab",
+      action: () => hooks.onOpenInNewTab!(item),
+    });
   items.push({ label: "Open With...", action: () => openWith(item) });
   if (isArchiveItem(item) && hooks.onExtractArchive) {
     items.push({

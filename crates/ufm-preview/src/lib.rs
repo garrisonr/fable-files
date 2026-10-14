@@ -151,8 +151,8 @@ impl PreviewProvider for ExtensionProvider {
             ) => PreviewKind::Native,
             // Media: audio/video playback surface.
             Some(
-                "mp3" | "flac" | "ogg" | "oga" | "wav" | "m4a" | "opus" | "mp4" | "mkv"
-                | "webm" | "mov" | "avi",
+                "mp3" | "flac" | "ogg" | "oga" | "wav" | "m4a" | "m4b" | "opus" | "mp4"
+                | "mkv" | "webm" | "mov" | "avi",
             ) => PreviewKind::Media,
             // Document: paginated document / ebook.
             Some("pdf" | "epub" | "doc" | "docx" | "odt") => PreviewKind::Document,
@@ -215,6 +215,8 @@ mod tests {
             ("data.csv", PreviewKind::Native),
             ("song.flac", PreviewKind::Media),
             ("song.MP3", PreviewKind::Media),
+            ("audiobook.m4b", PreviewKind::Media),
+            ("audiobook.M4B", PreviewKind::Media), // case-insensitive
             ("movie.mkv", PreviewKind::Media),
             ("clip.mov", PreviewKind::Media),
             ("book.pdf", PreviewKind::Document),
