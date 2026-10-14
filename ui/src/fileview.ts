@@ -10,6 +10,7 @@ import { ContextMenu, type MenuItem } from "./contextmenu";
 import { OpenWithDialog } from "./openwith";
 import { labelColor, loadLabelDefs } from "./labels";
 import { isVideoName } from "./video";
+import { isAudioName } from "./music";
 
 export interface FileViewHooks {
   onOpen(item: Item): void; // Enter / double-click on a folder (or file)
@@ -19,6 +20,7 @@ export interface FileViewHooks {
   onDelete(item: Item): void; // move to trash
   onTrash?(items: Item[]): void; // move a whole selection to trash
   onMediaRename?(items: Item[]): void; // Plex/Kodi/Emby rename
+  onPlayMusic?(items: Item[]): void; // music player
   onRenameInline?(item: Item, newName: string): void;
   onProperties(item: Item): void;
   // Round 4 (Nautilus + Finder parity) — optional so every view can
@@ -227,6 +229,15 @@ export async function showItemMenu(
     items.push({ label: "Duplicate", action: () => hooks.onDuplicate!(targets) });
   if (hooks.onMakeAlias && targets.length === 1)
     items.push({ label: "Make Alias", action: () => hooks.onMakeAlias!(item) });
+  if (
+    hooks.onPlayMusic &&
+    targets.length >= 1 &&
+    targets.every((t) => t.kind !== "folder" && isAudioName(t.name))
+  )
+    items.push({
+      label: targets.length === 1 ? "Play" : `Play ${targets.length} Tracks`,
+      action: () => hooks.onPlayMusic!(targets),
+    });
   if (
     hooks.onMediaRename &&
     targets.length >= 1 &&

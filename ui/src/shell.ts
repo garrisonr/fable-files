@@ -27,6 +27,8 @@ import { FolderPicker, type PickerShortcut } from "./picker";
 import { RenameDialog } from "./rename";
 import { LabelManager, saveLabelRules } from "./labels";
 import { loadLabelDefs, migrateLabelAssignments, saveLabelDefs } from "./labels";
+import { loadRomSystems, saveRomSystems, romsEnabled, setRomsEnabled, type RomSystem } from "./roms";
+import { MusicPlayer } from "./music";
 import { OpenWithDialog } from "./openwith";
 import type { ArchiveEntry } from "./api";
 import { TerminalPanel } from "./terminal";
@@ -122,8 +124,11 @@ export class Shell {
   private labelManager = new LabelManager();
   private searchOpenWith = new OpenWithDialog();
   private mediaRename = new MediaRenameDialog();
+  private musicPlayer = new MusicPlayer();
   private labelList!: HTMLElement;
   private smartList!: HTMLElement;
+  private romsHead!: HTMLElement;
+  private romsList!: HTMLElement;
   /** Archive browsing state: archive item id -> its catalog Item and
    * cached listing. */
   private archiveMeta = new Map<string, Item>();
@@ -153,6 +158,7 @@ export class Shell {
           this.refreshActiveDir();
           if (this.searchView.active) this.searchView.refresh();
         }),
+      onPlayMusic: (items: Item[]) => this.musicPlayer.open(items),
       onOpen: (item) => this.openItem(item),
       onSelect: (item) => this.onSelect(item),
       onTogglePreview: () => this.togglePreview(),
@@ -593,6 +599,19 @@ export class Shell {
     smartHead.textContent = "Smart Folders";
     this.smartList = document.createElement("div");
     this.smartList.className = "side-list";
+    this.romsHead = document.createElement("h2");
+    this.romsHead.className = "side-head";
+    this.romsHead.textContent = "Roms Collection";
+    this.romsHead.title = "Right-click to add a system";
+    this.romsHead.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.ctxMenu.open(e.clientX, e.clientY, [
+        { label: "Add a System\u2026", action: () => this.openRomEditor(null) },
+      ]);
+    });
+    this.romsList = document.createElement("div");
+    this.romsList.className = "side-list";
     sidebar.append(
       favHead,
       this.favList,
@@ -600,6 +619,8 @@ export class Shell {
       this.labelList,
       smartHead,
       this.smartList,
+      this.romsHead,
+      this.romsList,
       locHead,
       this.sidebarList,
     );
@@ -1893,7 +1914,7 @@ export class Shell {
                 );
                 if (!ok) return;
                 Shell.saveSmartFolders(
-                  Shell.loadSmartFolders().filter((f) => f !== sf),
+                  Shell.loadSmartFolders().filter((f) => f.name !== sf.name),
                 );
                 void this.buildSidebar();
                 Toast.success(`Deleted smart folder "${sf.name}".`);
@@ -1904,6 +1925,7 @@ export class Shell {
       });
       this.smartList.appendChild(b);
     }
+    this.renderRomsSection();
   }
 
   /**
@@ -2223,6 +2245,15 @@ export class Shell {
       },
       { label: "Restore Defaults\u2026", danger: true, action: () => void this.restoreDefaults() },
       {
+        label: romsEnabled() ? "Roms Collection \u2713" : "Roms Collection",
+        action: () => {
+          const on = !romsEnabled();
+          setRomsEnabled(on);
+          void this.buildSidebar();
+          Toast.success(on ? "Roms Collection is on." : "Roms Collection is off. Your systems are kept.");
+        },
+      },
+      {
         label: "Synchronize Folders\u2026",
         action: () => void this.openSyncHere(),
       },
@@ -2293,6 +2324,124 @@ export class Shell {
     for (const k of keys) localStorage.removeItem(k);
     Toast.success("Defaults restored \u2014 restarting\u2026", 2500);
     setTimeout(() => location.reload(), 800);
+  }
+
+  /** Render the Roms Collection sidebar section (systems as rule folders). */
+  private renderRomsSection(): void {
+    if (!this.romsList || !this.romsHead) return;
+    const on = romsEnabled();
+    this.romsHead.hidden = !on;
+    this.romsList.hidden = !on;
+    this.romsList.innerHTML = "";
+    if (!on) return;
+    const systems = loadRomSystems();
+    if (systems.length === 0) {
+      const p = document.createElement("p");
+      p.className = "side-empty";
+      p.textContent = "No systems yet. Right-click the heading to add one.";
+      this.romsList.appendChild(p);
+      return;
+    }
+    for (const sys of systems) {
+      const b = document.createElement("button");
+      b.className = "side-item";
+      b.textContent = "\uD83C\uDFAE " + sys.name;
+      b.title = "ROM files: " + sys.extensions.map((x) => "." + x).join(", ");
+      b.addEventListener("click", () => {
+        void this.searchView.runRule(sys.name, { extensions: sys.extensions });
+      });
+      b.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.ctxMenu.open(e.clientX, e.clientY, [
+          {
+            label: `Manage "${sys.name}"\u2026`,
+            action: () => this.openRomEditor(sys),
+          },
+          {
+            label: `Delete "${sys.name}"`,
+            danger: true,
+            action: () => {
+              void (async () => {
+                const ok = await confirmDialog(
+                  `Delete "${sys.name}"?`,
+                  "The system is removed from Roms Collection. Your ROM files are not touched.",
+                  "Delete",
+                  true,
+                );
+                if (!ok) return;
+                saveRomSystems(loadRomSystems().filter((s) => s.name !== sys.name));
+                void this.buildSidebar();
+                Toast.success(`Deleted system "${sys.name}".`);
+              })();
+            },
+          },
+        ]);
+      });
+      this.romsList.appendChild(b);
+    }
+  }
+
+  /** Add or edit a Roms Collection system (name + ROM extensions). */
+  private openRomEditor(sys: RomSystem | null): void {
+    const overlay = document.createElement("div");
+    overlay.className = "picker-overlay";
+    overlay.innerHTML = `
+      <div class="picker-card labels-card" role="dialog" aria-label="Rom system">
+        <h3 class="picker-title">${sys ? "Rom System" : "Add a System"}</h3>
+        <label class="smart-lab">Name
+          <input class="smart-in rom-name" type="text" placeholder="e.g. Atari Jaguar" />
+        </label>
+        <label class="smart-lab">ROM file extensions (comma separated)
+          <input class="smart-in rom-exts" type="text" placeholder="e.g. j64, jag" />
+        </label>
+        <p class="smart-hint">A system gathers files with those extensions from your indexed locations. Shared extensions (iso, bin, zip) can appear under several systems.</p>
+        <div class="picker-actions">
+          <button class="rom-cancel">Cancel</button>
+          <button class="rom-save primary">Save</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const q = <T extends HTMLElement>(sel: string) => overlay.querySelector(sel) as T;
+    if (sys) {
+      q<HTMLInputElement>(".rom-name").value = sys.name;
+      q<HTMLInputElement>(".rom-exts").value = sys.extensions.join(", ");
+    }
+    q<HTMLButtonElement>(".rom-cancel").addEventListener("click", () => overlay.remove());
+    overlay.addEventListener("pointerdown", (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+    q<HTMLButtonElement>(".rom-save").addEventListener("click", () => {
+      const name = q<HTMLInputElement>(".rom-name").value.trim();
+      const exts = q<HTMLInputElement>(".rom-exts")
+        .value.split(/[,\s]+/)
+        .map((s) => s.replace(/^\./, "").toLowerCase())
+        .filter(Boolean);
+      if (!name) {
+        Toast.error("Give the system a name.");
+        return;
+      }
+      if (exts.length === 0) {
+        Toast.error("Add at least one ROM extension.");
+        return;
+      }
+      const list = loadRomSystems();
+      if (sys) {
+        const idx = list.findIndex((s) => s.name === sys.name);
+        if (idx >= 0) list[idx] = { name, extensions: exts };
+      } else {
+        if (list.some((s) => s.name === name)) {
+          Toast.error(`"${name}" is already in the collection.`);
+          return;
+        }
+        list.push({ name, extensions: exts });
+        list.sort((a, b) => a.name.localeCompare(b.name));
+      }
+      saveRomSystems(list);
+      void this.buildSidebar();
+      overlay.remove();
+      Toast.success(`Saved system \u201c${name}\u201d.`);
+    });
   }
 
   /** Manage a smart folder: edit its name and what it gathers. */

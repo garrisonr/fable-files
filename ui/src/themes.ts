@@ -46,6 +46,8 @@ export const DISTRO_ENGINES: DistroEngine[] = [
   { id: "redmondxp", name: "Redmond XP \u00b7 Luna", dark: false, preview: ["#ece9de", "#102040", "#0058e6"] },
   { id: "redmond8", name: "Redmond 8 \u00b7 Metro", dark: true, preview: ["#122028", "#f2f2f2", "#1ba1e2"] },
   { id: "redmond1011", name: "Redmond 10/11 \u00b7 Fluent", dark: true, preview: ["#202020", "#f5f5f5", "#0067c0"] },
+  { id: "liquidglass", name: "Liquid Glass", dark: true, preview: ["#1a202c", "#f5f9ff", "#6fd3ff"] },
+  { id: "materialyou", name: "Material You", dark: true, preview: ["#141218", "#e6e0e9", "#cfbcff"] },
 ];
 const DISTRO_IDS = new Set(DISTRO_ENGINES.map((e) => e.id));
 
