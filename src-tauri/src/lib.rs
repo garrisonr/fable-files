@@ -81,6 +81,12 @@ pub struct AppState {
     /// at startup awaiting resume. The catalog holds the durable copies
     /// (jobs + job_journal tables); this registry is the control surface.
     pub jobs: Mutex<HashMap<JobId, commands::JobHandle>>,
+    /// The bundled ROM DAT dataset (rom-dats.bin), loaded lazily on the
+    /// first identification pass and shared thereafter.
+    pub rom_dataset: Mutex<Option<std::sync::Arc<ufm_media::romdat::RomDataset>>>,
+    /// True while a ROM identification pass is running (identify_roms
+    /// is idempotent — concurrent calls report the running pass).
+    pub rom_identify_running: std::sync::atomic::AtomicBool,
 }
 
 /// One row of the `locations.json` sidecar. The catalog persists locations but
@@ -140,6 +146,8 @@ impl AppState {
             )),
             transcode_cancels: Mutex::new(std::collections::HashMap::new()),
             jobs: Mutex::new(HashMap::new()),
+            rom_dataset: Mutex::new(None),
+            rom_identify_running: std::sync::atomic::AtomicBool::new(false),
         };
 
         seed_themes(&themes_dir)?;
@@ -443,6 +451,8 @@ pub fn run() {
             commands::list_items_by_label,
             commands::rule_items,
             commands::apply_label_rules,
+            commands::identify_roms,
+            commands::rom_collection_items,
             commands::media_url_for_path,
             commands::add_path_location,
             commands::remove_path_location,

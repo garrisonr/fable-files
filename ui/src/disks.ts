@@ -8,7 +8,7 @@
  */
 import { api } from "./api";
 import type { DiskInfo, DiskPart } from "./api";
-import { Toast } from "./toast";
+import { Toast, errText} from "./toast";
 
 function fmt(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -79,7 +79,7 @@ export class DiskUtility {
       this.filesystems = fss;
       this.render(disks);
     } catch (err) {
-      this.listEl.textContent = `Could not read disks: ${err}`;
+      this.listEl.textContent = `Could not read disks: ${errText(err)}`;
     }
   }
 
@@ -176,7 +176,7 @@ export class DiskUtility {
             this.onChanged?.();
             await this.load();
           } catch (err) {
-            Toast.error(`Unmount failed: ${err}`);
+            Toast.error(`Unmount failed: ${errText(err)}`);
           }
         });
         actions.appendChild(unmount);
@@ -291,7 +291,7 @@ export class DiskUtility {
         this.onChanged?.();
         await this.load();
       } catch (err) {
-        Toast.error(`Format failed: ${err}`);
+        Toast.error(`Format failed: ${errText(err)}`);
         run.disabled = false;
         run.textContent = `Format ${part.path}`;
       }
@@ -338,7 +338,7 @@ export class DiskUtility {
         this.onChanged?.();
         await this.load();
       } catch (err) {
-        Toast.error(`Erase failed: ${err}`);
+        Toast.error(`Erase failed: ${errText(err)}`);
         run.disabled = false;
         run.textContent = `Erase ${disk.path}`;
       }
@@ -357,7 +357,7 @@ export class DiskUtility {
     try {
       info = await api.partitionResizeInfo(part.path);
     } catch (err) {
-      loading.textContent = `Couldn't check: ${err}`;
+      loading.textContent = `Couldn't check: ${errText(err)}`;
       return form;
     }
     form.replaceChildren();
@@ -417,7 +417,7 @@ export class DiskUtility {
         this.onChanged?.();
         await this.load();
       } catch (err) {
-        Toast.error(`Resize failed: ${err}`);
+        Toast.error(`Resize failed: ${errText(err)}`);
         run.disabled = false;
         run.textContent = "Resize";
       }

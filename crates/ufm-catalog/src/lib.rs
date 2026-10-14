@@ -30,6 +30,17 @@ pub struct Catalog {
     conn: Connection,
 }
 
+/// A stored media identity (see `Catalog::media_identity_for`).
+#[derive(Debug, Clone)]
+pub struct MediaIdentityRow {
+    pub item_id: String,
+    pub media_kind: String,
+    pub title: Option<String>,
+    pub platform: Option<String>,
+    pub sha1: Option<String>,
+    pub evidence_json: String,
+}
+
 impl Catalog {
     /// Open (or create) the catalog. WAL mode + foreign keys, always.
     pub fn open(path: &std::path::Path) -> Result<Self> {
@@ -639,6 +650,149 @@ impl Catalog {
         Ok(out)
     }
 
+    /// One stored media-identity row (ROM identification results).
+    pub fn media_identity_for(&self, item_id: &ItemId) -> Result<Option<MediaIdentityRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT item_id, media_kind, title, platform, sha1, match_evidence_json
+                 FROM media_identities WHERE item_id = ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![item_id.to_string()], |row| {
+                Ok(MediaIdentityRow {
+                    item_id: row.get(0)?,
+                    media_kind: row.get(1)?,
+                    title: row.get(2)?,
+                    platform: row.get(3)?,
+                    sha1: row.get(4)?,
+                    evidence_json: row.get(5)?,
+                })
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r.map_err(|e| UfmError::Database(e.to_string()))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Insert or replace a media identity (identification is recomputed
+    /// only when the file's size/mtime changed — the caller checks the
+    /// evidence payload for freshness before rehashing).
+    pub fn upsert_media_identity(
+        &self,
+        item_id: &ItemId,
+        media_kind: &str,
+        title: Option<&str>,
+        platform: Option<&str>,
+        sha1: Option<&str>,
+        evidence_json: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO media_identities
+                 (item_id, media_kind, title, year, tmdb_id, platform, sha1, match_evidence_json)
+                 VALUES (?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6)",
+                params![
+                    item_id.to_string(),
+                    media_kind,
+                    title,
+                    platform,
+                    sha1,
+                    evidence_json
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// ROM collection membership: items with a stored DAT identification
+    /// for `platform` — either as the primary platform or in the
+    /// evidence's `also` list (MAME sets belong to Arcade AND their home
+    /// system). `location_ids` restricts scope (None = every location).
+    /// Returns (item, DAT display name) ordered by DAT name.
+    pub fn rom_collection_items(
+        &self,
+        platform: &str,
+        location_ids: Option<&[String]>,
+    ) -> Result<Vec<(ufm_vfs::Item, String)>> {
+        let mut sql = String::from(
+            "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes,
+                    i.modified, i.provider_key, mi.title
+             FROM media_identities AS mi
+             JOIN items AS i ON i.id = mi.item_id
+             WHERE mi.media_kind = 'rom' AND mi.title IS NOT NULL
+               AND (mi.platform = ?1
+                    OR EXISTS (SELECT 1 FROM json_each(mi.match_evidence_json, '$.also')
+                               WHERE value = ?1))",
+        );
+        if let Some(ids) = location_ids {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let placeholders: Vec<String> =
+                ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 2)).collect();
+            sql.push_str(&format!(" AND i.location_id IN ({})", placeholders.join(",")));
+        }
+        sql.push_str(" ORDER BY mi.title COLLATE NOCASE");
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut values: Vec<rusqlite::types::Value> =
+            vec![rusqlite::types::Value::Text(platform.to_string())];
+        if let Some(ids) = location_ids {
+            values.extend(ids.iter().map(|s| rusqlite::types::Value::Text(s.clone())));
+        }
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, location_id, name, kind_s, size_bytes, modified_s, provider_key, title) =
+                row.map_err(|e| UfmError::Database(e.to_string()))?;
+            let parse_id = |s: &str, what: &str| {
+                uuid::Uuid::parse_str(s)
+                    .map_err(|e| UfmError::Database(format!("bad {what} id {s:?}: {e}")))
+            };
+            let labels = match &provider_key {
+                Some(pk) => self.labels_for_path(pk).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            out.push((
+                ufm_vfs::Item {
+                    id: ufm_core::ItemId(parse_id(&id, "item")?),
+                    location: ufm_core::LocationId(parse_id(&location_id, "location")?),
+                    name,
+                    kind: parse_kind(&kind_s),
+                    size_bytes: size_bytes.map(|s| s as u64),
+                    modified: modified_s.and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&chrono::Utc))
+                    }),
+                    provider_key,
+                    labels,
+                    starred: false,
+                },
+                title,
+            ));
+        }
+        Ok(out)
+    }
+
     /// Cache a probed media duration for a path (0.0 = probed, unreadable).
     pub fn set_duration(&self, provider_key: &str, secs: f64) -> Result<()> {
         self.conn
@@ -863,6 +1017,58 @@ mod tests {
         assert_eq!(cat.labels_for(&id).unwrap(), vec!["receipts", "taxes-2026"]);
         cat.untag(&id, "receipts").unwrap();
         assert_eq!(cat.labels_for(&id).unwrap(), vec!["taxes-2026"]);
+    }
+
+    #[test]
+    fn rom_identity_roundtrip_and_collection_scope() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let mut set_item = named_item(loc, "mslug.zip", ItemKind::File);
+        set_item.provider_key = Some("/roms/mslug.zip".into());
+        let mut plain = named_item(loc, "notes.md", ItemKind::File);
+        plain.provider_key = Some("/docs/notes.md".into());
+        cat.insert_item(&set_item).unwrap();
+        cat.insert_item(&plain).unwrap();
+        // A MAME set identified primarily as arcade, also Neo Geo.
+        cat.upsert_media_identity(
+            &set_item.id,
+            "rom",
+            Some("Metal Slug - Super Vehicle-001"),
+            Some("arcade"),
+            Some("deadbeef"),
+            r#"{"crc":0,"also":["neogeo"],"size":100,"modified":null,"container":"set"}"#,
+        )
+        .unwrap();
+        // An unmatched candidate is cached too (title/platform NULL).
+        cat.upsert_media_identity(
+            &plain.id,
+            "rom",
+            None,
+            None,
+            None,
+            r#"{"matched":false,"size":10,"modified":null}"#,
+        )
+        .unwrap();
+        let row = cat.media_identity_for(&set_item.id).unwrap().unwrap();
+        assert_eq!(row.platform.as_deref(), Some("arcade"));
+        assert_eq!(row.title.as_deref(), Some("Metal Slug - Super Vehicle-001"));
+        // Primary platform, also-platform, and a miss.
+        assert_eq!(cat.rom_collection_items("arcade", None).unwrap().len(), 1);
+        let neo = cat.rom_collection_items("neogeo", None).unwrap();
+        assert_eq!(neo.len(), 1);
+        assert_eq!(neo[0].1, "Metal Slug - Super Vehicle-001");
+        assert!(cat.rom_collection_items("nes", None).unwrap().is_empty());
+        // Scope: the item's own location includes it; another excludes it.
+        let mine = vec![loc.to_string()];
+        assert_eq!(cat.rom_collection_items("arcade", Some(&mine)).unwrap().len(), 1);
+        let other = vec![LocationId::new().to_string()];
+        assert!(cat.rom_collection_items("arcade", Some(&other)).unwrap().is_empty());
+        // The unmatched file is in NO collection.
+        assert!(cat
+            .rom_collection_items("c64", None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

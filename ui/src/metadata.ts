@@ -5,7 +5,7 @@
  */
 import { api } from "./api";
 import type { Item, MetaTag } from "./api";
-import { Toast } from "./toast";
+import { Toast, errText} from "./toast";
 
 const WRITABLE = new Set([
   "Artist", "Author", "Creator", "Copyright", "Make", "Model",
@@ -102,7 +102,7 @@ export class MetadataDialog {
       const tags = await api.readMetadata(this.item.id);
       this.render(tags);
     } catch (err) {
-      this.statusEl.textContent = `Could not read metadata: ${err}`;
+      this.statusEl.textContent = `Could not read metadata: ${errText(err)}`;
     }
   }
 
@@ -164,7 +164,7 @@ export class MetadataDialog {
       await this.load();
       this.onChanged?.();
     } catch (err) {
-      Toast.error(`Save failed: ${err}`);
+      Toast.error(`Save failed: ${errText(err)}`);
     }
   }
 
@@ -179,7 +179,7 @@ export class MetadataDialog {
       await this.load();
       this.onChanged?.();
     } catch (err) {
-      Toast.error(`Wash failed: ${err}`);
+      Toast.error(`Wash failed: ${errText(err)}`);
     }
   }
 
@@ -190,7 +190,7 @@ export class MetadataDialog {
       Toast.success(`Clean copy saved: ${path.split("/").pop()}`);
       this.onChanged?.();
     } catch (err) {
-      Toast.error(`Clean copy failed: ${err}`);
+      Toast.error(`Clean copy failed: ${errText(err)}`);
     }
   }
 }

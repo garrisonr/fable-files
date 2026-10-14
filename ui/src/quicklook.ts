@@ -1,3 +1,4 @@
+import { errText } from "./toast";
 /**
  * Quick Look: Space (or double-click on a file) opens a preview pane anchored
  * to the right of the selected file. The pane slides in from the right and
@@ -50,6 +51,18 @@ export class QuickLook {
       // element already detached — nothing left to stop
     }
     this.audioEl = null;
+  }
+
+  /** Live video player (fix block item 3): tracked like the audio
+   * element so closing the pane or re-rendering the card destroys it
+   * — a detached <video> kept sounding after the pane closed and
+   * only quitting the app stopped it (Dickles' Matlock repro). */
+  private videoPlayer: VideoPlayer | null = null;
+
+  private stopVideo(): void {
+    if (!this.videoPlayer) return;
+    this.videoPlayer.destroy();
+    this.videoPlayer = null;
   }
 
   /** Set by the shell: cast the previewed media item. */
@@ -124,6 +137,7 @@ export class QuickLook {
   close(): void {
     if (!this.openItem) return;
     this.stopAudio();
+    this.stopVideo();
     this.requestToken++;
     this.openItem = null;
     this.slideTo(this.closedX(), () => {
@@ -178,9 +192,10 @@ export class QuickLook {
   }
 
   private async renderCard(item: Item, kind: PreviewKind | null): Promise<void> {
-    // A re-render replaces the card: stop any audio the old card was
-    // playing before its element is discarded.
+    // A re-render replaces the card: stop any audio AND video the old
+    // card was playing before its elements are discarded.
     this.stopAudio();
+    this.stopVideo();
     const body = this.el.querySelector(".ql-body")!;
     body.innerHTML = "";
     const card = document.createElement("div");
@@ -276,6 +291,7 @@ export class QuickLook {
                 .catch(() => undefined);
             },
           });
+          this.videoPlayer = player;
           card.insertBefore(player.el, dl);
         }
       }
@@ -296,6 +312,11 @@ export class QuickLook {
         art.className = "ql-audio-art";
         art.alt = "";
         art.hidden = true;
+        // A failed art load falls back to the glyph (fix block item 5).
+        art.addEventListener("error", () => {
+          art.hidden = true;
+          glyph.hidden = false;
+        });
         const glyph = document.createElement("div");
         glyph.className = "ql-audio-glyph";
         glyph.textContent = "🎵";
@@ -359,7 +380,7 @@ export class QuickLook {
         } catch (err) {
           const note = document.createElement("p");
           note.className = "ql-preview-error";
-          note.textContent = `Image preview unavailable: ${err}`;
+          note.textContent = `Image preview unavailable: ${errText(err)}`;
           card.appendChild(note);
         }
       }

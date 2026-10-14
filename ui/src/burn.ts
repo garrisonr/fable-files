@@ -7,7 +7,7 @@
  */
 import { api } from "./api";
 import { FolderPicker } from "./picker";
-import { Toast, promptDialog } from "./toast";
+import { Toast, promptDialog, errText} from "./toast";
 import { Dropdown } from "./dropdown";
 
 export type BurnTarget = "cd" | "dvd" | "bluray" | "iso" | "usb";
@@ -408,8 +408,8 @@ export class BurnStudio {
       }
       return isoPath;
     } catch (err) {
-      this.statusEl.textContent = `Build failed: ${err}`;
-      Toast.error(`ISO build failed: ${err}`);
+      this.statusEl.textContent = `Build failed: ${errText(err)}`;
+      Toast.error(`ISO build failed: ${errText(err)}`);
       return null;
     }
   }
@@ -426,7 +426,7 @@ export class BurnStudio {
     try {
       devices = await api.listBlockDevices();
     } catch (err) {
-      Toast.error(`Device scan failed: ${err}`);
+      Toast.error(`Device scan failed: ${errText(err)}`);
       return;
     }
     if (devices.length === 0) {
@@ -452,7 +452,7 @@ export class BurnStudio {
       const jobId = await api.writeUsb(iso, d.path);
       Toast.info(`USB write started (job ${jobId.slice(0, 8)}…) — progress in the jobs card.`);
     } catch (err) {
-      Toast.error(`USB write failed: ${err}`);
+      Toast.error(`USB write failed: ${errText(err)}`);
     }
   }
 
@@ -465,8 +465,8 @@ export class BurnStudio {
       this.statusEl.textContent = `Burned to ${drive}. ✓`;
       Toast.success("Disc burned.");
     } catch (err) {
-      this.statusEl.textContent = `Burn failed: ${err}`;
-      Toast.error(`Burn failed: ${err}`);
+      this.statusEl.textContent = `Burn failed: ${errText(err)}`;
+      Toast.error(`Burn failed: ${errText(err)}`);
     }
   }
 }

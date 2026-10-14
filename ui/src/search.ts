@@ -5,15 +5,23 @@
  * "reveal in folder" is impossible until the backend adds one — click opens
  * the item itself, which is the honest subset for this milestone.
  */
-import { api, formatBytes, type Item, type SearchHit } from "./api";
+import {
+  api,
+  formatBytes,
+  onRomIdentifyProgress,
+  type Item,
+  type RomScope,
+  type SearchHit,
+} from "./api";
 import { ContextMenu } from "./contextmenu";
+import { errText } from "./toast";
 
 export interface SearchHooks {
   onNavigateToItem(item: Item): void;
   /** Absolute path of the folder the file view shows (folder scope). */
   currentDirPath(): string | null | Promise<string | null>;
   /** Locations for the scope picker (null id = everywhere). */
-  scopes(): Array<{ id: string | null; name: string }>;
+  scopes(): Array<{ id: string | null; name: string; provider?: string }>;
   onPreviewItem(item: Item): void;
   /** Trash the selected hits (shell owns the batch + toast + undo). */
   onTrashItems?(items: Item[]): void;
@@ -77,6 +85,14 @@ export class SearchView {
     name: string;
     rule: { extensions: string[]; minDurationSecs?: number | null };
   } | null = null;
+  /** Last ROM collection shown (DAT-identified membership). */
+  private lastRom: { name: string; systemKey: string; scope: RomScope } | null =
+    null;
+  /** Display-name overrides for the current rule/collection render:
+   * item id → DAT name (ROM Lists: the DAT name headlines, the real
+   * filename stays in the path line). */
+  private displayNames: Map<string, string> | null = null;
+  private romProgressWired = false;
   /** Set by runExternal so run() can tell a smart-folder invocation
    * (keep titleHint) from a hand-typed search (clear titleHint). */
   private externalRun = false;
@@ -87,6 +103,7 @@ export class SearchView {
   private indexingBusy = false;
   private indexingFiles: number | null = null;
   private bannerEl!: HTMLDivElement;
+  private bannerTextEl!: HTMLSpanElement;
   /** The last typed-search render, so the empty-state copy can be
    * rephrased the moment indexing state flips. */
   private lastResults: { q: string; hits: SearchHit[] } | null = null;
@@ -171,10 +188,18 @@ export class SearchView {
 
     // Indexing banner (inc-2 item 13): a sibling of the results
     // wrap — the render methods wipe resultsEl, the banner must
-    // survive them. Hidden unless indexing is active.
+    // survive them. Hidden unless indexing is active. Fix block
+    // item 8: the spinner is a real CSS spinner in theme tokens,
+    // not the ⏳ emoji (which rendered as a Windows-95 hourglass).
     this.bannerEl = document.createElement("div");
     this.bannerEl.className = "search-indexing-banner";
     this.bannerEl.hidden = true;
+    const spinner = document.createElement("span");
+    spinner.className = "search-spinner";
+    spinner.setAttribute("aria-hidden", "true");
+    this.bannerTextEl = document.createElement("span");
+    this.bannerTextEl.className = "search-indexing-text";
+    this.bannerEl.append(spinner, this.bannerTextEl);
     this.el.appendChild(this.bannerEl);
 
     this.resultsEl = document.createElement("div");
@@ -280,8 +305,8 @@ export class SearchView {
     if (!busy) this.indexingFiles = null;
     this.bannerEl.hidden = !busy;
     if (busy) {
-      this.bannerEl.textContent =
-        `⏳ Still indexing… results may be incomplete` +
+      this.bannerTextEl.textContent =
+        `Still indexing… results may be incomplete` +
         (this.indexingFiles !== null
           ? ` · ${this.indexingFiles.toLocaleString()} files indexed so far`
           : "");
@@ -381,8 +406,15 @@ export class SearchView {
    * looking at so newly downloaded files appear without a restart. */
   rerunAfterIndex(): void {
     if (!this.active) return;
-    if (this.lastRule) void this.runRule(this.lastRule.name, this.lastRule.rule);
-    else this.refresh();
+    if (this.lastRom) {
+      void this.runRomCollection(
+        this.lastRom.name,
+        this.lastRom.systemKey,
+        this.lastRom.scope,
+      );
+    } else if (this.lastRule) {
+      void this.runRule(this.lastRule.name, this.lastRule.rule);
+    } else this.refresh();
   }
 
   /** Results header: status line + the Re-index button (Round 7.1). */
@@ -439,11 +471,14 @@ export class SearchView {
   async runRule(
     name: string,
     rule: { extensions: string[]; minDurationSecs?: number | null },
+    scope?: RomScope,
   ): Promise<void> {
     this.active = true;
     this.el.hidden = false;
     this.titleHint = name;
     this.lastRule = { name, rule };
+    this.lastRom = null;
+    this.displayNames = null;
     this.hooks.onResults();
     this.renderStatus(`Gathering “${name}”…`);
     try {
@@ -461,9 +496,75 @@ export class SearchView {
           `Reading media durations for “${name}”… (${items.length} so far)`,
         );
       }
+      // Collection scope (ROM systems without a DAT keep extension
+      // rules; their scope filters client-side by item location).
+      if (scope && scope.mode !== "all") {
+        const allowed =
+          scope.mode === "boot"
+            ? new Set(
+                this.hooks
+                  .scopes()
+                  .filter((l) => l.provider !== "volume")
+                  .map((l) => l.id),
+              )
+            : new Set<string | null>(scope.drives);
+        items = items.filter((it) => allowed.has(it.location));
+      }
       this.renderItems(name, items);
     } catch {
       this.renderStatus(`Could not gather “${name}”. Please try again.`);
+    }
+  }
+
+  /** ROM collection (ROM Lists): membership = a DAT identification,
+   * never an extension. Runs the identification pass first (cached
+   * identifications make repeat opens instant), then renders the
+   * collection with DAT names headlining each row. */
+  async runRomCollection(
+    name: string,
+    systemKey: string,
+    scope: RomScope,
+  ): Promise<void> {
+    this.active = true;
+    this.el.hidden = false;
+    this.titleHint = name;
+    this.lastRule = null;
+    this.lastRom = { name, systemKey, scope };
+    this.displayNames = null;
+    this.hooks.onResults();
+    this.renderStatus(`Identifying ROMs for “${name}”…`);
+    if (!this.romProgressWired) {
+      this.romProgressWired = true;
+      void onRomIdentifyProgress((p) => {
+        if (this.active && this.lastRom) {
+          this.renderStatus(
+            `Identifying ROMs… ${p.done.toLocaleString()} of ${p.total.toLocaleString()} checked · ${p.matched.toLocaleString()} identified`,
+          );
+        }
+      }).catch(() => undefined);
+    }
+    try {
+      await api.identifyRoms();
+      const hits = await api.romCollectionItems(systemKey, scope);
+      const names = new Map<string, string>();
+      const items: Item[] = [];
+      for (const h of hits) {
+        items.push(h.item);
+        names.set(h.item.id, h.datName);
+      }
+      this.displayNames = names;
+      this.renderItems(name, items);
+      if (items.length === 0) {
+        const note = document.createElement("p");
+        note.className = "search-hint";
+        note.textContent =
+          "No verified ROMs yet. Membership comes from the No-Intro / Redump / MAME lists — a file joins only when its contents match a known game exactly.";
+        this.resultsEl.appendChild(note);
+      }
+    } catch (err) {
+      this.renderStatus(
+        `Could not open “${name}”: ${errText(err)}`,
+      );
     }
   }
 
@@ -615,7 +716,10 @@ export class SearchView {
 
       const name = document.createElement("span");
       name.className = "hit-name";
-      name.textContent = hit.item.name;
+      // ROM collections headline the DAT name; the row's path line
+      // still shows the real file path.
+      name.textContent =
+        this.displayNames?.get(hit.item.id) ?? hit.item.name;
 
       const path = document.createElement("span");
       path.className = "hit-path";

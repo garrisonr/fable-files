@@ -1,3 +1,4 @@
+import { errText } from "./toast";
 /**
  * RenameDialog — small modal for renaming one item (F2 / context menu,
  * Finder's Rename). Prefills the current name with the stem selected.
@@ -73,7 +74,7 @@ export class RenameDialog {
       this.close();
       if (done) done();
     } catch (err) {
-      this.errorEl.textContent = `${err}`;
+      this.errorEl.textContent = `${errText(err)}`;
     }
   }
 

@@ -432,7 +432,11 @@ th[data-sort]:focus-visible {
   border-radius: calc(var(--ufm-radius-md) / 2);
   cursor: pointer;
   padding: 0.125rem 0.375rem;
-  font-size: 0.875rem;
+  /* Fix block item 10: the × gets the same bolder treatment as the
+     nav arrows — 17px at weight 700. */
+  font-size: 1.0625rem;
+  font-weight: 700;
+  line-height: 1;
   /* inc-2 item 10: same minimum-target treatment as the nav arrows —
      the hit target is generous even though the glyph stays small. */
   min-width: 2rem;
@@ -454,10 +458,13 @@ th[data-sort]:focus-visible {
 .tab-add {
   flex: 0 0 auto;
   /* inc-2 item 10: explicit 2rem minimum target + a readable glyph
-     (it is an .icon-btn, but the tab strip states it plainly). */
+     (it is an .icon-btn, but the tab strip states it plainly).
+     Fix block item 10: bolder + larger, like the nav arrows. */
   min-width: 2rem;
   min-height: 2rem;
-  font-size: 1rem;
+  font-size: 1.25rem;
+  font-weight: 700;
+  line-height: 1;
   color: var(--ufm-text);
 }
 
@@ -1366,13 +1373,16 @@ body[data-layout="tv"] .cell-icon {
 /* Navigation arrows (inc-2 item 10, accessibility): full 2rem x 2rem
    targets and a full-strength glyph when enabled — the toolbar
    override above shrank them to dim 14px ghosts. Dimming is reserved
-   for the genuinely disabled state. */
+   for the genuinely disabled state. ROM-lists fix block item 10:
+   Dickles' verdict on the inc-2 size was "still too small — make
+   BOLDER": 22px glyphs at weight 800 in the same 2rem targets. */
 .nav-buttons .nav-btn {
   width: 2rem;
   height: 2rem;
   padding: 0;
-  font-size: 1.0625rem;
-  font-weight: 600;
+  font-size: 1.375rem;
+  font-weight: 800;
+  line-height: 1;
   color: var(--ufm-text);
   opacity: 1;
 }
@@ -2343,6 +2353,21 @@ tr.row[style*="--label-color"] {
   background: color-mix(in srgb, var(--ufm-accent) 16%, transparent);
   border: 1px solid color-mix(in srgb, var(--ufm-accent) 40%, transparent);
   color: var(--ufm-text); font-size: 0.8125rem; font-weight: 550;
+  display: flex; align-items: center; gap: 0.55rem;
+}
+/* Fix block item 8: a real spinner in the theme tokens — the ⏳
+   emoji rendered as a Windows-95 hourglass. Reduced-motion keeps a
+   static ring (the text still says indexing is in progress). */
+.search-spinner {
+  flex: 0 0 auto;
+  width: 0.9rem; height: 0.9rem;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--ufm-accent) 35%, transparent);
+  border-top-color: var(--ufm-accent);
+  animation: vp-spin 0.9s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .search-spinner { animation: none; }
 }
 .search-head-row .search-status { margin: 0; }
 

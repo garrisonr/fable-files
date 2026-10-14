@@ -8,3 +8,7 @@ license.workspace = true
 ufm-core.workspace = true
 serde.workspace = true
 chrono.workspace = true
+# ROM identification (romdat): streaming CRC32 + MD5 + SHA1.
+crc32fast = "1"
+md5 = "0.7"
+sha1 = "0.10"

@@ -3,6 +3,28 @@
  * Replaces ugly native alert()/confirm() with styled UI.
  */
 
+/** Render any thrown value as human text for a toast. Tauri command
+ * errors arrive as CommandError objects ({code, message}) — a bare
+ * `${err}` stringifies those as "[object Object]" (Dickles hit this
+ * on Trash and Clipboard, 2026-10-14). Every user-visible error
+ * interpolation goes through here. */
+export function errText(err: unknown): string {
+  if (typeof err === "string") return err;
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object") {
+    const o = err as { message?: unknown; code?: unknown };
+    if (typeof o.message === "string" && o.message) return o.message;
+    if (typeof o.code === "string" && o.code) return o.code;
+    try {
+      return JSON.stringify(err);
+    } catch {
+      return "Unknown error";
+    }
+  }
+  if (err === null || err === undefined) return "Unknown error";
+  return String(err);
+}
+
 export class Toast {
   private static container: HTMLElement | null = null;
 

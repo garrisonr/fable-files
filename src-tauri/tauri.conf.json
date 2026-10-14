@@ -37,7 +37,8 @@
     ],
     "targets": "all",
     "resources": [
-      "../themes"
+      "../themes",
+      "resources/rom-dats.bin"
     ]
   },
   "identifier": "com.garrisonr.fablefiles",

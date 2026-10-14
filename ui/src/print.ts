@@ -4,7 +4,7 @@
  */
 import { api } from "./api";
 import type { Item } from "./api";
-import { Toast } from "./toast";
+import { Toast, errText} from "./toast";
 
 export class PrintDialog {
   readonly element: HTMLDivElement;
@@ -38,7 +38,7 @@ export class PrintDialog {
     try {
       printers = await api.listPrinters();
     } catch (err) {
-      this.body.textContent = `Printer search failed: ${err}`;
+      this.body.textContent = `Printer search failed: ${errText(err)}`;
       return;
     }
     this.body.replaceChildren();
@@ -96,7 +96,7 @@ export class PrintDialog {
         Toast.success(job || `Sent to ${printerSel.value}.`);
         this.close();
       } catch (err) {
-        Toast.error(`Print failed: ${err}`);
+        Toast.error(`Print failed: ${errText(err)}`);
         printBtn.disabled = false;
         printBtn.textContent = "Print";
       }

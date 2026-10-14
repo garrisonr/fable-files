@@ -8,6 +8,79 @@
 export interface RomSystem {
   name: string;
   extensions: string[];
+  /** Collection scope (Dickles 2026-10-14): which drives this
+   * collection draws from. Absent = all drives. Persisted with the
+   * system definition. Drive entries are location ids as the app
+   * knows them today (Indexer v2 will harden volume identity). */
+  scope?: { mode: "all" | "boot" | "drives"; drives: string[] };
+}
+
+/** Built-in system → DAT dataset key (crates/ufm-media romdat).
+ * Systems listed here are governed by the ROM LISTS: membership is a
+ * hash identification against the No-Intro / Redump / MAME DATs, and
+ * their extension lists are retired. Systems NOT listed (Nintendo
+ * Switch, PlayStation 4/5 — no DAT exists in any source we can
+ * redistribute) keep extension rules, as do Dickles' custom systems. */
+export const ROM_SYSTEM_KEYS: Record<string, string> = {
+  "3DO": "3do",
+  "Amiga": "amiga",
+  "Arcade (MAME)": "arcade",
+  "Arcade": "arcade",
+  "Atari 2600": "atari2600",
+  "Atari 5200": "atari5200",
+  "Atari 7800": "atari7800",
+  "Atari 8-Bit": "atari8bit",
+  "Atari Lynx": "lynx",
+  "ColecoVision": "colecovision",
+  "Commodore 64": "c64",
+  "Dreamcast": "dreamcast",
+  "Game Boy": "gb",
+  "Game Boy Advance": "gba",
+  "Game Boy Color": "gbc",
+  "Game Gear": "gamegear",
+  "GameCube": "gamecube",
+  "Genesis": "genesis",
+  "Intellivision": "intellivision",
+  "Jaguar": "jaguar",
+  "Master System": "mastersystem",
+  "MSX": "msx",
+  "Neo Geo": "neogeo",
+  "Neo Geo Pocket": "neogeopocket",
+  "NES": "nes",
+  "Nintendo 3DS": "n3ds",
+  "Nintendo 64": "n64",
+  "Nintendo DS": "nds",
+  "PlayStation": "psx",
+  "PlayStation 2": "ps2",
+  "PlayStation 3": "ps3",
+  "PSP": "psp",
+  "Saturn": "saturn",
+  "Sega 32X": "sega32x",
+  "Sega CD": "segacd",
+  "SNES": "snes",
+  "TurboGrafx-16": "tg16",
+  "Vectrex": "vectrex",
+  "Virtual Boy": "virtualboy",
+  "Wii": "wii",
+  "Wii U": "wiiu",
+  "WonderSwan": "wonderswan",
+  "Xbox": "xbox",
+  "Xbox 360": "xbox360",
+  "ZX Spectrum": "zxspectrum",
+};
+
+/** The DAT dataset key for a system, or null when it is not a
+ * list-governed built-in (custom systems, Switch, PS4, PS5). */
+export function romSystemKey(sys: RomSystem): string | null {
+  return ROM_SYSTEM_KEYS[sys.name] ?? null;
+}
+
+/** The system's scope as a backend RomScope (default: all drives). */
+export function romScopeOf(sys: RomSystem): {
+  mode: "all" | "boot" | "drives";
+  drives: string[];
+} {
+  return sys.scope ?? { mode: "all", drives: [] };
 }
 
 const STORE_KEY = "ff-rom-systems";

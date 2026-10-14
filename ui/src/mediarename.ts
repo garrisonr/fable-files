@@ -9,7 +9,7 @@
  * applying, batches included (Dickles, 2026-10-13).
  */
 import { api, type Item } from "./api";
-import { Toast } from "./toast";
+import { Toast, errText} from "./toast";
 
 const JUNK = new Set([
   "2160p", "1080p", "720p", "576p", "480p", "4k", "uhd", "web", "webrip",
@@ -250,7 +250,7 @@ export class MediaRenameDialog {
         await api.renameItem(row.item.id, newName);
         renamed++;
       } catch (err) {
-        errors.push(`${row.item.name}: ${err}`);
+        errors.push(`${row.item.name}: ${errText(err)}`);
       }
     }
     this.close();

@@ -8,7 +8,7 @@
  */
 import { api, formatBytes } from "./api";
 import type { Item } from "./api";
-import { Toast } from "./toast";
+import { Toast, errText} from "./toast";
 
 const DEFAULT_TRACKERS = [
   "udp://tracker.opentrackr.org:1337/announce",
@@ -89,7 +89,7 @@ export class TorrentDialog {
         Toast.success("mktorrent installed.");
         this.renderForm();
       } catch (err) {
-        Toast.error(`Install failed: ${err}`);
+        Toast.error(`Install failed: ${errText(err)}`);
         install.disabled = false;
         install.textContent = "Install mktorrent";
       }
@@ -198,7 +198,7 @@ export class TorrentDialog {
           washBox.checked || cleanBox.checked,
         );
       } catch (err) {
-        Toast.error(`Torrent failed: ${err}`);
+        Toast.error(`Torrent failed: ${errText(err)}`);
         create.disabled = false;
         create.textContent = "Create Torrent";
       }

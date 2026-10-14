@@ -338,18 +338,34 @@ export const api = {
   // resumable copy/move/delete through the ufm-jobs engine. All
   // start_* commands return the JobId; progress arrives as
   // `job-progress` events (see jobs.ts).
-  startCopy: (sources: string[], dstParent: string) =>
-    invoke<string>("start_copy", { req: { sources, dstParent } }),
-  startCopyFromPaths: (sources: string[], dstDir: string) =>
-    invoke<string>("start_copy_from_paths", { req: { sources, dstDir } }),
-  startMove: (sources: string[], dstDir: string) =>
-    invoke<string>("start_move", { req: { sources, dstDir } }),
-  startMoveFromPaths: (sources: string[], dstDir: string) =>
-    invoke<string>("start_move_from_paths", { req: { sources, dstDir } }),
-  startDelete: (sources: string[], useTrash: boolean) =>
-    invoke<string>("start_delete", { req: { sources, useTrash } }),
-  startDeleteFromPaths: (paths: string[], useTrash: boolean) =>
-    invoke<string>("start_delete_from_paths", { req: { paths, useTrash } }),
+  startCopy: (sources: string[], dstParent: string) => {
+    const req: CopyRequest = { sources, dstParent };
+    return invoke<string>("start_copy", { req });
+  },
+  startCopyFromPaths: (sources: string[], dstDir: string) => {
+    const req: CopyPathsRequest = { sources, dstDir };
+    return invoke<string>("start_copy_from_paths", { req });
+  },
+  startMove: (sources: string[], dstDir: string) => {
+    const req: MoveRequest = { sources, dstDir };
+    return invoke<string>("start_move", { req });
+  },
+  startMoveFromPaths: (sources: string[], dstDir: string) => {
+    const req: MovePathsRequest = { sources, dstDir };
+    return invoke<string>("start_move_from_paths", { req });
+  },
+  startDelete: (sources: string[], useTrash: boolean) => {
+    const req: DeleteRequest = { sources, useTrash };
+    return invoke<string>("start_delete", { req });
+  },
+  startDeleteFromPaths: (paths: string[], useTrash: boolean) => {
+    const req: DeletePathsRequest = { paths, useTrash };
+    return invoke<string>("start_delete_from_paths", { req });
+  },
+  // ROM Lists: DAT-based identification + collection membership.
+  identifyRoms: () => invoke<RomIdentifyStats>("identify_roms"),
+  romCollectionItems: (system: string, scope: RomScope) =>
+    invoke<RomHit[]>("rom_collection_items", { system, scope }),
   pauseJob: (job: string) => invoke<void>("pause_job", { job }),
   resumeJob: (job: string) => invoke<void>("resume_job", { job }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),
@@ -499,6 +515,78 @@ export const api = {
 
 export function onIndexProgress(cb: (s: IndexState) => void): Promise<UnlistenFn> {
   return listen<IndexState>("index-progress", (e) => cb(e.payload));
+}
+
+/** Job request payloads (seam-guarded): these interfaces mirror the
+ * Rust request structs field-for-field. The wrappers above build them
+ * as annotated literals, so dropping or renaming a key is a tsc
+ * compile error here — and the Rust fixture test
+ * `seam_job_requests_accept_frontend_camel_case` pins the wire shape
+ * on the other side. (2026-10-14: all six start_* commands silently
+ * rejected every call when the structs lost their camelCase rename.) */
+export interface CopyRequest {
+  sources: string[];
+  dstParent: string;
+}
+export interface MoveRequest {
+  sources: string[];
+  dstDir: string;
+}
+export interface MovePathsRequest {
+  sources: string[];
+  dstDir: string;
+}
+export interface CopyPathsRequest {
+  sources: string[];
+  dstDir: string;
+}
+export interface DeleteRequest {
+  sources: string[];
+  useTrash: boolean;
+}
+export interface DeletePathsRequest {
+  paths: string[];
+  useTrash: boolean;
+}
+
+/** ROM identification pass result (identify_roms). */
+export interface RomIdentifyStats {
+  alreadyRunning: boolean;
+  candidates: number;
+  hashed: number;
+  matched: number;
+  fresh: number;
+  errors: number;
+  elapsedMs: number;
+  filesPerSec: number;
+}
+
+export interface RomIdentifyProgress {
+  done: number;
+  total: number;
+  matched: number;
+}
+
+/** Per-collection scope (Dickles 2026-10-14): all drives (default),
+ * the boot drive only, or a chosen set of drives (location ids). */
+export interface RomScope {
+  mode: "all" | "boot" | "drives";
+  drives: string[];
+}
+
+/** One ROM collection member: the catalog item plus its DAT name. */
+export interface RomHit {
+  item: Item;
+  datName: string;
+  system: string;
+}
+
+export function onRomIdentifyProgress(
+  cb: (p: RomIdentifyProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<RomIdentifyProgress>("rom-identify-progress", (e) =>
+    cb(e.payload),
+  );
 }
 
 export function formatBytes(n: number | null): string {

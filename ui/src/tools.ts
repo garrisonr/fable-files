@@ -6,7 +6,7 @@
 import { api } from "./api";
 import type { Item } from "./api";
 import { FolderPicker } from "./picker";
-import { Toast } from "./toast";
+import { Toast, errText} from "./toast";
 
 function fmt(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -110,7 +110,7 @@ export class ChecksumDialog {
       const hash = await api.checksumItem(this.item.id, algo);
       this.show(`${algo}: ${hash}`, true);
     } catch (err) {
-      this.show(`Failed: ${err}`);
+      this.show(`Failed: ${errText(err)}`);
     }
   }
 
@@ -120,7 +120,7 @@ export class ChecksumDialog {
       const path = await api.createChecksumFile(this.item.id, this.algoSel.value);
       Toast.success(`Wrote ${path.split("/").pop()}`);
     } catch (err) {
-      Toast.error(`Create failed: ${err}`);
+      Toast.error(`Create failed: ${errText(err)}`);
     }
   }
 
@@ -143,7 +143,7 @@ export class ChecksumDialog {
       sum.textContent = `${okCount}/${results.length} files OK.`;
       this.out.appendChild(sum);
     } catch (err) {
-      this.show(`Verify failed: ${err}`);
+      this.show(`Verify failed: ${errText(err)}`);
     }
   }
 
@@ -296,7 +296,7 @@ export class SyncDialog {
       Toast.success("Schedule on — Fable Files will start with the system so syncs can run.");
       await this.renderSchedules();
     } catch (err) {
-      Toast.error(`Could not schedule: ${err}`);
+      Toast.error(`Could not schedule: ${errText(err)}`);
     }
   }
 
@@ -348,7 +348,7 @@ export class SyncDialog {
       this.statusEl.textContent =
         `${this.rows.length} files compared · ${diff} differ · ${this.rows.length - diff} identical.`;
     } catch (err) {
-      this.statusEl.textContent = `Compare failed: ${err}`;
+      this.statusEl.textContent = `Compare failed: ${errText(err)}`;
     }
   }
 
@@ -402,7 +402,7 @@ export class SyncDialog {
       this.onDone?.();
       await this.compare();
     } catch (err) {
-      Toast.error(`Copy failed: ${err}`);
+      Toast.error(`Copy failed: ${errText(err)}`);
     }
   }
 }
@@ -484,7 +484,7 @@ export class SplitDialog {
       this.element.hidden = true;
       this.onDone?.();
     } catch (err) {
-      Toast.error(`Split failed: ${err}`);
+      Toast.error(`Split failed: ${errText(err)}`);
     }
   }
 }
@@ -576,7 +576,7 @@ export class DuplicatesDialog {
       );
       this.render(groups);
     } catch (err) {
-      this.statusEl.textContent = `Search failed: ${err}`;
+      this.statusEl.textContent = `Search failed: ${errText(err)}`;
     }
   }
 
@@ -629,7 +629,7 @@ export class DuplicatesDialog {
       if (this.onTrackJob) {
         this.onTrackJob(jobId, `Trash ${count} duplicates`, async (error) => {
           if (error) {
-            Toast.error(`Could not trash duplicates: ${error}`);
+            Toast.error(`Could not trash duplicates: ${errText(error)}`);
           } else {
             Toast.success(
               `Trashed ${count} duplicate cop${count === 1 ? "y" : "ies"}.`,
@@ -645,7 +645,7 @@ export class DuplicatesDialog {
         this.onDone?.();
       }
     } catch (err) {
-      Toast.error(`Could not trash duplicates: ${err}`);
+      Toast.error(`Could not trash duplicates: ${errText(err)}`);
     }
   }
 }

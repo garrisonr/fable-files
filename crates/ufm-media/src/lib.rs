@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod romdat;
+
 // ---------------------------------------------------------------------------
 // MediaIdentity — what the classifier decided a file is, with evidence.
 // Matches are never silent guesses: evidence + override history are stored

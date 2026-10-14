@@ -59,6 +59,38 @@ export class VideoPlayer {
   private transcoding = false;
   private streamStart = 0;
   private origDuration = 0;
+  /** Set by destroy(): late async continuations (mediaSrc, transcode
+   * spin-up) must not resurrect a torn-down player. */
+  private destroyed = false;
+
+  /** Tear the player down completely (fix block item 3): pause, drop
+   * the source, cancel the watchdog + control-hide timers, leave
+   * fullscreen, and remove the element. A detached <video> keeps
+   * sounding in WebKitGTK after its surface closes — no media element
+   * may outlive its surface. Hosts MUST call this. */
+  destroy(): void {
+    this.destroyed = true;
+    if (this.hideTimer !== null) {
+      window.clearTimeout(this.hideTimer);
+      this.hideTimer = null;
+    }
+    if (this.watchdog !== null) {
+      window.clearTimeout(this.watchdog);
+      this.watchdog = null;
+    }
+    try {
+      if (document.fullscreenElement === this.el) {
+        void document.exitFullscreen().catch(() => undefined);
+      }
+      this.video.pause();
+      this.video.removeAttribute("src");
+      this.video.load();
+    } catch {
+      // element already gone — nothing left to stop
+    }
+    this.hideLoading();
+    this.el.remove();
+  }
 
   constructor(opts: VideoPlayerOpts) {
     this.path = opts.path;
@@ -70,7 +102,7 @@ export class VideoPlayer {
     // Stream from the loopback media server (HTTP Range) — the asset
     // protocol silently fails on real video in WebKitGTK.
     void mediaSrc(opts.path).then((url) => {
-      if (!this.failed) {
+      if (!this.failed && !this.destroyed) {
         this.video.src = url;
         this.armWatchdog();
       }
@@ -327,6 +359,7 @@ export class VideoPlayer {
   private async startTranscode(startSecs: number): Promise<void> {
     this.showLoading();
     const url = await transcodeSrc(this.path, startSecs);
+    if (this.destroyed) return;
     if (!url) {
       this.showFallback();
       return;
@@ -370,6 +403,15 @@ export class VideoPlayer {
     }
     this.hideLoading();
     this.bar.remove();
+    // Silence before detaching: a removed-but-loaded <video> can
+    // keep sounding (the ghost-playback class, fix block item 3).
+    try {
+      this.video.pause();
+      this.video.removeAttribute("src");
+      this.video.load();
+    } catch {
+      // already detached
+    }
     this.video.remove();
     // Quiet single-line inline note (inc-2 item 8) — the old
     // full-card notice is gone by Dickles' order.

@@ -6,7 +6,7 @@
  * (`rclone authorize <type>`) and paste the token back here.
  */
 import { api } from "./api";
-import { Toast } from "./toast";
+import { Toast, errText} from "./toast";
 
 interface FieldDef {
   key: string;
@@ -384,8 +384,8 @@ export class CloudMount {
       Toast.success(`Cloud drive ${name} mounted.`);
       await this.renderMounts();
     } catch (err) {
-      this.statusEl.textContent = `Failed: ${err}`;
-      Toast.error(`Mount failed: ${err}`);
+      this.statusEl.textContent = `Failed: ${errText(err)}`;
+      Toast.error(`Mount failed: ${errText(err)}`);
     }
   }
 
@@ -427,7 +427,7 @@ export class CloudMount {
             await this.hooks.refreshSidebar();
             await this.renderMounts();
           } catch (err) {
-            Toast.error(`Unmount failed: ${err}`);
+            Toast.error(`Unmount failed: ${errText(err)}`);
           }
         });
         row.appendChild(unmount);
@@ -446,7 +446,7 @@ export class CloudMount {
             await this.hooks.refreshSidebar();
             await this.renderMounts();
           } catch (err) {
-            Toast.error(`Mount failed: ${err}`);
+            Toast.error(`Mount failed: ${errText(err)}`);
           }
         });
         row.appendChild(mount);
@@ -468,7 +468,7 @@ export class CloudMount {
           await this.hooks.refreshSidebar();
           await this.renderMounts();
         } catch (err) {
-          Toast.error(`Forget failed: ${err}`);
+          Toast.error(`Forget failed: ${errText(err)}`);
         }
       });
       row.appendChild(del);

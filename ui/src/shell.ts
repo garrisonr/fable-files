@@ -21,7 +21,7 @@ import { IndexTracker } from "./indexing";
 import { reducedMotion, animateFromLive, liveOpacity } from "./motion";
 import { QuickLook } from "./quicklook";
 import { ContextMenu } from "./contextmenu";
-import { Toast, confirmDialog, promptDialog } from "./toast";
+import { Toast, confirmDialog, promptDialog, errText} from "./toast";
 import { SearchView } from "./search";
 import { MediaRenameDialog } from "./mediarename";
 import { PropertiesDialog } from "./properties";
@@ -29,7 +29,7 @@ import { FolderPicker, type PickerShortcut } from "./picker";
 import { RenameDialog } from "./rename";
 import { LabelManager, saveLabelRules } from "./labels";
 import { loadLabelDefs, migrateLabelAssignments, saveLabelDefs } from "./labels";
-import { loadRomSystems, saveRomSystems, romsEnabled, setRomsEnabled, type RomSystem } from "./roms";
+import { loadRomSystems, saveRomSystems, romsEnabled, romScopeOf, romSystemKey, setRomsEnabled, type RomSystem } from "./roms";
 import { MusicPlayer } from "./music";
 import { OpenWithDialog } from "./openwith";
 import type { ArchiveEntry } from "./api";
@@ -251,18 +251,18 @@ export class Shell {
               }
             }
           })
-          .catch((err) => Toast.error(`Compress failed: ${err}`));
+          .catch((err) => Toast.error(`Compress failed: ${errText(err)}`));
       },
       onEmail: (items) => {
         void api
           .emailItems(items.map((i) => i.id))
-          .catch((err) => Toast.error(`Email failed: ${err}`));
+          .catch((err) => Toast.error(`Email failed: ${errText(err)}`));
       },
       onSendLocalSend: (item) => {
         void api
           .sendViaLocalsend(item.id)
           .then(() => Toast.success("Sent to LocalSend"))
-          .catch((err) => Toast.error(`LocalSend failed: ${err}`));
+          .catch((err) => Toast.error(`LocalSend failed: ${errText(err)}`));
       },
       onDuplicate: (items) => void this.duplicateItems(items),
       onMakeAlias: (item) => {
@@ -273,7 +273,7 @@ export class Shell {
             const t = this.activeTab;
             if (t) void this.loadDir(t);
           })
-          .catch((err) => Toast.error(`Alias failed: ${err}`));
+          .catch((err) => Toast.error(`Alias failed: ${errText(err)}`));
       },
       onConvertImage: (item, format) => {
         void api
@@ -283,7 +283,7 @@ export class Shell {
             const t = this.activeTab;
             if (t) void this.loadDir(t);
           })
-          .catch((err) => Toast.error(`Convert failed: ${err}`));
+          .catch((err) => Toast.error(`Convert failed: ${errText(err)}`));
       },
       onCreatePdf: (items) => {
         if (items.length === 0) return;
@@ -294,7 +294,7 @@ export class Shell {
             const t = this.activeTab;
             if (t) void this.loadDir(t);
           })
-          .catch((err) => Toast.error(`PDF failed: ${err}`));
+          .catch((err) => Toast.error(`PDF failed: ${errText(err)}`));
       },
       onRotateImage: (item) => {
         void api
@@ -305,13 +305,13 @@ export class Shell {
             if (t) await this.loadDir(t);
             this.refreshQuickLook(item.provider_key);
           })
-          .catch((err) => Toast.error(`Rotate failed: ${err}`));
+          .catch((err) => Toast.error(`Rotate failed: ${errText(err)}`));
       },
       onSetWallpaper: (item) => {
         void api
           .setWallpaper(item.id)
           .then(() => Toast.success("Desktop picture set"))
-          .catch((err) => Toast.error(`Wallpaper failed: ${err}`));
+          .catch((err) => Toast.error(`Wallpaper failed: ${errText(err)}`));
       },
       onToggleLabel: (items, label, on) =>
         void this.toggleLabel(items, label, on),
@@ -326,7 +326,7 @@ export class Shell {
         void api
           .transcode(item.id, preset)
           .then((id) => this.jobsPanel.trackTranscode(id, item.name))
-          .catch((err) => Toast.error(`Transcode failed: ${err}`));
+          .catch((err) => Toast.error(`Transcode failed: ${errText(err)}`));
       },
       onMetadata: (item) =>
         void this.metadataDialog.open(item, () => this.refreshActiveDir()),
@@ -341,7 +341,7 @@ export class Shell {
             Toast.success(`Combined: ${out.split("/").pop()}`);
             this.refreshActiveDir();
           })
-          .catch((err) => Toast.error(`Combine failed: ${err}`));
+          .catch((err) => Toast.error(`Combine failed: ${errText(err)}`));
       },
       onPrint: (item) => void this.printDialog.open(item),
       onCreateTorrent: (item) => void this.torrentDialog.open(item),
@@ -412,7 +412,11 @@ export class Shell {
     this.searchView = new SearchView({
       currentDirPath: () => this.currentDirPath(),
       scopes: () =>
-        this.locations.map((l) => ({ id: l.id as string | null, name: l.display_name })),
+        this.locations.map((l) => ({
+          id: l.id as string | null,
+          name: l.display_name,
+          provider: l.provider,
+        })),
       onNavigateToItem: (item) => {
         this.searchView.clear(); // back to the file view before navigating
         this.openItem(item);
@@ -489,7 +493,7 @@ export class Shell {
       this.refreshActiveDir();
     };
     this.jobsPanel.onJobError = (error) => {
-      Toast.error(`Job failed: ${error}`);
+      Toast.error(`Job failed: ${errText(error)}`);
     };
     this.jobsPanel.onTransferDone = (jobId, error) => {
       const cont = this.transferContinuations.get(jobId);
@@ -499,7 +503,7 @@ export class Shell {
       } else {
         // No call-site continuation (e.g. a hydrated recovered job
         // cancelled from the panel): still refresh + report.
-        if (error) Toast.error(`Job failed: ${error}`);
+        if (error) Toast.error(`Job failed: ${errText(error)}`);
         this.refreshActiveDir();
       }
     };
@@ -520,6 +524,9 @@ export class Shell {
         // A full re-index pass finished: refresh the visible smart
         // folder / search results so new files appear live.
         if (this.searchView.active) this.searchView.rerunAfterIndex();
+        // ROM Lists: refresh identifications after each full pass —
+        // unchanged files are never rehashed (the pass is fresh-cached).
+        void api.identifyRoms().catch(() => undefined);
       },
     );
     // Inc-2 item 13: the search view mirrors indexing state in its
@@ -938,6 +945,7 @@ export class Shell {
     this.loadSeqByTab.set(tab, seq);
     const isCurrent = (): boolean => this.loadSeqByTab.get(tab) === seq;
     let items: Item[];
+    let gone = false;
     try {
       if (dir.dirId.startsWith("label:")) {
         items = await api.listItemsByLabel(dir.dirId.slice("label:".length));
@@ -951,11 +959,15 @@ export class Shell {
       // Round 7 (Copilot audit): a failed archive open must not strand
       // the user in an empty tab — toast and keep the previous view.
       if (dir.dirId.startsWith("archive:")) {
-        Toast.error(`Couldn't open that archive: ${err}`);
+        Toast.error(`Couldn't open that archive: ${errText(err)}`);
         return;
       }
+      // Fix block item 4: a vanished folder renders a humane "this
+      // folder is gone" state, never a silent empty void.
+      gone = true;
       items = [];
     }
+    tab.dirGone = gone;
     if (!isCurrent()) return; // stale load finished late — discard it
     tab.items = items;
     if (tab === this.activeTab) {
@@ -1029,8 +1041,17 @@ export class Shell {
           dirId: item.id,
           crumbs: [{ dirId: item.id, name: item.name }],
         });
-      } else {
+      } else if (
+        item.location === dir.locationId &&
+        tab.items.some((i) => i.id === item.id)
+      ) {
+        // A true child of the directory being browsed: descend.
         this.navigateTo(descend(tab, item));
+      } else {
+        // A search hit / cross-location / rule-view folder: appending
+        // crumbs here FABRICATED paths (…/richard/Videos/Videos/…,
+        // 2026-10-14). Walk its real path from the location root.
+        void this.openFolderByPath(item);
       }
     } else if (Shell.isArchiveName(item.name)) {
       this.openArchive(item);
@@ -1039,6 +1060,73 @@ export class Shell {
       void api
         .openItem(item.id)
         .catch(() => void this.quickLook.open(item));
+    }
+  }
+
+  /** Walk from a location's root to `targetDirPath`, building the
+   * TRUE crumb chain (each level resolved by listing the parent).
+   * Returns null when the path can't be walked (folder moved, drive
+   * unmounted, different root). Shared by Open in New Tab and by
+   * search-hit navigation (fix block item 4). */
+  private async crumbsForPath(
+    loc: LocationSummary,
+    targetDirPath: string,
+  ): Promise<{ dirId: string; crumbs: { dirId: string; name: string }[] } | null> {
+    const rootPath = await api.getItemPath(loc.root_item).catch(() => "");
+    if (!rootPath) return null;
+    if (targetDirPath === rootPath) {
+      return {
+        dirId: loc.root_item,
+        crumbs: [{ dirId: loc.root_item, name: loc.display_name }],
+      };
+    }
+    if (!targetDirPath.startsWith(rootPath + "/")) return null;
+    const segments = targetDirPath
+      .slice(rootPath.length + 1)
+      .split("/")
+      .filter((s) => s.length > 0);
+    const crumbs: { dirId: string; name: string }[] = [
+      { dirId: loc.root_item, name: loc.display_name },
+    ];
+    let curDirId = loc.root_item;
+    for (const seg of segments) {
+      const entries = await api.listDir(loc.id, curDirId).catch(() => null);
+      if (!entries) return null;
+      const next = entries.find((e) => e.kind === "folder" && e.name === seg);
+      if (!next) return null; // path moved on
+      crumbs.push({ dirId: next.id, name: next.name });
+      curDirId = next.id;
+    }
+    return { dirId: curDirId, crumbs };
+  }
+
+  /** Open a folder that is NOT a child of the current directory
+   * (search hit, cross-location jump) at its real path, with real
+   * crumbs — never by appending to the current path. */
+  private async openFolderByPath(item: Item): Promise<void> {
+    const loc =
+      this.locations.find((l) => l.id === item.location) ?? this.locations[0];
+    if (!loc || !item.provider_key) {
+      this.navigateTo({
+        locationId: item.location,
+        dirId: item.id,
+        crumbs: [{ dirId: item.id, name: item.name }],
+      });
+      return;
+    }
+    const walked = await this.crumbsForPath(loc, item.provider_key);
+    if (walked) {
+      this.navigateTo({
+        locationId: loc.id,
+        dirId: walked.dirId,
+        crumbs: walked.crumbs,
+      });
+    } else {
+      this.navigateTo({
+        locationId: item.location,
+        dirId: item.id,
+        crumbs: [{ dirId: item.id, name: item.name }],
+      });
     }
   }
 
@@ -1059,38 +1147,10 @@ export class Shell {
       item.kind === "folder"
         ? item.provider_key
         : dirname(item.provider_key);
-    let rootPath: string;
-    try {
-      rootPath = await api.getItemPath(loc.root_item);
-    } catch {
-      return;
-    }
-    if (targetDirPath !== rootPath) {
-      if (!targetDirPath.startsWith(rootPath + "/")) return;
-      const segments = targetDirPath
-        .slice(rootPath.length + 1)
-        .split("/")
-        .filter((s) => s.length > 0);
-      const crumbs: { dirId: string; name: string }[] = [
-        { dirId: loc.root_item, name: loc.display_name },
-      ];
-      let curDirId = loc.root_item;
-      for (const seg of segments) {
-        let entries: Item[];
-        try {
-          entries = await api.listDir(loc.id, curDirId);
-        } catch {
-          return;
-        }
-        const next = entries.find(
-          (e) => e.kind === "folder" && e.name === seg,
-        );
-        if (!next) return; // path moved on — the root tab still serves
-        crumbs.push({ dirId: next.id, name: next.name });
-        curDirId = next.id;
-      }
-      navigate(tab, { locationId: loc.id, dirId: curDirId, crumbs });
-      tab.title = crumbs[crumbs.length - 1].name;
+    const walked = await this.crumbsForPath(loc, targetDirPath);
+    if (walked && walked.dirId !== loc.root_item) {
+      navigate(tab, { locationId: loc.id, dirId: walked.dirId, crumbs: walked.crumbs });
+      tab.title = walked.crumbs[walked.crumbs.length - 1].name;
     }
     await this.loadDir(tab);
     if (item.kind !== "folder" && tab.items.some((i) => i.id === item.id)) {
@@ -1179,7 +1239,7 @@ export class Shell {
       const temp = await api.extractArchiveEntry(archivePath, entryPath);
       await api.openPath(temp);
     } catch (err) {
-      Toast.error(`Could not open ${item.name}: ${err}`);
+      Toast.error(`Could not open ${item.name}: ${errText(err)}`);
     }
   }
 
@@ -1250,7 +1310,7 @@ export class Shell {
       this.quickLook.close();
       this.trackTransfer(jobId, `Trash ${item.name}`, async (error) => {
         if (error) {
-          Toast.error(`Could not delete “${item.name}”: ${error}`);
+          Toast.error(`Could not delete “${item.name}”: ${errText(error)}`);
         } else {
           const outcomes = await this.jobOutcomes(jobId);
           this.pushTrashUndo(
@@ -1263,7 +1323,7 @@ export class Shell {
         if (tab) await this.loadDir(tab);
       });
     } catch (err) {
-      Toast.error(`Could not delete “${item.name}”: ${err}`);
+      Toast.error(`Could not delete “${item.name}”: ${errText(err)}`);
     }
   }
 
@@ -1289,7 +1349,7 @@ export class Shell {
           : `Trash ${items.length} items`;
       this.trackTransfer(jobId, label, async (error) => {
         if (error) {
-          Toast.error(`Could not trash items: ${error}`);
+          Toast.error(`Could not trash items: ${errText(error)}`);
         } else {
           const outcomes = await this.jobOutcomes(jobId);
           const ok = this.pushTrashUndo(outcomes, nameByPath);
@@ -1305,7 +1365,7 @@ export class Shell {
         if (this.searchView.active) this.searchView.refresh();
       });
     } catch (err) {
-      Toast.error(`Could not trash items: ${err}`);
+      Toast.error(`Could not trash items: ${errText(err)}`);
     }
   }
 
@@ -1325,7 +1385,7 @@ export class Shell {
       if (t) await this.loadDir(t);
       this.refreshQuickLook(item.provider_key);
     } catch (err) {
-      Toast.error(`Rename failed: ${err}`);
+      Toast.error(`Rename failed: ${errText(err)}`);
       const t = this.activeTab;
       if (t) await this.loadDir(t);
     }
@@ -1363,7 +1423,7 @@ export class Shell {
         `${cut ? "Cut" : "Copied"} ${paths.length} item${paths.length === 1 ? "" : "s"}`,
       );
     } catch (err) {
-      Toast.error(`Clipboard failed: ${err}`);
+      Toast.error(`Clipboard failed: ${errText(err)}`);
     }
   }
 
@@ -1394,7 +1454,7 @@ export class Shell {
         clip.cut ? "Move" : "Copy",
         async (error) => {
           if (error) {
-            Toast.error(`Paste failed: ${error}`);
+            Toast.error(`Paste failed: ${errText(error)}`);
           } else if (clip.cut) {
             const outcomes = await this.jobOutcomes(jobId);
             let moved = 0;
@@ -1422,7 +1482,7 @@ export class Shell {
         },
       );
     } catch (err) {
-      Toast.error(`Paste failed: ${err}`);
+      Toast.error(`Paste failed: ${errText(err)}`);
     }
   }
 
@@ -1444,7 +1504,7 @@ export class Shell {
       try {
         const jobId = await api.startCopyFromPaths(paths, parent);
         this.trackTransfer(jobId, "Duplicate", async (error) => {
-          if (error) Toast.error(`Duplicate failed: ${error}`);
+          if (error) Toast.error(`Duplicate failed: ${errText(error)}`);
           else {
             Toast.success(
               `Duplicated ${count} item${count === 1 ? "" : "s"}`,
@@ -1453,7 +1513,7 @@ export class Shell {
           this.refreshActiveDir();
         });
       } catch (err) {
-        Toast.error(`Could not duplicate: ${err}`);
+        Toast.error(`Could not duplicate: ${errText(err)}`);
       }
     }
   }
@@ -1498,7 +1558,7 @@ export class Shell {
         );
         this.trackTransfer(jobId, "Move", async (error) => {
           if (error) {
-            Toast.error(`Could not move items: ${error}`);
+            Toast.error(`Could not move items: ${errText(error)}`);
           } else {
             const outcomes = await this.jobOutcomes(jobId);
             let moved = 0;
@@ -1534,7 +1594,7 @@ export class Shell {
         if (paths.length === 0) return;
         const jobId = await api.startCopyFromPaths(paths, dest);
         this.trackTransfer(jobId, "Copy", async (error) => {
-          if (error) Toast.error(`Could not copy items: ${error}`);
+          if (error) Toast.error(`Could not copy items: ${errText(error)}`);
           else {
             Toast.success(
               `Copied ${paths.length} item${paths.length === 1 ? "" : "s"}`,
@@ -1544,7 +1604,7 @@ export class Shell {
         });
       }
     } catch (err) {
-      Toast.error(`Could not ${mode} items: ${err}`);
+      Toast.error(`Could not ${mode} items: ${errText(err)}`);
     }
   }
 
@@ -1556,7 +1616,7 @@ export class Shell {
         await api.setPathLabel(item.provider_key, label, on);
         done++;
       } catch (err) {
-        Toast.error(`Label failed for ${item.name}: ${err}`);
+        Toast.error(`Label failed for ${item.name}: ${errText(err)}`);
       }
     }
     if (done > 0) {
@@ -1593,7 +1653,7 @@ export class Shell {
       Toast.success(`Extracted to ${out}`);
       this.refreshActiveDir();
     } catch (err) {
-      Toast.error(`Extract failed: ${err}`);
+      Toast.error(`Extract failed: ${errText(err)}`);
     }
   }
 
@@ -1762,7 +1822,7 @@ export class Shell {
       Toast.success(`Created ${path.split("/").pop()}`);
       this.refreshActiveDir();
     } catch (err) {
-      Toast.error(`Create folder failed: ${err}`);
+      Toast.error(`Create folder failed: ${errText(err)}`);
     }
   }
 
@@ -1780,7 +1840,7 @@ export class Shell {
       Toast.success(`Created ${path.split("/").pop()}`);
       this.refreshActiveDir();
     } catch (err) {
-      Toast.error(`Create file failed: ${err}`);
+      Toast.error(`Create file failed: ${errText(err)}`);
     }
   }
 
@@ -1913,7 +1973,7 @@ export class Shell {
         body.appendChild(row);
       }
     } catch (err) {
-      body.textContent = `Could not read disk info: ${err}`;
+      body.textContent = `Could not read disk info: ${errText(err)}`;
     }
   }
 
@@ -1927,7 +1987,7 @@ export class Shell {
       );
       Toast.success(`Mounted “${item.name}”.`);
     } catch (err) {
-      Toast.error(`Mount failed: ${err}`);
+      Toast.error(`Mount failed: ${errText(err)}`);
     }
   }
 
@@ -2005,7 +2065,7 @@ export class Shell {
       });
       Toast.success(`Connected: ${summary.display_name}`);
     } catch (err) {
-      Toast.error(`Connect failed: ${err}`);
+      Toast.error(`Connect failed: ${errText(err)}`);
     }
   }
 
@@ -2345,10 +2405,29 @@ export class Shell {
   /** Drop an item onto a user-favorite folder: a journaled Move job
    * with outcome-fed undo — the same behavior as dropping onto a
    * built-in favorite. */
+  /** Open a sidebar favorite in a fresh tab (fix block item 9). */
+  private openFavoriteInNewTab(target: FavoriteTarget, name: string): void {
+    const loc =
+      this.locations.find((l) => l.id === target.locationId) ??
+      this.locations[0];
+    if (!loc) return;
+    const tab = this.newTab(loc);
+    if (target.dirId !== loc.root_item) {
+      navigate(tab, {
+        locationId: target.locationId,
+        dirId: target.dirId,
+        crumbs: [{ dirId: target.dirId, name }],
+      });
+      tab.title = name;
+    }
+    void this.loadDir(tab);
+  }
+
   private async fileDraggedIntoFolder(
     dragged: Item,
     target: FavoriteTarget,
     label: string,
+    copy = false,
   ): Promise<void> {
     try {
       const dest = await api.getItemPath(target.dirId);
@@ -2356,10 +2435,25 @@ export class Shell {
       if (dragged.provider_key && dirname(dragged.provider_key) === dest) {
         return; // already in this folder
       }
+      if (copy) {
+        // Ctrl+drop = copy (fix block item 2): the destination parent
+        // is the folder's own item id, which is what start_copy wants.
+        const jobId = await api.startCopy([dragged.id], target.dirId);
+        this.trackTransfer(jobId, `Copy ${dragged.name}`, async (error) => {
+          if (error) {
+            Toast.error(`Could not copy “${dragged.name}”: ${errText(error)}`);
+          } else {
+            Toast.success(`Copied “${dragged.name}” to ${label}.`);
+          }
+          const tab = this.activeTab;
+          if (tab) await this.loadDir(tab);
+        });
+        return;
+      }
       const jobId = await api.startMove([dragged.id], dest);
       this.trackTransfer(jobId, `Move ${dragged.name}`, async (error) => {
         if (error) {
-          Toast.error(`Could not move “${dragged.name}”: ${error}`);
+          Toast.error(`Could not move “${dragged.name}”: ${errText(error)}`);
         } else {
           const outcomes = await this.jobOutcomes(jobId);
           for (const o of outcomes) {
@@ -2381,7 +2475,7 @@ export class Shell {
         if (tab) await this.loadDir(tab);
       });
     } catch (err) {
-      Toast.error(`Could not move “${dragged.name}”: ${err}`);
+      Toast.error(`Could not move “${dragged.name}”: ${errText(err)}`);
     }
   }
 
@@ -2454,6 +2548,10 @@ export class Shell {
               if (!p) return;
               this.ctxMenu.open(e.clientX, e.clientY, [
                 {
+                  label: "Open in New Tab",
+                  action: () => this.openFavoriteInNewTab(target, name),
+                },
+                {
                   label: "Disk Properties…",
                   action: () => void this.showDiskProperties(name, p),
                 },
@@ -2472,7 +2570,7 @@ export class Shell {
           }
           if (!dragState.item) return;
           e.preventDefault();
-          if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+          if (e.dataTransfer) e.dataTransfer.dropEffect = e.ctrlKey ? "copy" : "move";
           b.classList.add("drop-hover");
         });
         b.addEventListener("dragleave", () => b.classList.remove("drop-hover"));
@@ -2486,6 +2584,7 @@ export class Shell {
           }
           const dragged = dragState.item;
           if (!dragged) return;
+          const copyWanted = e.ctrlKey;
           try {
             if (name === "Trash") {
               const jobId = await api.startDelete([dragged.id], true);
@@ -2495,7 +2594,7 @@ export class Shell {
                 async (error) => {
                   if (error) {
                     Toast.error(
-                      `Could not move “${dragged.name}”: ${error}`,
+                      `Could not move “${dragged.name}”: ${errText(error)}`,
                     );
                   } else {
                     const outcomes = await this.jobOutcomes(jobId);
@@ -2514,6 +2613,28 @@ export class Shell {
                   if (tab) await this.loadDir(tab);
                 },
               );
+            } else if (copyWanted) {
+              // Ctrl+drop = copy into the favorite (fix block item 2).
+              const dest = await api.getItemPath(target.dirId);
+              if (dragged.provider_key && dirname(dragged.provider_key) === dest) {
+                return; // already in this folder
+              }
+              const jobId = await api.startCopy([dragged.id], target.dirId);
+              this.trackTransfer(
+                jobId,
+                `Copy ${dragged.name}`,
+                async (error) => {
+                  if (error) {
+                    Toast.error(
+                      `Could not copy “${dragged.name}”: ${errText(error)}`,
+                    );
+                  } else {
+                    Toast.success(`Copied “${dragged.name}” to ${name}.`);
+                  }
+                  const tab = this.activeTab;
+                  if (tab) await this.loadDir(tab);
+                },
+              );
             } else {
               const dest = await api.getItemPath(target.dirId);
               if (dragged.provider_key && dirname(dragged.provider_key) === dest) {
@@ -2526,7 +2647,7 @@ export class Shell {
                 async (error) => {
                   if (error) {
                     Toast.error(
-                      `Could not move “${dragged.name}”: ${error}`,
+                      `Could not move “${dragged.name}”: ${errText(error)}`,
                     );
                   } else {
                     const outcomes = await this.jobOutcomes(jobId);
@@ -2553,7 +2674,7 @@ export class Shell {
               );
             }
           } catch (err) {
-            Toast.error(`Could not move “${dragged.name}”: ${err}`);
+            Toast.error(`Could not move “${dragged.name}”: ${errText(err)}`);
           }
         });
         // Trash gets a right-click menu: Empty / Secure Delete
@@ -2581,7 +2702,7 @@ export class Shell {
                       // Refresh the view if we're looking at trash
                       this.renderCrumbs();
                     } catch (err) {
-                      Toast.error(`Failed to empty trash: ${err}`);
+                      Toast.error(`Failed to empty trash: ${errText(err)}`);
                     }
                   }
                 },
@@ -2603,7 +2724,7 @@ export class Shell {
                       const r = await api.secureEmptyTrash();
                       Toast.success(`Securely deleted ${r.items} item${r.items === 1 ? "" : "s"} (${r.files} file${r.files === 1 ? "" : "s"} overwritten)${r.errors > 0 ? ` (${r.errors} errors)` : ""}.`);
                     } catch (err) {
-                      alert(`Failed to secure-delete: ${err}`);
+                      Toast.error(`Failed to secure-delete: ${errText(err)}`);
                     }
                   }
                 },
@@ -2638,6 +2759,10 @@ export class Shell {
         e.stopPropagation();
         this.ctxMenu.open(e.clientX, e.clientY, [
           {
+            label: "Open in New Tab",
+            action: () => this.openFavoriteInNewTab(target, fav.name),
+          },
+          {
             label: "Disk Properties…",
             action: () => void this.showDiskProperties(fav.name, fav.path),
           },
@@ -2651,7 +2776,7 @@ export class Shell {
       b.addEventListener("dragover", (e) => {
         if (dragState.favName || !dragState.item) return;
         e.preventDefault();
-        if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+        if (e.dataTransfer) e.dataTransfer.dropEffect = e.ctrlKey ? "copy" : "move";
         b.classList.add("drop-hover");
       });
       b.addEventListener("dragleave", () => b.classList.remove("drop-hover"));
@@ -2660,7 +2785,7 @@ export class Shell {
         b.classList.remove("drop-hover");
         const dragged = dragState.item;
         if (!dragged || dragState.favName) return;
-        void this.fileDraggedIntoFolder(dragged, target, fav.name);
+        void this.fileDraggedIntoFolder(dragged, target, fav.name, e.ctrlKey);
       });
       this.favList.appendChild(b);
     }
@@ -2690,7 +2815,7 @@ export class Shell {
               await api.unmountPath(loc.path!);
               Toast.success(`Ejected ${loc.display_name}.`);
             } catch (err) {
-              Toast.error(`Eject failed: ${err}`);
+              Toast.error(`Eject failed: ${errText(err)}`);
             }
             await this.refreshLocations();
           })();
@@ -2712,6 +2837,13 @@ export class Shell {
             .getItemPath(loc.root_item)
             .catch(() => "");
           const menuItems: MenuItem[] = [];
+          menuItems.push({
+            label: "Open in New Tab",
+            action: () => {
+              const t = this.newTab(loc);
+              void this.loadDir(t);
+            },
+          });
           if (rootPath) {
             menuItems.push({
               label: "Disk Properties…",
@@ -2735,12 +2867,34 @@ export class Shell {
                     Toast.success(`Unmounted ${loc.display_name}.`);
                     await this.refreshLocations();
                   })
-                  .catch((err) => Toast.error(`Unmount failed: ${err}`));
+                  .catch((err) => Toast.error(`Unmount failed: ${errText(err)}`));
               },
             });
           }
           this.ctxMenu.open(e.clientX, e.clientY, menuItems);
         })();
+      });
+      // Drop target (fix block item 2): drag a file/folder onto a
+      // location to move it there (Ctrl = copy), through the jobs
+      // engine like the favorites.
+      b.addEventListener("dragover", (e) => {
+        if (dragState.favName || !dragState.item) return;
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = e.ctrlKey ? "copy" : "move";
+        b.classList.add("drop-hover");
+      });
+      b.addEventListener("dragleave", () => b.classList.remove("drop-hover"));
+      b.addEventListener("drop", (e) => {
+        e.preventDefault();
+        b.classList.remove("drop-hover");
+        const dragged = dragState.item;
+        if (!dragged || dragState.favName) return;
+        void this.fileDraggedIntoFolder(
+          dragged,
+          { locationId: loc.id, dirId: loc.root_item, display: loc.path ?? loc.display_name },
+          loc.display_name,
+          e.ctrlKey,
+        );
       });
       this.sidebarList.appendChild(b);
     }
@@ -3098,7 +3252,7 @@ export class Shell {
       }
       Toast.success("Path copied");
     } catch (err) {
-      Toast.error(`Copy failed: ${err}`);
+      Toast.error(`Copy failed: ${errText(err)}`);
     }
   }
 
@@ -3271,12 +3425,19 @@ export class Shell {
     setTimeout(() => location.reload(), 800);
   }
 
-  /** Render the Roms Collection sidebar section (systems as rule folders). */
+  /** Render the Roms Collection sidebar section. Built-in systems are
+   * governed by the ROM Lists (DAT identification); custom systems
+   * keep their extension rules. */
   private renderRomsSection(): void {
     if (!this.romsList || !this.romsHead) return;
     const on = romsEnabled();
     this.romsHead.hidden = !on;
-    this.romsList.hidden = !on;
+    // Fix block item 6: this render runs on EVERY sidebar rebuild and
+    // used to force hidden = !on, stomping the user's collapse pref a
+    // beat after every rebuild. The durable pref wins here too.
+    this.romsList.hidden = !on || this.prefCollapsed("ff-roms-collapsed");
+    const chev = this.romsHead.querySelector(".side-chev");
+    if (chev) chev.textContent = this.romsList.hidden ? "▸" : "▾";
     this.romsList.innerHTML = "";
     if (!on) return;
     const systems = loadRomSystems();
@@ -3291,9 +3452,20 @@ export class Shell {
       const b = document.createElement("button");
       b.className = "side-item";
       b.textContent = "\uD83C\uDFAE " + sys.name;
-      b.title = "ROM files: " + sys.extensions.map((x) => "." + x).join(", ");
+      const key = romSystemKey(sys);
+      b.title = key
+        ? "Verified by the ROM lists (No-Intro / Redump / MAME) — only exact matches appear"
+        : "ROM files: " + sys.extensions.map((x) => "." + x).join(", ");
       b.addEventListener("click", () => {
-        void this.searchView.runRule(sys.name, { extensions: sys.extensions });
+        if (key) {
+          void this.searchView.runRomCollection(sys.name, key, romScopeOf(sys));
+        } else {
+          void this.searchView.runRule(
+            sys.name,
+            { extensions: sys.extensions },
+            romScopeOf(sys),
+          );
+        }
       });
       b.addEventListener("contextmenu", (e) => {
         e.preventDefault();
@@ -3327,8 +3499,13 @@ export class Shell {
     }
   }
 
-  /** Add or edit a Roms Collection system (name + ROM extensions). */
+  /** Add or edit a Roms Collection system. Built-in systems are
+   * governed by the ROM Lists (identification, not extensions) and
+   * their names are locked to the list keys; every system carries a
+   * scope (which drives it draws from). Custom systems keep the
+   * extension editor. */
   private openRomEditor(sys: RomSystem | null): void {
+    const isDat = sys ? romSystemKey(sys) !== null : false;
     const overlay = document.createElement("div");
     overlay.className = "picker-overlay";
     overlay.innerHTML = `
@@ -3337,10 +3514,21 @@ export class Shell {
         <label class="smart-lab">Name
           <input class="smart-in rom-name" type="text" placeholder="e.g. Atari Jaguar" />
         </label>
-        <label class="smart-lab">ROM file extensions (comma separated)
-          <input class="smart-in rom-exts" type="text" placeholder="e.g. j64, jag" />
+        <div class="rom-ext-wrap">
+          <label class="smart-lab">ROM file extensions (comma separated)
+            <input class="smart-in rom-exts" type="text" placeholder="e.g. j64, jag" />
+          </label>
+          <p class="smart-hint">A system gathers files with those extensions from your indexed locations. Shared extensions (iso, bin, zip) can appear under several systems.</p>
+        </div>
+        <p class="smart-hint rom-dat-note" hidden>This system is governed by the ROM lists (No-Intro / Redump / MAME): a file appears only when its contents match a known game exactly — extensions don't decide, so there is nothing to edit here.</p>
+        <label class="smart-lab">Look for ROMs on
+          <select class="smart-in rom-scope">
+            <option value="all">All drives</option>
+            <option value="boot">Boot drive only</option>
+            <option value="drives">Choose drives…</option>
+          </select>
         </label>
-        <p class="smart-hint">A system gathers files with those extensions from your indexed locations. Shared extensions (iso, bin, zip) can appear under several systems.</p>
+        <div class="rom-drives"></div>
         <div class="picker-actions">
           <button class="rom-cancel">Cancel</button>
           <button class="rom-save primary">Save</button>
@@ -3348,38 +3536,85 @@ export class Shell {
       </div>`;
     document.body.appendChild(overlay);
     const q = <T extends HTMLElement>(sel: string) => overlay.querySelector(sel) as T;
+    const scopeSel = q<HTMLSelectElement>(".rom-scope");
+    const drivesEl = q<HTMLDivElement>(".rom-drives");
+    const renderDrives = () => {
+      drivesEl.innerHTML = "";
+      if (scopeSel.value !== "drives") return;
+      const chosen = new Set(sys?.scope?.drives ?? []);
+      for (const loc of this.locations) {
+        const lab = document.createElement("label");
+        lab.className = "rom-drive";
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.value = loc.id;
+        cb.checked = chosen.has(loc.id);
+        const span = document.createElement("span");
+        span.textContent = loc.display_name;
+        lab.append(cb, span);
+        drivesEl.appendChild(lab);
+      }
+      if (this.locations.length === 0) {
+        drivesEl.textContent = "No drives are available right now.";
+      }
+    };
+    scopeSel.addEventListener("change", renderDrives);
     if (sys) {
       q<HTMLInputElement>(".rom-name").value = sys.name;
       q<HTMLInputElement>(".rom-exts").value = sys.extensions.join(", ");
+      scopeSel.value = sys.scope?.mode ?? "all";
     }
+    if (isDat) {
+      // The name is the dataset key — renaming would orphan the system.
+      q<HTMLInputElement>(".rom-name").disabled = true;
+      q<HTMLInputElement>(".rom-name").title =
+        "Built-in system names come from the ROM lists and can't be renamed.";
+      q<HTMLDivElement>(".rom-ext-wrap").hidden = true;
+      q<HTMLParagraphElement>(".rom-dat-note").hidden = false;
+    }
+    renderDrives();
     q<HTMLButtonElement>(".rom-cancel").addEventListener("click", () => overlay.remove());
     overlay.addEventListener("pointerdown", (e) => {
       if (e.target === overlay) overlay.remove();
     });
     q<HTMLButtonElement>(".rom-save").addEventListener("click", () => {
       const name = q<HTMLInputElement>(".rom-name").value.trim();
-      const exts = q<HTMLInputElement>(".rom-exts")
-        .value.split(/[,\s]+/)
-        .map((s) => s.replace(/^\./, "").toLowerCase())
-        .filter(Boolean);
+      const exts = isDat
+        ? [...(sys?.extensions ?? [])]
+        : q<HTMLInputElement>(".rom-exts")
+            .value.split(/[,\s]+/)
+            .map((s) => s.replace(/^\./, "").toLowerCase())
+            .filter(Boolean);
       if (!name) {
         Toast.error("Give the system a name.");
         return;
       }
-      if (exts.length === 0) {
+      if (!isDat && exts.length === 0) {
         Toast.error("Add at least one ROM extension.");
         return;
       }
+      const mode = scopeSel.value as "all" | "boot" | "drives";
+      const drives =
+        mode === "drives"
+          ? [...drivesEl.querySelectorAll<HTMLInputElement>("input:checked")].map(
+              (cb) => cb.value,
+            )
+          : [];
+      if (mode === "drives" && drives.length === 0) {
+        Toast.error("Pick at least one drive, or choose All drives.");
+        return;
+      }
+      const scope = { mode, drives };
       const list = loadRomSystems();
       if (sys) {
         const idx = list.findIndex((s) => s.name === sys.name);
-        if (idx >= 0) list[idx] = { name, extensions: exts };
+        if (idx >= 0) list[idx] = { name, extensions: exts, scope };
       } else {
         if (list.some((s) => s.name === name)) {
           Toast.error(`"${name}" is already in the collection.`);
           return;
         }
-        list.push({ name, extensions: exts });
+        list.push({ name, extensions: exts, scope });
         list.sort((a, b) => a.name.localeCompare(b.name));
       }
       saveRomSystems(list);
@@ -3504,7 +3739,7 @@ export class Shell {
       const tab = this.activeTab;
       if (tab) await this.loadDir(tab);
     } catch (err) {
-      Toast.error(`Undo failed: ${err}`);
+      Toast.error(`Undo failed: ${errText(err)}`);
     }
   }
 

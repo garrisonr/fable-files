@@ -27,6 +27,10 @@ export interface Tab {
   sort: SortKey;
   sortDir: SortDir;
   items: Item[];
+  /** True when the current directory failed to load (moved, deleted,
+   * drive unplugged) — the view renders a humane "gone" state instead
+   * of an empty void (fix block item 4). */
+  dirGone: boolean;
   selection: Set<string>;
   anchorIndex: number;
   title: string;
@@ -44,6 +48,7 @@ export function makeTab(loc: LocationSummary): Tab {
     sort: "name",
     sortDir: 1,
     items: [],
+    dirGone: false,
     selection: new Set(),
     anchorIndex: -1,
     title: loc.display_name,
@@ -54,8 +59,18 @@ export function currentDir(tab: Tab): DirState {
   return tab.history[tab.hIndex];
 }
 
-/** Push a new location onto the tab's history (truncates forward branch). */
+/** Push a new location onto the tab's history (truncates forward branch).
+ * Consecutive duplicates are impossible: navigating to the directory
+ * already current refreshes its crumbs in place instead of pushing a
+ * twin entry (the two-click-Back bug, 2026-10-14 — descend() used to
+ * navigate internally AND its caller navigated again). */
 export function navigate(tab: Tab, next: DirState): void {
+  const cur = tab.history[tab.hIndex];
+  if (cur && cur.locationId === next.locationId && cur.dirId === next.dirId) {
+    tab.history[tab.hIndex] = next;
+    tab.title = next.crumbs[next.crumbs.length - 1].name;
+    return;
+  }
   tab.history = tab.history.slice(0, tab.hIndex + 1);
   tab.history.push(next);
   tab.hIndex = tab.history.length - 1;
@@ -104,18 +119,19 @@ export function goToCrumb(tab: Tab, crumbIndex: number): DirState | null {
   return next;
 }
 
-/** Descend into a folder item from the current dir. */
+/** Build the DirState for descending into a folder item that IS a
+ * child of the current directory (pure — the caller navigates, once).
+ * For items that are NOT children of the current dir (search hits,
+ * cross-location jumps), appending crumbs fabricates a path that does
+ * not exist; callers must root-walk the item's real path instead
+ * (see Shell.crumbsForPath). */
 export function descend(tab: Tab, item: Item): DirState {
   const dir = currentDir(tab);
-  const next: DirState = {
-    // The hit's own location, not the tab's: a search hit may belong to a
-    // different location than the tab is browsing.
+  return {
     locationId: item.location,
     dirId: item.id,
     crumbs: [...dir.crumbs, { dirId: item.id, name: item.name }],
   };
-  navigate(tab, next);
-  return next;
 }
 
 /** Go up one level; returns null when already at the location root. */

@@ -5,7 +5,7 @@
  * Leftovers go to the Trash, never straight to /dev/null.
  */
 import { api } from "./api";
-import { Toast } from "./toast";
+import { Toast, errText} from "./toast";
 
 interface AppEntry {
   name: string;
@@ -86,7 +86,7 @@ export class AppDeleter {
     try {
       this.apps = await api.listInstalledApps();
     } catch (err) {
-      Toast.error(`Could not list apps: ${err}`);
+      Toast.error(`Could not list apps: ${errText(err)}`);
       this.apps = [];
     }
     this.renderList();
@@ -123,7 +123,7 @@ export class AppDeleter {
     try {
       leftovers = await api.findAppLeftovers(app.id, app.name);
     } catch (err) {
-      loading.textContent = `Leftover hunt failed: ${err}`;
+      loading.textContent = `Leftover hunt failed: ${errText(err)}`;
       return;
     }
     this.checks.clear();
@@ -212,7 +212,7 @@ export class AppDeleter {
         this.renderList();
         this.onDone?.();
       } catch (err) {
-        Toast.error(`Uninstall failed: ${err}`);
+        Toast.error(`Uninstall failed: ${errText(err)}`);
         btn.disabled = false;
         btn.textContent = `Uninstall ${app.name}`;
       }

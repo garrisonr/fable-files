@@ -9,7 +9,7 @@
  * office work, IT/homelab, his film archive, media and gaming.
  */
 import { api } from "./api";
-import { Toast, confirmDialog } from "./toast";
+import { Toast, confirmDialog, errText} from "./toast";
 
 export interface LabelDef {
   name: string;
@@ -450,7 +450,7 @@ export class LabelManager {
       }
       if (this.onChanged) this.onChanged();
     } catch (err) {
-      this.rulesStatus.textContent = `Apply failed: ${err}`;
+      this.rulesStatus.textContent = `Apply failed: ${errText(err)}`;
     } finally {
       this.applyBtn.disabled = false;
     }

@@ -242,6 +242,12 @@ export class MusicPlayer {
     // Album art: folder art (folder.jpg / cover.jpg / front.jpg …) wins;
     // otherwise the thumbnailer extracts embedded cover art for audio.
     const img = q<HTMLImageElement>(".music-art-img");
+    // A failed art load must fall back to the glyph, never a broken
+    // image box (fix block item 5).
+    img.addEventListener("error", () => {
+      img.hidden = true;
+      q<HTMLSpanElement>(".music-art-glyph").hidden = false;
+    });
     if (first) {
       void (async () => {
         const show = (url: string) => {

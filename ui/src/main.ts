@@ -1,3 +1,4 @@
+import { errText } from "./toast";
 /**
  * Fable Files — adaptive shell entry point.
  *
@@ -40,7 +41,7 @@ async function boot(): Promise<void> {
   } catch (e) {
     // Never leave a blank window: surface the failure in the status bar.
     const status = shell.el.querySelector(".status-left");
-    if (status) status.textContent = `Boot failed: ${e}`;
+    if (status) status.textContent = `Boot failed: ${errText(e)}`;
   }
 }
 
@@ -59,6 +60,9 @@ function bootPlayer(params: URLSearchParams): void {
     },
   });
   root.appendChild(player.el);
+  // The window closing IS the surface closing: tear playback down
+  // with it (fix block item 3).
+  window.addEventListener("beforeunload", () => player.destroy());
 }
 
 const bootParams = new URLSearchParams(location.search);

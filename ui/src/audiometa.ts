@@ -10,7 +10,7 @@
  * — Quick Look previously skipped folder art entirely and showed
  * the bare glyph for folders that thumbnail fine in the grid.
  */
-import { api, mediaSrc, type Item } from "./api";
+import { api, type Item } from "./api";
 
 export interface AudioTags {
   title?: string;
@@ -116,7 +116,14 @@ export async function listFolderByPath(
 const artCache = new Map<string, Promise<string | null>>();
 
 /** URL of the folder art for the folder containing `item`, or null
- * when the folder carries none. Cached per (location, folder). */
+ * when the folder carries none. Cached per (location, folder).
+ *
+ * The art comes back through the thumbnailer as a data URL — NOT via
+ * the loopback media server: the app CSP allows media-src from
+ * 127.0.0.1 but NOT img-src, so an http://127.0.0.1 <img> was blocked
+ * and folder art silently never rendered in Quick Look or the Music
+ * Player (fix block item 5, 2026-10-14). Data URLs are CSP-clean and
+ * the thumbnail cache makes repeats free. */
 export function folderArtUrl(
   item: Item,
   folderPath: string,
@@ -131,7 +138,9 @@ export function folderArtUrl(
       const art = entries?.find((e) =>
         FOLDER_ART_NAMES.has(e.name.toLowerCase()),
       );
-      if (art?.provider_key) return await mediaSrc(art.provider_key);
+      if (art?.provider_key) {
+        return await api.getThumbnail(art.id, art.provider_key, true);
+      }
       return null;
     } catch {
       return null;

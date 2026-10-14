@@ -586,6 +586,7 @@ pub async fn list_dir(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CopyRequest {
     pub sources: Vec<ItemId>,
     pub dst_parent: ItemId,
@@ -2177,30 +2178,35 @@ pub async fn start_copy(
 // rather than a destination ItemId. Do not retrofit CopyRequest.
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MoveRequest {
     pub sources: Vec<ItemId>,
     pub dst_dir: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MovePathsRequest {
     pub sources: Vec<String>,
     pub dst_dir: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CopyPathsRequest {
     pub sources: Vec<String>,
     pub dst_dir: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeleteRequest {
     pub sources: Vec<ItemId>,
     pub use_trash: bool,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeletePathsRequest {
     pub paths: Vec<String>,
     pub use_trash: bool,
@@ -4474,7 +4480,7 @@ fn file_uri_to_path(u: &str) -> Option<String> {
 #[tauri::command]
 pub async fn clipboard_write(paths: Vec<String>, cut: bool) -> Cmd<()> {
     tauri::async_runtime::spawn_blocking(move || {
-        use std::io::Write;
+        use std::io::{Read, Write};
         let (mime, data) = if cut {
             let mut d = String::from("cut\n");
             for p in &paths {
@@ -4490,19 +4496,37 @@ pub async fn clipboard_write(paths: Vec<String>, cut: bool) -> Cmd<()> {
             }
             ("text/uri-list", d)
         };
+        // AppImage hygiene (ROM-lists fix block): the bundle's
+        // LD_LIBRARY_PATH must not leak into system tools — a bundled
+        // libwayland/libffi can make wl-copy fail to start or to reach
+        // the compositor, and the old code swallowed the exit status,
+        // so the failure surfaced only as "[object Object]".
         let mut child = std::process::Command::new("wl-copy")
             .arg("--type")
             .arg(mime)
+            .env_remove("LD_LIBRARY_PATH")
             .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| format!("wl-copy: {e}"))?;
+            .map_err(|e| format!("could not start wl-copy: {e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(data.as_bytes())
                 .map_err(|e| format!("wl-copy write: {e}"))?;
         }
-        // wl-copy forks a server and the parent exits promptly.
-        let _ = child.wait();
+        // wl-copy forks a server and the parent exits promptly; a
+        // nonzero exit is a REAL failure and must reach the user.
+        let status = child.wait().map_err(|e| format!("wl-copy wait: {e}"))?;
+        if !status.success() {
+            let mut err_text = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_string(&mut err_text);
+            }
+            return Err(format!(
+                "wl-copy exited {status}: {}",
+                err_text.trim()
+            ));
+        }
         Ok::<(), String>(())
     })
     .await
@@ -4525,6 +4549,7 @@ pub async fn clipboard_read() -> Cmd<ClipboardData> {
                 .arg("--type")
                 .arg(mime)
                 .arg("--no-newline")
+                .env_remove("LD_LIBRARY_PATH")
                 .output()
                 .ok()?;
             if out.status.success() {
@@ -5255,6 +5280,317 @@ pub async fn apply_label_rules(
         });
     }
     Ok(outcomes)
+}
+
+/// ---------------------------------------------------------------------------
+/// ROM identification (ROM Lists): built-in ROM collection membership is
+/// a DAT identification, never an extension guess. The dataset ships as
+/// the rom-dats.bin bundle resource (see ROM-DATS.md); results cache in
+/// the catalog's media_identities keyed by item id, validated against
+/// (size, modified) so unchanged files are never rehashed.
+/// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomIdentifyStats {
+    pub already_running: bool,
+    pub candidates: u32,
+    pub hashed: u32,
+    pub matched: u32,
+    pub fresh: u32,
+    pub errors: u32,
+    pub elapsed_ms: u64,
+    pub files_per_sec: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomIdentifyProgress {
+    pub done: u32,
+    pub total: u32,
+    pub matched: u32,
+}
+
+fn rom_dataset(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<std::sync::Arc<ufm_media::romdat::RomDataset>, CommandError> {
+    if let Some(ds) = state.rom_dataset.lock().unwrap().clone() {
+        return Ok(ds);
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(res) = app.path().resource_dir() {
+        candidates.push(res.join("rom-dats.bin"));
+        candidates.push(res.join("resources/rom-dats.bin"));
+    }
+    candidates.push(PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/resources/rom-dats.bin"
+    )));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("rom-dats.bin"));
+            candidates.push(dir.join("resources/rom-dats.bin"));
+        }
+    }
+    for c in &candidates {
+        if let Ok(bytes) = std::fs::read(c) {
+            let ds = ufm_media::romdat::RomDataset::load(bytes).map_err(|e| {
+                CommandError::from(UfmError::InvalidInput(format!("rom dataset: {e}")))
+            })?;
+            let arc = std::sync::Arc::new(ds);
+            *state.rom_dataset.lock().unwrap() = Some(arc.clone());
+            return Ok(arc);
+        }
+    }
+    Err(CommandError::from(UfmError::NotFound(
+        "rom dataset (rom-dats.bin) not found in app resources".into(),
+    )))
+}
+
+/// Which DAT project a system key's rows came from (evidence label).
+fn rom_source_label(sys: &str) -> &'static str {
+    match sys {
+        "arcade" | "neogeo" => "mame",
+        "3do" | "dreamcast" | "gamecube" | "psx" | "ps2" | "ps3" | "saturn" | "segacd"
+        | "wii" | "xbox" | "xbox360" => "redump",
+        _ => "no-intro",
+    }
+}
+
+#[tauri::command]
+pub async fn identify_roms(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Cmd<RomIdentifyStats> {
+    use std::sync::atomic::Ordering;
+    if state
+        .rom_identify_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(RomIdentifyStats {
+            already_running: true,
+            candidates: 0,
+            hashed: 0,
+            matched: 0,
+            fresh: 0,
+            errors: 0,
+            elapsed_ms: 0,
+            files_per_sec: 0.0,
+        });
+    }
+    let app2 = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let st = app2.state::<AppState>();
+        run_rom_identify(&app2, &st)
+    })
+    .await;
+    state
+        .rom_identify_running
+        .store(false, Ordering::SeqCst);
+    match result {
+        Ok(r) => r,
+        Err(e) => Err(CommandError::from(UfmError::InvalidInput(format!(
+            "identify task failed: {e}"
+        )))),
+    }
+}
+
+fn run_rom_identify(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Cmd<RomIdentifyStats> {
+    let started = std::time::Instant::now();
+    let ds = rom_dataset(app, state)?;
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let exts: Vec<String> = ufm_media::romdat::candidate_extensions()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let candidates = catalog
+        .rule_candidates(&exts)
+        .map_err(CommandError::from)?;
+    let total = candidates.len() as u32;
+    let mut stats = RomIdentifyStats {
+        already_running: false,
+        candidates: total,
+        hashed: 0,
+        matched: 0,
+        fresh: 0,
+        errors: 0,
+        elapsed_ms: 0,
+        files_per_sec: 0.0,
+    };
+    for (i, (item, _dur)) in candidates.iter().enumerate() {
+        if i % 100 == 0 {
+            let _ = app.emit(
+                "rom-identify-progress",
+                RomIdentifyProgress {
+                    done: i as u32,
+                    total,
+                    matched: stats.matched,
+                },
+            );
+        }
+        let Some(pk) = item.provider_key.clone() else {
+            continue;
+        };
+        let size = item.size_bytes.unwrap_or(0);
+        let modified = item.modified.map(|m| m.to_rfc3339());
+        // Freshness: a stored identity whose evidence matches the
+        // file's current (size, modified) is still true — skip.
+        if let Ok(Some(row)) = catalog.media_identity_for(&item.id) {
+            if let Ok(ev) =
+                serde_json::from_str::<serde_json::Value>(&row.evidence_json)
+            {
+                let ev_size = ev.get("size").and_then(|v| v.as_u64());
+                let ev_mod = ev
+                    .get("modified")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                if ev_size == Some(size) && ev_mod == modified {
+                    stats.fresh += 1;
+                    continue;
+                }
+            }
+        }
+        stats.hashed += 1;
+        let path = std::path::PathBuf::from(&pk);
+        let identified = ufm_media::romdat::identify_file(&ds, &path);
+        let (title, platform, sha1, evidence) = match identified {
+            Ok(Some(id)) => {
+                stats.matched += 1;
+                let ev = serde_json::json!({
+                    "matched": true,
+                    "crc": id.crc,
+                    "md5": id.md5_hex(),
+                    "size": size,
+                    "modified": modified,
+                    "source": rom_source_label(&id.sys),
+                    "container": id.container,
+                    "also": id.also,
+                });
+                (
+                    Some(id.dat_name.clone()),
+                    Some(id.sys.clone()),
+                    Some(id.sha1_hex()),
+                    ev,
+                )
+            }
+            Ok(None) => {
+                let ev = serde_json::json!({
+                    "matched": false,
+                    "size": size,
+                    "modified": modified,
+                    "also": [],
+                });
+                (None, None, None, ev)
+            }
+            Err(_) => {
+                stats.errors += 1;
+                continue;
+            }
+        };
+        // Write with a small retry: the indexer may hold the WAL
+        // writer briefly; a vanished item (FK) just counts as an error.
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match catalog.upsert_media_identity(
+                &item.id,
+                "rom",
+                title.as_deref(),
+                platform.as_deref(),
+                sha1.as_deref(),
+                &evidence.to_string(),
+            ) {
+                Ok(()) => break,
+                Err(e) => {
+                    if attempt < 3 && e.to_string().to_lowercase().contains("locked") {
+                        std::thread::sleep(std::time::Duration::from_millis(120));
+                        continue;
+                    }
+                    stats.errors += 1;
+                    break;
+                }
+            }
+        }
+    }
+    let _ = app.emit(
+        "rom-identify-progress",
+        RomIdentifyProgress {
+            done: total,
+            total,
+            matched: stats.matched,
+        },
+    );
+    stats.elapsed_ms = started.elapsed().as_millis() as u64;
+    if stats.elapsed_ms > 0 && stats.hashed > 0 {
+        stats.files_per_sec =
+            stats.hashed as f64 / (stats.elapsed_ms as f64 / 1000.0);
+    }
+    Ok(stats)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomScope {
+    /// "all" | "boot" | "drives"
+    pub mode: String,
+    #[serde(default)]
+    pub drives: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomHit {
+    pub item: Item,
+    pub dat_name: String,
+    pub system: String,
+}
+
+/// The members of one built-in ROM collection: catalog items with a
+/// DAT identification for `system`, honoring the collection's scope.
+/// Display names come from the DAT, not the filename.
+#[tauri::command]
+pub async fn rom_collection_items(
+    state: State<'_, AppState>,
+    system: String,
+    scope: RomScope,
+) -> Cmd<Vec<RomHit>> {
+    let location_ids: Option<Vec<String>> = match scope.mode.as_str() {
+        "boot" => Some(
+            state
+                .locations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.provider != "volume")
+                .map(|l| l.id.to_string())
+                .collect(),
+        ),
+        "drives" => Some(scope.drives.clone()),
+        _ => None,
+    };
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let rows = catalog
+        .rom_collection_items(&system, location_ids.as_deref())
+        .map_err(CommandError::from)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (item, title) in rows {
+        let remapped = remap_session_items(state.inner(), vec![item]);
+        if let Some(it) = remapped.into_iter().next() {
+            out.push(RomHit {
+                item: it,
+                dat_name: title,
+                system: system.clone(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Register a local file with the built-in media server and return a
@@ -8903,6 +9239,72 @@ pub async fn create_torrent(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn seam_job_requests_accept_frontend_camel_case() {
+        // SEAM TEST (ROM-lists fix block item 1): the frontend sends
+        // camelCase keys — dstParent / dstDir / useTrash (ui/src/api.ts).
+        // These fixtures mirror those payloads exactly. When the request
+        // structs lacked #[serde(rename_all = "camelCase")], EVERY
+        // start_* command rejected every call with "missing field
+        // `use_trash`" / `dst_dir` / `dst_parent` — Trash, Move, Copy
+        // and both FromPaths variants were all dead (2026-10-14).
+        // If a rename is ever lost again, this test fails the gate
+        // instead of the user.
+        let id = "11111111-1111-1111-1111-111111111111";
+        let copy: super::CopyRequest = serde_json::from_value(serde_json::json!({
+            "sources": [id], "dstParent": id
+        }))
+        .expect("start_copy payload must deserialize");
+        assert_eq!(copy.sources.len(), 1);
+        assert_eq!(copy.dst_parent.to_string(), id);
+
+        let mv: super::MoveRequest = serde_json::from_value(serde_json::json!({
+            "sources": [id], "dstDir": "/tmp/dest"
+        }))
+        .expect("start_move payload must deserialize");
+        assert_eq!(mv.dst_dir, "/tmp/dest");
+
+        let mvp: super::MovePathsRequest = serde_json::from_value(serde_json::json!({
+            "sources": ["/a/b"], "dstDir": "/tmp/dest"
+        }))
+        .expect("start_move_from_paths payload must deserialize");
+        assert_eq!(mvp.dst_dir, "/tmp/dest");
+
+        let cpp: super::CopyPathsRequest = serde_json::from_value(serde_json::json!({
+            "sources": ["/a/b"], "dstDir": "/tmp/dest"
+        }))
+        .expect("start_copy_from_paths payload must deserialize");
+        assert_eq!(cpp.dst_dir, "/tmp/dest");
+
+        let del: super::DeleteRequest = serde_json::from_value(serde_json::json!({
+            "sources": [id], "useTrash": true
+        }))
+        .expect("start_delete payload must deserialize");
+        assert!(del.use_trash);
+        let del_perm: super::DeleteRequest = serde_json::from_value(serde_json::json!({
+            "sources": [id], "useTrash": false
+        }))
+        .expect("start_delete (permanent) payload must deserialize");
+        assert!(!del_perm.use_trash);
+
+        let delp: super::DeletePathsRequest = serde_json::from_value(serde_json::json!({
+            "paths": ["/a/b"], "useTrash": true
+        }))
+        .expect("start_delete_from_paths payload must deserialize");
+        assert!(delp.use_trash);
+
+        // The old snake_case shape must NOT parse (it would mean the
+        // rename fell off and the frontend broke silently again).
+        assert!(serde_json::from_value::<super::DeleteRequest>(serde_json::json!({
+            "sources": [id], "use_trash": true
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<super::MoveRequest>(serde_json::json!({
+            "sources": [id], "dst_dir": "/tmp/dest"
+        }))
+        .is_err());
+    }
+
     #[test]
     fn mkfs_commands_are_well_formed() {
         // Labels are sanitized before they ever reach a shell string:

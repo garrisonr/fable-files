@@ -1,3 +1,4 @@
+import { errText } from "./toast";
 /**
  * FolderPicker — in-app destination chooser for Move to… / Copy to… /
  * Extract to…. Sidebar-style shortcuts plus a drill-down folder browser
@@ -141,7 +142,7 @@ export class FolderPicker {
         list.appendChild(row);
       }
     } catch (err) {
-      this.el.querySelector(".picker-path")!.textContent = `Error: ${err}`;
+      this.el.querySelector(".picker-path")!.textContent = `Error: ${errText(err)}`;
     }
   }
 

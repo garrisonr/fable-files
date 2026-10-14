@@ -592,6 +592,20 @@ export class FileView {
     }
     const tab = this.tab();
     this.el.dataset.view = tab.view;
+    if (tab.items.length === 0) {
+      // Empty states: a folder that failed to load says so plainly
+      // (fix block item 4); a folder that is simply empty says that.
+      this.scroller.className = "fileview-scroller";
+      this.scroller.innerHTML = "";
+      const p = document.createElement("p");
+      p.className = "empty-state";
+      p.textContent = tab.dirGone
+        ? "This folder is gone — it may have been moved or deleted, or its drive is unplugged. Back takes you to the previous folder."
+        : "This folder is empty.";
+      this.scroller.appendChild(p);
+      this.updateSelection();
+      return;
+    }
     if (tab.view === "grid") this.renderGrid(tab);
     else this.renderList(tab);
     this.updateSelection();
@@ -856,7 +870,7 @@ export class FileView {
     cell.addEventListener("dragstart", (e) => {
       dragState.item = item;
       if (e.dataTransfer) {
-        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.effectAllowed = "copyMove";
         e.dataTransfer.setData("text/plain", item.provider_key ?? item.name);
       }
       cell.classList.add("dragging");

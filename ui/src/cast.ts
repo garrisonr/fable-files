@@ -5,7 +5,7 @@
  */
 import { api } from "./api";
 import type { Item } from "./api";
-import { Toast } from "./toast";
+import { Toast, errText} from "./toast";
 import { isVideoName } from "./video";
 
 interface Device {
@@ -93,7 +93,7 @@ export class CastDialog {
       this.render(devices);
     } catch (err) {
       this.listEl.replaceChildren();
-      this.statusEl.textContent = `Scan failed: ${err}`;
+      this.statusEl.textContent = `Scan failed: ${errText(err)}`;
     }
   }
 
@@ -130,8 +130,8 @@ export class CastDialog {
       this.statusEl.textContent = `▶ Playing on ${device.name}.`;
       Toast.success(`Casting to ${device.name}.`);
     } catch (err) {
-      this.statusEl.textContent = `Cast failed: ${err}`;
-      Toast.error(`Cast failed: ${err}`);
+      this.statusEl.textContent = `Cast failed: ${errText(err)}`;
+      Toast.error(`Cast failed: ${errText(err)}`);
     }
   }
 
@@ -141,7 +141,7 @@ export class CastDialog {
       await api.castStop(this.playing);
       this.statusEl.textContent = `Stopped ${this.playing.name}.`;
     } catch (err) {
-      Toast.error(`Stop failed: ${err}`);
+      Toast.error(`Stop failed: ${errText(err)}`);
     }
     this.playing = null;
     this.stopBtn.hidden = true;
