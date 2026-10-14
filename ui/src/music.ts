@@ -25,6 +25,14 @@ function extOf(name: string): string {
   return dot < 0 ? "" : name.slice(dot + 1).toLowerCase();
 }
 
+/** Parent directory of an absolute path; mirrors dirname() in shell.ts
+ * (kept local: shell.ts imports this module, so importing back would
+ * cycle). Never returns "" — dirname("/foo.mp3") === "/". */
+function dirname(path: string): string {
+  const idx = path.lastIndexOf("/");
+  return idx <= 0 ? "/" : path.slice(0, idx);
+}
+
 function fmtTime(secs: number): string {
   if (!Number.isFinite(secs) || secs < 0) return "–:––";
   const m = Math.floor(secs / 60);
@@ -51,6 +59,9 @@ export class MusicPlayer {
   private rows: HTMLDivElement[] = [];
   private tracksEl: HTMLDivElement | null = null;
   private dragFrom: number | null = null;
+  /** Id of the item whose src was loaded most recently; a
+   * loadedmetadata event for any other item is stale (Round 7). */
+  private loadingItemId: string | null = null;
   private playBtn!: HTMLButtonElement;
   private seek!: HTMLInputElement;
   private timeLabel!: HTMLSpanElement;
@@ -62,8 +73,11 @@ export class MusicPlayer {
     this.audio.preload = "metadata";
     this.audio.addEventListener("timeupdate", () => this.syncProgress());
     this.audio.addEventListener("loadedmetadata", () => {
+      // Round 7 (Copilot audit): metadata can arrive after a fast skip —
+      // record it only when it belongs to the item loaded most recently,
+      // or track A's duration lands on track B's row.
       const cur = this.queue[this.index];
-      if (cur) {
+      if (cur && cur.id === this.loadingItemId) {
         this.durations.set(cur.id, this.audio.duration);
         this.fillDuration(this.index);
       }
@@ -105,17 +119,30 @@ export class MusicPlayer {
   private queueFolder(): string | null {
     const first = this.queue[0]?.provider_key;
     if (!first) return null;
-    const folder = first.replace(/\/[^/]*$/, "");
-    return this.queue.every((i) => (i.provider_key ?? "").replace(/\/[^/]*$/, "") === folder)
+    const folder = dirname(first);
+    return this.queue.every((i) => dirname(i.provider_key ?? "") === folder)
       ? folder
       : null;
   }
 
-  /** A saved custom order (drag-reorder) wins over name order. */
+  /** A saved custom order (drag-reorder) wins over name order.
+   * Round 7: orders persist by item id (`ff-music-order-id:<folder>`);
+   * the legacy provider_key order (`ff-music-order:<folder>`) is read
+   * as a fallback so existing users keep their custom order. */
   private applySavedOrder(): void {
     const folder = this.queueFolder();
     if (!folder) return;
     try {
+      const rawIds = localStorage.getItem(`ff-music-order-id:${folder}`);
+      if (rawIds) {
+        const saved = JSON.parse(rawIds) as string[];
+        const ids = new Set(this.queue.map((i) => i.id));
+        if (saved.length === this.queue.length && saved.every((id) => ids.has(id))) {
+          const rank = new Map(saved.map((id, i) => [id, i]));
+          this.queue.sort((a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0));
+        }
+        return;
+      }
       const raw = localStorage.getItem(`ff-music-order:${folder}`);
       if (!raw) return;
       const saved = JSON.parse(raw) as string[];
@@ -131,8 +158,8 @@ export class MusicPlayer {
     if (!folder) return;
     try {
       localStorage.setItem(
-        `ff-music-order:${folder}`,
-        JSON.stringify(this.queue.map((i) => i.provider_key)),
+        `ff-music-order-id:${folder}`,
+        JSON.stringify(this.queue.map((i) => i.id)),
       );
     } catch { /* ignore */ }
   }
@@ -149,6 +176,7 @@ export class MusicPlayer {
 
   close(): void {
     this.audio.pause();
+    this.loadingItemId = null;
     this.audio.removeAttribute("src");
     this.audio.load();
     if (this.overlay) {
@@ -167,7 +195,7 @@ export class MusicPlayer {
       try { return localStorage.getItem("ff-music-mode") === "playlist"; } catch { return false; }
     })();
     const first = this.queue[0];
-    const folder = first?.provider_key?.replace(/\/[^/]*$/, "").split("/").pop() ?? "";
+    const folder = dirname(first?.provider_key ?? "").split("/").pop() ?? "";
     overlay.innerHTML = `
       <div class="music-card${compact ? " compact" : ""}" role="dialog" aria-label="Music player">
         <div class="music-head">
@@ -270,6 +298,7 @@ export class MusicPlayer {
     if (i < 0 || i >= this.queue.length) return;
     this.index = i;
     const item = this.queue[i];
+    this.loadingItemId = item.id;
     const path = item.provider_key ?? item.name;
     this.badge.textContent = formatBadge(item.name);
     this.rows.forEach((r, j) => r.classList.toggle("playing", j === i));
@@ -373,6 +402,9 @@ export class MusicPlayer {
         const after = e.clientY > rect.top + rect.height / 2;
         let to = i + (after ? 1 : 0);
         if (to > this.dragFrom) to -= 1;
+        // Clamp into range: dropping after the last row moves the item
+        // to the end instead of silently doing nothing (Round 7).
+        to = Math.max(0, Math.min(this.queue.length - 1, to));
         const from = this.dragFrom;
         this.dragFrom = null;
         this.reorder(from, to);

@@ -93,8 +93,27 @@
 /* — Liquid Glass (BRAND — shared with Linux System Profiler): frosted
    translucent panels, bright hairlines, icy sky accent — */
 [data-theme="liquidglass"] { color-scheme: dark; --ufm-accent:#6fd3ff; --ufm-text:#f5f9ff; --ufm-text-muted:#a9bed6; --ufm-surface:rgba(26,32,44,.55); --ufm-content-canvas:rgba(26,32,44,.55); --ufm-rail:rgba(18,22,32,.58); --ufm-border:rgba(255,255,255,.22); --ufm-radius:12px; --ufm-card-radius:18px; --ufm-danger:#ff6b81; font-family:system-ui,"Inter",sans-serif; }
-[data-theme="liquidglass"] .ctx-menu, [data-theme="liquidglass"] .toast { backdrop-filter: blur(18px) saturate(1.5); -webkit-backdrop-filter: blur(18px) saturate(1.5); box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 12px 32px rgba(0,0,0,.35); }
+[data-theme="liquidglass"] .ctx-menu, [data-theme="liquidglass"] .toast { background: rgba(13,17,25,.82); backdrop-filter: blur(18px) saturate(1.5); -webkit-backdrop-filter: blur(18px) saturate(1.5); box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 12px 32px rgba(0,0,0,.35); }
 
 /* — Material You (BRAND — shared with Linux System Profiler): MD3 dark
    tonal surfaces, pill geometry, lavender primary — */
 [data-theme="materialyou"] { color-scheme: dark; --ufm-accent:#cfbcff; --ufm-text:#e6e0e9; --ufm-text-muted:#9d97a6; --ufm-surface:rgba(20,18,24,.95); --ufm-content-canvas:rgba(20,18,24,.95); --ufm-rail:rgba(16,13,20,.97); --ufm-border:rgba(147,143,153,.38); --ufm-radius:16px; --ufm-card-radius:24px; --ufm-danger:#ffb4ab; font-family:"Roboto","Inter",system-ui,sans-serif; }
+
+/* — Accessibility layer (Round 7 — Copilot audit + design law) ——————
+   The theme layer must honor the OS switches, not just document them:
+   reduced transparency kills backdrop blur and pushes the translucent
+   materials toward opaque; reduced motion neutralizes theme-layer
+   transitions/animations. Liquid Glass menus/popovers also carry an
+   opaque scrim background above, so glass never stacks on glass. */
+@media (prefers-reduced-transparency: reduce) {
+  *, *::before, *::after { backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }
+  [data-theme="liquidglass"] { --ufm-surface:rgba(26,32,44,.97); --ufm-content-canvas:rgba(26,32,44,.97); --ufm-rail:rgba(18,22,32,.98); }
+  [data-theme="liquidglass"] .ctx-menu, [data-theme="liquidglass"] .toast { background: rgba(13,17,25,.98); }
+  [data-theme="deepin"] { --ufm-surface:rgba(255,255,255,.97); --ufm-content-canvas:rgba(255,255,255,.97); --ufm-rail:rgba(255,255,255,.98); }
+}
+@media (prefers-reduced-transparency: reduce) and (prefers-color-scheme: dark) {
+  [data-theme="deepin"] { --ufm-surface:rgba(24,28,34,.97); --ufm-content-canvas:rgba(24,28,34,.97); --ufm-rail:rgba(18,22,28,.98); }
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+}

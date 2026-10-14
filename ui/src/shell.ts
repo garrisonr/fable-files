@@ -64,6 +64,18 @@ import {
 } from "./tabs";
 import { DEFAULT_THEME, ThemeManager, type MenuThemeItem } from "./themes";
 
+/** Parent directory of an absolute path: dirname("/a/b") === "/a",
+ * dirname("/foo.mp3") === "/", dirname("/") === "/". Never returns ""
+ * (the old `replace(/\/[^/]*$/, "")` yielded "" for root-level files,
+ * breaking parent comparisons — Gemini audit, Round 7). */
+export function dirname(path: string): string {
+  const idx = path.lastIndexOf("/");
+  return idx <= 0 ? "/" : path.slice(0, idx);
+}
+
+/** Cap on cached archive listings (LRU eviction) — Round 7. */
+const ARCHIVE_CACHE_LIMIT = 10;
+
 /** Where a sidebar favorite navigates: a real location root or a
  * same-named folder inside the Home location. */
 interface FavoriteTarget {
@@ -133,6 +145,9 @@ export class Shell {
    * cached listing. */
   private archiveMeta = new Map<string, Item>();
   private archiveCache = new Map<string, ArchiveEntry[]>();
+  /** Monotonic per-tab load tokens: a stale async loadDir must never
+   * overwrite a newer view (Round 7 race fix — Gemini audit). */
+  private loadSeqByTab = new WeakMap<Tab, number>();
   private termPanel = new TerminalPanel();
   private jobsPanel = new JobsPanel();
   private metadataDialog = new MetadataDialog();
@@ -742,17 +757,33 @@ export class Shell {
 
   private async loadDir(tab: Tab): Promise<void> {
     const dir = currentDir(tab);
+    // Round 7 (Gemini audit): capture a load token; if a newer load for
+    // this tab starts while we await, this result is stale — discard it
+    // silently instead of overwriting the current view.
+    const seq = (this.loadSeqByTab.get(tab) ?? 0) + 1;
+    this.loadSeqByTab.set(tab, seq);
+    const isCurrent = (): boolean => this.loadSeqByTab.get(tab) === seq;
+    let items: Item[];
     try {
       if (dir.dirId.startsWith("label:")) {
-        tab.items = await api.listItemsByLabel(dir.dirId.slice("label:".length));
+        items = await api.listItemsByLabel(dir.dirId.slice("label:".length));
       } else if (dir.dirId.startsWith("archive:")) {
-        tab.items = await this.archiveItems(dir.dirId);
+        items = await this.archiveItems(dir.dirId);
       } else {
-        tab.items = await api.listDir(dir.locationId, dir.dirId);
+        items = await api.listDir(dir.locationId, dir.dirId);
       }
-    } catch {
-      tab.items = [];
+    } catch (err) {
+      if (!isCurrent()) return;
+      // Round 7 (Copilot audit): a failed archive open must not strand
+      // the user in an empty tab — toast and keep the previous view.
+      if (dir.dirId.startsWith("archive:")) {
+        Toast.error(`Couldn't open that archive: ${err}`);
+        return;
+      }
+      items = [];
     }
+    if (!isCurrent()) return; // stale load finished late — discard it
+    tab.items = items;
     if (tab === this.activeTab) {
       this.renderActiveView();
       this.renderCrumbs();
@@ -862,9 +893,19 @@ export class Shell {
     const meta = this.archiveMeta.get(archiveId);
     if (!meta) return [];
     let entries = this.archiveCache.get(archiveId);
-    if (!entries) {
+    if (entries) {
+      // LRU: refresh recency on hit (Map preserves insertion order).
+      this.archiveCache.delete(archiveId);
+      this.archiveCache.set(archiveId, entries);
+    } else {
       entries = await api.listArchive(archiveId);
       this.archiveCache.set(archiveId, entries);
+      // Cap the cache: evict least-recently-used listings (Round 7).
+      while (this.archiveCache.size > ARCHIVE_CACHE_LIMIT) {
+        const oldest = this.archiveCache.keys().next().value;
+        if (oldest === undefined) break;
+        this.archiveCache.delete(oldest);
+      }
     }
     const prefix = sub ? `${sub}/` : "";
     const byName = new Map<string, Item>();
@@ -1041,7 +1082,7 @@ export class Shell {
       }
       let done = 0;
       for (const src of clip.paths) {
-        const parent = src.replace(/\/[^/]*$/, "");
+        const parent = dirname(src);
         if (parent === destDir) {
           if (clip.cut) continue; // cutting into the same folder: no-op
           // copy into the same folder = duplicate with a suffix (backend)
@@ -1065,7 +1106,7 @@ export class Shell {
     let done = 0;
     for (const item of items) {
       if (!item.provider_key) continue;
-      const parent = item.provider_key.replace(/\/[^/]*$/, "");
+      const parent = dirname(item.provider_key);
       try {
         await api.copyPathTo(item.provider_key, parent);
         done++;
@@ -1112,7 +1153,7 @@ export class Shell {
         if (mode === "move") {
           const newPath = await api.moveItemTo(item.id, dest);
           const fromDir = item.provider_key
-            ? item.provider_key.replace(/\/[^/]*$/, "")
+            ? dirname(item.provider_key)
             : "";
           if (fromDir && fromDir !== dest) {
             this.undoStack.push({ kind: "move", newPath, fromDir, label: item.name });
@@ -1686,12 +1727,12 @@ export class Shell {
               Toast.success(`Moved “${dragged.name}” to Trash. Super+Z to undo.`);
             } else {
               const dest = await api.getItemPath(target.dirId);
-              if (dragged.provider_key && dragged.provider_key.replace(/\/[^/]*$/, "") === dest) {
+              if (dragged.provider_key && dirname(dragged.provider_key) === dest) {
                 return; // already in this folder
               }
               const newPath = await api.moveItemTo(dragged.id, dest);
               const fromDir = dragged.provider_key
-                ? dragged.provider_key.replace(/\/[^/]*$/, "")
+                ? dirname(dragged.provider_key)
                 : "";
               if (fromDir) {
                 this.undoStack.push({ kind: "move", newPath, fromDir, label: dragged.name });
