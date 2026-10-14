@@ -42,6 +42,7 @@ md5 = "0.7"
 open = "5"
 portable-pty = "0.8"
 sha2 = "0.10"
+libc = "0.2"
 tracing-subscriber.workspace = true
 
 [features]

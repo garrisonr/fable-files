@@ -1023,6 +1023,8 @@ mod job_tests {
             depends_on: vec![],
             state: StepState::Pending,
             compensation: None,
+            outcome: false,
+            outcome_path: None,
         });
         job
     }
@@ -1061,6 +1063,42 @@ mod job_tests {
         finished.state = JobState::Completed;
         cat.upsert_job(&finished).unwrap();
         assert!(cat.unfinished_jobs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn job_outcomes_roundtrip() {
+        // Inc-2 §4.3: outcomes ride inside job_json — a job carrying a
+        // trash outcome and a move outcome loads back intact, and the
+        // unfinished filter is unaffected.
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut job = sample_job(JobState::Running);
+        job.outcomes = vec![
+            ufm_jobs::JobOutcome {
+                step_id: "s0001".into(),
+                src_path: "/tmp/a.txt".into(),
+                result_path: None,
+                trash_name: Some("a.txt".into()),
+            },
+            ufm_jobs::JobOutcome {
+                step_id: "s0002".into(),
+                src_path: "/tmp/b.txt".into(),
+                result_path: Some("/dst/b.txt".into()),
+                trash_name: None,
+            },
+        ];
+        cat.upsert_job(&job).unwrap();
+        let loaded = cat.load_job(&job.id).unwrap().unwrap();
+        assert_eq!(loaded.outcomes.len(), 2);
+        assert_eq!(loaded.outcomes[0].step_id, "s0001");
+        assert_eq!(loaded.outcomes[0].trash_name.as_deref(), Some("a.txt"));
+        assert_eq!(loaded.outcomes[0].result_path, None);
+        assert_eq!(
+            loaded.outcomes[1].result_path.as_deref(),
+            Some("/dst/b.txt")
+        );
+        let unfinished = cat.unfinished_jobs().unwrap();
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].id, job.id);
     }
 
     #[test]

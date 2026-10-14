@@ -7,6 +7,7 @@
 // dot-matrix spectrum are the next increments.
 
 import { api, mediaSrc, type Item } from "./api";
+import { audioTags, folderArtUrl } from "./audiometa";
 import { Toast } from "./toast";
 
 const AUDIO_EXTS = new Set([
@@ -67,6 +68,7 @@ export class MusicPlayer {
   private timeLabel!: HTMLSpanElement;
   private badge!: HTMLSpanElement;
   private titleEl!: HTMLDivElement;
+  private subEl!: HTMLDivElement;
   private onKey = (e: KeyboardEvent): void => this.handleKey(e);
 
   constructor() {
@@ -125,37 +127,9 @@ export class MusicPlayer {
       : null;
   }
 
-  /** List a folder given its absolute path. `list_dir` resolves
-   * directory IDS, not paths — passing the raw path here silently
-   * failed and folder art never loaded (Round 7.2 fix). Mirror the
-   * shell's resolution (openItemInNewTab): start at the item's
-   * location root and walk the path segments, matching child folders
-   * by name, until the final segment's id can be listed. */
-  private async listFolderByPath(
-    first: Item,
-    folderPath: string,
-  ): Promise<Item[] | null> {
-    const locations = await api.listLocations();
-    const loc = locations.find((l) => l.id === first.location) ?? locations[0];
-    if (!loc) return null;
-    const rootPath = await api.getItemPath(loc.root_item);
-    if (folderPath === rootPath) {
-      return api.listDir(loc.id, loc.root_item);
-    }
-    if (!folderPath.startsWith(rootPath + "/")) return null;
-    const segments = folderPath
-      .slice(rootPath.length + 1)
-      .split("/")
-      .filter((s) => s.length > 0);
-    let curDirId = loc.root_item;
-    for (const seg of segments) {
-      const entries = await api.listDir(loc.id, curDirId);
-      const next = entries.find((e) => e.kind === "folder" && e.name === seg);
-      if (!next) return null;
-      curDirId = next.id;
-    }
-    return api.listDir(loc.id, curDirId);
-  }
+  // The path→id folder walk that used to live here moved to
+  // audiometa.ts (inc-2 item 9) as listFolderByPath — shared with
+  // Quick Look so folder art resolves identically everywhere.
 
   /** A saved custom order (drag-reorder) wins over name order.
    * Round 7: orders persist by item id (`ff-music-order-id:<folder>`);
@@ -256,7 +230,8 @@ export class MusicPlayer {
     const q = <T extends HTMLElement>(sel: string) => overlay.querySelector(sel) as T;
     this.titleEl = q<HTMLDivElement>(".music-title");
     this.titleEl.textContent = folder || "Music";
-    q<HTMLDivElement>(".music-sub").textContent =
+    this.subEl = q<HTMLDivElement>(".music-sub");
+    this.subEl.textContent =
       `${this.queue.length} track${this.queue.length === 1 ? "" : "s"} · drag rows to reorder`;
     this.playBtn = q<HTMLButtonElement>(".music-play");
     this.seek = q<HTMLInputElement>(".music-seek");
@@ -276,15 +251,12 @@ export class MusicPlayer {
         };
         try {
           const folder = this.queueFolder();
-          if (folder && first.location) {
-            const names = new Set([
-              "folder.jpg", "folder.jpeg", "folder.png", "cover.jpg", "cover.jpeg",
-              "cover.png", "front.jpg", "front.jpeg", "front.png", "albumart.jpg",
-            ]);
-            const entries = await this.listFolderByPath(first, folder);
-            const art = entries?.find((e) => names.has(e.name.toLowerCase()));
-            if (art?.provider_key) {
-              show(await mediaSrc(art.provider_key));
+          if (folder) {
+            // Shared with Quick Look (inc-2 item 9): audiometa's
+            // folderArtUrl owns the art-name set + path→id walk.
+            const url = await folderArtUrl(first, folder);
+            if (url) {
+              show(url);
               return;
             }
           }
@@ -333,6 +305,18 @@ export class MusicPlayer {
     this.loadingItemId = item.id;
     const path = item.provider_key ?? item.name;
     this.badge.textContent = formatBadge(item.name);
+    // Headline + subline from embedded tags (inc-2 item 9): the
+    // Title tag is the headline, Artist · Album the subline; the
+    // cleaned filename is only the fallback.
+    this.titleEl.textContent = cleanTitle(item.name);
+    void audioTags(item).then((tags) => {
+      if (this.index !== i) return;
+      if (tags.title) this.titleEl.textContent = tags.title;
+      const sub = [tags.artist, tags.album]
+        .filter((s): s is string => !!s)
+        .join(" · ");
+      if (sub && this.subEl) this.subEl.textContent = sub;
+    });
     this.rows.forEach((r, j) => r.classList.toggle("playing", j === i));
     try {
       this.audio.src = await mediaSrc(path);
@@ -401,6 +385,13 @@ export class MusicPlayer {
         <span class="music-fmt"></span>
         <span class="music-d">–:––</span>`;
       (row.querySelector(".music-t") as HTMLSpanElement).textContent = cleanTitle(item.name);
+      // Embedded Title tag replaces the filename when present
+      // (inc-2 item 9); reads are cached per item in audiometa.
+      void audioTags(item).then((tags) => {
+        if (!tags.title) return;
+        const t = row.querySelector(".music-t") as HTMLSpanElement | null;
+        if (t) t.textContent = tags.title;
+      });
       (row.querySelector(".music-fmt") as HTMLSpanElement).textContent = formatBadge(item.name);
       const known = this.durations.get(item.id);
       if (known) {

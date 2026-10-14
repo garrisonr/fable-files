@@ -6,7 +6,9 @@
  */
 import {
   api,
+  formatBytes,
   type Item,
+  type JobOutcome,
   type LocationSummary,
   type ThemeInfo,
 } from "./api";
@@ -73,6 +75,12 @@ export function dirname(path: string): string {
   return idx <= 0 ? "/" : path.slice(0, idx);
 }
 
+/** Normalize an absolute path for favorite-identity comparisons
+ * (inc-2 item 14): trailing slashes don't make a different folder. */
+function normFavPath(p: string): string {
+  return p.length > 1 ? p.replace(/\/+$/, "") : p;
+}
+
 /** Cap on cached archive listings (LRU eviction) — Round 7. */
 const ARCHIVE_CACHE_LIMIT = 10;
 
@@ -124,6 +132,14 @@ export class Shell {
     | { kind: "trash"; trashName: string; label: string }
     | { kind: "move"; newPath: string; fromDir: string; label: string }
   > = [];
+  /** Completion continuations for transfer jobs, keyed by JobId
+   * (Phase 1 inc-2 §3.3): jobs finish asynchronously, so the
+   * post-completion work (toast, refresh, undo push) is registered at
+   * call time and drained by JobsPanel.onTransferDone. */
+  private transferContinuations = new Map<
+    string,
+    (error: string | null) => Promise<void>
+  >();
   private quickLook: QuickLook;
   private searchView: SearchView;
   private themeManager: ThemeManager;
@@ -147,6 +163,13 @@ export class Shell {
   private romsChevEl: HTMLElement | null = null;
   /** Durable UI prefs (backend sidecar via api.getUiPrefs). */
   private uiPrefs: Record<string, unknown> = {};
+  /** Normalized paths currently shown in Favorites, rebuilt by
+   * buildSidebar — the item context menu reads its Add/Remove state
+   * from here (inc-2 item 14). */
+  private favoritePathSet = new Set<string>();
+  /** Built-in favorite name by normalized path, including ones the
+   * user has hidden — rebuilt by buildSidebar (inc-2 item 14). */
+  private builtinFavNames = new Map<string, string>();
   /** Archive browsing state: archive item id -> its catalog Item and
    * cached listing. */
   private archiveMeta = new Map<string, Item>();
@@ -182,6 +205,8 @@ export class Shell {
       onPlayMusic: (items: Item[]) => this.musicPlayer.open(items),
       onOpen: (item) => this.openItem(item),
       onOpenInNewTab: (item) => void this.openItemInNewTab(item),
+      isFavorite: (item) => this.isFavoriteItem(item),
+      onToggleFavorite: (item) => void this.toggleFavorite(item),
       onSelect: (item) => this.onSelect(item),
       onTogglePreview: () => this.togglePreview(),
       onMakeExecutable: (item) => {
@@ -466,6 +491,21 @@ export class Shell {
     this.jobsPanel.onJobError = (error) => {
       Toast.error(`Job failed: ${error}`);
     };
+    this.jobsPanel.onTransferDone = (jobId, error) => {
+      const cont = this.transferContinuations.get(jobId);
+      this.transferContinuations.delete(jobId);
+      if (cont) {
+        void cont(error);
+      } else {
+        // No call-site continuation (e.g. a hydrated recovered job
+        // cancelled from the panel): still refresh + report.
+        if (error) Toast.error(`Job failed: ${error}`);
+        this.refreshActiveDir();
+      }
+    };
+    void this.jobsPanel.hydrate();
+    this.dupDialog.onTrackJob = (jobId, label, onDone) =>
+      this.trackTransfer(jobId, label, onDone);
 
     this.themeManager = new ThemeManager({
       renderMenu: (themes, activeId, anchor) => this.renderThemeMenu(themes, activeId, anchor),
@@ -482,6 +522,10 @@ export class Shell {
         if (this.searchView.active) this.searchView.rerunAfterIndex();
       },
     );
+    // Inc-2 item 13: the search view mirrors indexing state in its
+    // results area (banner + honest empty-state copy).
+    this.indexTracker.onObserve = (busy, files) =>
+      this.searchView.setIndexingState(busy, files);
 
     document.addEventListener("keydown", (e) => this.onGlobalKey(e));
     // The native webview context menu (Back / Forward / Stop / Reload)
@@ -650,6 +694,40 @@ export class Shell {
     favHead.textContent = "Favorites";
     this.favList = document.createElement("div");
     this.favList.className = "side-list";
+    // Inc-2 item 14: the Favorites section itself is a drop door —
+    // drag a FOLDER onto the header or the list background to pin
+    // it. Buttons inside the list keep their own drop behavior
+    // (file-into / reorder); files are never accepted here.
+    const favDoorOver = (e: DragEvent): void => {
+      const it = dragState.item;
+      if (!it || dragState.favName || it.kind !== "folder") return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+      favHead.classList.add("drop-hover");
+      this.favList.classList.add("drop-hover");
+    };
+    const favDoorClear = (): void => {
+      favHead.classList.remove("drop-hover");
+      this.favList.classList.remove("drop-hover");
+    };
+    const favDoorDrop = (e: DragEvent): void => {
+      e.preventDefault();
+      favDoorClear();
+      const it = dragState.item;
+      if (it && it.kind === "folder") void this.addFavoriteFromItem(it);
+    };
+    favHead.addEventListener("dragover", favDoorOver);
+    favHead.addEventListener("dragleave", favDoorClear);
+    favHead.addEventListener("drop", favDoorDrop);
+    this.favList.addEventListener("dragover", (e) => {
+      if ((e.target as HTMLElement).closest("button")) return;
+      favDoorOver(e);
+    });
+    this.favList.addEventListener("dragleave", favDoorClear);
+    this.favList.addEventListener("drop", (e) => {
+      if ((e.target as HTMLElement).closest("button")) return;
+      favDoorDrop(e);
+    });
     const locHead = document.createElement("h2");
     locHead.className = "side-head";
     locHead.textContent = "Locations";
@@ -667,13 +745,13 @@ export class Shell {
     this.labelChevEl = labelChev;
     this.labelList = document.createElement("div");
     this.labelList.className = "side-list";
-    const labelsCollapsed = (() => {
-      try {
-        return localStorage.getItem("ff-labels-collapsed") === "1";
-      } catch {
-        return false;
-      }
-    })();
+    // Inc-2 item 11 fix: initialize from prefCollapsed (durable
+    // backend prefs win, localStorage is only the pre-boot fast
+    // path). The old localStorage-only read here is why a re-index
+    // rebuild re-expanded sections whose collapse lived only in the
+    // backend sidecar — buildSidebar runs on ~18 paths, boot's
+    // applyCollapsePrefs only once.
+    const labelsCollapsed = this.prefCollapsed("ff-labels-collapsed");
     this.labelList.hidden = labelsCollapsed;
     labelChev.style.transform = labelsCollapsed ? "rotate(-90deg)" : "";
     labelHead.addEventListener("click", () => {
@@ -711,13 +789,10 @@ export class Shell {
     this.romsHead = romsHead;
     this.romsList = document.createElement("div");
     this.romsList.className = "side-list";
-    const romsCollapsed = (() => {
-      try {
-        return localStorage.getItem("ff-roms-collapsed") === "1";
-      } catch {
-        return false;
-      }
-    })();
+    // Inc-2 item 11 fix: same as Labels above — prefCollapsed, not
+    // a localStorage-only read, so every rebuild honors the durable
+    // collapse state.
+    const romsCollapsed = this.prefCollapsed("ff-roms-collapsed");
     this.romsList.hidden = romsCollapsed;
     romsChev.style.transform = romsCollapsed ? "rotate(-90deg)" : "";
     romsHead.addEventListener("click", () => {
@@ -766,7 +841,7 @@ export class Shell {
 
   private navButton(label: string, glyph: string, onClick: () => void): HTMLButtonElement {
     const b = document.createElement("button");
-    b.className = "icon-btn";
+    b.className = "icon-btn nav-btn";
     b.textContent = glyph;
     b.setAttribute("aria-label", label);
     b.title = label;
@@ -1127,41 +1202,111 @@ export class Shell {
     return this.fileView.selected;
   }
 
-  /** Move an item to the Trash, refresh the listing, and say so. */
+  /** Track a transfer job in the panel and register what should
+   * happen when it reaches a terminal state (inc-2 §3.3). */
+  private trackTransfer(
+    jobId: string,
+    label: string,
+    onDone: (error: string | null) => Promise<void>,
+  ): void {
+    this.transferContinuations.set(jobId, onDone);
+    this.jobsPanel.trackJob(jobId, label);
+  }
+
+  /** Outcomes of a finished job; [] when unavailable (unknown job /
+   * backend error) — undo simply offers less in that case. */
+  private async jobOutcomes(jobId: string): Promise<JobOutcome[]> {
+    try {
+      return await api.getJobOutcomes(jobId);
+    } catch {
+      return [];
+    }
+  }
+
+  /** Feed the undo stack from a finished trash job's outcomes. */
+  private pushTrashUndo(
+    outcomes: JobOutcome[],
+    nameByPath: Map<string, string>,
+  ): number {
+    let pushed = 0;
+    for (const o of outcomes) {
+      if (!o.trash_name) continue;
+      this.undoStack.push({
+        kind: "trash",
+        trashName: o.trash_name,
+        label: nameByPath.get(o.src_path) ?? o.src_path.split("/").pop() ?? o.src_path,
+      });
+      pushed++;
+    }
+    return pushed;
+  }
+
+  /** Move an item to the Trash as a tracked job (inc-2: replaces the
+   * direct trash_item call; undo is fed by job outcomes at
+   * completion). */
   private async deleteItem(item: Item): Promise<void> {
     try {
-      const trashName = await api.trashItem(item.id);
-      this.undoStack.push({ kind: "trash", trashName, label: item.name });
-      Toast.success(`Moved “${item.name}” to Trash. Super+Z to undo.`);
+      const jobId = await api.startDelete([item.id], true);
       this.quickLook.close();
-      const tab = this.activeTab;
-      if (tab) await this.loadDir(tab);
+      this.trackTransfer(jobId, `Trash ${item.name}`, async (error) => {
+        if (error) {
+          Toast.error(`Could not delete “${item.name}”: ${error}`);
+        } else {
+          const outcomes = await this.jobOutcomes(jobId);
+          this.pushTrashUndo(
+            outcomes,
+            new Map([[item.provider_key ?? "", item.name]]),
+          );
+          Toast.success(`Moved “${item.name}” to Trash. Super+Z to undo.`);
+        }
+        const tab = this.activeTab;
+        if (tab) await this.loadDir(tab);
+      });
     } catch (err) {
       Toast.error(`Could not delete “${item.name}”: ${err}`);
     }
   }
 
-  /** Move a whole selection to the Trash: one toast, one refresh. */
+  /** Move a whole selection to the Trash as ONE tracked job (inc-2;
+   * replaces the per-item trash_item loop — failures are now
+   * per-job and surface via the panel + toast at completion). */
   private async trashItems(items: Item[]): Promise<void> {
-    let ok = 0;
-    for (const it of items) {
-      try {
-        const trashName = await api.trashItem(it.id);
-        this.undoStack.push({ kind: "trash", trashName, label: it.name });
-        ok++;
-      } catch {
-        // counted below
-      }
+    if (items.length === 0) return;
+    try {
+      const jobId = await api.startDelete(
+        items.map((i) => i.id),
+        true,
+      );
+      this.quickLook.close();
+      const nameByPath = new Map(
+        items.map(
+          (i) => [i.provider_key ?? "", i.name] as [string, string],
+        ),
+      );
+      const label =
+        items.length === 1
+          ? `Trash ${items[0].name}`
+          : `Trash ${items.length} items`;
+      this.trackTransfer(jobId, label, async (error) => {
+        if (error) {
+          Toast.error(`Could not trash items: ${error}`);
+        } else {
+          const outcomes = await this.jobOutcomes(jobId);
+          const ok = this.pushTrashUndo(outcomes, nameByPath);
+          if (ok === 1)
+            Toast.success(
+              `Moved “${items[0].name}” to Trash. Super+Z to undo.`,
+            );
+          else if (ok > 1)
+            Toast.success(`Moved ${ok} items to Trash. Super+Z to undo.`);
+        }
+        const t = this.activeTab;
+        if (t) await this.loadDir(t);
+        if (this.searchView.active) this.searchView.refresh();
+      });
+    } catch (err) {
+      Toast.error(`Could not trash items: ${err}`);
     }
-    if (ok === 1)
-      Toast.success(`Moved “${items[0].name}” to Trash. Super+Z to undo.`);
-    else if (ok > 1)
-      Toast.success(`Moved ${ok} items to Trash. Super+Z to undo.`);
-    if (ok < items.length)
-      Toast.error(`Could not trash ${items.length - ok} item(s).`);
-    this.quickLook.close();
-    const t = this.activeTab;
-    if (t) await this.loadDir(t);
   }
 
   /** If Quick Look is showing this path, re-open it on the fresh Item
@@ -1237,43 +1382,79 @@ export class Shell {
         Toast.error("Clipboard has no files.");
         return;
       }
-      let done = 0;
-      for (const src of clip.paths) {
-        const parent = dirname(src);
-        if (parent === destDir) {
-          if (clip.cut) continue; // cutting into the same folder: no-op
-          // copy into the same folder = duplicate with a suffix (backend)
-        }
-        if (clip.cut) await api.movePathTo(src, destDir);
-        else await api.copyPathTo(src, destDir);
-        done++;
-      }
-      if (done > 0) {
-        Toast.success(
-          `Pasted ${done} item${done === 1 ? "" : "s"}${clip.cut ? " (moved)" : ""}`,
-        );
-        this.refreshActiveDir();
-      }
+      // One job per paste, not per path (inc-2 §3.3). The planner
+      // owns the same-folder cut no-op and the copy-into-same-folder
+      // suffix idiom now.
+      const paths = clip.paths;
+      const jobId = clip.cut
+        ? await api.startMoveFromPaths(paths, destDir)
+        : await api.startCopyFromPaths(paths, destDir);
+      this.trackTransfer(
+        jobId,
+        clip.cut ? "Move" : "Copy",
+        async (error) => {
+          if (error) {
+            Toast.error(`Paste failed: ${error}`);
+          } else if (clip.cut) {
+            const outcomes = await this.jobOutcomes(jobId);
+            let moved = 0;
+            for (const o of outcomes) {
+              if (!o.result_path) continue;
+              this.undoStack.push({
+                kind: "move",
+                newPath: o.result_path,
+                fromDir: dirname(o.src_path),
+                label: o.src_path.split("/").pop() ?? o.src_path,
+              });
+              moved++;
+            }
+            if (moved > 0) {
+              Toast.success(
+                `Pasted ${moved} item${moved === 1 ? "" : "s"} (moved)`,
+              );
+            }
+          } else {
+            Toast.success(
+              `Pasted ${paths.length} item${paths.length === 1 ? "" : "s"}`,
+            );
+          }
+          this.refreshActiveDir();
+        },
+      );
     } catch (err) {
       Toast.error(`Paste failed: ${err}`);
     }
   }
 
   private async duplicateItems(items: Item[]): Promise<void> {
-    let done = 0;
+    // One copy job per parent folder (inc-2 §3.3; a selection lives
+    // in one folder in practice, but grouping keeps odd selections
+    // honest).
+    const byParent = new Map<string, string[]>();
     for (const item of items) {
       if (!item.provider_key) continue;
       const parent = dirname(item.provider_key);
-      try {
-        await api.copyPathTo(item.provider_key, parent);
-        done++;
-      } catch (err) {
-        Toast.error(`Could not duplicate ${item.name}: ${err}`);
-      }
+      const group = byParent.get(parent) ?? [];
+      group.push(item.provider_key);
+      byParent.set(parent, group);
     }
-    if (done > 0) {
-      Toast.success(`Duplicated ${done} item${done === 1 ? "" : "s"}`);
-      this.refreshActiveDir();
+    if (byParent.size === 0) return;
+    for (const [parent, paths] of byParent) {
+      const count = paths.length;
+      try {
+        const jobId = await api.startCopyFromPaths(paths, parent);
+        this.trackTransfer(jobId, "Duplicate", async (error) => {
+          if (error) Toast.error(`Duplicate failed: ${error}`);
+          else {
+            Toast.success(
+              `Duplicated ${count} item${count === 1 ? "" : "s"}`,
+            );
+          }
+          this.refreshActiveDir();
+        });
+      } catch (err) {
+        Toast.error(`Could not duplicate: ${err}`);
+      }
     }
   }
 
@@ -1304,31 +1485,66 @@ export class Shell {
       start,
     );
     if (!dest) return;
-    let done = 0;
-    for (const item of items) {
-      try {
-        if (mode === "move") {
-          const newPath = await api.moveItemTo(item.id, dest);
-          const fromDir = item.provider_key
-            ? dirname(item.provider_key)
-            : "";
-          if (fromDir && fromDir !== dest) {
-            this.undoStack.push({ kind: "move", newPath, fromDir, label: item.name });
+    try {
+      if (mode === "move") {
+        const jobId = await api.startMove(
+          items.map((i) => i.id),
+          dest,
+        );
+        const nameByPath = new Map(
+          items.map(
+            (i) => [i.provider_key ?? "", i.name] as [string, string],
+          ),
+        );
+        this.trackTransfer(jobId, "Move", async (error) => {
+          if (error) {
+            Toast.error(`Could not move items: ${error}`);
+          } else {
+            const outcomes = await this.jobOutcomes(jobId);
+            let moved = 0;
+            for (const o of outcomes) {
+              if (!o.result_path) continue;
+              const fromDir = dirname(o.src_path);
+              // Parity with the old direct flow: no undo entry for
+              // a no-op move (source already in the destination).
+              if (!fromDir || dirname(o.result_path) === fromDir) continue;
+              this.undoStack.push({
+                kind: "move",
+                newPath: o.result_path,
+                fromDir,
+                label:
+                  nameByPath.get(o.src_path) ??
+                  o.src_path.split("/").pop() ??
+                  o.src_path,
+              });
+              moved++;
+            }
+            if (moved > 0) {
+              Toast.success(
+                `Moved ${moved} item${moved === 1 ? "" : "s"}. Super+Z to undo.`,
+              );
+            }
           }
-        } else {
-          if (!item.provider_key) continue;
-          await api.copyPathTo(item.provider_key, dest);
-        }
-        done++;
-      } catch (err) {
-        Toast.error(`Could not ${mode} ${item.name}: ${err}`);
+          this.refreshActiveDir();
+        });
+      } else {
+        const paths = items
+          .map((i) => i.provider_key)
+          .filter((p): p is string => !!p);
+        if (paths.length === 0) return;
+        const jobId = await api.startCopyFromPaths(paths, dest);
+        this.trackTransfer(jobId, "Copy", async (error) => {
+          if (error) Toast.error(`Could not copy items: ${error}`);
+          else {
+            Toast.success(
+              `Copied ${paths.length} item${paths.length === 1 ? "" : "s"}`,
+            );
+          }
+          this.refreshActiveDir();
+        });
       }
-    }
-    if (done > 0) {
-      Toast.success(
-        `${mode === "move" ? "Moved" : "Copied"} ${done} item${done === 1 ? "" : "s"}${mode === "move" ? ". Super+Z to undo." : ""}`,
-      );
-      this.refreshActiveDir();
+    } catch (err) {
+      Toast.error(`Could not ${mode} items: ${err}`);
     }
   }
 
@@ -1625,6 +1841,82 @@ export class Shell {
     }
   }
 
+  /** Disk Properties (inc-2 item 12): identity + space of the
+   * volume backing a sidebar location or favorite. Free space is
+   * the headline figure; numbers are statvfs (df-equivalent). */
+  private async showDiskProperties(
+    name: string,
+    path: string,
+  ): Promise<void> {
+    const overlay = document.createElement("div");
+    overlay.className = "confirm-overlay";
+    const card = document.createElement("div");
+    card.className = "confirm-card disk-card";
+    const title = document.createElement("h3");
+    title.textContent = `💽 ${name}`;
+    const body = document.createElement("div");
+    body.className = "disk-body";
+    body.textContent = "Reading disk…";
+    const actions = document.createElement("div");
+    actions.className = "confirm-actions";
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "pill-btn primary";
+    closeBtn.textContent = "Close";
+    const dismiss = () => overlay.remove();
+    closeBtn.addEventListener("click", dismiss);
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) dismiss();
+    });
+    actions.appendChild(closeBtn);
+    card.append(title, body, actions);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    closeBtn.focus();
+    try {
+      const info = await api.getDiskInfo(path);
+      body.textContent = "";
+      const freeBig = document.createElement("div");
+      freeBig.className = "disk-free-big";
+      freeBig.textContent = `${formatBytes(info.free_bytes)} free`;
+      const pct = document.createElement("div");
+      pct.className = "disk-free-pct";
+      pct.textContent = `${info.percent_free.toFixed(1)}% of this volume is free`;
+      const barTrack = document.createElement("div");
+      barTrack.className = "disk-bar";
+      const fill = document.createElement("div");
+      fill.className = "disk-bar-fill";
+      const usedPct =
+        info.total_bytes > 0
+          ? (info.used_bytes / info.total_bytes) * 100
+          : 0;
+      fill.style.width = `${Math.min(100, Math.max(0, usedPct))}%`;
+      barTrack.appendChild(fill);
+      body.append(freeBig, pct, barTrack);
+      const rows: Array<[string, string]> = [
+        ["Mount point", info.mount_point],
+        ["Filesystem", info.fstype ?? "—"],
+        ["Device", info.source ?? "—"],
+        ["Total", formatBytes(info.total_bytes)],
+        ["Used", formatBytes(info.used_bytes)],
+        ["Free", formatBytes(info.free_bytes)],
+      ];
+      for (const [k, v] of rows) {
+        const row = document.createElement("div");
+        row.className = "disk-row";
+        const kk = document.createElement("span");
+        kk.className = "disk-key";
+        kk.textContent = k;
+        const vv = document.createElement("span");
+        vv.className = "disk-val";
+        vv.textContent = v;
+        row.append(kk, vv);
+        body.appendChild(row);
+      }
+    } catch (err) {
+      body.textContent = `Could not read disk info: ${err}`;
+    }
+  }
+
   /** Mount an ISO item and open it as a sidebar location. */
   private async mountIsoItem(item: Item): Promise<void> {
     try {
@@ -1866,6 +2158,233 @@ export class Shell {
 
   // ---------------------------------------------------------------- sidebar
 
+  // ------------------------------------------------ favorites (inc-2 item 14)
+
+  /** User-pinned favorites, durable in the backend sidecar prefs
+   * with a localStorage mirror — the same dual-store pattern as the
+   * collapse prefs (localStorage alone lost state in 7.1 QA). */
+  private loadUserFavorites(): { name: string; path: string }[] {
+    const raw = this.uiPrefs["ff-user-favorites"];
+    if (Array.isArray(raw)) {
+      return raw.filter(
+        (f): f is { name: string; path: string } =>
+          !!f &&
+          typeof f === "object" &&
+          typeof (f as { name?: unknown }).name === "string" &&
+          typeof (f as { path?: unknown }).path === "string",
+      );
+    }
+    try {
+      const ls = localStorage.getItem("ff-user-favorites");
+      if (ls) return JSON.parse(ls) as { name: string; path: string }[];
+    } catch {
+      // no mirror — start empty
+    }
+    return [];
+  }
+
+  private saveUserFavorites(favs: { name: string; path: string }[]): void {
+    this.uiPrefs["ff-user-favorites"] = favs;
+    try {
+      localStorage.setItem("ff-user-favorites", JSON.stringify(favs));
+    } catch {
+      // mirror only — the sidecar is the durable copy
+    }
+    void api.setUiPrefs({ ...this.uiPrefs }).catch(() => undefined);
+  }
+
+  /** Built-in favorites the user removed. They stay restorable:
+   * the context-menu entry is state-aware in both directions. */
+  private loadHiddenFavorites(): string[] {
+    const raw = this.uiPrefs["ff-fav-hidden"];
+    if (Array.isArray(raw)) {
+      return raw.filter((x): x is string => typeof x === "string");
+    }
+    try {
+      const ls = localStorage.getItem("ff-fav-hidden");
+      if (ls) return JSON.parse(ls) as string[];
+    } catch {
+      // no mirror — start empty
+    }
+    return [];
+  }
+
+  private saveHiddenFavorites(names: string[]): void {
+    this.uiPrefs["ff-fav-hidden"] = names;
+    try {
+      localStorage.setItem("ff-fav-hidden", JSON.stringify(names));
+    } catch {
+      // mirror only — the sidecar is the durable copy
+    }
+    void api.setUiPrefs({ ...this.uiPrefs }).catch(() => undefined);
+  }
+
+  /** Live favorite state for the item context menu. */
+  private isFavoriteItem(item: Item): boolean {
+    if (!item.provider_key) return false;
+    return this.favoritePathSet.has(normFavPath(item.provider_key));
+  }
+
+  /** Pin a folder to Favorites (shared by the drag door and the
+   * context-menu door). Already-favorite folders never duplicate. */
+  private async addFavoriteFromItem(item: Item): Promise<void> {
+    const path =
+      item.provider_key ??
+      (await api.getItemPath(item.id).catch(() => ""));
+    if (!path) return;
+    const n = normFavPath(path);
+    if (this.favoritePathSet.has(n)) {
+      Toast.success(`“${item.name}” is already in Favorites.`);
+      return;
+    }
+    const builtin = this.builtinFavNames.get(n);
+    if (builtin) {
+      // A built-in the user had removed: pinning restores it.
+      if (this.loadHiddenFavorites().includes(builtin)) {
+        this.saveHiddenFavorites(
+          this.loadHiddenFavorites().filter((h) => h !== builtin),
+        );
+        Toast.success(`Added “${item.name}” to Favorites.`);
+        void this.buildSidebar();
+      }
+      return;
+    }
+    const favs = this.loadUserFavorites();
+    if (!favs.some((f) => normFavPath(f.path) === n)) {
+      favs.push({ name: item.name, path: n });
+      this.saveUserFavorites(favs);
+    }
+    Toast.success(`Added “${item.name}” to Favorites.`);
+    void this.buildSidebar();
+  }
+
+  /** The context menu's Add/Remove door: state read live at open. */
+  private async toggleFavorite(item: Item): Promise<void> {
+    const path =
+      item.provider_key ??
+      (await api.getItemPath(item.id).catch(() => ""));
+    if (!path) return;
+    const n = normFavPath(path);
+    const favs = this.loadUserFavorites();
+    const idx = favs.findIndex((f) => normFavPath(f.path) === n);
+    if (idx >= 0) {
+      favs.splice(idx, 1);
+      this.saveUserFavorites(favs);
+      Toast.success(`Removed “${item.name}” from Favorites.`);
+      void this.buildSidebar();
+      return;
+    }
+    const builtin = this.builtinFavNames.get(n);
+    if (builtin) {
+      const hidden = this.loadHiddenFavorites();
+      if (hidden.includes(builtin)) {
+        this.saveHiddenFavorites(hidden.filter((h) => h !== builtin));
+        Toast.success(`Added “${item.name}” to Favorites.`);
+      } else {
+        this.saveHiddenFavorites([...hidden, builtin]);
+        Toast.success(`Removed “${item.name}” from Favorites.`);
+      }
+      void this.buildSidebar();
+      return;
+    }
+    await this.addFavoriteFromItem(item);
+  }
+
+  private removeUserFavorite(path: string): void {
+    const n = normFavPath(path);
+    this.saveUserFavorites(
+      this.loadUserFavorites().filter((f) => normFavPath(f.path) !== n),
+    );
+    void this.buildSidebar();
+  }
+
+  /** Resolve an arbitrary folder path to a browsable target: the
+   * location whose root contains it, then a segment walk — the
+   * same resolution open-in-new-tab uses. Null when no mounted
+   * location contains the path. */
+  private async resolvePathTarget(
+    path: string,
+  ): Promise<FavoriteTarget | null> {
+    const n = normFavPath(path);
+    for (const loc of this.locations) {
+      const root = await api.getItemPath(loc.root_item).catch(() => "");
+      if (!root) continue;
+      const rn = normFavPath(root);
+      if (n === rn) {
+        return {
+          locationId: loc.id,
+          dirId: loc.root_item,
+          display: loc.display_name,
+        };
+      }
+      const prefix = rn === "/" ? "/" : `${rn}/`;
+      if (!n.startsWith(prefix)) continue;
+      const rel = n.slice(prefix.length).split("/").filter(Boolean);
+      let dirId = loc.root_item;
+      let ok = true;
+      for (const seg of rel) {
+        const kids = await api.listDir(loc.id, dirId).catch(() => null);
+        const kid = kids?.find((k) => k.kind === "folder" && k.name === seg);
+        if (!kid) {
+          ok = false;
+          break;
+        }
+        dirId = kid.id;
+      }
+      if (ok) {
+        return {
+          locationId: loc.id,
+          dirId,
+          display: rel[rel.length - 1] ?? loc.display_name,
+        };
+      }
+    }
+    return null;
+  }
+
+  /** Drop an item onto a user-favorite folder: a journaled Move job
+   * with outcome-fed undo — the same behavior as dropping onto a
+   * built-in favorite. */
+  private async fileDraggedIntoFolder(
+    dragged: Item,
+    target: FavoriteTarget,
+    label: string,
+  ): Promise<void> {
+    try {
+      const dest = await api.getItemPath(target.dirId);
+      if (!dest) return;
+      if (dragged.provider_key && dirname(dragged.provider_key) === dest) {
+        return; // already in this folder
+      }
+      const jobId = await api.startMove([dragged.id], dest);
+      this.trackTransfer(jobId, `Move ${dragged.name}`, async (error) => {
+        if (error) {
+          Toast.error(`Could not move “${dragged.name}”: ${error}`);
+        } else {
+          const outcomes = await this.jobOutcomes(jobId);
+          for (const o of outcomes) {
+            if (!o.result_path) continue;
+            const fromDir = dirname(o.src_path);
+            if (fromDir) {
+              this.undoStack.push({
+                kind: "move",
+                newPath: o.result_path,
+                fromDir,
+                label: dragged.name,
+              });
+            }
+          }
+          Toast.success(`Moved “${dragged.name}” to ${label}. Super+Z to undo.`);
+        }
+        this.quickLook.close();
+        const tab = this.activeTab;
+        if (tab) await this.loadDir(tab);
+      });
+    } catch (err) {
+      Toast.error(`Could not move “${dragged.name}”: ${err}`);
+    }
+  }
+
   private async buildSidebar(): Promise<void> {
     this.favList.innerHTML = "";
     this.sidebarList.innerHTML = "";
@@ -1878,10 +2397,25 @@ export class Shell {
       const i = order.indexOf(n);
       return i < 0 ? 999 : i;
     };
-    const pairs = names
+    const hiddenFavs = this.loadHiddenFavorites();
+    const allPairs = names
       .map((n, i) => ({ name: n, target: targets[i] }))
-      .filter((p) => p.target)
+      .filter((p) => p.target);
+    const pairs = allPairs
+      .filter((p) => !hiddenFavs.includes(p.name))
       .sort((a, b) => orderIdx(a.name) - orderIdx(b.name));
+    // Favorite identity by path (inc-2 item 14): the item context
+    // menu reads its Add/Remove state from these, rebuilt each pass.
+    this.builtinFavNames.clear();
+    this.favoritePathSet.clear();
+    for (const p of allPairs) {
+      const path = await api.getItemPath(p.target!.dirId).catch(() => "");
+      if (path) this.builtinFavNames.set(normFavPath(path), p.name);
+    }
+    for (const p of pairs) {
+      const path = await api.getItemPath(p.target!.dirId).catch(() => "");
+      if (path) this.favoritePathSet.add(normFavPath(path));
+    }
     for (const pair of pairs) {
       const name = pair.name;
       const target = pair.target!;
@@ -1907,6 +2441,26 @@ export class Shell {
             crumbs: [{ dirId: target.dirId, name: target.display }],
           });
         });
+        // Right-click: Disk Properties for the volume behind the
+        // favorite (inc-2 item 12). Trash has no volume of its own.
+        if (name !== "Trash") {
+          b.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            void (async () => {
+              const p = await api
+                .getItemPath(target.dirId)
+                .catch(() => "");
+              if (!p) return;
+              this.ctxMenu.open(e.clientX, e.clientY, [
+                {
+                  label: "Disk Properties…",
+                  action: () => void this.showDiskProperties(name, p),
+                },
+              ]);
+            })();
+          });
+        }
         // Drop target: drag a file here to file it (or trash it).
         b.addEventListener("dragover", (e) => {
           if (dragState.favName) {
@@ -1934,26 +2488,70 @@ export class Shell {
           if (!dragged) return;
           try {
             if (name === "Trash") {
-              const trashName = await api.trashItem(dragged.id);
-              this.undoStack.push({ kind: "trash", trashName, label: dragged.name });
-              Toast.success(`Moved “${dragged.name}” to Trash. Super+Z to undo.`);
+              const jobId = await api.startDelete([dragged.id], true);
+              this.trackTransfer(
+                jobId,
+                `Trash ${dragged.name}`,
+                async (error) => {
+                  if (error) {
+                    Toast.error(
+                      `Could not move “${dragged.name}”: ${error}`,
+                    );
+                  } else {
+                    const outcomes = await this.jobOutcomes(jobId);
+                    this.pushTrashUndo(
+                      outcomes,
+                      new Map([
+                        [dragged.provider_key ?? "", dragged.name],
+                      ]),
+                    );
+                    Toast.success(
+                      `Moved “${dragged.name}” to Trash. Super+Z to undo.`,
+                    );
+                  }
+                  this.quickLook.close();
+                  const tab = this.activeTab;
+                  if (tab) await this.loadDir(tab);
+                },
+              );
             } else {
               const dest = await api.getItemPath(target.dirId);
               if (dragged.provider_key && dirname(dragged.provider_key) === dest) {
                 return; // already in this folder
               }
-              const newPath = await api.moveItemTo(dragged.id, dest);
-              const fromDir = dragged.provider_key
-                ? dirname(dragged.provider_key)
-                : "";
-              if (fromDir) {
-                this.undoStack.push({ kind: "move", newPath, fromDir, label: dragged.name });
-              }
-              Toast.success(`Moved “${dragged.name}” to ${name}. Super+Z to undo.`);
+              const jobId = await api.startMove([dragged.id], dest);
+              this.trackTransfer(
+                jobId,
+                `Move ${dragged.name}`,
+                async (error) => {
+                  if (error) {
+                    Toast.error(
+                      `Could not move “${dragged.name}”: ${error}`,
+                    );
+                  } else {
+                    const outcomes = await this.jobOutcomes(jobId);
+                    for (const o of outcomes) {
+                      if (!o.result_path) continue;
+                      const fromDir = dirname(o.src_path);
+                      if (fromDir) {
+                        this.undoStack.push({
+                          kind: "move",
+                          newPath: o.result_path,
+                          fromDir,
+                          label: dragged.name,
+                        });
+                      }
+                    }
+                    Toast.success(
+                      `Moved “${dragged.name}” to ${name}. Super+Z to undo.`,
+                    );
+                  }
+                  this.quickLook.close();
+                  const tab = this.activeTab;
+                  if (tab) await this.loadDir(tab);
+                },
+              );
             }
-            this.quickLook.close();
-            const tab = this.activeTab;
-            if (tab) await this.loadDir(tab);
           } catch (err) {
             Toast.error(`Could not move “${dragged.name}”: ${err}`);
           }
@@ -2016,6 +2614,56 @@ export class Shell {
       }
       this.favList.appendChild(b);
     }
+    // User-pinned favorites (inc-2 item 14): folders pinned by drag
+    // or by the item context menu. One whose folder can't be resolved
+    // right now (drive not mounted) is OMITTED, never shown disabled
+    // — the same rule as the built-ins above.
+    for (const fav of this.loadUserFavorites()) {
+      const target = await this.resolvePathTarget(fav.path);
+      if (!target) continue;
+      this.favoritePathSet.add(normFavPath(fav.path));
+      const b = document.createElement("button");
+      b.className = "side-item";
+      b.textContent = fav.name;
+      b.title = fav.path;
+      b.addEventListener("click", () => {
+        this.navigateTo({
+          locationId: target.locationId,
+          dirId: target.dirId,
+          crumbs: [{ dirId: target.dirId, name: fav.name }],
+        });
+      });
+      b.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.ctxMenu.open(e.clientX, e.clientY, [
+          {
+            label: "Disk Properties…",
+            action: () => void this.showDiskProperties(fav.name, fav.path),
+          },
+          {
+            label: "Remove from Favorites",
+            action: () => this.removeUserFavorite(fav.path),
+          },
+        ]);
+      });
+      // File-into drop parity with the built-in favorites.
+      b.addEventListener("dragover", (e) => {
+        if (dragState.favName || !dragState.item) return;
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+        b.classList.add("drop-hover");
+      });
+      b.addEventListener("dragleave", () => b.classList.remove("drop-hover"));
+      b.addEventListener("drop", (e) => {
+        e.preventDefault();
+        b.classList.remove("drop-hover");
+        const dragged = dragState.item;
+        if (!dragged || dragState.favName) return;
+        void this.fileDraggedIntoFolder(dragged, target, fav.name);
+      });
+      this.favList.appendChild(b);
+    }
     for (const loc of this.locations) {
       const b = document.createElement("button");
       b.className = "side-item";
@@ -2063,13 +2711,19 @@ export class Shell {
           const rootPath = await api
             .getItemPath(loc.root_item)
             .catch(() => "");
-          const menuItems: MenuItem[] = [
-            {
-              label: "Disk Utility…",
+          const menuItems: MenuItem[] = [];
+          if (rootPath) {
+            menuItems.push({
+              label: "Disk Properties…",
               action: () =>
-                void this.diskDialog.open(rootPath || undefined),
-            },
-          ];
+                void this.showDiskProperties(loc.display_name, rootPath),
+            });
+          }
+          menuItems.push({
+            label: "Disk Utility…",
+            action: () =>
+              void this.diskDialog.open(rootPath || undefined),
+          });
           const home = await this.homePath().catch(() => "");
           if (rootPath && rootPath !== "/" && rootPath !== home) {
             menuItems.push({

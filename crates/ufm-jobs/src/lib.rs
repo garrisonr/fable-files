@@ -27,6 +27,29 @@ pub struct Step {
     pub state: StepState,
     /// Compensating action recorded when the step completes (for undo).
     pub compensation: Option<StepOp>,
+    /// Inc-2: this step is the outcome step for its top-level source —
+    /// its completion means the source fully arrived (move) or is fully
+    /// gone / trashed (delete), so the executor records a `JobOutcome`.
+    /// `serde(default)` keeps inc-1 job snapshots loadable.
+    #[serde(default)]
+    pub outcome: bool,
+    /// Inc-2: the result path to record in the outcome when it cannot be
+    /// derived from the op (decomposed cross-device moves).
+    #[serde(default)]
+    pub outcome_path: Option<String>,
+}
+
+/// Inc-2: the durable, per-source record of what a job actually did —
+/// the undo feed. Lives in the job snapshot so it survives the app
+/// being closed mid-job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobOutcome {
+    pub step_id: String,
+    pub src_path: String,
+    /// Final absolute path for a fully moved source.
+    pub result_path: Option<String>,
+    /// Trash entry name (the `files/` name) for Delete-to-trash steps.
+    pub trash_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +88,10 @@ pub struct Job {
     /// Human-readable effect preview, computed before the first step runs
     /// (spec §6: power features preview their effect and reveal conflicts).
     pub preview: JobPreview,
+    /// Inc-2: per-source outcomes, appended by the executor as outcome
+    /// steps complete. `serde(default)` keeps inc-1 snapshots loadable.
+    #[serde(default)]
+    pub outcomes: Vec<JobOutcome>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +135,7 @@ impl Job {
             created: now_utc(),
             state: JobState::Queued,
             preview,
+            outcomes: Vec::new(),
         }
     }
 
@@ -307,6 +335,8 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             state: StepState::Pending,
             compensation: None,
+            outcome: false,
+            outcome_path: None,
         }
     }
 
@@ -388,5 +418,63 @@ mod tests {
         assert_eq!(restored.steps["s1"].state, StepState::Done);
         assert_eq!(restored.steps["s2"].state, StepState::Pending); // reset
         assert_eq!(restored.steps["s3"].state, StepState::Pending);
+    }
+
+    #[test]
+    fn job_outcomes_default_empty_and_step_outcome_defaults_false() {
+        // Upgrade safety (inc-2 §4.1): a Job built in code has no
+        // outcomes, and an inc-1-era step snapshot — serialized before
+        // the outcome fields existed — still deserializes with the
+        // defaults. Crash recovery loads these from users' catalog DBs.
+        let job = sample_job();
+        assert!(job.outcomes.is_empty());
+
+        let s = step(
+            "sx",
+            StepOp::Delete {
+                target: item("d.txt", ItemKind::File),
+                use_trash: true,
+            },
+            &[],
+        );
+        let mut v = serde_json::to_value(&s).unwrap();
+        v.as_object_mut().unwrap().remove("outcome");
+        v.as_object_mut().unwrap().remove("outcome_path");
+        let back: Step = serde_json::from_value(v).unwrap();
+        assert!(!back.outcome);
+        assert_eq!(back.outcome_path, None);
+
+        let mut jv = serde_json::to_value(&job).unwrap();
+        jv.as_object_mut().unwrap().remove("outcomes");
+        let jback: Job = serde_json::from_value(jv).unwrap();
+        assert!(jback.outcomes.is_empty());
+    }
+
+    #[test]
+    fn replay_resets_running_delete_step() {
+        // Inc-2 §4.2: the replay contract (Running -> Pending) covers
+        // the new Delete op exactly like Copy.
+        let mk = || {
+            step(
+                "s1",
+                StepOp::Delete {
+                    target: item("gone.txt", ItemKind::File),
+                    use_trash: true,
+                },
+                &[],
+            )
+        };
+        let mut job = Job::new("del", JobPreview::default());
+        job.add_step(mk());
+        let id = job.id;
+        let mut journal = JobJournal::new();
+        journal.record(id, "s1", StepState::Pending, StepState::Running);
+        // "Crash" here: the delete was Running, never journaled Done.
+        let replayed = JobJournal::from_entries(journal.entries().to_vec());
+        let mut restored = Job::new("del", JobPreview::default());
+        restored.id = id;
+        restored.add_step(mk());
+        replayed.replay_into(&mut restored);
+        assert_eq!(restored.steps["s1"].state, StepState::Pending);
     }
 }

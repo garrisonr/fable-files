@@ -80,6 +80,16 @@ export class SearchView {
   /** Set by runExternal so run() can tell a smart-folder invocation
    * (keep titleHint) from a hand-typed search (clear titleHint). */
   private externalRun = false;
+  /** Indexing state mirrored from the shell's IndexTracker (inc-2
+   * item 13): while the index is incomplete, results are partial
+   * and must SAY so — a bare "No results" during indexing is a lie
+   * by omission. */
+  private indexingBusy = false;
+  private indexingFiles: number | null = null;
+  private bannerEl!: HTMLDivElement;
+  /** The last typed-search render, so the empty-state copy can be
+   * rephrased the moment indexing state flips. */
+  private lastResults: { q: string; hits: SearchHit[] } | null = null;
 
   constructor(private hooks: SearchHooks) {
     this.el = document.createElement("div");
@@ -158,6 +168,14 @@ export class SearchView {
     beforeWrap.appendChild(this.beforeInput);
     this.filtersEl.append(scopeWrap, afterWrap, beforeWrap);
     this.el.appendChild(this.filtersEl);
+
+    // Indexing banner (inc-2 item 13): a sibling of the results
+    // wrap — the render methods wipe resultsEl, the banner must
+    // survive them. Hidden unless indexing is active.
+    this.bannerEl = document.createElement("div");
+    this.bannerEl.className = "search-indexing-banner";
+    this.bannerEl.hidden = true;
+    this.el.appendChild(this.bannerEl);
 
     this.resultsEl = document.createElement("div");
     this.resultsEl.className = "search-results-wrap";
@@ -250,6 +268,29 @@ export class SearchView {
     return true;
   }
 
+  /** Indexing state from the shell's IndexTracker (inc-2 item 13).
+   * The banner updates live (count ticks, no list rebuild); when the
+   * busy flag flips while an EMPTY result is on screen, the results
+   * re-render so the empty-state copy matches reality ("No matches
+   * yet — still indexing…" vs the final "No results"). */
+  setIndexingState(busy: boolean, files: number | null): void {
+    const flipped = busy !== this.indexingBusy;
+    this.indexingBusy = busy;
+    if (files !== null) this.indexingFiles = files;
+    if (!busy) this.indexingFiles = null;
+    this.bannerEl.hidden = !busy;
+    if (busy) {
+      this.bannerEl.textContent =
+        `⏳ Still indexing… results may be incomplete` +
+        (this.indexingFiles !== null
+          ? ` · ${this.indexingFiles.toLocaleString()} files indexed so far`
+          : "");
+    }
+    if (flipped && this.active && this.lastResults && this.lastResults.hits.length === 0) {
+      this.renderResults(this.lastResults.q, this.lastResults.hits);
+    }
+  }
+
   /** Re-run the current query (e.g. after trashing hits from it). */
   refresh(): void {
     if (!this.active) return;
@@ -330,6 +371,7 @@ export class SearchView {
     this.beforeInput.value = "";
     this.active = false;
     this.titleHint = null;
+    this.lastResults = null;
     this.el.hidden = true;
     this.resultsEl.innerHTML = "";
     this.hooks.onClear();
@@ -523,6 +565,7 @@ export class SearchView {
 
   private renderResults(q: string, hits: SearchHit[]): void {
     this.hits = hits;
+    this.lastResults = { q, hits };
     this.selected.clear();
     this.anchor = -1;
     this.resultsEl.innerHTML = "";
@@ -530,9 +573,15 @@ export class SearchView {
     this.resultsEl.appendChild(
       this.resultsHeader(
         hits.length === 0
-          ? q
-            ? `No results for “${q}”.`
-            : `No ${typeLabel ?? "files"} found.`
+          ? this.indexingBusy
+            ? // Inc-2 item 13: never state a final "No results"
+              // while the index is still being built.
+              q
+              ? `No matches yet for “${q}” — still indexing…`
+              : `No ${typeLabel ?? "files"} found yet — still indexing…`
+            : q
+              ? `No results for “${q}”.`
+              : `No ${typeLabel ?? "files"} found.`
           : q
             ? `${hits.length} result${hits.length === 1 ? "" : "s"} for “${q}”.`
             : `${hits.length} ${typeLabel ?? "files"}${hits.length === 50 ? " (first 50)" : ""}.`,

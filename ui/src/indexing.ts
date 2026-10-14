@@ -34,6 +34,13 @@ export class IndexTracker {
     private onComplete?: () => void,
   ) {}
 
+  /** Secondary observer (inc-2 item 13): the search view mirrors
+   * indexing state in its results area so partial results never
+   * read as final. Called on every state change with the busy flag
+   * and the live files-indexed count (null when idle). Same source
+   * of truth as the status bar — this tracker. */
+  onObserve: ((busy: boolean, files: number | null) => void) | null = null;
+
   async boot(locationIds: string[]): Promise<void> {
     if (locationIds.length === 0) return;
     await this.reindexAll(locationIds);
@@ -45,6 +52,9 @@ export class IndexTracker {
       if (!this.queue.includes(id)) this.queue.push(id);
     }
     if (this.queue.length === 0) return;
+    // Immediate busy signal (the ↻ button lives in the search view;
+    // its banner should react on click, not on the first poll).
+    this.onObserve?.(true, null);
     await this.ensureWatching();
     await this.startNext();
   }
@@ -105,11 +115,13 @@ export class IndexTracker {
       const more =
         this.queue.length > 1 ? ` (${this.queue.length} locations)` : "";
       this.onStatus(`Indexing… ${files} files${more}`);
+      this.onObserve?.(true, s.files_done);
       return;
     }
     // Not running: either the head finished or nothing has started yet.
     if (this.queue.length === 0) {
       this.onStatus(null);
+      this.onObserve?.(false, null);
       this.stopWatching();
       return;
     }
@@ -127,6 +139,7 @@ export class IndexTracker {
     }
     // Queue drained: the whole pass is complete.
     this.onStatus(null);
+    this.onObserve?.(false, null);
     this.stopWatching();
     this.onComplete?.();
   }

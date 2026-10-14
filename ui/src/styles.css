@@ -432,7 +432,14 @@ th[data-sort]:focus-visible {
   border-radius: calc(var(--ufm-radius-md) / 2);
   cursor: pointer;
   padding: 0.125rem 0.375rem;
-  font-size: 0.75rem;
+  font-size: 0.875rem;
+  /* inc-2 item 10: same minimum-target treatment as the nav arrows —
+     the hit target is generous even though the glyph stays small. */
+  min-width: 2rem;
+  min-height: 2rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .tab-close:hover {
@@ -446,6 +453,12 @@ th[data-sort]:focus-visible {
 
 .tab-add {
   flex: 0 0 auto;
+  /* inc-2 item 10: explicit 2rem minimum target + a readable glyph
+     (it is an .icon-btn, but the tab strip states it plainly). */
+  min-width: 2rem;
+  min-height: 2rem;
+  font-size: 1rem;
+  color: var(--ufm-text);
 }
 
 /* ---------------------------------------------------------------- viewport */
@@ -1350,6 +1363,25 @@ body[data-layout="tv"] .cell-icon {
   padding: 6px 12px;
 }
 
+/* Navigation arrows (inc-2 item 10, accessibility): full 2rem x 2rem
+   targets and a full-strength glyph when enabled — the toolbar
+   override above shrank them to dim 14px ghosts. Dimming is reserved
+   for the genuinely disabled state. */
+.nav-buttons .nav-btn {
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  font-size: 1.0625rem;
+  font-weight: 600;
+  color: var(--ufm-text);
+  opacity: 1;
+}
+
+.nav-buttons .nav-btn:disabled {
+  color: var(--ufm-text-muted);
+  opacity: 0.4;
+}
+
 .toolbar .crumb-bar {
   font-size: 14px;
 }
@@ -1397,6 +1429,16 @@ body[data-layout="tv"] .cell-icon {
 }
 
 .side-item.drop-hover {
+  background: var(--ufm-accent, #0a84ff);
+  color: #fff;
+  border-radius: var(--ufm-radius-md);
+  transition: background 120ms ease;
+}
+
+/* Favorites section as a drop door (inc-2 item 14): dragging a
+   folder over the header or the list background highlights both. */
+.side-head.drop-hover,
+.side-list.drop-hover {
   background: var(--ufm-accent, #0a84ff);
   color: #fff;
   border-radius: var(--ufm-radius-md);
@@ -2011,6 +2053,23 @@ body[data-layout="tv"] .cell-icon {
 .confirm-card h3 { margin: 0 0 0.5rem; font-size: 1rem; overflow-wrap: anywhere; }
 .confirm-card p { margin: 0 0 0.75rem; font-size: 0.875rem; color: var(--ufm-text-muted); }
 .confirm-actions { display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 0.75rem; }
+/* Disk Properties dialog (inc-2 item 12): free space is the headline,
+   capacity bar in the house tokens. */
+.disk-card { min-width: 20rem; }
+.disk-free-big { font-size: 1.375rem; font-weight: 650; margin-top: 0.25rem; }
+.disk-free-pct { color: var(--ufm-text-muted); font-size: 0.8125rem; margin-bottom: 0.6rem; }
+.disk-bar {
+  height: 0.5rem; border-radius: 999px; overflow: hidden;
+  background: color-mix(in srgb, var(--ufm-text) 12%, transparent);
+  margin-bottom: 0.75rem;
+}
+.disk-bar-fill { height: 100%; background: var(--ufm-accent); border-radius: 999px; }
+.disk-row {
+  display: flex; justify-content: space-between; gap: 1rem;
+  padding: 0.2rem 0; font-size: 0.8125rem;
+}
+.disk-key { color: var(--ufm-text-muted); }
+.disk-val { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; text-align: right; }
 .confirm-cancel, .confirm-ok {
   appearance: none; border-radius: 999px; padding: 0.4rem 0.9rem;
   font-size: 0.8125rem; font-weight: 600; cursor: pointer;
@@ -2236,14 +2295,31 @@ tr.row[style*="--label-color"] {
 }
 .vp-btn:hover { background: rgb(255 255 255 / 0.28); }
 .vp-seek { flex: 1; accent-color: var(--ufm-accent, #f5c518); cursor: pointer; min-height: 2rem; }
-.vp-transcode-btn {
-  background: var(--ufm-accent, #f5c518); color: #16130a; font-weight: 600;
-  border-radius: 999px; padding: 0.45rem 1rem; margin-top: 0.75rem;
-}
-.vp-transcode-btn:hover { background: var(--ufm-accent, #f5c518); filter: brightness(1.08); }
 .vp-time { color: #fff; font-size: 0.75rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .vp-fallback {
   color: #eee; padding: 2rem 1.25rem; text-align: center; font-size: 0.9rem; line-height: 1.5;
+}
+/* Automatic transcode fallback (inc-2 item 8): a subtle loading
+   overlay while the stream spins up — feedback without nagging.
+   The old notice card + "Transcode & Play" button are gone. */
+.vp-loading {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 0.6rem; pointer-events: none;
+}
+.vp-loading-spinner {
+  width: 1.5rem; height: 1.5rem; border-radius: 50%;
+  border: 2px solid rgb(255 255 255 / 0.25);
+  border-top-color: #fff;
+  animation: vp-spin 0.9s linear infinite;
+}
+.vp-loading-caption { color: rgb(255 255 255 / 0.75); font-size: 0.75rem; }
+@keyframes vp-spin { to { transform: rotate(360deg); } }
+/* Quiet single-line inline error, shown only when even the
+   transcode stream cannot play (inc-2 item 8). */
+.vp-note {
+  color: var(--ufm-text-muted); padding: 1rem 1.25rem; text-align: center;
+  font-size: 0.8125rem; line-height: 1.4;
 }
 .ql-detached {
   display: flex; flex-direction: column; align-items: center; gap: 0.6rem;
@@ -2252,11 +2328,22 @@ tr.row[style*="--label-color"] {
 .ql-cast { font-size: 0.95rem; }
 /* Quick Look audio player (Round 7.1) */
 .ql-audio { display: flex; flex-direction: column; gap: 0.6rem; margin-bottom: 0.85rem; }
+/* Artist · Album subline under the Quick Look headline (inc-2 item 9). */
+.ql-sub { color: var(--ufm-text-muted); font-size: 0.85rem; margin: 0.1rem 0 0.5rem; }
 .ql-audio-art { width: 100%; border-radius: 12px; }
 .ql-audio-glyph { font-size: 3rem; text-align: center; padding: 1.1rem 0 0.3rem; }
 .ql-audio-player { width: 100%; height: 2rem; }
 /* Search / smart-folder results header row (Round 7.1) */
 .search-head-row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+/* Indexing banner in the search results area (inc-2 item 13):
+   partial results must never read as final. */
+.search-indexing-banner {
+  margin: 0 0 0.5rem; padding: 0.45rem 0.75rem;
+  border-radius: var(--ufm-radius-md);
+  background: color-mix(in srgb, var(--ufm-accent) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ufm-accent) 40%, transparent);
+  color: var(--ufm-text); font-size: 0.8125rem; font-weight: 550;
+}
 .search-head-row .search-status { margin: 0; }
 
 /* ——— terminal panel ——— */
@@ -2294,6 +2381,7 @@ tr.row[style*="--label-color"] {
 .jobs-head { font-size: 0.75rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ufm-text-muted); margin-bottom: 0.4rem; }
 .jobs-list { display: flex; flex-direction: column; gap: 0.5rem; }
 .job-row { display: grid; grid-template-columns: 1fr auto auto; gap: 0.25rem 0.5rem; align-items: center; }
+.job-row-xfer { grid-template-columns: 1fr auto auto auto; }
 .job-name { font-size: 0.8125rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; grid-column: 1 / -1; }
 .job-track { height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--ufm-text) 14%, transparent); overflow: hidden; }
 .job-bar { height: 100%; width: 0%; background: var(--ufm-accent); border-radius: 3px; transition: width 200ms ease; }
@@ -2456,6 +2544,8 @@ tr.row[style*="--label-color"] {
   .meta-dialog, .burn-dialog, .cloud-dialog, .cast-dialog,
   .deleter-dialog, .tools-dialog, .picker-card, .confirm-card { animation: none; }
   .vp-bar, .job-bar, .pill-btn { transition: none; }
+  /* Reduced motion: the loading spinner crawls rather than spins. */
+  .vp-loading-spinner { animation-duration: 2.4s; }
 }
 /* ============================================================
    ROUND 5 — Disk Utility + Print

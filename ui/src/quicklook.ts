@@ -23,6 +23,7 @@ import {
 } from "./api";
 import { onPlayerClosed } from "./api";
 import { VideoPlayer, isVideoName } from "./video";
+import { audioTags, folderArtUrl } from "./audiometa";
 import { fadeTo, reducedMotion, springTo } from "./motion";
 
 const FALLBACK_PANEL_WIDTH = 340;
@@ -310,16 +311,40 @@ export class QuickLook {
         });
         void (async () => {
           try {
-            const url = await api.getThumbnail(item.id, item.provider_key, true);
+            // Art order (7.1 design, inc-2 item 9): folder art FIRST
+            // via the Music Player's shared lookup, then the
+            // thumbnailer's embedded cover art. This branch used to
+            // skip folder art entirely and showed the bare glyph
+            // for folders that thumbnail fine in the grid.
+            const folder = apath.slice(0, apath.lastIndexOf("/"));
+            const furl = folder ? await folderArtUrl(item, folder) : null;
+            const url =
+              furl ??
+              (await api.getThumbnail(item.id, item.provider_key, true));
             if (url) {
               art.src = url;
               art.hidden = false;
               glyph.hidden = true;
             }
           } catch {
-            // no embedded art — the glyph stays
+            // no art anywhere — the glyph stays
           }
         })();
+        // Headline + subline from embedded tags (inc-2 item 9): the
+        // Title tag headlines, Artist · Album sits beneath; the
+        // filename remains only as the no-tags fallback.
+        void audioTags(item).then((tags) => {
+          if (tags.title) name.textContent = tags.title;
+          const sub = [tags.artist, tags.album]
+            .filter((s): s is string => !!s)
+            .join(" · ");
+          if (sub) {
+            const subEl = document.createElement("div");
+            subEl.className = "ql-sub";
+            subEl.textContent = sub;
+            name.after(subEl);
+          }
+        });
       }
       const imgExts = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff", "ico"];
       if (imgExts.includes(ext)) {

@@ -507,6 +507,15 @@ export class DuplicatesDialog {
   private rootPath = "";
   private checks = new Map<string, HTMLInputElement>();
   onDone: (() => void) | null = null;
+  /** Set by the shell (inc-2 §3.4): route a started job to the
+   * JobsPanel with a completion continuation. */
+  onTrackJob:
+    | ((
+        jobId: string,
+        label: string,
+        onDone: (error: string | null) => Promise<void>,
+      ) => void)
+    | null = null;
 
   constructor() {
     const { overlay, dialog } = baseDialog("tools-dialog wide", "Duplicate Finder");
@@ -609,17 +618,34 @@ export class DuplicatesDialog {
       Toast.error("No copies checked.");
       return;
     }
-    let done = 0;
-    for (const p of chosen) {
-      try {
-        await api.trashFilePath(p);
-        done++;
-      } catch {
-        // keep going; count tells the story
+    // Inc-2 §3.4: ONE delete job for the whole selection (pausable /
+    // cancellable like every other transfer) instead of per-path
+    // trashFilePath calls. Bonus fix: the job executor writes the
+    // .trashinfo Path= RAW, so these items now restore to the right
+    // place via untrash (trash_path_internal URL-encoded it — §7.4).
+    try {
+      const jobId = await api.startDeleteFromPaths(chosen, true);
+      const count = chosen.length;
+      if (this.onTrackJob) {
+        this.onTrackJob(jobId, `Trash ${count} duplicates`, async (error) => {
+          if (error) {
+            Toast.error(`Could not trash duplicates: ${error}`);
+          } else {
+            Toast.success(
+              `Trashed ${count} duplicate cop${count === 1 ? "y" : "ies"}.`,
+            );
+          }
+          this.onDone?.();
+          await this.find();
+        });
+      } else {
+        Toast.success(
+          `Trashing ${count} duplicate cop${count === 1 ? "y" : "ies"}…`,
+        );
+        this.onDone?.();
       }
+    } catch (err) {
+      Toast.error(`Could not trash duplicates: ${err}`);
     }
-    Toast.success(`Trashed ${done} duplicate cop${done === 1 ? "y" : "ies"}.`);
-    this.onDone?.();
-    await this.find();
   }
 }

@@ -216,6 +216,99 @@ fn volume_uuid(seed: &str) -> uuid::Uuid {
     uuid::Uuid::from_bytes(bytes)
 }
 
+/// Disk space for the volume backing a path (inc-2 item 12: sidebar
+/// "Disk Properties…"). Byte counts come from statvfs — the same
+/// source `df` reports — so the dialog can be checked against df:
+/// free_bytes is f_bavail (what an unprivileged user can actually
+/// write), used_bytes mirrors df's Used ((f_blocks - f_bfree) blocks).
+/// Mount point / source / fstype come from findmnt --target, the
+/// tool the Disk Utility layer already shells out to.
+#[derive(serde::Serialize)]
+pub struct DiskSpaceInfo {
+    pub path: String,
+    pub mount_point: String,
+    pub source: Option<String>,
+    pub fstype: Option<String>,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub percent_free: f64,
+}
+
+fn statvfs_totals(path: &str) -> std::result::Result<(u64, u64, u64), String> {
+    let cpath = std::ffi::CString::new(path)
+        .map_err(|_| "path contains a NUL byte".to_string())?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut st) };
+    if rc != 0 {
+        return Err(format!(
+            "statvfs {path}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let fr = st.f_frsize as u64;
+    let total = (st.f_blocks as u64).saturating_mul(fr);
+    let free_all = (st.f_bfree as u64).saturating_mul(fr);
+    let avail = (st.f_bavail as u64).saturating_mul(fr);
+    Ok((total, total.saturating_sub(free_all), avail))
+}
+
+#[tauri::command]
+pub async fn get_disk_info(path: String) -> Cmd<DiskSpaceInfo> {
+    let info = tauri::async_runtime::spawn_blocking(move || {
+        let (total, used, free) = statvfs_totals(&path)?;
+        // findmnt resolves the mount that actually contains the path.
+        // TARGET goes last in the column list so a mount point with
+        // spaces ("Desk SSD") survives the split intact.
+        let (mut source, mut fstype, mut mount_point) =
+            (None, None, path.clone());
+        if let Ok(out) = std::process::Command::new("findmnt")
+            .args(["-no", "SOURCE,FSTYPE,TARGET", "--target"])
+            .arg(&path)
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let line = text.lines().next().unwrap_or("").trim_end();
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            if toks.len() >= 3 {
+                source = Some(toks[0].to_string());
+                fstype = Some(toks[1].to_string());
+                // Re-join the tail: the target may contain spaces.
+                let head = format!("{} {}", toks[0], toks[1]);
+                if let Some(rest) = line
+                    .trim_start()
+                    .strip_prefix(&head)
+                    .map(|r| r.trim_start())
+                {
+                    if !rest.is_empty() {
+                        mount_point = rest.to_string();
+                    }
+                }
+            }
+        }
+        let denom = used.saturating_add(free);
+        let percent_free = if denom > 0 {
+            (free as f64 / denom as f64) * 100.0
+        } else {
+            0.0
+        };
+        Ok::<DiskSpaceInfo, String>(DiskSpaceInfo {
+            path,
+            mount_point,
+            source,
+            fstype,
+            total_bytes: total,
+            used_bytes: used,
+            free_bytes: free,
+            percent_free,
+        })
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("disk info task failed: {e}"))))?
+    .map_err(|e: String| CommandError::from(UfmError::Internal(e)))?;
+    Ok(info)
+}
+
 #[tauri::command]
 pub async fn list_locations(state: State<'_, AppState>) -> Cmd<Vec<LocationSummary>> {
     let volumes = tauri::async_runtime::spawn_blocking(enumerate_mounted_volumes)
@@ -542,8 +635,12 @@ fn job_state_name(state: ufm_jobs::JobState) -> &'static str {
     }
 }
 
-/// Bytes attributable to finished copy steps (Done or verify-Skipped).
+/// Bytes attributable to finished steps (Done or verify-Skipped).
 /// Recomputed from the snapshot so progress survives pause/resume.
+/// Inc-2 (§2.5): Move/Delete steps count too — rename moves carry the
+/// walked tree total on their src Item, permanent deletes carry
+/// per-file sizes, and a trash step's target carries the walked total,
+/// so move/delete progress bars advance instead of sitting at 0.
 fn job_bytes_done(job: &ufm_jobs::Job) -> u64 {
     job.steps
         .values()
@@ -555,6 +652,8 @@ fn job_bytes_done(job: &ufm_jobs::Job) -> u64 {
         })
         .filter_map(|s| match &s.op {
             ufm_jobs::StepOp::Copy { src, .. } => src.size_bytes,
+            ufm_jobs::StepOp::Move { src, .. } => src.size_bytes,
+            ufm_jobs::StepOp::Delete { target, .. } => target.size_bytes,
             _ => None,
         })
         .sum()
@@ -686,6 +785,8 @@ impl CopyPlanner {
             depends_on: depends_on.into_iter().collect(),
             state: ufm_jobs::StepState::Pending,
             compensation: None,
+            outcome: false,
+            outcome_path: None,
         });
         id
     }
@@ -723,6 +824,8 @@ impl CopyPlanner {
             depends_on: vec![],
             state: ufm_jobs::StepState::Pending,
             compensation: None,
+            outcome: false,
+            outcome_path: None,
         });
         let mut deps = vec![verify_id];
         if let Some(m) = mkdir_dep {
@@ -746,6 +849,8 @@ impl CopyPlanner {
             depends_on: deps,
             state: ufm_jobs::StepState::Pending,
             compensation: None,
+            outcome: false,
+            outcome_path: None,
         });
         self.job.preview.files_affected += 1;
         self.job.preview.bytes_to_move += size;
@@ -808,27 +913,42 @@ fn build_copy_job(state: &AppState, req: &CopyRequest) -> Cmd<ufm_jobs::Job> {
         }
         (dst_dir, locs.get(&req.dst_parent).copied(), srcs)
     };
+    let location = dst_location.unwrap_or_default();
+    plan_copy_job_paths(&src_paths, &dst_dir, location)
+}
+
+/// The paths-based copy core (inc-2 §2.3): `build_copy_job` resolves
+/// ids and delegates here; `start_copy_from_paths` calls it directly.
+fn plan_copy_job_paths(
+    srcs: &[PathBuf],
+    dst_dir: &Path,
+    location: LocationId,
+) -> Cmd<ufm_jobs::Job> {
+    if srcs.is_empty() {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "nothing to copy".into(),
+        )));
+    }
     if !dst_dir.is_dir() {
         return Err(CommandError::from(UfmError::InvalidInput(
             "destination is not a folder".into(),
         )));
     }
-    let location = dst_location.unwrap_or_default();
-    let title = if src_paths.len() == 1 {
-        let name = src_paths[0]
+    let title = if srcs.len() == 1 {
+        let name = srcs[0]
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "item".into());
         format!("Copy {name}")
     } else {
-        format!("Copy {} items", src_paths.len())
+        format!("Copy {} items", srcs.len())
     };
     let mut planner = CopyPlanner {
         job: ufm_jobs::Job::new(title, ufm_jobs::JobPreview::default()),
         seq: 0,
         location,
     };
-    for src_path in &src_paths {
+    for src_path in srcs {
         let meta = std::fs::metadata(src_path).map_err(|e| {
             CommandError::from(UfmError::Internal(format!(
                 "source {}: {e}",
@@ -843,20 +963,616 @@ fn build_copy_job(state: &AppState, req: &CopyRequest) -> Cmd<ufm_jobs::Job> {
             })?;
         if meta.is_dir() {
             let resolved =
-                resolve_dest_name(&dst_dir, &name, &mut planner.job.preview);
-            let mid = planner.add_mkdir(&dst_dir, &resolved, None);
+                resolve_dest_name(dst_dir, &name, &mut planner.job.preview);
+            let mid = planner.add_mkdir(dst_dir, &resolved, None);
             planner.plan_dir(src_path, &dst_dir.join(&resolved), Some(mid))?;
         } else {
             let resolved =
-                resolve_dest_name(&dst_dir, &name, &mut planner.job.preview);
-            planner.add_file(src_path, &dst_dir, &resolved, meta.len(), None);
+                resolve_dest_name(dst_dir, &name, &mut planner.job.preview);
+            planner.add_file(src_path, dst_dir, &resolved, meta.len(), None);
         }
     }
     Ok(planner.job)
 }
 
+/// Same-device test for move planning (inc-2 §2.3): `rename(2)`
+/// succeeds iff both paths share an `st_dev` (btrfs subvolumes report
+/// distinct `st_dev` and cross-subvolume rename returns EXDEV, so the
+/// check agrees with reality there too). Any metadata error → false
+/// (decompose — the safe direction).
+fn same_device(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev(),
+        _ => false,
+    }
+}
+
+/// Metadata-only walk: (file count, total bytes). Symlinks are leaves
+/// — never followed — matching the planners' kind rule (§2.3).
+fn walk_totals(path: &Path) -> (u64, u64) {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return (0, 0),
+    };
+    if !meta.is_dir() {
+        return (1, meta.len());
+    }
+    let mut files = 0;
+    let mut bytes = 0;
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for entry in rd.flatten() {
+            let (f, b) = walk_totals(&entry.path());
+            files += f;
+            bytes += b;
+        }
+    }
+    (files, bytes)
+}
+
+/// Planner for move/delete jobs (inc-2 §2.3): a sibling of
+/// `CopyPlanner` — which stays untouched, shipped behavior — reusing
+/// the same helpers and deterministic `s{:04}` step ids.
+struct PathPlanner {
+    job: ufm_jobs::Job,
+    seq: u32,
+    location: LocationId,
+}
+
+impl PathPlanner {
+    fn next_id(&mut self) -> String {
+        self.seq += 1;
+        format!("s{:04}", self.seq)
+    }
+
+    fn add_step(
+        &mut self,
+        label: String,
+        op: ufm_jobs::StepOp,
+        depends_on: Vec<String>,
+        outcome: bool,
+        outcome_path: Option<String>,
+    ) -> String {
+        let id = self.next_id();
+        self.job.add_step(ufm_jobs::Step {
+            id: id.clone(),
+            label,
+            op,
+            depends_on,
+            state: ufm_jobs::StepState::Pending,
+            compensation: None,
+            outcome,
+            outcome_path,
+        });
+        id
+    }
+
+    fn add_mkdir(
+        &mut self,
+        parent: &Path,
+        name: &str,
+        depends_on: Option<String>,
+    ) -> String {
+        self.add_step(
+            format!("create folder {name}"),
+            ufm_jobs::StepOp::Mkdir {
+                parent: job_item(
+                    ItemId::new(),
+                    self.location,
+                    parent,
+                    ItemKind::Folder,
+                    None,
+                ),
+                name: name.to_string(),
+            },
+            depends_on.into_iter().collect(),
+            false,
+            None,
+        )
+    }
+
+    /// VerifyCopy → Copy → source Delete for one file of a
+    /// cross-device move. The Delete depends only on its Copy —
+    /// **a source is deleted only after its copy is journaled
+    /// Done/Skipped** (the §2.4 invariant; if the Copy was
+    /// verify-Skipped, the bytes are provably at the destination and
+    /// the Delete still runs; if the Copy Failed, `run_job` stops the
+    /// job before any dependent Delete executes). A crash anywhere in
+    /// here leaves duplicates (src + dst), never loss.
+    /// Returns (verify_id, copy_id, delete_id).
+    fn add_move_file(
+        &mut self,
+        src_path: &Path,
+        dst_dir: &Path,
+        new_name: &str,
+        size: u64,
+        mkdir_dep: Option<String>,
+    ) -> (String, String, String) {
+        let src_item = job_item(
+            ItemId::new(),
+            self.location,
+            src_path,
+            ItemKind::File,
+            Some(size),
+        );
+        let dst_item = job_item(
+            ItemId::new(),
+            self.location,
+            &dst_dir.join(new_name),
+            ItemKind::File,
+            Some(size),
+        );
+        let verify_id = self.add_step(
+            format!("verify {}", src_path.display()),
+            ufm_jobs::StepOp::VerifyCopy {
+                src: src_item.clone(),
+                dst: dst_item,
+            },
+            vec![],
+            false,
+            None,
+        );
+        let mut deps = vec![verify_id.clone()];
+        if let Some(m) = mkdir_dep {
+            deps.push(m);
+        }
+        let copy_id = self.add_step(
+            format!("copy {}", src_path.display()),
+            ufm_jobs::StepOp::Copy {
+                src: src_item.clone(),
+                dst_parent: job_item(
+                    ItemId::new(),
+                    self.location,
+                    dst_dir,
+                    ItemKind::Folder,
+                    None,
+                ),
+                new_name: new_name.to_string(),
+            },
+            deps,
+            false,
+            None,
+        );
+        let delete_id = self.add_step(
+            format!("remove {}", src_path.display()),
+            ufm_jobs::StepOp::Delete {
+                target: src_item,
+                use_trash: false,
+            },
+            vec![copy_id.clone()],
+            false,
+            None,
+        );
+        self.job.preview.files_affected += 1;
+        self.job.preview.bytes_to_move += size;
+        (verify_id, copy_id, delete_id)
+    }
+
+    /// Plan the contents of `src_dir` into `dst_dir` (created by
+    /// `mkdir_dep`'s step) for a cross-device move. Returns every step
+    /// id created in this subtree so the source dir's own Delete can
+    /// depend on all of them — directories are removed deepest-first
+    /// and always empty when their turn comes.
+    fn plan_move_dir(
+        &mut self,
+        src_dir: &Path,
+        dst_dir: &Path,
+        mkdir_dep: &str,
+    ) -> Cmd<Vec<String>> {
+        let io_err =
+            |e: std::io::Error| CommandError::from(UfmError::Internal(e.to_string()));
+        let mut entries: Vec<std::fs::DirEntry> = Vec::new();
+        for entry in std::fs::read_dir(src_dir).map_err(io_err)? {
+            entries.push(entry.map_err(io_err)?);
+        }
+        entries.sort_by_key(|e| e.file_name());
+        let mut ids = Vec::new();
+        for entry in entries {
+            let ty = entry.file_type().map_err(io_err)?;
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if ty.is_dir() {
+                let child_mkdir =
+                    self.add_mkdir(dst_dir, &name, Some(mkdir_dep.to_string()));
+                let mut entry_ids = vec![child_mkdir.clone()];
+                let mut sub =
+                    self.plan_move_dir(&path, &dst_dir.join(&name), &child_mkdir)?;
+                entry_ids.append(&mut sub);
+                let del = self.add_step(
+                    format!("remove {}", path.display()),
+                    ufm_jobs::StepOp::Delete {
+                        target: job_item(
+                            ItemId::new(),
+                            self.location,
+                            &path,
+                            ItemKind::Folder,
+                            Some(0),
+                        ),
+                        use_trash: false,
+                    },
+                    entry_ids.clone(),
+                    false,
+                    None,
+                );
+                entry_ids.push(del);
+                ids.extend(entry_ids);
+            } else {
+                // DirEntry::metadata follows symlinks — parity with
+                // CopyPlanner (copies read through links).
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let (verify_id, copy_id, delete_id) = self.add_move_file(
+                    &path,
+                    dst_dir,
+                    &name,
+                    size,
+                    Some(mkdir_dep.to_string()),
+                );
+                ids.extend([verify_id, copy_id, delete_id]);
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Plan a permanent-delete walk for the contents of `src_dir`:
+    /// one Delete per file, one per subdirectory (depending on
+    /// everything inside it). Returns every Delete id in the subtree.
+    fn plan_delete_dir(&mut self, src_dir: &Path) -> Cmd<Vec<String>> {
+        let io_err =
+            |e: std::io::Error| CommandError::from(UfmError::Internal(e.to_string()));
+        let mut entries: Vec<std::fs::DirEntry> = Vec::new();
+        for entry in std::fs::read_dir(src_dir).map_err(io_err)? {
+            entries.push(entry.map_err(io_err)?);
+        }
+        entries.sort_by_key(|e| e.file_name());
+        let mut ids = Vec::new();
+        for entry in entries {
+            let ty = entry.file_type().map_err(io_err)?;
+            let path = entry.path();
+            if ty.is_dir() {
+                let mut sub = self.plan_delete_dir(&path)?;
+                let del = self.add_step(
+                    format!("remove {}", path.display()),
+                    ufm_jobs::StepOp::Delete {
+                        target: job_item(
+                            ItemId::new(),
+                            self.location,
+                            &path,
+                            ItemKind::Folder,
+                            Some(0),
+                        ),
+                        use_trash: false,
+                    },
+                    sub.clone(),
+                    false,
+                    None,
+                );
+                sub.push(del);
+                ids.extend(sub);
+            } else {
+                // Leaf (file or symlink — links are never walked).
+                let size =
+                    std::fs::symlink_metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let del = self.add_step(
+                    format!("delete {}", path.display()),
+                    ufm_jobs::StepOp::Delete {
+                        target: job_item(
+                            ItemId::new(),
+                            self.location,
+                            &path,
+                            ItemKind::File,
+                            Some(size),
+                        ),
+                        use_trash: false,
+                    },
+                    vec![],
+                    false,
+                    None,
+                );
+                ids.push(del);
+            }
+        }
+        Ok(ids)
+    }
+}
+
+/// Build (but do not run) a move job over resolved paths (§2.3).
+fn plan_move_job(
+    srcs: &[PathBuf],
+    dst_dir: &Path,
+    location: LocationId,
+) -> Cmd<ufm_jobs::Job> {
+    plan_move_job_with(srcs, dst_dir, location, &same_device)
+}
+
+/// `plan_move_job` with the device predicate injected, so tests can
+/// force the cross-device decomposition on a single-filesystem host.
+fn plan_move_job_with(
+    srcs: &[PathBuf],
+    dst_dir: &Path,
+    location: LocationId,
+    same_dev: &dyn Fn(&Path, &Path) -> bool,
+) -> Cmd<ufm_jobs::Job> {
+    if srcs.is_empty() {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "nothing to move".into(),
+        )));
+    }
+    if !dst_dir.is_dir() {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "destination is not a folder".into(),
+        )));
+    }
+    let title = if srcs.len() == 1 {
+        let name = srcs[0]
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "item".into());
+        format!("Move {name}")
+    } else {
+        format!("Move {} items", srcs.len())
+    };
+    let mut planner = PathPlanner {
+        job: ufm_jobs::Job::new(title, ufm_jobs::JobPreview::default()),
+        seq: 0,
+        location,
+    };
+    for src in srcs {
+        let name = src
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .ok_or_else(|| {
+                CommandError::from(UfmError::InvalidInput("source has no name".into()))
+            })?;
+        // Already in the destination → no steps for this source
+        // (parity with move_item_to's no-op; checked BEFORE collision
+        // resolution, exactly as today).
+        if src.parent() == Some(dst_dir) {
+            continue;
+        }
+        let resolved = resolve_dest_name(dst_dir, &name, &mut planner.job.preview);
+        let is_dir = std::fs::symlink_metadata(src)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if same_dev(src, dst_dir) {
+            // One rename step — a directory moves whole; the tree is
+            // never decomposed. Preview totals come from a
+            // metadata-only walk (rename moves complete near-instantly
+            // but report the same totals as any other move).
+            let (files, bytes) = walk_totals(src);
+            planner.job.preview.files_affected += files;
+            planner.job.preview.bytes_to_move += bytes;
+            let kind = if is_dir {
+                ItemKind::Folder
+            } else {
+                ItemKind::File
+            };
+            planner.add_step(
+                format!("move {}", src.display()),
+                ufm_jobs::StepOp::Move {
+                    src: job_item(
+                        ItemId::new(),
+                        location,
+                        src,
+                        kind,
+                        Some(bytes),
+                    ),
+                    dst_parent: job_item(
+                        ItemId::new(),
+                        location,
+                        dst_dir,
+                        ItemKind::Folder,
+                        None,
+                    ),
+                    new_name: resolved,
+                },
+                vec![],
+                true,
+                None,
+            );
+        } else if is_dir {
+            // Cross-device directory: copy walk + source cleanup.
+            let mid = planner.add_mkdir(dst_dir, &resolved, None);
+            let mut ids = vec![mid.clone()];
+            let mut sub = planner.plan_move_dir(src, &dst_dir.join(&resolved), &mid)?;
+            ids.append(&mut sub);
+            // The top-level source dir's Delete depends on ALL steps
+            // in its subtree and carries the source's outcome.
+            planner.add_step(
+                format!("remove {}", src.display()),
+                ufm_jobs::StepOp::Delete {
+                    target: job_item(
+                        ItemId::new(),
+                        location,
+                        src,
+                        ItemKind::Folder,
+                        Some(0),
+                    ),
+                    use_trash: false,
+                },
+                ids,
+                true,
+                Some(dst_dir.join(&resolved).to_string_lossy().into_owned()),
+            );
+        } else {
+            // Cross-device file: VerifyCopy → Copy → Delete.
+            let size = std::fs::metadata(src).map_err(|e| {
+                CommandError::from(UfmError::Internal(format!(
+                    "source {}: {e}",
+                    src.display()
+                )))
+            })?
+            .len();
+            let (_, _, del) = planner.add_move_file(src, dst_dir, &resolved, size, None);
+            if let Some(s) = planner.job.steps.get_mut(&del) {
+                s.outcome = true;
+                s.outcome_path =
+                    Some(dst_dir.join(&resolved).to_string_lossy().into_owned());
+            }
+        }
+    }
+    Ok(planner.job)
+}
+
+/// Build (but do not run) a delete job over resolved paths (§2.3).
+fn plan_delete_job(
+    srcs: &[PathBuf],
+    use_trash: bool,
+    location: LocationId,
+) -> Cmd<ufm_jobs::Job> {
+    if srcs.is_empty() {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "nothing to delete".into(),
+        )));
+    }
+    let n = srcs.len();
+    let plural = if n == 1 { "" } else { "s" };
+    let title = if use_trash {
+        format!("Move {n} item{plural} to Trash")
+    } else {
+        format!("Delete {n} item{plural}")
+    };
+    let mut planner = PathPlanner {
+        job: ufm_jobs::Job::new(title, ufm_jobs::JobPreview::default()),
+        seq: 0,
+        location,
+    };
+    for src in srcs {
+        // Preview totals: one metadata-only walk per source (spec §6
+        // preview contract); the walked total is also stored on the
+        // step's target Item so job_bytes_done can advance (§2.5).
+        let (files, bytes) = walk_totals(src);
+        planner.job.preview.files_affected += files;
+        planner.job.preview.bytes_to_move += bytes;
+        let is_dir = std::fs::symlink_metadata(src)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if use_trash {
+            // ONE step per top-level source: trashing is a rename of
+            // the whole item (tree intact, one Trash entry).
+            // Decomposing it would shatter one trash entry into many
+            // and break untrash_item semantics.
+            let kind = if is_dir {
+                ItemKind::Folder
+            } else {
+                ItemKind::File
+            };
+            planner.add_step(
+                format!("trash {}", src.display()),
+                ufm_jobs::StepOp::Delete {
+                    target: job_item(
+                        ItemId::new(),
+                        location,
+                        src,
+                        kind,
+                        Some(bytes),
+                    ),
+                    use_trash: true,
+                },
+                vec![],
+                true,
+                None,
+            );
+        } else if is_dir {
+            // Permanent delete walks and decomposes — granularity is
+            // the point of the destroy flavor.
+            let ids = planner.plan_delete_dir(src)?;
+            planner.add_step(
+                format!("remove {}", src.display()),
+                ufm_jobs::StepOp::Delete {
+                    target: job_item(
+                        ItemId::new(),
+                        location,
+                        src,
+                        ItemKind::Folder,
+                        Some(0),
+                    ),
+                    use_trash: false,
+                },
+                ids,
+                true,
+                None,
+            );
+        } else {
+            let size = std::fs::symlink_metadata(src).map(|m| m.len()).unwrap_or(0);
+            planner.add_step(
+                format!("delete {}", src.display()),
+                ufm_jobs::StepOp::Delete {
+                    target: job_item(
+                        ItemId::new(),
+                        location,
+                        src,
+                        ItemKind::File,
+                        Some(size),
+                    ),
+                    use_trash: false,
+                },
+                vec![],
+                true,
+                None,
+            );
+        }
+    }
+    Ok(planner.job)
+}
+
+/// Derive the `JobOutcome` for a finished outcome step (inc-2 §2.2) —
+/// the record the frontend's undo stack is fed from at job completion.
+/// `result_path` comes from the step's `outcome_path` when the planner
+/// recorded one (decomposed moves), else is derived from the op. The
+/// trash entry name arrives via the Done-transition journal note
+/// (`trash_name=<name>`, written by the Delete executor arm).
+fn build_outcome(step: &ufm_jobs::Step, note: Option<&str>) -> ufm_jobs::JobOutcome {
+    let (src_path, result_path, trash_name) = match &step.op {
+        ufm_jobs::StepOp::Copy {
+            src,
+            dst_parent,
+            new_name,
+        }
+        | ufm_jobs::StepOp::Move {
+            src,
+            dst_parent,
+            new_name,
+        } => {
+            let derived = dst_parent.provider_key.as_ref().map(|p| {
+                Path::new(p)
+                    .join(new_name)
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            (
+                src.provider_key.clone().unwrap_or_default(),
+                step.outcome_path.clone().or(derived),
+                None,
+            )
+        }
+        ufm_jobs::StepOp::Delete { target, use_trash } => {
+            let trash = if *use_trash {
+                note.and_then(|n| n.strip_prefix("trash_name="))
+                    .map(|s| s.to_string())
+            } else {
+                None
+            };
+            (
+                target.provider_key.clone().unwrap_or_default(),
+                None,
+                trash,
+            )
+        }
+        _ => (String::new(), None, None),
+    };
+    ufm_jobs::JobOutcome {
+        step_id: step.id.clone(),
+        src_path,
+        result_path,
+        trash_name,
+    }
+}
+
 /// Record one step transition everywhere it must land: the in-memory
 /// snapshot, the durable journal, and the jobs-table snapshot.
+/// Inc-2: when an outcome step (§2.2) finishes, its `JobOutcome` is
+/// appended under the same lock, before the upsert, so the outcome is
+/// durable in the same snapshot write as the transition itself.
 fn transition_step(
     handle: &JobHandle,
     catalog: &ufm_catalog::Catalog,
@@ -874,6 +1590,21 @@ fn transition_step(
             .unwrap_or(ufm_jobs::StepState::Pending);
         if let Some(s) = j.steps.get_mut(step_id) {
             s.state = to;
+        }
+        if matches!(
+            to,
+            ufm_jobs::StepState::Done | ufm_jobs::StepState::Skipped
+        ) {
+            let outcome = j.steps.get(step_id).and_then(|s| {
+                if s.outcome && !j.outcomes.iter().any(|o| o.step_id == step_id) {
+                    Some(build_outcome(s, note.as_deref()))
+                } else {
+                    None
+                }
+            });
+            if let Some(o) = outcome {
+                j.outcomes.push(o);
+            }
         }
         (j.clone(), from)
     };
@@ -907,10 +1638,123 @@ fn wait_while_paused(handle: &JobHandle) -> bool {
 }
 
 enum StepOutcome {
-    Done,
+    /// Finished. The payload is an optional journal note carried into
+    /// the Done transition (inc-2: the trash executor returns
+    /// `trash_name=<name>` so the entry name is durable in the journal
+    /// and feeds `JobOutcome.trash_name`).
+    Done(Option<String>),
     Skipped,
     Failed(String),
     Cancelled,
+}
+
+/// Filesystem core of the Move arm (inc-2 §2.4): a single rename,
+/// guarded so a re-run after a crash can never overwrite or duplicate.
+/// The planner decomposes cross-device moves; the executor never
+/// falls back to a silent in-step copy.
+fn exec_move_rename(src: &Path, dst: &Path) -> StepOutcome {
+    let src_exists = src.symlink_metadata().is_ok();
+    let dst_exists = dst.symlink_metadata().is_ok();
+    match (src_exists, dst_exists) {
+        // The rename landed just before a crash, before its journal
+        // transition — the move is done.
+        (false, true) => StepOutcome::Done(None),
+        (false, false) => StepOutcome::Failed("source vanished".into()),
+        // std::fs::rename would SILENTLY REPLACE an existing
+        // destination file on Linux — this guard is the never-overwrite
+        // rule. Do not simplify it away (§7.2).
+        (true, true) => {
+            StepOutcome::Failed("destination appeared since planning".into())
+        }
+        (true, false) => match std::fs::rename(src, dst) {
+            Ok(()) => StepOutcome::Done(None),
+            // EXDEV (raw OS error 18 on Linux): the planner's device
+            // check was raced — fail loudly, never improvise a copy.
+            Err(e) if e.raw_os_error() == Some(18) => StepOutcome::Failed(
+                "cross-device move reached executor undecomposed".into(),
+            ),
+            Err(e) => StepOutcome::Failed(e.to_string()),
+        },
+    }
+}
+
+/// Filesystem core of the trash Delete arm (inc-2 §2.4): replicates
+/// `trash_item` exactly, parameterized by trash root so tests can use
+/// a temp root. Returns the trash entry name.
+fn exec_trash(
+    target: &Path,
+    trash_root: &Path,
+) -> std::result::Result<String, String> {
+    let files_dir = trash_root.join("files");
+    let info_dir = trash_root.join("info");
+    std::fs::create_dir_all(&files_dir).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&info_dir).map_err(|e| e.to_string())?;
+
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("invalid file name")?
+        .to_string();
+
+    // Collision-free destination name: name, "name 2", "name 3", ...
+    // Checks BOTH dirs — an orphan .trashinfo left by a crash in the
+    // write-then-rename window still reserves its name.
+    let mut dest_name = name.clone();
+    let mut n = 2;
+    while files_dir.join(&dest_name).exists()
+        || info_dir.join(format!("{dest_name}.trashinfo")).exists()
+    {
+        dest_name = format!("{name} {n}");
+        n += 1;
+    }
+    let dest = files_dir.join(&dest_name);
+
+    // Write the .trashinfo first, then move (spec order). Path= is the
+    // RAW absolute path — untrash_item parses it raw.
+    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let info = format!(
+        "[Trash Info]\nPath={}\nDeletionDate={}\n",
+        target.to_string_lossy(),
+        now
+    );
+    std::fs::write(info_dir.join(format!("{dest_name}.trashinfo")), info)
+        .map_err(|e| e.to_string())?;
+
+    // rename; fall back to copy+remove across filesystems (the Trash
+    // lives under $HOME; sources on other devices are the normal case).
+    if std::fs::rename(target, &dest).is_err() {
+        let ty = std::fs::metadata(target).map_err(|e| e.to_string())?;
+        if ty.is_dir() {
+            copy_dir_recursive(target, &dest).map_err(|e| e.to_string())?;
+            std::fs::remove_dir_all(target).map_err(|e| e.to_string())?;
+        } else {
+            std::fs::copy(target, &dest).map_err(|e| e.to_string())?;
+            std::fs::remove_file(target).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(dest_name)
+}
+
+/// Filesystem core of the permanent Delete arm (inc-2 §2.4).
+/// Directories go with `remove_dir` — NEVER `remove_dir_all`: the
+/// planner's dependency order guarantees the dir is empty by the time
+/// its step runs, and a non-empty error is a real signal (something
+/// is writing into the tree) that must surface as Failed.
+fn exec_permanent_delete(target: &Path) -> StepOutcome {
+    let meta = match std::fs::symlink_metadata(target) {
+        Ok(m) => m,
+        // A re-run after a kill: absence is the goal state.
+        Err(_) => return StepOutcome::Skipped,
+    };
+    let result = if meta.is_dir() {
+        std::fs::remove_dir(target)
+    } else {
+        std::fs::remove_file(target)
+    };
+    match result {
+        Ok(()) => StepOutcome::Done(None),
+        Err(e) => StepOutcome::Failed(e.to_string()),
+    }
 }
 
 /// Execute one step. Copy is chunked (1 MiB) so pause/cancel land
@@ -927,7 +1771,7 @@ fn execute_step(
         ufm_jobs::StepOp::Mkdir { parent, name } => {
             let base = parent.provider_key.as_deref().unwrap_or_default();
             match std::fs::create_dir_all(Path::new(base).join(name)) {
-                Ok(()) => StepOutcome::Done,
+                Ok(()) => StepOutcome::Done(None),
                 Err(e) => StepOutcome::Failed(e.to_string()),
             }
         }
@@ -942,7 +1786,7 @@ fn execute_step(
                     Ok(dm) if dm.is_file() && dm.len() == sm.len() => {
                         StepOutcome::Skipped
                     }
-                    _ => StepOutcome::Done,
+                    _ => StepOutcome::Done(None),
                 },
                 Err(e) => StepOutcome::Failed(e.to_string()),
             }
@@ -1004,7 +1848,7 @@ fn execute_step(
                             meta.permissions(),
                         );
                     }
-                    StepOutcome::Done
+                    StepOutcome::Done(None)
                 }
                 Err(outcome) => {
                     // Compensating action: never leave a partial file
@@ -1015,9 +1859,42 @@ fn execute_step(
                 }
             }
         }
-        _ => StepOutcome::Failed(
-            "step type is not supported by the copy executor yet".into(),
-        ),
+        ufm_jobs::StepOp::Move {
+            src,
+            dst_parent,
+            new_name,
+        } => {
+            let src_path =
+                Path::new(src.provider_key.as_deref().unwrap_or_default());
+            let dst_path =
+                Path::new(dst_parent.provider_key.as_deref().unwrap_or_default())
+                    .join(new_name);
+            exec_move_rename(src_path, &dst_path)
+        }
+        ufm_jobs::StepOp::Delete { target, use_trash } => {
+            let target_path =
+                Path::new(target.provider_key.as_deref().unwrap_or_default());
+            if *use_trash {
+                // Target already gone → Skipped (idempotent re-run;
+                // the entry is already in Trash — §2.6: its trash
+                // name is unrecoverable for the undo stack, but the
+                // item itself is safe and restorable from Trash view).
+                if target_path.symlink_metadata().is_err() {
+                    return StepOutcome::Skipped;
+                }
+                let home = std::env::var("HOME").unwrap_or_default();
+                let trash_root =
+                    PathBuf::from(format!("{home}/.local/share/Trash"));
+                match exec_trash(target_path, &trash_root) {
+                    Ok(name) => {
+                        StepOutcome::Done(Some(format!("trash_name={name}")))
+                    }
+                    Err(e) => StepOutcome::Failed(e),
+                }
+            } else {
+                exec_permanent_delete(target_path)
+            }
+        }
     }
 }
 
@@ -1126,14 +2003,14 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
         emit_job_progress(&app, &snap, bytes_done, Some(&step.label), None);
         let outcome = execute_step(&step.op, &handle, &app, &snap, &mut bytes_done);
         match outcome {
-            StepOutcome::Done => {
+            StepOutcome::Done(note) => {
                 let snap = transition_step(
                     &handle,
                     &catalog,
                     &mut journal,
                     step_id,
                     ufm_jobs::StepState::Done,
-                    None,
+                    note,
                 );
                 bytes_done = job_bytes_done(&snap);
                 emit_job_progress(&app, &snap, bytes_done, None, None);
@@ -1226,6 +2103,64 @@ fn job_handle(state: &AppState, job: JobId) -> Cmd<JobHandle> {
         .ok_or_else(|| CommandError::from(UfmError::NotFound("unknown job".into())))
 }
 
+/// The shared tail of every `start_*` command (inc-2 §2.1):
+/// journal-first upsert → register the handle → spawn the executor.
+/// The snapshot is durable before any step runs, so even a crash
+/// mid-operation leaves a resumable record.
+fn start_job(
+    app: tauri::AppHandle,
+    state: &AppState,
+    job: ufm_jobs::Job,
+) -> Cmd<JobId> {
+    let id = job.id;
+    state.catalog.lock().unwrap().upsert_job(&job)?;
+    state
+        .jobs
+        .lock()
+        .unwrap()
+        .insert(id, JobHandle::new(job, false));
+    spawn_executor(app, state, id);
+    Ok(id)
+}
+
+/// Resolve id-based sources to paths through the live-browse caches
+/// (mirrors `build_copy_job`; `NotFound` on unknown ids). The job's
+/// location is the first source's location.
+fn resolve_source_paths(
+    state: &AppState,
+    ids: &[ItemId],
+) -> Cmd<(Vec<PathBuf>, LocationId)> {
+    let paths = state.item_paths.lock().unwrap();
+    let locs = state.item_locations.lock().unwrap();
+    let mut srcs = Vec::new();
+    let mut location = None;
+    for id in ids {
+        let p = paths.get(id).cloned().ok_or_else(|| {
+            CommandError::from(UfmError::NotFound("unknown source item".into()))
+        })?;
+        if location.is_none() {
+            location = locs.get(id).copied();
+        }
+        srcs.push(p);
+    }
+    Ok((srcs, location.unwrap_or_default()))
+}
+
+/// Best-effort location for a path-based request: the location of a
+/// listed item at the same path, else the default location.
+fn location_for_path(state: &AppState, path: &Path) -> LocationId {
+    let paths = state.item_paths.lock().unwrap();
+    let locs = state.item_locations.lock().unwrap();
+    for (id, p) in paths.iter() {
+        if p.as_path() == path {
+            if let Some(l) = locs.get(id) {
+                return *l;
+            }
+        }
+    }
+    LocationId::default()
+}
+
 #[tauri::command]
 pub async fn start_copy(
     app: tauri::AppHandle,
@@ -1233,17 +2168,156 @@ pub async fn start_copy(
     req: CopyRequest,
 ) -> Cmd<JobId> {
     let job = build_copy_job(&state, &req)?;
-    let id = job.id;
-    // Journal first (spec §25): the snapshot is durable before any
-    // step runs, so even a crash mid-copy leaves a resumable record.
-    state.catalog.lock().unwrap().upsert_job(&job)?;
-    state
-        .jobs
-        .lock()
-        .unwrap()
-        .insert(id, JobHandle::new(job, false));
-    spawn_executor(app, &state, id);
-    Ok(id)
+    start_job(app, &state, job)
+}
+
+// Inc-2 (§2.1): move/delete requests. Note the deliberate asymmetry
+// with CopyRequest — every move/delete call site in the UI already
+// works with a destination PATH string, so these take `dst_dir`
+// rather than a destination ItemId. Do not retrofit CopyRequest.
+
+#[derive(Debug, Deserialize)]
+pub struct MoveRequest {
+    pub sources: Vec<ItemId>,
+    pub dst_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MovePathsRequest {
+    pub sources: Vec<String>,
+    pub dst_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CopyPathsRequest {
+    pub sources: Vec<String>,
+    pub dst_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeleteRequest {
+    pub sources: Vec<ItemId>,
+    pub use_trash: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeletePathsRequest {
+    pub paths: Vec<String>,
+    pub use_trash: bool,
+}
+
+#[tauri::command]
+pub async fn start_move(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    req: MoveRequest,
+) -> Cmd<JobId> {
+    let (srcs, location) = resolve_source_paths(&state, &req.sources)?;
+    let job = plan_move_job(&srcs, Path::new(&req.dst_dir), location)?;
+    start_job(app, &state, job)
+}
+
+#[tauri::command]
+pub async fn start_move_from_paths(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    req: MovePathsRequest,
+) -> Cmd<JobId> {
+    let srcs: Vec<PathBuf> = req.sources.iter().map(PathBuf::from).collect();
+    let location = location_for_path(&state, Path::new(&req.dst_dir));
+    let job = plan_move_job(&srcs, Path::new(&req.dst_dir), location)?;
+    start_job(app, &state, job)
+}
+
+#[tauri::command]
+pub async fn start_copy_from_paths(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    req: CopyPathsRequest,
+) -> Cmd<JobId> {
+    let srcs: Vec<PathBuf> = req.sources.iter().map(PathBuf::from).collect();
+    let location = location_for_path(&state, Path::new(&req.dst_dir));
+    let job = plan_copy_job_paths(&srcs, Path::new(&req.dst_dir), location)?;
+    start_job(app, &state, job)
+}
+
+#[tauri::command]
+pub async fn start_delete(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    req: DeleteRequest,
+) -> Cmd<JobId> {
+    let (srcs, location) = resolve_source_paths(&state, &req.sources)?;
+    let job = plan_delete_job(&srcs, req.use_trash, location)?;
+    start_job(app, &state, job)
+}
+
+#[tauri::command]
+pub async fn start_delete_from_paths(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    req: DeletePathsRequest,
+) -> Cmd<JobId> {
+    let srcs: Vec<PathBuf> = req.paths.iter().map(PathBuf::from).collect();
+    let location = srcs
+        .first()
+        .map(|p| location_for_path(&state, p))
+        .unwrap_or_default();
+    let job = plan_delete_job(&srcs, req.use_trash, location)?;
+    start_job(app, &state, job)
+}
+
+/// Panel-facing summary of one registered job (§2.1).
+#[derive(Debug, Serialize)]
+pub struct JobSummary {
+    pub job_id: String,
+    pub title: String,
+    pub state: String,
+    pub steps_done: usize,
+    pub steps_total: usize,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+#[tauri::command]
+pub async fn list_jobs(state: State<'_, AppState>) -> Cmd<Vec<JobSummary>> {
+    let mut snaps: Vec<ufm_jobs::Job> = {
+        let jobs = state.jobs.lock().unwrap();
+        jobs.values().map(|h| h.snapshot()).collect()
+    };
+    snaps.sort_by_key(|j| j.created);
+    Ok(snaps
+        .iter()
+        .map(|j| JobSummary {
+            job_id: j.id.to_string(),
+            title: j.title.clone(),
+            state: job_state_name(j.state).to_string(),
+            steps_done: j
+                .steps
+                .values()
+                .filter(|s| {
+                    matches!(
+                        s.state,
+                        ufm_jobs::StepState::Done | ufm_jobs::StepState::Skipped
+                    )
+                })
+                .count(),
+            steps_total: j.steps.len(),
+            bytes_done: job_bytes_done(j),
+            bytes_total: j.preview.bytes_to_move,
+        })
+        .collect())
+}
+
+/// The per-source outcome records of a job (§2.2): the frontend's
+/// undo feed at completion time.
+#[tauri::command]
+pub async fn get_job_outcomes(
+    state: State<'_, AppState>,
+    job: JobId,
+) -> Cmd<Vec<ufm_jobs::JobOutcome>> {
+    let handle = job_handle(&state, job)?;
+    Ok(handle.snapshot().outcomes)
 }
 
 #[tauri::command]
@@ -3094,11 +4168,25 @@ pub async fn get_thumbnail(
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
-        if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico") {
+        let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico");
+        // Audio files thumbnail through their EMBEDDED cover art
+        // (inc-2 item 9): Quick Look and the Music Player fall back
+        // to this when the folder carries no art file, and until now
+        // the gate below rejected every audio file outright, so the
+        // fallback could never fire (Dickles' Technomancer m4b has a
+        // covr atom and still showed the placeholder).
+        let is_audio = matches!(
+            ext.as_str(),
+            "mp3" | "flac" | "ogg" | "oga" | "opus" | "m4a" | "m4b" | "aac" | "aif" | "aiff" | "wav" | "wma" | "dsf" | "dff"
+        );
+        if !is_image && !is_audio {
             return Err("not a thumbnail-able image".to_string());
         }
         let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
-        if meta.len() > 64 * 1024 * 1024 {
+        // The size cap guards image decoding; an audiobook can be
+        // hundreds of MB and still carry a small cover, and ffmpeg
+        // streams it without loading the file.
+        if is_image && meta.len() > 64 * 1024 * 1024 {
             return Err("image too large to thumbnail".to_string());
         }
         let home = std::env::var("HOME").map_err(|e| e.to_string())?;
@@ -3119,7 +4207,27 @@ pub async fn get_thumbnail(
 
         if !cache_fresh {
             std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
-            let img = image::open(&path).map_err(|e| format!("decode: {e}"))?;
+            let img = if is_image {
+                image::open(&path).map_err(|e| format!("decode: {e}"))?
+            } else {
+                // Embedded cover art: ffmpeg exposes an MP3's APIC,
+                // an MP4's covr and a FLAC/Vorbis picture as a video
+                // stream — take one frame, piped back as PNG.
+                let out = std::process::Command::new("ffmpeg")
+                    .args(["-v", "error", "-i"])
+                    .arg(&path)
+                    .args([
+                        "-map", "0:v:0", "-frames:v", "1", "-f", "image2pipe",
+                        "-vcodec", "png", "-",
+                    ])
+                    .output()
+                    .map_err(|e| format!("ffmpeg: {e}"))?;
+                if !out.status.success() || out.stdout.is_empty() {
+                    return Err("no embedded cover art".to_string());
+                }
+                image::load_from_memory(&out.stdout)
+                    .map_err(|e| format!("decode art: {e}"))?
+            };
             let thumb = img.thumbnail(max_px, max_px);
             // Write via a temp file + rename so readers never see a partial PNG.
             let tmp = cache_dir.join(format!("{digest}.tmp.png"));
@@ -7890,6 +8998,368 @@ mod tests {
         let (already3, snap3) = claim_index_slot(&slot);
         assert!(!already3 && snap3.running);
         assert_eq!(snap3.dirs_done, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Inc-2 (§4): planner shapes + executor cores. Fixtures are plain
+    // files under a per-test temp dir; no Tauri runtime is needed
+    // because the planner/executor cores take plain paths by design.
+    // ---------------------------------------------------------------
+
+    fn inc2_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ufm-inc2-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_file(path: &Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn op_target_key(step: &ufm_jobs::Step) -> Option<String> {
+        match &step.op {
+            ufm_jobs::StepOp::Delete { target, .. } => target.provider_key.clone(),
+            ufm_jobs::StepOp::Move { src, .. } => src.provider_key.clone(),
+            ufm_jobs::StepOp::Copy { src, .. } => src.provider_key.clone(),
+            _ => None,
+        }
+    }
+
+    fn find_step<'a>(
+        job: &'a ufm_jobs::Job,
+        key: &Path,
+    ) -> Option<&'a ufm_jobs::Step> {
+        let key = key.to_string_lossy().into_owned();
+        job.steps
+            .values()
+            .find(|s| op_target_key(s).as_deref() == Some(key.as_str()))
+    }
+
+    #[test]
+    fn move_plan_same_device_is_single_rename_steps() {
+        let base = inc2_dir("move-same");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        let file = base.join("a.txt");
+        write_file(&file, b"alpha");
+        let tree = base.join("tree");
+        write_file(&tree.join("sub/b.txt"), b"beta");
+        let stay = dst.join("stay.txt");
+        write_file(&stay, b"stay");
+        write_file(&dst.join("collide.txt"), b"old");
+        let collide = base.join("collide.txt");
+        write_file(&collide, b"new");
+
+        let job = plan_move_job(
+            &[file.clone(), tree.clone(), stay.clone()],
+            &dst,
+            LocationId::default(),
+        )
+        .unwrap();
+        // Exactly one Move step per real source; the already-there
+        // source produced zero steps; nothing is decomposed.
+        let moves: Vec<_> = job
+            .steps
+            .values()
+            .filter(|s| matches!(s.op, ufm_jobs::StepOp::Move { .. }))
+            .collect();
+        assert_eq!(moves.len(), 2);
+        assert!(moves.iter().all(|s| s.outcome));
+        assert!(job
+            .steps
+            .values()
+            .all(|s| !matches!(s.op, ufm_jobs::StepOp::Delete { .. })));
+
+        // Collision: resolved name + a preview NameCollision conflict.
+        let job2 = plan_move_job(&[collide], &dst, LocationId::default()).unwrap();
+        assert_eq!(job2.steps.len(), 1);
+        let only = job2.steps.values().next().unwrap();
+        match &only.op {
+            ufm_jobs::StepOp::Move { new_name, .. } => {
+                assert_eq!(new_name, "collide.txt 2")
+            }
+            _ => panic!("expected a Move step"),
+        }
+        assert_eq!(job2.preview.conflicts.len(), 1);
+        assert!(matches!(
+            job2.preview.conflicts[0].kind,
+            ufm_jobs::ConflictKind::NameCollision
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_plan_cross_device_decomposes() {
+        let base = inc2_dir("move-cross");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        let tree = base.join("tree");
+        write_file(&tree.join("f1.txt"), b"one");
+        write_file(&tree.join("sub/f2.txt"), b"two");
+
+        let job = plan_move_job_with(
+            &[tree.clone()],
+            &dst,
+            LocationId::default(),
+            &|_, _| false,
+        )
+        .unwrap();
+
+        let copies: Vec<_> = job
+            .steps
+            .values()
+            .filter(|s| matches!(s.op, ufm_jobs::StepOp::Copy { .. }))
+            .collect();
+        assert_eq!(copies.len(), 2);
+        // Every Copy has a dependent source Delete.
+        for copy in &copies {
+            let src_key = op_target_key(copy).unwrap();
+            let del = job.steps.values().find(|s| {
+                matches!(s.op, ufm_jobs::StepOp::Delete { use_trash: false, .. })
+                    && op_target_key(s).as_deref() == Some(src_key.as_str())
+                    && s.depends_on.iter().any(|d| d == &copy.id)
+            });
+            assert!(del.is_some(), "copy {} lacks a dependent delete", copy.id);
+        }
+        // Directory Deletes depend on everything inside them; the
+        // root Delete carries the outcome.
+        let root_del = find_step(&job, &tree).expect("root delete");
+        assert!(matches!(
+            root_del.op,
+            ufm_jobs::StepOp::Delete { use_trash: false, .. }
+        ));
+        assert!(root_del.outcome);
+        assert_eq!(
+            root_del.outcome_path.as_deref(),
+            Some(dst.join("tree").to_string_lossy().as_ref())
+        );
+        assert_eq!(root_del.depends_on.len(), job.steps.len() - 1);
+        let sub_del = find_step(&job, &tree.join("sub")).expect("sub delete");
+        assert!(sub_del.depends_on.len() >= 4);
+        // Runnable order places every Delete after its Copy.
+        let order = job.runnable_order().unwrap();
+        let pos = |id: &str| order.iter().position(|s| s == id).unwrap();
+        for copy in &copies {
+            let del = job
+                .steps
+                .values()
+                .find(|s| {
+                    s.depends_on.iter().any(|d| d == &copy.id)
+                        && matches!(s.op, ufm_jobs::StepOp::Delete { .. })
+                })
+                .unwrap();
+            assert!(pos(&copy.id) < pos(&del.id));
+        }
+
+        // A lone cross-device file: VerifyCopy -> Copy -> Delete, the
+        // Delete carrying the outcome.
+        let lone = base.join("lone.bin");
+        write_file(&lone, b"lone");
+        let job2 =
+            plan_move_job_with(&[lone], &dst, LocationId::default(), &|_, _| false)
+                .unwrap();
+        assert_eq!(job2.steps.len(), 3);
+        let del2 = job2
+            .steps
+            .values()
+            .find(|s| matches!(s.op, ufm_jobs::StepOp::Delete { .. }))
+            .unwrap();
+        assert!(del2.outcome);
+        assert_eq!(
+            del2.outcome_path.as_deref(),
+            Some(dst.join("lone.bin").to_string_lossy().as_ref())
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delete_plan_trash_is_one_step_per_source() {
+        let base = inc2_dir("del-trash");
+        let tree = base.join("tree");
+        write_file(&tree.join("x.txt"), b"xxx");
+        write_file(&tree.join("y.txt"), b"yyyy");
+        let lone = base.join("lone.txt");
+        write_file(&lone, b"z");
+        let job =
+            plan_delete_job(&[tree, lone], true, LocationId::default()).unwrap();
+        // One Delete step per top-level source — never decomposed.
+        assert_eq!(job.steps.len(), 2);
+        assert!(job.steps.values().all(|s| matches!(
+            s.op,
+            ufm_jobs::StepOp::Delete {
+                use_trash: true,
+                ..
+            }
+        ) && s.outcome));
+        // Preview totals equal the walked fixture.
+        assert_eq!(job.preview.files_affected, 3);
+        assert_eq!(job.preview.bytes_to_move, 3 + 4 + 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn delete_plan_permanent_walks() {
+        let base = inc2_dir("del-perm");
+        let tree = base.join("tree");
+        write_file(&tree.join("a.txt"), b"aaa");
+        write_file(&tree.join("sub/b.txt"), b"bbbb");
+        std::os::unix::fs::symlink(tree.join("a.txt"), tree.join("link")).unwrap();
+        let job =
+            plan_delete_job(&[tree.clone()], false, LocationId::default()).unwrap();
+        let deletes: Vec<_> = job
+            .steps
+            .values()
+            .filter(|s| {
+                matches!(
+                    s.op,
+                    ufm_jobs::StepOp::Delete {
+                        use_trash: false,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        // a.txt, b.txt, the symlink (a leaf — never walked), sub, root.
+        assert_eq!(deletes.len(), 5);
+        let a_del = find_step(&job, &tree.join("a.txt")).expect("a delete");
+        let b_del = find_step(&job, &tree.join("sub/b.txt")).expect("b delete");
+        match &a_del.op {
+            ufm_jobs::StepOp::Delete { target, .. } => {
+                assert_eq!(target.size_bytes, Some(3))
+            }
+            _ => panic!("expected Delete"),
+        }
+        match &b_del.op {
+            ufm_jobs::StepOp::Delete { target, .. } => {
+                assert_eq!(target.size_bytes, Some(4))
+            }
+            _ => panic!("expected Delete"),
+        }
+        // Directory Deletes depend on their contents.
+        let sub_del = find_step(&job, &tree.join("sub")).expect("sub delete");
+        assert_eq!(sub_del.depends_on, vec![b_del.id.clone()]);
+        let root_del = find_step(&job, &tree).expect("root delete");
+        assert!(root_del.outcome);
+        assert_eq!(root_del.depends_on.len(), 4);
+        assert!(root_del.depends_on.contains(&sub_del.id));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn exec_move_rename_guards() {
+        let base = inc2_dir("exec-move");
+        let src = base.join("src.txt");
+        let dst = base.join("dst.txt");
+        write_file(&src, b"payload");
+        // Normal rename.
+        assert!(matches!(
+            exec_move_rename(&src, &dst),
+            StepOutcome::Done(None)
+        ));
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
+        // !src && dst -> Done (the rename landed just before a crash).
+        let ghost = base.join("ghost.txt");
+        assert!(matches!(
+            exec_move_rename(&ghost, &dst),
+            StepOutcome::Done(None)
+        ));
+        // src && dst -> Failed, and the destination is UNCHANGED
+        // (the overwrite guard).
+        write_file(&src, b"new");
+        assert!(matches!(
+            exec_move_rename(&src, &dst),
+            StepOutcome::Failed(_)
+        ));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
+        assert_eq!(std::fs::read(&src).unwrap(), b"new");
+        // Both missing -> Failed.
+        let nowhere = base.join("nowhere.txt");
+        assert!(matches!(
+            exec_move_rename(&ghost, &nowhere),
+            StepOutcome::Failed(_)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn exec_trash_writes_info_first_and_returns_name() {
+        let base = inc2_dir("exec-trash");
+        let root = base.join("Trash");
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let f = work.join("hello.txt");
+        write_file(&f, b"hi");
+        let name = exec_trash(&f, &root).unwrap();
+        assert_eq!(name, "hello.txt");
+        assert!(!f.exists());
+        assert_eq!(
+            std::fs::read(root.join("files/hello.txt")).unwrap(),
+            b"hi"
+        );
+        let info =
+            std::fs::read_to_string(root.join("info/hello.txt.trashinfo")).unwrap();
+        assert!(info.contains(&format!("Path={}", f.to_string_lossy())));
+        assert!(info.contains("DeletionDate="));
+        // A second same-named file gets "hello.txt 2".
+        let f2 = work.join("hello.txt");
+        write_file(&f2, b"hi2");
+        let name2 = exec_trash(&f2, &root).unwrap();
+        assert_eq!(name2, "hello.txt 2");
+        assert_eq!(
+            std::fs::read(root.join("files/hello.txt 2")).unwrap(),
+            b"hi2"
+        );
+        // A directory trashes whole, tree intact.
+        let d = work.join("folder");
+        write_file(&d.join("inner.txt"), b"in");
+        let dname = exec_trash(&d, &root).unwrap();
+        assert_eq!(dname, "folder");
+        assert!(root.join("files/folder/inner.txt").exists());
+        assert!(!d.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn exec_permanent_delete_removes_file_and_empty_dir_only() {
+        let base = inc2_dir("exec-perm");
+        let f = base.join("f.txt");
+        write_file(&f, b"x");
+        assert!(matches!(
+            exec_permanent_delete(&f),
+            StepOutcome::Done(None)
+        ));
+        assert!(!f.exists());
+        let empty = base.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(matches!(
+            exec_permanent_delete(&empty),
+            StepOutcome::Done(None)
+        ));
+        assert!(!empty.exists());
+        // Non-empty dir -> Failed, contents intact (remove_dir, never
+        // remove_dir_all).
+        let full = base.join("full");
+        write_file(&full.join("keep.txt"), b"keep");
+        assert!(matches!(
+            exec_permanent_delete(&full),
+            StepOutcome::Failed(_)
+        ));
+        assert_eq!(std::fs::read(full.join("keep.txt")).unwrap(), b"keep");
+        // Missing target -> Skipped (absence is the goal state).
+        let missing = base.join("missing");
+        assert!(matches!(
+            exec_permanent_delete(&missing),
+            StepOutcome::Skipped
+        ));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 

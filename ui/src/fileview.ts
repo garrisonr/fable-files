@@ -15,6 +15,10 @@ import { isAudioName } from "./music";
 export interface FileViewHooks {
   onOpen(item: Item): void; // Enter / double-click on a folder (or file)
   onOpenInNewTab?(item: Item): void; // right-click: open in a new tab
+  /** Inc-2 item 14: sidebar Favorites doors. State is read live when
+   * the menu opens, so the Add/Remove label is never stale. */
+  isFavorite?(item: Item): boolean;
+  onToggleFavorite?(item: Item): void;
   onSelect(item: Item | null): void; // selection changed
   onTogglePreview(): void; // Space handled by shell
   onMakeExecutable(item: Item): void;
@@ -199,6 +203,21 @@ export async function showItemMenu(
     shortcut: "Space",
     action: () => hooks.onTogglePreview(),
   });
+  // Inc-2 item 14: folders can be pinned to / removed from the
+  // sidebar Favorites here as well as by dragging onto the section.
+  if (
+    hooks.isFavorite &&
+    hooks.onToggleFavorite &&
+    targets.length === 1 &&
+    item.kind === "folder"
+  ) {
+    items.push({
+      label: hooks.isFavorite(item)
+        ? "Remove from Favorites"
+        : "Add to Favorites",
+      action: () => hooks.onToggleFavorite!(item),
+    });
+  }
   items.push(sep);
   if (hooks.onCut)
     items.push({

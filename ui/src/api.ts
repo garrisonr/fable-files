@@ -55,6 +55,40 @@ export interface MetaTag {
   value: string;
 }
 
+/** One registered job, as `list_jobs` reports it (Phase 1 inc-2). */
+export interface JobSummary {
+  job_id: string;
+  title: string;
+  state: string;
+  steps_done: number;
+  steps_total: number;
+  bytes_done: number;
+  bytes_total: number;
+}
+
+/** Per-source record of what a finished job actually did — the undo
+ * feed (Phase 1 inc-2 §2.2). Mirrors ufm_jobs::JobOutcome. */
+/** Disk space for the volume backing a path (inc-2 item 12) —
+ * statvfs numbers (df-equivalent) + findmnt mount metadata. */
+export interface DiskInfo {
+  path: string;
+  mount_point: string;
+  source: string | null;
+  fstype: string | null;
+  total_bytes: number;
+  used_bytes: number;
+  /** f_bavail — what an unprivileged user can actually write. */
+  free_bytes: number;
+  percent_free: number;
+}
+
+export interface JobOutcome {
+  step_id: string;
+  src_path: string;
+  result_path: string | null;
+  trash_name: string | null;
+}
+
 export interface ArchiveEntry {
   path: string;
   size: number;
@@ -300,6 +334,30 @@ export const api = {
   transcode: (item: string, preset: string) =>
     invoke<string>("transcode", { item, preset }),
   cancelTranscode: (id: string) => invoke<void>("cancel_transcode", { id }),
+  // Transfer jobs (Phase 1 inc-1/inc-2): journaled, pausable,
+  // resumable copy/move/delete through the ufm-jobs engine. All
+  // start_* commands return the JobId; progress arrives as
+  // `job-progress` events (see jobs.ts).
+  startCopy: (sources: string[], dstParent: string) =>
+    invoke<string>("start_copy", { req: { sources, dstParent } }),
+  startCopyFromPaths: (sources: string[], dstDir: string) =>
+    invoke<string>("start_copy_from_paths", { req: { sources, dstDir } }),
+  startMove: (sources: string[], dstDir: string) =>
+    invoke<string>("start_move", { req: { sources, dstDir } }),
+  startMoveFromPaths: (sources: string[], dstDir: string) =>
+    invoke<string>("start_move_from_paths", { req: { sources, dstDir } }),
+  startDelete: (sources: string[], useTrash: boolean) =>
+    invoke<string>("start_delete", { req: { sources, useTrash } }),
+  startDeleteFromPaths: (paths: string[], useTrash: boolean) =>
+    invoke<string>("start_delete_from_paths", { req: { paths, useTrash } }),
+  pauseJob: (job: string) => invoke<void>("pause_job", { job }),
+  resumeJob: (job: string) => invoke<void>("resume_job", { job }),
+  cancelJob: (job: string) => invoke<void>("cancel_job", { job }),
+  listJobs: () => invoke<JobSummary[]>("list_jobs"),
+  getJobOutcomes: (job: string) =>
+    invoke<JobOutcome[]>("get_job_outcomes", { job }),
+  /** Disk space for the volume backing a path (inc-2 item 12). */
+  getDiskInfo: (path: string) => invoke<DiskInfo>("get_disk_info", { path }),
   readMetadata: (item: string) =>
     invoke<MetaTag[]>("read_metadata", { item }),
   editMetadata: (item: string, edits: Array<[string, string]>) =>

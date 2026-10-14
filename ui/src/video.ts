@@ -52,7 +52,9 @@ export class VideoPlayer {
   /** A real frame reached the screen (Round 7.1 watchdog). */
   private frameSeen = false;
   private watchdog: number | null = null;
-  private offerEl: HTMLDivElement | null = null;
+  /** Subtle loading overlay while the transcode stream spins up
+   * (inc-2 item 8: the fallback is automatic — no notice, no button). */
+  private loadingEl: HTMLDivElement | null = null;
   /** Streaming-transcode mode: position = streamStart + currentTime. */
   private transcoding = false;
   private streamStart = 0;
@@ -171,7 +173,7 @@ export class VideoPlayer {
     this.video.addEventListener("loadeddata", () => this.checkFrame());
     this.video.addEventListener("canplay", () => this.checkFrame());
     this.video.addEventListener("ended", () => this.showControls(true));
-    this.video.addEventListener("error", () => this.enterOffer());
+    this.video.addEventListener("error", () => this.enterFallback());
 
     // Interaction: click toggles play, double-click fullscreen,
     // any pointer activity wakes the controls.
@@ -247,13 +249,18 @@ export class VideoPlayer {
   private checkFrame(): void {
     if (this.video.videoWidth > 0 && this.video.readyState >= 2) {
       this.frameSeen = true;
+      this.hideLoading();
     }
   }
 
   /** First-frame watchdog (Round 7.1): WebKitGTK loads metadata and
    * even seeks HEVC 10-bit files but never presents a frame. If no
-   * frame lands within ~2.5s of the source being set, offer the
-   * streaming-transcode fallback instead of a black rectangle. */
+   * frame lands within ~2.5s of the source being set, the
+   * streaming-transcode fallback engages AUTOMATICALLY (inc-2
+   * item 8 — Dickles: the old notice + "Transcode & Play" button was
+   * nagging; the player just plays). While transcoding, the watchdog
+   * re-arms longer: a stream that produces neither frames nor an
+   * error within ~8s counts as failed. */
   private armWatchdog(): void {
     if (this.watchdog !== null) window.clearTimeout(this.watchdog);
     const v = this.video as HTMLVideoElement & {
@@ -262,47 +269,63 @@ export class VideoPlayer {
     try {
       v.requestVideoFrameCallback?.(() => {
         this.frameSeen = true;
+        this.hideLoading();
       });
     } catch {
       // rVFC is a bonus signal; readyState checks still apply
     }
+    const timeout = this.transcoding ? 8000 : 2500;
     this.watchdog = window.setTimeout(() => {
       this.watchdog = null;
       this.checkFrame();
-      if (!this.frameSeen && !this.transcoding && !this.failed) {
-        this.enterOffer();
+      if (this.frameSeen || this.failed) return;
+      if (this.transcoding) {
+        this.showFallback();
+        return;
       }
-    }, 2500);
+      this.enterFallback();
+    }, timeout);
   }
 
-  private enterOffer(): void {
+  /** Native playback failed (watchdog or error event): switch to the
+   * transcode stream and play — no notice card, no button, no user
+   * action. Only a subtle loading indicator while the stream spins
+   * up. If the transcode stream itself is what failed, land on the
+   * quiet one-line note (showFallback). */
+  private enterFallback(): void {
     if (this.failed) return;
     if (this.transcoding) {
       this.showFallback();
       return;
     }
     this.checkFrame();
-    if (this.frameSeen || this.offerEl) return;
-    this.video.style.display = "none";
-    const offer = document.createElement("div");
-    offer.className = "vp-fallback";
-    const msg = document.createElement("p");
-    msg.textContent =
-      "🎬 This video's format (e.g. HEVC 10-bit) can't render in the built-in preview.";
-    const btn = document.createElement("button");
-    btn.className = "vp-btn vp-transcode-btn";
-    btn.textContent = "▶ Transcode & Play";
-    btn.title = "Re-encode on the fly to a format the preview can play";
-    btn.addEventListener("click", () =>
-      void this.startTranscode(this.video.currentTime || 0),
-    );
-    offer.append(msg, btn);
-    this.offerEl = offer;
-    this.el.appendChild(offer);
-    this.showControls(true);
+    if (this.frameSeen) return;
+    void this.startTranscode(this.video.currentTime || 0);
+  }
+
+  private showLoading(): void {
+    if (this.loadingEl) return;
+    const wrap = document.createElement("div");
+    wrap.className = "vp-loading";
+    const spinner = document.createElement("div");
+    spinner.className = "vp-loading-spinner";
+    const caption = document.createElement("div");
+    caption.className = "vp-loading-caption";
+    caption.textContent = "Preparing playback…";
+    wrap.append(spinner, caption);
+    this.loadingEl = wrap;
+    this.el.appendChild(wrap);
+  }
+
+  private hideLoading(): void {
+    if (this.loadingEl) {
+      this.loadingEl.remove();
+      this.loadingEl = null;
+    }
   }
 
   private async startTranscode(startSecs: number): Promise<void> {
+    this.showLoading();
     const url = await transcodeSrc(this.path, startSecs);
     if (!url) {
       this.showFallback();
@@ -310,12 +333,9 @@ export class VideoPlayer {
     }
     this.transcoding = true;
     this.streamStart = startSecs;
-    if (this.offerEl) {
-      this.offerEl.remove();
-      this.offerEl = null;
-    }
-    this.video.style.display = "";
+    this.frameSeen = false;
     this.video.src = url;
+    this.armWatchdog();
     try {
       await this.video.play();
     } catch {
@@ -348,16 +368,15 @@ export class VideoPlayer {
       window.clearTimeout(this.watchdog);
       this.watchdog = null;
     }
-    if (this.offerEl) {
-      this.offerEl.remove();
-      this.offerEl = null;
-    }
+    this.hideLoading();
     this.bar.remove();
     this.video.remove();
+    // Quiet single-line inline note (inc-2 item 8) — the old
+    // full-card notice is gone by Dickles' order.
     const note = document.createElement("div");
-    note.className = "vp-fallback";
+    note.className = "vp-note";
     note.textContent =
-      "🎬 This video format can't play in the preview. Double-click the file to open it in your video player.";
+      "🎬 Can't play this video here — double-click to open it in your video player.";
     this.el.appendChild(note);
   }
 }
