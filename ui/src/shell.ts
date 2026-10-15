@@ -438,6 +438,8 @@ export class Shell {
     this.galleryView = new GalleryView(() => this.requireTab(), viewHooks);
     this.quickLook = new QuickLook(() => this.fileView.el.focus({ preventScroll: true }));
     this.quickLook.onCast = (item) => void this.castDialog.open(item);
+    this.quickLook.castPicker = (name, video) =>
+      this.castDialog.openPicker(name, video);
     this.burnStudio = new BurnStudio({
       getSelectionPaths: async () =>
         this.activeSelectionItems()

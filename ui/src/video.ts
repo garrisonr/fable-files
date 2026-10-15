@@ -7,7 +7,8 @@
  * uninterrupted; fullscreen on demand; detach to a pop-out window;
  * one click back from pop-out to the inline preview.
  */
-import { mediaSrc, transcodeSrc } from "./api";
+import { api, mediaSrc, transcodeSrc } from "./api";
+import { Toast, errText } from "./toast";
 
 const VIDEO_EXTS = new Set([
   "mp4", "webm", "mov", "m4v", "ogv", "mkv", "avi", "mpg", "mpeg",
@@ -71,6 +72,15 @@ export interface VideoPlayerOpts {
   onState?: (t: number, playing: boolean) => void;
 }
 
+/** A cast target as the player needs it — structurally the
+ * CastDialog's Device (cast.ts), declared here so the player
+ * doesn't import the dialog (it lazy-loads it instead). */
+export interface CastDeviceLike {
+  name: string;
+  kind: string;
+  address: string;
+}
+
 export class VideoPlayer {
   readonly el: HTMLDivElement;
   private video: HTMLVideoElement;
@@ -100,6 +110,25 @@ export class VideoPlayer {
   private pendingSeek: number | null = null;
   private wantPlay = false;
   private stateTimer: number | null = null;
+  /** Player round — cast session state. While castDevice is set
+   * the RECEIVER owns playback: transport routes to it, the
+   * scrubber shows its position (polled every 2 s), and the local
+   * element stays paused behind the "Casting to …" badge. */
+  private castPicker: ((name: string, video: boolean) => Promise<CastDeviceLike | null>) | null = null;
+  private castDevice: CastDeviceLike | null = null;
+  private castBtn: HTMLButtonElement | null = null;
+  private castBadge: HTMLDivElement | null = null;
+  private castBadgeText: HTMLSpanElement | null = null;
+  private castTimer: number | null = null;
+  private castPos = 0;
+  private castDur = 0;
+  private castPlaying = false;
+  private castSawPlaying = false;
+  private castScrubbing = false;
+  /** Grace window at session start: the receiver may still be
+   * loading, so position polls are ignored until the initial
+   * seek (to the local position) has had time to land. */
+  private castSeekAt = 0;
 
   /** The file this player is showing (hosts snapshot it before a
    * re-render tears the player down — fix batch item 1). */
@@ -142,6 +171,14 @@ export class VideoPlayer {
    * may outlive its surface. Hosts MUST call this. */
   destroy(): void {
     this.destroyed = true;
+    // Player round: never leave a receiver playing from a dead
+    // surface — stop the cast session on the way out (no local
+    // resume; the surface is gone).
+    if (this.castDevice) {
+      const dev = this.castDevice;
+      this.teardownCast();
+      void api.castStop(dev).catch(() => undefined);
+    }
     this.stopStateTimer();
     if (this.hideTimer !== null) {
       window.clearTimeout(this.hideTimer);
@@ -171,7 +208,7 @@ export class VideoPlayer {
     if (opts.startAt && opts.startAt > 0) this.pendingSeek = opts.startAt;
     this.wantPlay = opts.autoPlay ?? false;
     this.el = document.createElement("div");
-    this.el.className = "vp" + (opts.standalone ? " vp-standalone" : "");
+    this.el.className = "vp" + (opts.standalone ? " standalone" : "");
 
     this.video = document.createElement("video");
     this.video.className = "vp-video";
@@ -203,6 +240,16 @@ export class VideoPlayer {
     this.seek.max = "1000";
     this.seek.value = "0";
     this.seek.addEventListener("input", () => {
+      if (this.castDevice) {
+        // Scrubbing the RECEIVER: the readout follows the thumb
+        // now; the seek itself goes out on release (change).
+        const total = this.castDur;
+        if (total > 0) {
+          this.castPos = (Number(this.seek.value) / 1000) * total;
+          this.timeLabel.textContent = `${fmtTime(this.castPos)} / ${fmtTime(total)}`;
+        }
+        return;
+      }
       if (this.transcoding) {
         // The transcode stream is live: seeking restarts it at the
         // target offset (server-side input seek).
@@ -218,6 +265,20 @@ export class VideoPlayer {
       if (isFinite(d) && d > 0) {
         this.video.currentTime = (Number(this.seek.value) / 1000) * d;
       }
+    });
+    this.seek.addEventListener("change", () => {
+      this.castScrubbing = false;
+      if (this.castDevice && this.castDur > 0) {
+        const target = (Number(this.seek.value) / 1000) * this.castDur;
+        this.castPos = target;
+        void api.castSeek(this.castDevice, target).catch(() => undefined);
+      }
+    });
+    this.seek.addEventListener("pointerdown", () => {
+      this.castScrubbing = true;
+    });
+    this.seek.addEventListener("pointerup", () => {
+      this.castScrubbing = false;
     });
 
     this.timeLabel = document.createElement("span");
@@ -258,7 +319,34 @@ export class VideoPlayer {
     fsBtn.addEventListener("click", () => this.toggleFullscreen());
     this.bar.appendChild(fsBtn);
 
+    // Cast (Player round): pick a Chromecast / AirPlay / DLNA /
+    // Sonos target; while a session runs, this button stops it
+    // and playback resumes here at the receiver's position.
+    const castBtn = document.createElement("button");
+    castBtn.className = "vp-btn";
+    castBtn.textContent = "📡";
+    castBtn.title = "Cast to a device…";
+    castBtn.setAttribute("aria-label", "Cast to a device");
+    castBtn.addEventListener("click", () => void this.openCastPicker());
+    this.bar.appendChild(castBtn);
+    this.castBtn = castBtn;
+
     this.el.appendChild(this.bar);
+
+    // "Casting to <device>" badge — the local picture is paused
+    // while the TV plays; the badge is the honest state, with the
+    // way back (Stop returns playback here, same position).
+    this.castBadge = document.createElement("div");
+    this.castBadge.className = "vp-cast-badge";
+    this.castBadge.hidden = true;
+    this.castBadgeText = document.createElement("span");
+    this.castBadgeText.className = "vp-cast-badge-text";
+    const badgeStop = document.createElement("button");
+    badgeStop.className = "vp-cast-stop";
+    badgeStop.textContent = "Stop casting";
+    badgeStop.addEventListener("click", () => void this.stopCast(true));
+    this.castBadge.append(this.castBadgeText, badgeStop);
+    this.el.appendChild(this.castBadge);
 
     // Playback wiring.
     this.video.addEventListener("play", () => {
@@ -342,12 +430,24 @@ export class VideoPlayer {
       e.stopPropagation();
       this.togglePlay();
     } else if (e.key === "ArrowRight") {
-      this.video.currentTime = Math.min(
-        this.video.duration || 0,
-        this.video.currentTime + 5,
-      );
+      if (this.castDevice) {
+        this.castPos = Math.min(this.castDur || 0, this.castPos + 5);
+        void api.castSeek(this.castDevice, this.castPos).catch(() => undefined);
+        this.renderCastProgress();
+      } else {
+        this.video.currentTime = Math.min(
+          this.video.duration || 0,
+          this.video.currentTime + 5,
+        );
+      }
     } else if (e.key === "ArrowLeft") {
-      this.video.currentTime = Math.max(0, this.video.currentTime - 5);
+      if (this.castDevice) {
+        this.castPos = Math.max(0, this.castPos - 5);
+        void api.castSeek(this.castDevice, this.castPos).catch(() => undefined);
+        this.renderCastProgress();
+      } else {
+        this.video.currentTime = Math.max(0, this.video.currentTime - 5);
+      }
     } else if (e.key.toLowerCase() === "f") {
       this.toggleFullscreen();
     } else if (e.key.toLowerCase() === "m") {
@@ -360,6 +460,10 @@ export class VideoPlayer {
 
   togglePlay(): void {
     if (this.failed) return;
+    if (this.castDevice) {
+      void this.castToggle();
+      return;
+    }
     if (this.video.paused) void this.video.play().catch(() => undefined);
     else this.video.pause();
   }
@@ -373,7 +477,192 @@ export class VideoPlayer {
     this.showControls(false);
   }
 
+  /** Hosts with a shared CastDialog (the shell) wire it here so
+   * the dialog is the app's one instance; hosts without one (the
+   * pop-out window) get a lazily-built dialog from openCastPicker. */
+  setCastPicker(
+    fn: (name: string, video: boolean) => Promise<CastDeviceLike | null>,
+  ): void {
+    this.castPicker = fn;
+  }
+
+  private async openCastPicker(): Promise<void> {
+    if (this.castDevice) {
+      // The button is also the way out while a session runs.
+      void this.stopCast(true);
+      return;
+    }
+    if (!this.castPicker) {
+      try {
+        const { CastDialog } = await import("./cast");
+        const dlg = new CastDialog();
+        this.el.appendChild(dlg.element);
+        this.castPicker = (n, v) => dlg.openPicker(n, v);
+      } catch {
+        return;
+      }
+    }
+    const name = this.path.split("/").pop() ?? "Video";
+    const device = await this.castPicker(name, true);
+    if (!device || this.destroyed) return;
+    await this.startCast(device);
+  }
+
+  private async startCast(device: CastDeviceLike): Promise<void> {
+    const resumeAt = this.position();
+    try {
+      const url = await api.castRegisterPath(this.path);
+      await api.castPlay(device, url);
+    } catch (err) {
+      Toast.error(`Cast failed: ${errText(err)}`);
+      return;
+    }
+    if (this.destroyed) {
+      void api.castStop(device).catch(() => undefined);
+      return;
+    }
+    this.castDevice = device;
+    this.castPos = resumeAt;
+    const d = this.video.duration;
+    this.castDur = isFinite(d) && d > 0 ? d : 0;
+    this.castPlaying = true;
+    this.castSawPlaying = false;
+    this.video.pause();
+    // Receivers start at 0; seek to where local playback was once
+    // the receiver has had a moment to load (polls ignore position
+    // during the grace window so the bar doesn't snap to 0).
+    if (resumeAt > 1) {
+      this.castSeekAt = Date.now() + 2500;
+      window.setTimeout(() => {
+        if (this.castDevice === device) {
+          void api.castSeek(device, resumeAt).catch(() => undefined);
+        }
+      }, 1200);
+    }
+    if (this.castBadge && this.castBadgeText) {
+      this.castBadgeText.textContent = `📡 Casting to ${device.name}`;
+      this.castBadge.hidden = false;
+    }
+    if (this.castBtn) this.castBtn.title = "Stop casting";
+    this.playBtn.textContent = "⏸";
+    this.renderCastProgress();
+    if (this.castTimer !== null) window.clearInterval(this.castTimer);
+    this.castTimer = window.setInterval(() => void this.pollCast(), 2000);
+    void this.pollCast();
+    Toast.success(`Casting to ${device.name}.`);
+  }
+
+  /** Stop the receiver and (normally) resume locally at the
+   * position the receiver had reached — the round trip Dickles
+   * asked for: the TV hands the film back where it left off. */
+  private async stopCast(resumeLocal: boolean): Promise<void> {
+    const dev = this.castDevice;
+    if (!dev) return;
+    const at = this.castPos;
+    const wasPlaying = this.castPlaying;
+    this.teardownCast();
+    try {
+      await api.castStop(dev);
+    } catch {
+      // The receiver may already be gone; local resume proceeds.
+    }
+    if (resumeLocal && !this.destroyed) {
+      this.resumeLocal(at, wasPlaying);
+      Toast.success(`Back on this device — stopped casting to ${dev.name}.`);
+    }
+  }
+
+  private teardownCast(): void {
+    this.castDevice = null;
+    if (this.castTimer !== null) {
+      window.clearInterval(this.castTimer);
+      this.castTimer = null;
+    }
+    if (this.castBadge) this.castBadge.hidden = true;
+    if (this.castBtn) this.castBtn.title = "Cast to a device…";
+    this.playBtn.textContent = "▶";
+  }
+
+  private resumeLocal(at: number, play: boolean): void {
+    const d = this.video.duration;
+    if (at > 0 && isFinite(d) && d > 0) {
+      try {
+        this.video.currentTime = Math.min(at, Math.max(0, d - 0.25));
+      } catch {
+        // not seekable yet — starting from the top beats hanging
+      }
+    }
+    if (play) void this.video.play().catch(() => undefined);
+  }
+
+  private async castToggle(): Promise<void> {
+    const dev = this.castDevice;
+    if (!dev) return;
+    try {
+      if (this.castPlaying) {
+        await api.castPause(dev);
+        this.castPlaying = false;
+      } else {
+        await api.castResume(dev);
+        this.castPlaying = true;
+      }
+    } catch {
+      // A failed toggle resyncs on the next poll — no dead end.
+    }
+    this.playBtn.textContent = this.castPlaying ? "⏸" : "▶";
+  }
+
+  private async pollCast(): Promise<void> {
+    const dev = this.castDevice;
+    if (!dev) return;
+    let st: { state: string; position: number; duration: number };
+    try {
+      st = await api.castStatus(dev);
+    } catch {
+      return; // transient — next poll retries
+    }
+    if (this.castDevice !== dev) return; // session changed mid-flight
+    if (st.duration > 0) this.castDur = st.duration;
+    if (st.state === "playing") this.castSawPlaying = true;
+    if (st.state === "playing" || st.state === "paused") {
+      this.castPlaying = st.state === "playing";
+      if (!this.castScrubbing && Date.now() >= this.castSeekAt) {
+        this.castPos = st.position;
+      }
+    } else if (st.state === "idle" && this.castSawPlaying) {
+      // The receiver stopped on its own — the film ended, or
+      // someone stopped it at the TV. End the session here and
+      // hand playback back at the last known position.
+      const at = this.castPos;
+      const wasPlaying = this.castPlaying;
+      const name = dev.name;
+      this.teardownCast();
+      if (!this.destroyed) {
+        this.resumeLocal(at, wasPlaying);
+        Toast.success(`Casting to ${name} ended — back on this device.`);
+      }
+      return;
+    }
+    this.playBtn.textContent = this.castPlaying ? "⏸" : "▶";
+    this.renderCastProgress();
+  }
+
+  private renderCastProgress(): void {
+    const total = this.castDur;
+    if (!(total > 0)) return;
+    if (!this.castScrubbing) {
+      this.seek.value = String(Math.round((this.castPos / total) * 1000));
+    }
+    this.timeLabel.textContent = `${fmtTime(this.castPos)} / ${fmtTime(total)}`;
+  }
+
   private syncProgress(): void {
+    if (this.castDevice) {
+      // The receiver's clock drives the bar while casting (the
+      // poll keeps castPos fresh); local timeupdate is paused.
+      this.renderCastProgress();
+      return;
+    }
     const d = this.video.duration;
     const c = this.video.currentTime;
     if (this.transcoding) {

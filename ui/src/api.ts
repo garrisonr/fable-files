@@ -844,12 +844,22 @@ export const api = {
     invoke<void>("rclone_unmount", { name, mountPoint }),
   castRegisterFile: (item: string) =>
     invoke<string>("cast_register_file", { item }),
+  castRegisterPath: (path: string) =>
+    invoke<string>("cast_register_path", { path }),
   castScan: () =>
     invoke<Array<{ name: string; kind: string; address: string }>>("cast_scan"),
   castPlay: (device: { name: string; kind: string; address: string }, url: string) =>
     invoke<void>("cast_play", { device, url }),
   castStop: (device: { name: string; kind: string; address: string }) =>
     invoke<void>("cast_stop", { device }),
+  castPause: (device: { name: string; kind: string; address: string }) =>
+    invoke<void>("cast_pause", { device }),
+  castResume: (device: { name: string; kind: string; address: string }) =>
+    invoke<void>("cast_resume", { device }),
+  castSeek: (device: { name: string; kind: string; address: string }, seconds: number) =>
+    invoke<void>("cast_seek", { device, seconds }),
+  castStatus: (device: { name: string; kind: string; address: string }) =>
+    invoke<{ state: string; position: number; duration: number }>("cast_status", { device }),
   castBackends: () => invoke<string[]>("cast_backends"),
   castSetup: () => invoke<string[]>("cast_setup"),
   listInstalledApps: () =>

@@ -24,6 +24,7 @@ import {
 } from "./api";
 import { onPlayerClosed, onPlayerReturn, onPlayerState } from "./api";
 import { VideoPlayer, isVideoName } from "./video";
+import type { CastDeviceLike } from "./video";
 import { audioTags, folderArtUrl } from "./audiometa";
 import { parseLrcLines } from "./musiccomplete";
 import { fadeTo, reducedMotion, springTo } from "./motion";
@@ -163,6 +164,9 @@ export class QuickLook {
 
   /** Set by the shell: cast the previewed media item. */
   onCast: ((item: Item) => void) | null = null;
+  /** Set by the shell (Player round): the player's own Cast
+   * button picks through the shell's shared CastDialog. */
+  castPicker: ((name: string, video: boolean) => Promise<CastDeviceLike | null>) | null = null;
   private castBtn: HTMLButtonElement | null = null;
 
   constructor(private onDismiss: () => void) {
@@ -677,6 +681,7 @@ export class QuickLook {
                 : true,
             onDetach: () => this.detachVideo(item, player),
           });
+          if (this.castPicker) player.setCastPicker(this.castPicker);
           this.videoPlayer = player;
           card.insertBefore(player.el, dl);
           // Detach, discoverable (fix batch item 6): the transport

@@ -2622,7 +2622,20 @@ tr.row[style*="--label-color"] {
   display: flex; flex-direction: column;
 }
 .vp.standalone { position: fixed; inset: 0; border-radius: 0; }
-.vp-video { width: 100%; flex: 1; min-height: 0; background: #000; }
+.vp-video { width: 100%; flex: 1; min-height: 0; background: #000; object-fit: contain; }
+.vp-cast-badge {
+  position: absolute; top: 0.6rem; left: 0.6rem; z-index: 5;
+  display: flex; align-items: center; gap: 0.6rem;
+  background: rgb(0 0 0 / 0.62); color: #fff;
+  padding: 0.35rem 0.4rem 0.35rem 0.7rem; border-radius: 999px;
+  font-size: 0.85rem; backdrop-filter: blur(6px);
+}
+.vp-cast-badge[hidden] { display: none; }
+.vp-cast-stop {
+  background: var(--ufm-accent); color: #fff; border: 0;
+  border-radius: 999px; padding: 0.2rem 0.6rem; cursor: pointer;
+  font: inherit; font-size: 0.8rem;
+}
 .vp-bar {
   position: absolute; left: 0; right: 0; bottom: 0;
   display: flex; align-items: center; gap: 0.4rem;

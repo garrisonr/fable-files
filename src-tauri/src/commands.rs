@@ -6940,7 +6940,21 @@ pub async fn open_player_window(
     let (w, h, min_w, min_h) = if audio {
         (460.0, 208.0, 340.0, 170.0)
     } else {
-        (560.0, 340.0, 320.0, 200.0)
+        // Player round (Dickles' Brave screenshot): the detach
+        // window used to open at a fixed 560x340 regardless of the
+        // picture, so a 2.35:1 film left a slab of dead window
+        // under the controls. The window now OPENS at the file's
+        // true aspect (ffprobe dims): height is whatever the
+        // picture needs at mini-player width — no more, no less.
+        // Later resizes are the user's; the layout (styles.css
+        // .vp-standalone) keeps any letterbox inside the picture.
+        match probe_video_dims(std::path::Path::new(&path)) {
+            Some((vw, vh)) => {
+                let (fw, fh) = player_fit_size(vw, vh);
+                (fw, fh, 320.0, 200.0)
+            }
+            None => (560.0, 340.0, 320.0, 200.0),
+        }
     };
     let window = tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url.into()))
         .title(format!("{name} — Fable Files"))
@@ -9891,6 +9905,135 @@ fn lan_ip() -> String {
         .unwrap_or_else(|_| "127.0.0.1".into())
 }
 
+/// Serve one media-server connection (extracted from
+/// media_server_port so the Range / Content-Type behavior is
+/// unit-testable against a real socket — Player round).
+fn serve_media_conn(
+    mut stream: std::net::TcpStream,
+    files: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>>,
+    >,
+) {
+    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut request = String::new();
+    let mut range: Option<(u64, Option<u64>)> = None;
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if request.is_empty() {
+            request = trimmed.to_string();
+        }
+        let lower = trimmed.to_lowercase();
+        if let Some(v) = lower.strip_prefix("range: bytes=") {
+            let mut it = v.splitn(2, '-');
+            let start: u64 = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+            let end: Option<u64> =
+                it.next().and_then(|x| x.trim().parse().ok());
+            range = Some((start, end));
+        }
+    }
+    let is_head = request.starts_with("HEAD");
+    let path_part = request
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("")
+        .to_string();
+    let is_transcode = path_part.starts_with("/transcode/");
+    let token_raw = if is_transcode {
+        path_part.trim_start_matches("/transcode/")
+    } else {
+        path_part.trim_start_matches("/cast/")
+    };
+    let token = token_raw.split(['?', '&']).next().unwrap_or("");
+    let file_path = files.lock().unwrap().get(token).cloned();
+    let Some(file_path) = file_path else {
+        let _ = stream.write_all(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+        );
+        return;
+    };
+    if is_transcode {
+        // Round 7.1: live H.264 transcode stream for formats
+        // WebKitGTK can't render (HEVC 10-bit). ?t=<secs>
+        // is the input-seek start offset.
+        let start = path_part
+            .split('?')
+            .nth(1)
+            .and_then(|q| {
+                q.split('&').find_map(|kv| {
+                    kv.strip_prefix("t=")
+                        .and_then(|v| v.parse::<u64>().ok())
+                })
+            })
+            .unwrap_or(0);
+        if is_head {
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 0\r\n\r\n",
+            );
+        } else {
+            serve_transcode(stream, &file_path, start);
+        }
+        return;
+    }
+    let Ok(mut file) = std::fs::File::open(&file_path) else {
+        let _ = stream.write_all(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+        );
+        return;
+    };
+    let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let (start, end) = match range {
+        Some((s, e)) => (s.min(total), e.unwrap_or(total.saturating_sub(1)).min(total.saturating_sub(1))),
+        None => (0, total.saturating_sub(1)),
+    };
+    let len = if total == 0 { 0 } else { end - start + 1 };
+    let status = if range.is_some() { "206 Partial Content" } else { "200 OK" };
+    // Real media type, not octet-stream: Chromecast and
+    // DLNA renderers refuse (or mis-seek) files served as
+    // application/octet-stream. Local playback didn't
+    // care; receivers do. (Player round.)
+    let mut headers = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {}\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\n",
+        guess_mime(&file_path)
+    );
+    if range.is_some() {
+        headers += &format!("Content-Range: bytes {start}-{end}/{total}\r\n");
+    }
+    headers += "\r\n";
+    if stream.write_all(headers.as_bytes()).is_err() {
+        return;
+    }
+    if is_head {
+        return;
+    }
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return;
+    }
+    let mut remaining = len;
+    let mut buf = vec![0u8; 1 << 16];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        match file.read(&mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => {
+                if stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+                remaining -= n as u64;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 /// Ensure the media server is running; returns (port). One server,
 /// token-addressed single files, HTTP Range supported (seeking).
 pub fn media_server_port(
@@ -9908,123 +10051,9 @@ pub fn media_server_port(
     let files = state.media_files.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
+            let Ok(stream) = stream else { continue };
             let files = files.clone();
-            std::thread::spawn(move || {
-                use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut request = String::new();
-                let mut range: Option<(u64, Option<u64>)> = None;
-                loop {
-                    let mut line = String::new();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => return,
-                        Ok(_) => {}
-                    }
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        break;
-                    }
-                    if request.is_empty() {
-                        request = trimmed.to_string();
-                    }
-                    let lower = trimmed.to_lowercase();
-                    if let Some(v) = lower.strip_prefix("range: bytes=") {
-                        let mut it = v.splitn(2, '-');
-                        let start: u64 = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
-                        let end: Option<u64> =
-                            it.next().and_then(|x| x.trim().parse().ok());
-                        range = Some((start, end));
-                    }
-                }
-                let is_head = request.starts_with("HEAD");
-                let path_part = request
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("")
-                    .to_string();
-                let is_transcode = path_part.starts_with("/transcode/");
-                let token_raw = if is_transcode {
-                    path_part.trim_start_matches("/transcode/")
-                } else {
-                    path_part.trim_start_matches("/cast/")
-                };
-                let token = token_raw.split(['?', '&']).next().unwrap_or("");
-                let file_path = files.lock().unwrap().get(token).cloned();
-                let Some(file_path) = file_path else {
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
-                    );
-                    return;
-                };
-                if is_transcode {
-                    // Round 7.1: live H.264 transcode stream for formats
-                    // WebKitGTK can't render (HEVC 10-bit). ?t=<secs>
-                    // is the input-seek start offset.
-                    let start = path_part
-                        .split('?')
-                        .nth(1)
-                        .and_then(|q| {
-                            q.split('&').find_map(|kv| {
-                                kv.strip_prefix("t=")
-                                    .and_then(|v| v.parse::<u64>().ok())
-                            })
-                        })
-                        .unwrap_or(0);
-                    if is_head {
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: 0\r\n\r\n",
-                        );
-                    } else {
-                        serve_transcode(stream, &file_path, start);
-                    }
-                    return;
-                }
-                let Ok(mut file) = std::fs::File::open(&file_path) else {
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
-                    );
-                    return;
-                };
-                let total = file.metadata().map(|m| m.len()).unwrap_or(0);
-                let (start, end) = match range {
-                    Some((s, e)) => (s.min(total), e.unwrap_or(total.saturating_sub(1)).min(total.saturating_sub(1))),
-                    None => (0, total.saturating_sub(1)),
-                };
-                let len = if total == 0 { 0 } else { end - start + 1 };
-                let status = if range.is_some() { "206 Partial Content" } else { "200 OK" };
-                let mut headers = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\n"
-                );
-                if range.is_some() {
-                    headers += &format!("Content-Range: bytes {start}-{end}/{total}\r\n");
-                }
-                headers += "\r\n";
-                if stream.write_all(headers.as_bytes()).is_err() {
-                    return;
-                }
-                if is_head {
-                    return;
-                }
-                if file.seek(SeekFrom::Start(start)).is_err() {
-                    return;
-                }
-                let mut remaining = len;
-                let mut buf = vec![0u8; 1 << 16];
-                while remaining > 0 {
-                    let want = remaining.min(buf.len() as u64) as usize;
-                    match file.read(&mut buf[..want]) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            if stream.write_all(&buf[..n]).is_err() {
-                                return;
-                            }
-                            remaining -= n as u64;
-                        }
-                        Err(_) => return,
-                    }
-                }
-            });
+            std::thread::spawn(move || serve_media_conn(stream, files));
         }
     });
     Ok(port)
@@ -10090,6 +10119,34 @@ fn probe_video_dims(path: &std::path::Path) -> Option<(u32, u32)> {
         }
     }
     None
+}
+
+/// Detach-player window size for a video of `vw`x`vh` (Player
+/// round): width starts at the mini-player's 640, height is exactly
+/// what the picture needs at that width. Absurd aspects clamp to a
+/// sane band (height 200..=900, width at most 1280) by trading the
+/// other dimension — the window still opens void-free, just not at
+/// a postage-stamp or billboard size. Pure math; unit-tested.
+pub fn player_fit_size(vw: u32, vh: u32) -> (f64, f64) {
+    if vw == 0 || vh == 0 {
+        return (560.0, 340.0);
+    }
+    let aspect = vw as f64 / vh as f64;
+    let mut w = 640.0;
+    let mut h = w / aspect;
+    if h > 900.0 {
+        h = 900.0;
+        w = h * aspect;
+    }
+    if h < 200.0 {
+        h = 200.0;
+        w = h * aspect;
+    }
+    if w > 1280.0 {
+        w = 1280.0;
+        h = w / aspect;
+    }
+    (w.round(), h.round())
 }
 
 /// Stream a live H.264 transcode of `path` (from `start` seconds) to
@@ -10263,28 +10320,52 @@ fn run_with_timeout(
     }
 }
 
+/// Parse `catt scan` output. REAL format (verified live
+/// 2026-10-15, catt 0.13.3): "192.168.12.226 - Natalie Vizio -
+/// Vizio VFD40M-0809" — IP FIRST, then name, then model. The
+/// original parser assumed name-first and silently swapped name
+/// and address (playback survived only because `catt -d` accepts
+/// an IP too; the picker showed IPs as names). Robust version:
+/// whichever field parses as an IPv4 address is the address; the
+/// field after it (or the first field when the IP trails) is the
+/// name. Pure; unit-tested.
+pub fn parse_catt_scan(out: &str) -> Vec<CastDevice> {
+    let mut devices = Vec::new();
+    for line in out.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.contains(" - ") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(" - ").map(|p| p.trim()).collect();
+        let ip_at = parts
+            .iter()
+            .position(|p| p.parse::<std::net::Ipv4Addr>().is_ok());
+        let Some(ip_at) = ip_at else { continue };
+        let address = parts[ip_at].to_string();
+        let name = if ip_at + 1 < parts.len() && !parts[ip_at + 1].is_empty() {
+            parts[ip_at + 1].to_string()
+        } else if ip_at > 0 {
+            parts[0].to_string()
+        } else {
+            address.clone()
+        };
+        devices.push(CastDevice {
+            name,
+            kind: "chromecast".into(),
+            address,
+        });
+    }
+    devices
+}
+
 /// Scan the LAN for cast targets: Chromecasts (catt), Apple TVs
-/// (pyatv atvremote), Sonos speakers (soco).
+/// (pyatv atvremote), Sonos speakers (soco), DLNA renderers (SSDP).
 #[tauri::command]
 pub async fn cast_scan() -> Cmd<Vec<CastDevice>> {
     tauri::async_runtime::spawn_blocking(move || {
         let mut devices: Vec<CastDevice> = Vec::new();
-        // Chromecasts: "Living Room TV - 192.168.1.20 - ..."
         if let Ok(out) = run_with_timeout(&local_bin("catt"), &["scan"], 12) {
-            for line in out.lines() {
-                let line = line.trim();
-                if line.is_empty() || !line.contains(" - ") {
-                    continue;
-                }
-                let parts: Vec<&str> = line.split(" - ").collect();
-                if parts.len() >= 2 {
-                    devices.push(CastDevice {
-                        name: parts[0].trim().to_string(),
-                        kind: "chromecast".into(),
-                        address: parts[1].trim().to_string(),
-                    });
-                }
-            }
+            devices.extend(parse_catt_scan(&out));
         }
         // Apple TVs: atvremote scan prints "Name: X" / "Address: Y"
         // blocks separated by blank lines.
@@ -10330,6 +10411,20 @@ pub async fn cast_scan() -> Cmd<Vec<CastDevice>> {
                         });
                     }
                 }
+            }
+        }
+        // DLNA renderers: native SSDP, no helper needed (Player
+        // round). A renderer's `address` is its AVTransport
+        // control URL — the actionable endpoint, SOAP speaks to it
+        // directly. Deduped against Sonos by name (a Sonos speaker
+        // is also a DLNA renderer; soco is the richer driver, so
+        // the DLNA twin stays hidden).
+        for d in dlna_scan() {
+            if !devices
+                .iter()
+                .any(|x| x.kind == "sonos" && x.name.eq_ignore_ascii_case(&d.name))
+            {
+                devices.push(d);
             }
         }
         Ok::<Vec<CastDevice>, String>(devices)
@@ -10383,17 +10478,8 @@ pub async fn cast_backends() -> Cmd<Vec<String>> {
 pub async fn cast_setup() -> Cmd<Vec<String>> {
     tauri::async_runtime::spawn_blocking(move || {
         crate::deps::ensure_tool("pipx", "pipx")?;
-        for (backend, package) in [
-            ("catt", "catt"),
-            ("atvremote", "pyatv"),
-            ("soco", "soco"),
-        ] {
-            let present = if backend == "soco" {
-                std::path::Path::new(&soco_python_path()).exists()
-            } else {
-                cast_tool_found(backend)
-            };
-            if present {
+        for (backend, package) in [("catt", "catt"), ("atvremote", "pyatv")] {
+            if cast_tool_found(backend) {
                 continue;
             }
             let out = std::process::Command::new("pipx")
@@ -10406,6 +10492,15 @@ pub async fn cast_setup() -> Cmd<Vec<String>> {
                     crate::deps::output_tail(&out)
                 ));
             }
+        }
+        // soco is a LIBRARY, not an app: `pipx install soco` can
+        // never succeed ("No apps associated with package soco").
+        // The cast code only needs a venv whose python imports
+        // soco, at the path soco_python_path() already points to —
+        // so build exactly that venv with python3 -m venv + pip.
+        // (Player round; proven by hand on the G9, soco 0.32.0.)
+        if !std::path::Path::new(&soco_python_path()).exists() {
+            ensure_soco_venv()?;
         }
         let mut missing: Vec<String> = Vec::new();
         if !cast_tool_found("catt") {
@@ -10426,9 +10521,44 @@ pub async fn cast_setup() -> Cmd<Vec<String>> {
 
 /// Start playback of a media URL on a cast device.
 #[tauri::command]
-pub async fn cast_play(device: CastDevice, url: String) -> Cmd<()> {
+pub async fn cast_play(
+    state: State<'_, AppState>,
+    device: CastDevice,
+    url: String,
+) -> Cmd<()> {
+    // DLNA wants DIDL-Lite metadata (title + real MIME) with the
+    // URI; reverse the media-server token back to its file to
+    // build it. Other backends ignore this.
+    let didl = {
+        let token = url.rsplit('/').next().unwrap_or("");
+        let path = state.media_files.lock().unwrap().get(token).cloned();
+        match path {
+            Some(p) => {
+                let title = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Video".to_string());
+                dlna_didl(&url, &title, &guess_mime(&p))
+            }
+            None => String::new(),
+        }
+    };
     tauri::async_runtime::spawn_blocking(move || {
         match device.kind.as_str() {
+            "dlna" => {
+                let args = format!(
+                    "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{}</CurrentURIMetaData>",
+                    xml_escape(&url),
+                    xml_escape(&didl)
+                );
+                dlna_soap(&device.address, "SetAVTransportURI", &args)?;
+                dlna_soap(
+                    &device.address,
+                    "Play",
+                    "<InstanceID>0</InstanceID><Speed>1</Speed>",
+                )?;
+                Ok::<(), String>(())
+            }
             "chromecast" => {
                 let out = run_with_timeout(
                     &local_bin("catt"),
@@ -10471,6 +10601,9 @@ pub async fn cast_play(device: CastDevice, url: String) -> Cmd<()> {
 pub async fn cast_stop(device: CastDevice) -> Cmd<()> {
     tauri::async_runtime::spawn_blocking(move || {
         match device.kind.as_str() {
+            "dlna" => {
+                dlna_soap(&device.address, "Stop", "<InstanceID>0</InstanceID>")?;
+            }
             "chromecast" => {
                 run_with_timeout(&local_bin("catt"), &["-d", &device.name, "stop"], 15)?;
             }
@@ -10498,6 +10631,535 @@ pub async fn cast_stop(device: CastDevice) -> Cmd<()> {
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("cast task failed: {e}"))))?
     .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Create the soco venv directly (see cast_setup): pipx refuses
+/// library packages, but the cast code only needs a python that
+/// imports soco at soco_python_path().
+fn ensure_soco_venv() -> std::result::Result<(), String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let venv = format!("{home}/.local/share/pipx/venvs/soco");
+    if std::path::Path::new(&soco_python_path()).exists() {
+        return Ok(());
+    }
+    let out = std::process::Command::new("python3")
+        .args(["-m", "venv", &venv])
+        .output()
+        .map_err(|e| format!("python3: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "Setting up the Sonos helper didn't finish: {}. Nothing else is affected — you can try again from the same button.",
+            crate::deps::output_tail(&out)
+        ));
+    }
+    let pip = format!("{venv}/bin/pip");
+    let out = std::process::Command::new(&pip)
+        .args(["install", "--quiet", "soco"])
+        .output()
+        .map_err(|e| format!("pip: {e}"))?;
+    if !out.status.success() || !std::path::Path::new(&soco_python_path()).exists() {
+        return Err(format!(
+            "Setting up the Sonos helper didn't finish: {}. Nothing else is affected — you can try again from the same button.",
+            crate::deps::output_tail(&out)
+        ));
+    }
+    Ok(())
+}
+
+/// Register a file by PATH with the media server (Player round):
+/// the video player is path-based in both its hosts (Quick Look
+/// and the detach window), so its cast flow cannot go through the
+/// item-id registration the file browser uses.
+#[tauri::command]
+pub async fn cast_register_path(
+    state: State<'_, AppState>,
+    path: String,
+) -> Cmd<String> {
+    let p = std::path::PathBuf::from(&path);
+    if !p.is_file() {
+        return Err(CommandError::from(UfmError::NotFound(format!(
+            "no file at {path}"
+        ))));
+    }
+    let port = media_server_port(state.inner())
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    let token = format!("{}", ItemId::new());
+    state.media_files.lock().unwrap().insert(token.clone(), p);
+    Ok(format!("http://{}:{}/cast/{}", lan_ip(), port, token))
+}
+
+// ---------------------------------------------------------------------------
+// Player round — cast transport + DLNA.
+//
+// The picker used to be fire-and-forget (play / stop, nothing in
+// between). These are the verbs that let the player's own
+// transport drive the receiver — pause, resume, seek — plus a
+// status poll the scrubber syncs to. DLNA renderers join the
+// picker through native SSDP discovery + SOAP AVTransport, the
+// one family that needs no helper download at all.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+pub struct CastStatus {
+    /// playing | paused | idle | unknown
+    pub state: String,
+    /// Seconds into the media (0 when unknown).
+    pub position: f64,
+    /// Seconds total (0 when unknown).
+    pub duration: f64,
+}
+
+impl CastStatus {
+    fn unknown() -> Self {
+        CastStatus {
+            state: "unknown".into(),
+            position: 0.0,
+            duration: 0.0,
+        }
+    }
+}
+
+/// Parse `catt info -j` JSON (player_state / current_time /
+/// duration — shape verified against catt 0.13.3's cast_info).
+pub fn parse_catt_status(json: &str) -> CastStatus {
+    let root: serde_json::Value =
+        serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
+    let v = root.get("info").unwrap_or(&root);
+    let num = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let state = match v.get("player_state").and_then(|x| x.as_str()).unwrap_or("") {
+        "PLAYING" | "BUFFERING" => "playing",
+        "PAUSED" => "paused",
+        "IDLE" => "idle",
+        _ => "unknown",
+    };
+    CastStatus {
+        state: state.into(),
+        position: num("current_time"),
+        duration: num("duration"),
+    }
+}
+
+/// Parse `atvscript playing` JSON (device_state / position /
+/// total_time). pyatv states arrive lowercase.
+pub fn parse_atv_status(json: &str) -> CastStatus {
+    let v: serde_json::Value =
+        serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
+    let num = |k: &str| v.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let state = match v
+        .get("device_state")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+    {
+        "playing" | "loading" | "seeking" => "playing",
+        "paused" => "paused",
+        "idle" | "stopped" => "idle",
+        _ => "unknown",
+    };
+    CastStatus {
+        state: state.into(),
+        position: num("position"),
+        duration: num("total_time"),
+    }
+}
+
+/// "1:02:03" / "02:03" / "90" → seconds. soco, DLNA and friends
+/// all speak H:MM:SS; junk ("NOT_IMPLEMENTED", "--:--") is 0.
+pub fn parse_hms(s: &str) -> f64 {
+    let s = s.trim();
+    if s.is_empty() || !s.chars().next().unwrap().is_ascii_digit() {
+        return 0.0;
+    }
+    let parts: Vec<f64> = s
+        .split(':')
+        .map(|p| p.trim().parse().unwrap_or(0.0))
+        .collect();
+    match parts.len() {
+        1 => parts[0],
+        2 => parts[0] * 60.0 + parts[1],
+        _ => parts[0] * 3600.0 + parts[1] * 60.0 + parts[2],
+    }
+}
+
+/// Seconds → "H:MM:SS" (DLNA REL_TIME / soco seek format).
+pub fn hms_of(secs: f64) -> String {
+    let t = secs.max(0.0) as u64;
+    format!("{}:{:02}:{:02}", t / 3600, (t % 3600) / 60, t % 60)
+}
+
+/// Parse the soco status one-liner this module prints:
+/// "STATE|position|duration" with H:MM:SS times.
+pub fn parse_soco_status(line: &str) -> CastStatus {
+    let mut it = line.trim().splitn(3, '|');
+    let raw = it.next().unwrap_or("");
+    let state = match raw {
+        "PLAYING" | "TRANSITIONING" => "playing",
+        "PAUSED_PLAYBACK" => "paused",
+        "STOPPED" | "NO_MEDIA_PRESENT" => "idle",
+        _ => "unknown",
+    };
+    CastStatus {
+        state: state.into(),
+        position: it.next().map(parse_hms).unwrap_or(0.0),
+        duration: it.next().map(parse_hms).unwrap_or(0.0),
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Text of the first `<tag>…</tag>` in a small XML payload (SSDP /
+/// SOAP / device descriptions are regular enough that a full XML
+/// parser would be overkill — and the crate has none).
+pub fn xml_tag_text(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    let raw = xml[start..end].trim();
+    Some(
+        raw.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// Resolve a possibly-relative UPnP URL against its base
+/// (description LOCATION or URLBase). Pure; unit-tested.
+pub fn resolve_http_url(base: &str, rel: &str) -> String {
+    if rel.starts_with("http://") || rel.starts_with("https://") {
+        return rel.to_string();
+    }
+    let after_scheme = base.find("://").map(|i| i + 3).unwrap_or(0);
+    let origin_end = base[after_scheme..]
+        .find('/')
+        .map(|j| after_scheme + j)
+        .unwrap_or(base.len());
+    let origin = &base[..origin_end];
+    if let Some(stripped) = rel.strip_prefix('/') {
+        return format!("{origin}/{stripped}");
+    }
+    if origin_end >= base.len() {
+        return format!("{origin}/{rel}");
+    }
+    let dir = &base[..=base.rfind('/').unwrap_or(origin_end)];
+    format!("{dir}{rel}")
+}
+
+/// Parse a UPnP device description: (friendlyName, AVTransport
+/// control URL resolved absolute). None when the device offers no
+/// AVTransport service (not a renderer we can drive).
+pub fn parse_dlna_description(xml: &str, location: &str) -> Option<(String, String)> {
+    let name = xml_tag_text(xml, "friendlyName").filter(|s| !s.is_empty())?;
+    let avt = xml.find("urn:schemas-upnp-org:service:AVTransport")?;
+    let control = xml_tag_text(&xml[avt..], "controlURL")?;
+    let base = xml_tag_text(xml, "URLBase").unwrap_or_else(|| location.to_string());
+    Some((name, resolve_http_url(&base, &control)))
+}
+
+/// The LOCATION header of an SSDP response (headers are
+/// case-insensitive; values may carry a trailing \r).
+pub fn parse_ssdp_location(resp: &str) -> Option<String> {
+    for line in resp.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("location") {
+                let v = v.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// SSDP discovery of DLNA MediaRenderers (multicast M-SEARCH,
+/// ~2.6 s listen window), then a description fetch per unique
+/// LOCATION. Runs inside cast_scan's blocking task.
+fn dlna_scan() -> Vec<CastDevice> {
+    use std::net::UdpSocket;
+    let mut locations: Vec<String> = Vec::new();
+    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+        let search = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n\
+                      MAN: \"ssdp:discover\"\r\nMX: 2\r\n\
+                      ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
+        for _ in 0..2 {
+            let _ = sock.send_to(search.as_bytes(), "239.255.255.250:1900");
+        }
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(2600);
+        let mut buf = [0u8; 4096];
+        while std::time::Instant::now() < deadline {
+            if let Ok((n, _)) = sock.recv_from(&mut buf) {
+                let text = String::from_utf8_lossy(&buf[..n]);
+                if let Some(loc) = parse_ssdp_location(&text) {
+                    if !locations.contains(&loc) {
+                        locations.push(loc);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for loc in locations {
+        let xml = ureq::AgentBuilder::new()
+            .build()
+            .get(&loc)
+            .timeout(std::time::Duration::from_secs(3))
+            .call()
+            .ok()
+            .and_then(|r| r.into_string().ok());
+        if let Some(xml) = xml {
+            if let Some((name, control)) = parse_dlna_description(&xml, &loc) {
+                out.push(CastDevice {
+                    name,
+                    kind: "dlna".into(),
+                    address: control,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// DIDL-Lite metadata for SetAVTransportURI. Many renderers show
+/// the title from here and gate playback on the res MIME.
+pub fn dlna_didl(url: &str, title: &str, mime: &str) -> String {
+    format!(
+        "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
+         xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
+         xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">\
+         <item id=\"0\" parentID=\"0\" restricted=\"1\">\
+         <dc:title>{}</dc:title>\
+         <upnp:class>object.item.videoItem</upnp:class>\
+         <res protocolInfo=\"http-get:*:{}:*\">{}</res>\
+         </item></DIDL-Lite>",
+        xml_escape(title),
+        mime,
+        xml_escape(url)
+    )
+}
+
+/// One AVTransport SOAP call; returns the response body. SOAP
+/// faults arrive as HTTP 500 WITH an XML body — for Get* actions
+/// the body may still carry the data, so a status error hands its
+/// body back instead of failing (callers parse defensively).
+fn dlna_soap(
+    control_url: &str,
+    action: &str,
+    args: &str,
+) -> std::result::Result<String, String> {
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+         <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+         s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+         <s:Body><u:{action} xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">\
+         {args}</u:{action}></s:Body></s:Envelope>"
+    );
+    // Fresh agent per call: renderers close sockets freely, and a
+    // pooled stale connection fails harder than a fresh dial.
+    let req = ureq::AgentBuilder::new()
+        .build()
+        .post(control_url)
+        .set("Content-Type", "text/xml; charset=\"utf-8\"")
+        .set(
+            "SOAPACTION",
+            &format!("\"urn:schemas-upnp-org:service:AVTransport:1#{action}\""),
+        )
+        .timeout(std::time::Duration::from_secs(8));
+    match req.send_string(&body) {
+        Ok(resp) => resp
+            .into_string()
+            .map_err(|e| format!("DLNA {action}: {e}")),
+        Err(ureq::Error::Status(_, resp)) => resp
+            .into_string()
+            .map_err(|e| format!("DLNA {action}: {e}")),
+        Err(e) => Err(format!("DLNA {action}: {e}")),
+    }
+}
+
+fn dlna_status(control_url: &str) -> std::result::Result<CastStatus, String> {
+    let info = dlna_soap(control_url, "GetTransportInfo", "<InstanceID>0</InstanceID>")?;
+    let raw = xml_tag_text(&info, "CurrentTransportState").unwrap_or_default();
+    let state = match raw.as_str() {
+        "PLAYING" | "TRANSITIONING" => "playing",
+        "PAUSED_PLAYBACK" | "PAUSED" => "paused",
+        "STOPPED" | "NO_MEDIA_PRESENT" => "idle",
+        _ => "unknown",
+    };
+    let (mut position, mut duration) = (0.0, 0.0);
+    if let Ok(p) = dlna_soap(control_url, "GetPositionInfo", "<InstanceID>0</InstanceID>") {
+        position = xml_tag_text(&p, "RelTime").map(|s| parse_hms(&s)).unwrap_or(0.0);
+        duration = xml_tag_text(&p, "TrackDuration")
+            .map(|s| parse_hms(&s))
+            .unwrap_or(0.0);
+    }
+    Ok(CastStatus {
+        state: state.into(),
+        position,
+        duration,
+    })
+}
+
+fn soco_py(script: &str, secs: u64) -> std::result::Result<String, String> {
+    run_with_timeout(&soco_python_path(), &["-c", script], secs)
+}
+
+fn cast_transport_sync(
+    device: &CastDevice,
+    action: &str,
+    seconds: f64,
+) -> std::result::Result<(), String> {
+    match device.kind.as_str() {
+        "chromecast" => {
+            let args: Vec<String> = match action {
+                "pause" => vec!["-d".into(), device.name.clone(), "pause".into()],
+                "resume" => vec!["-d".into(), device.name.clone(), "play".into()],
+                "seek" => vec![
+                    "-d".into(),
+                    device.name.clone(),
+                    "seek".into(),
+                    format!("{}", seconds.max(0.0) as u64),
+                ],
+                _ => return Err(format!("bad cast action {action}")),
+            };
+            let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            run_with_timeout(&local_bin("catt"), &refs, 15)?;
+        }
+        "airplay" => {
+            let arg = match action {
+                "pause" => "pause".to_string(),
+                "resume" => "play".to_string(),
+                "seek" => format!("set_position={}", seconds.max(0.0) as u64),
+                _ => return Err(format!("bad cast action {action}")),
+            };
+            run_with_timeout(
+                &local_bin("atvremote"),
+                &["-s", &device.address, &arg],
+                15,
+            )?;
+        }
+        "sonos" => {
+            let addr = device.address.replace('\'', "");
+            let script = match action {
+                "pause" => format!("from soco import SoCo\nSoCo('{addr}').pause()"),
+                "resume" => format!("from soco import SoCo\nSoCo('{addr}').play()"),
+                "seek" => format!(
+                    "from soco import SoCo\nSoCo('{addr}').seek('{}')",
+                    hms_of(seconds)
+                ),
+                _ => return Err(format!("bad cast action {action}")),
+            };
+            soco_py(&script, 15)?;
+        }
+        "dlna" => {
+            let args = match action {
+                "pause" => ("Pause", "<InstanceID>0</InstanceID>".to_string()),
+                "resume" => (
+                    "Play",
+                    "<InstanceID>0</InstanceID><Speed>1</Speed>".to_string(),
+                ),
+                "seek" => (
+                    "Seek",
+                    format!(
+                        "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>{}</Target>",
+                        hms_of(seconds)
+                    ),
+                ),
+                _ => return Err(format!("bad cast action {action}")),
+            };
+            dlna_soap(&device.address, args.0, &args.1)?;
+        }
+        other => return Err(format!("unknown device kind {other}")),
+    }
+    Ok(())
+}
+
+fn cast_status_sync(device: &CastDevice) -> std::result::Result<CastStatus, String> {
+    match device.kind.as_str() {
+        "chromecast" => {
+            // catt errors when nothing is loaded — that's an idle
+            // receiver, not a failure the poll should surface.
+            match run_with_timeout(&local_bin("catt"), &["-d", &device.name, "info", "-j"], 12) {
+                Ok(out) => Ok(parse_catt_status(&out)),
+                Err(_) => Ok(CastStatus {
+                    state: "idle".into(),
+                    position: 0.0,
+                    duration: 0.0,
+                }),
+            }
+        }
+        "airplay" => {
+            match run_with_timeout(&local_bin("atvscript"), &["-s", &device.address, "playing"], 12) {
+                Ok(out) => Ok(parse_atv_status(&out)),
+                Err(_) => Ok(CastStatus::unknown()),
+            }
+        }
+        "sonos" => {
+            let addr = device.address.replace('\'', "");
+            let script = format!(
+                "from soco import SoCo\nd = SoCo('{addr}')\nti = d.get_transport_info()\ninfo = d.get_current_track_info()\nprint(ti.get('current_transport_state', '') + '|' + (info.get('position') or '') + '|' + (info.get('duration') or ''))"
+            );
+            match soco_py(&script, 12) {
+                Ok(out) => Ok(parse_soco_status(&out)),
+                Err(_) => Ok(CastStatus::unknown()),
+            }
+        }
+        "dlna" => dlna_status(&device.address),
+        other => Err(format!("unknown device kind {other}")),
+    }
+}
+
+/// Pause the receiver (the player's transport drives it now).
+#[tauri::command]
+pub async fn cast_pause(device: CastDevice) -> Cmd<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        cast_transport_sync(&device, "pause", 0.0)
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("cast task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Resume the receiver.
+#[tauri::command]
+pub async fn cast_resume(device: CastDevice) -> Cmd<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        cast_transport_sync(&device, "resume", 0.0)
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("cast task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Seek the receiver to `seconds`.
+#[tauri::command]
+pub async fn cast_seek(device: CastDevice, seconds: f64) -> Cmd<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        cast_transport_sync(&device, "seek", seconds)
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("cast task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Receiver state + position for the player's scrubber sync.
+/// Helper-backed kinds report idle/unknown rather than erroring
+/// when the receiver has nothing loaded (their CLIs exit nonzero
+/// for an idle device — a state, not a failure).
+#[tauri::command]
+pub async fn cast_status(device: CastDevice) -> Cmd<CastStatus> {
+    tauri::async_runtime::spawn_blocking(move || cast_status_sync(&device))
+        .await
+        .map_err(|e| CommandError::from(UfmError::Internal(format!("cast task failed: {e}"))))?
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))
 }
 
 // ---------------------------------------------------------------------------
@@ -14907,4 +15569,303 @@ pub fn run_sync_headless(id: &str) -> i32 {
         let _ = f.write_all(line.as_bytes());
     }
     if errors > 0 { 1 } else { 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Player round tests: window fit, cast parsers, DLNA, media server.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod player_round_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn player_window_fit_hugs_the_picture() {
+        // 2.35:1 (Brave, 1920x816-ish): the screenshot case.
+        let (w, h) = player_fit_size(1920, 816);
+        assert_eq!((w, h), (640.0, 272.0));
+        // 16:9
+        assert_eq!(player_fit_size(1920, 1080), (640.0, 360.0));
+        // 4:3
+        assert_eq!(player_fit_size(1440, 1080), (640.0, 480.0));
+        // Portrait phone clip: height clamps, width trades down.
+        assert_eq!(player_fit_size(720, 1280), (506.0, 900.0));
+        // Ultra-wide: height floor, width stays in band.
+        let (w, h) = player_fit_size(3840, 800);
+        assert_eq!(h, 200.0);
+        assert!(w <= 1280.0);
+        // Degenerate metadata falls back to the old default.
+        assert_eq!(player_fit_size(0, 0), (560.0, 340.0));
+    }
+
+    #[test]
+    fn catt_scan_parses_the_real_ip_first_format() {
+        // Verbatim shape from a live `catt scan` (catt 0.13.3).
+        let out = "\
+Scanning Chromecasts...
+192.168.12.226 - Natalie Vizio - Vizio VFD40M-0809
+192.168.12.157 - Richard tv - Google Cast Group
+192.168.12.209 - [LG] webOS GX90SA - LG TV
+";
+        let devs = parse_catt_scan(out);
+        assert_eq!(devs.len(), 3);
+        assert_eq!(devs[0].name, "Natalie Vizio");
+        assert_eq!(devs[0].address, "192.168.12.226");
+        assert_eq!(devs[0].kind, "chromecast");
+        assert_eq!(devs[1].name, "Richard tv");
+        assert_eq!(devs[2].name, "[LG] webOS GX90SA");
+        assert!(parse_catt_scan("").is_empty());
+        assert!(parse_catt_scan("no devices found").is_empty());
+    }
+
+    #[test]
+    fn catt_status_json_parses() {
+        let s = parse_catt_status(
+            r#"{"player_state":"PLAYING","current_time":61.5,"duration":5610.0,"title":"Brave"}"#,
+        );
+        assert_eq!(s.state, "playing");
+        assert_eq!(s.position, 61.5);
+        assert_eq!(s.duration, 5610.0);
+        assert_eq!(parse_catt_status("{}").state, "unknown");
+        assert_eq!(parse_catt_status("not json").state, "unknown");
+    }
+
+    #[test]
+    fn atv_status_json_parses() {
+        let s = parse_atv_status(
+            r#"{"device_state":"paused","position":30,"total_time":600,"media_type":"video"}"#,
+        );
+        assert_eq!(s.state, "paused");
+        assert_eq!(s.position, 30.0);
+        assert_eq!(s.duration, 600.0);
+        assert_eq!(parse_atv_status("{}").state, "unknown");
+    }
+
+    #[test]
+    fn hms_round_trips_and_junk_is_zero() {
+        assert_eq!(parse_hms("1:33:37"), 5617.0);
+        assert_eq!(parse_hms("02:03"), 123.0);
+        assert_eq!(parse_hms("90"), 90.0);
+        assert_eq!(parse_hms("NOT_IMPLEMENTED"), 0.0);
+        assert_eq!(parse_hms("--:--"), 0.0);
+        assert_eq!(parse_hms(""), 0.0);
+        assert_eq!(hms_of(5617.0), "1:33:37");
+        assert_eq!(hms_of(65.0), "0:01:05");
+        assert_eq!(parse_hms(&hms_of(3723.0)), 3723.0);
+    }
+
+    #[test]
+    fn soco_status_line_parses() {
+        let s = parse_soco_status("PLAYING|0:01:30|1:33:37");
+        assert_eq!(s.state, "playing");
+        assert_eq!(s.position, 90.0);
+        assert_eq!(s.duration, 5617.0);
+        assert_eq!(parse_soco_status("STOPPED||").state, "idle");
+    }
+
+    #[test]
+    fn url_resolution_and_xml_helpers() {
+        assert_eq!(
+            resolve_http_url("http://192.168.1.5:8080/desc.xml", "/avt/control"),
+            "http://192.168.1.5:8080/avt/control"
+        );
+        assert_eq!(
+            resolve_http_url("http://192.168.1.5:8080/upnp/desc.xml", "control"),
+            "http://192.168.1.5:8080/upnp/control"
+        );
+        assert_eq!(
+            resolve_http_url("http://192.168.1.5:8080", "control"),
+            "http://192.168.1.5:8080/control"
+        );
+        assert_eq!(
+            resolve_http_url("http://h/d.xml", "http://other/x"),
+            "http://other/x"
+        );
+        assert_eq!(
+            xml_tag_text("<a><friendlyName>TV &amp; Co</friendlyName></a>", "friendlyName"),
+            Some("TV & Co".to_string())
+        );
+        assert_eq!(xml_tag_text("<a/>", "missing"), None);
+    }
+
+    #[test]
+    fn dlna_description_parses_and_requires_avtransport() {
+        let xml = r#"<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+ <device>
+  <friendlyName>Living Room TV</friendlyName>
+  <serviceList>
+   <service>
+    <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+    <controlURL>/upnp/control/AVTransport1</controlURL>
+   </service>
+  </serviceList>
+ </device>
+</root>"#;
+        let (name, url) =
+            parse_dlna_description(xml, "http://192.168.1.9:9197/dmr.xml").unwrap();
+        assert_eq!(name, "Living Room TV");
+        assert_eq!(url, "http://192.168.1.9:9197/upnp/control/AVTransport1");
+        // No AVTransport service → not a renderer we can drive.
+        let plain = "<root><device><friendlyName>Printer</friendlyName></device></root>";
+        assert!(parse_dlna_description(plain, "http://h/d.xml").is_none());
+    }
+
+    #[test]
+    fn ssdp_location_header_parses() {
+        let resp = "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nLOCATION: http://192.168.1.9:9197/dmr.xml\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
+        assert_eq!(
+            parse_ssdp_location(resp),
+            Some("http://192.168.1.9:9197/dmr.xml".to_string())
+        );
+        assert_eq!(parse_ssdp_location("HTTP/1.1 200 OK\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn didl_carries_title_mime_and_url() {
+        let d = dlna_didl("http://192.168.1.2:9/cast/abc", "Brave (2012).mkv", "video/x-matroska");
+        assert!(d.contains("Brave (2012).mkv"));
+        assert!(d.contains("http-get:*:video/x-matroska:*"));
+        assert!(d.contains("http://192.168.1.2:9/cast/abc"));
+    }
+
+    /// A mock DLNA renderer on loopback: proves the SOAP
+    /// envelope/action headers go out right and the status
+    /// parsers read a real response — the full control path
+    /// short of a physical TV.
+    #[test]
+    fn dlna_soap_round_trip_against_mock_renderer() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen2 = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let seen3 = seen2.clone();
+                std::thread::spawn(move || {
+                    let mut req = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    // Read headers, then the body per Content-Length.
+                    let mut body_at = None;
+                    let mut clen = 0usize;
+                    while body_at.is_none() {
+                        match s.read(&mut buf) {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                req.extend_from_slice(&buf[..n]);
+                                if let Some(pos) = find_subslice(&req, b"\r\n\r\n") {
+                                    body_at = Some(pos + 4);
+                                    let head = String::from_utf8_lossy(&req[..pos]).to_lowercase();
+                                    for line in head.lines() {
+                                        if let Some(v) = line.strip_prefix("content-length:") {
+                                            clen = v.trim().parse().unwrap_or(0);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let body_at = body_at.unwrap();
+                    while req.len() < body_at + clen {
+                        match s.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                            Err(_) => break,
+                        }
+                    }
+                    let text = String::from_utf8_lossy(&req).into_owned();
+                    seen3.lock().unwrap().push(text.clone());
+                    let reply = if text.contains("GetTransportInfo") {
+                        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetTransportInfoResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"><CurrentTransportState>PLAYING</CurrentTransportState></u:GetTransportInfoResponse></s:Body></s:Envelope>"
+                    } else if text.contains("GetPositionInfo") {
+                        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:GetPositionInfoResponse xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\"><TrackDuration>1:33:37</TrackDuration><RelTime>0:01:30</RelTime></u:GetPositionInfoResponse></s:Body></s:Envelope>"
+                    } else {
+                        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body/></s:Envelope>"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=\"utf-8\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        reply.len(),
+                        reply
+                    );
+                    let _ = s.write_all(resp.as_bytes());
+                });
+            }
+        });
+        let control = format!("http://127.0.0.1:{port}/avt");
+        // Play goes out as a proper SOAP action…
+        dlna_soap(&control, "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>").unwrap();
+        // …and status reads state + position back.
+        let st = dlna_status(&control).unwrap();
+        assert_eq!(st.state, "playing");
+        assert_eq!(st.position, 90.0);
+        assert_eq!(st.duration, 5617.0);
+        let reqs = seen.lock().unwrap();
+        assert!(reqs.iter().any(|r| r.contains("SOAPACTION") || r.to_lowercase().contains("soapaction")));
+        assert!(reqs.iter().any(|r| r.contains("#Play")));
+        assert!(reqs.iter().any(|r| r.contains("<u:Play")));
+    }
+
+    fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// The real media server over a real socket: full GET carries
+    /// the file's media type (the cast fix), Range GET returns the
+    /// exact byte slice with 206 + Content-Range, unknown tokens
+    /// 404. This is the server casting streams through.
+    #[test]
+    fn media_server_serves_ranges_with_media_type() {
+        use std::net::TcpListener;
+        let dir = std::env::temp_dir().join(format!("fable-media-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("clip.mp4");
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&file, &bytes).unwrap();
+        let files = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::from([("tok1".to_string(), file.clone())]),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let f = files.clone();
+                std::thread::spawn(move || serve_media_conn(stream, f));
+            }
+        });
+        let get = |req: &str| -> Vec<u8> {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(req.as_bytes()).unwrap();
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).unwrap();
+            out
+        };
+        let split = |resp: &[u8]| -> (String, Vec<u8>) {
+            let pos = find_subslice(resp, b"\r\n\r\n").unwrap();
+            (
+                String::from_utf8_lossy(&resp[..pos]).into_owned(),
+                resp[pos + 4..].to_vec(),
+            )
+        };
+
+        let (head, body) = split(&get("GET /cast/tok1 HTTP/1.1\r\nHost: x\r\n\r\n"));
+        assert!(head.contains("200"), "{head}");
+        assert!(head.to_lowercase().contains("content-type: video/mp4"), "{head}");
+        assert_eq!(body, bytes);
+
+        let (head, body) = split(&get(
+            "GET /cast/tok1 HTTP/1.1\r\nHost: x\r\nRange: bytes=100-199\r\n\r\n",
+        ));
+        assert!(head.contains("206"), "{head}");
+        assert!(head.contains("Content-Range: bytes 100-199/4096"), "{head}");
+        assert_eq!(body, bytes[100..200].to_vec());
+
+        let (head, _) = split(&get("GET /cast/nope HTTP/1.1\r\nHost: x\r\n\r\n"));
+        assert!(head.contains("404"), "{head}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

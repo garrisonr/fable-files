@@ -18,11 +18,13 @@ const KIND_ICON: Record<string, string> = {
   chromecast: "📺",
   airplay: "🍏",
   sonos: "🔊",
+  dlna: "🖥️",
 };
 const KIND_LABEL: Record<string, string> = {
   chromecast: "Chromecast",
   airplay: "AirPlay",
   sonos: "Sonos",
+  dlna: "DLNA",
 };
 
 export class CastDialog {
@@ -32,6 +34,12 @@ export class CastDialog {
   private stopBtn: HTMLButtonElement;
   private item: Item | null = null;
   private playing: Device | null = null;
+  /** Player round: when the video player drives the dialog, it
+   * opens in picker mode — a device click resolves the promise
+   * instead of starting playback here, because the player owns
+   * the session (transport, scrubber, stop-returns-locally). */
+  private pickResolve: ((d: Device | null) => void) | null = null;
+  private pickIsVideo = false;
 
   constructor() {
     this.element = document.createElement("div");
@@ -78,15 +86,35 @@ export class CastDialog {
     await this.scan();
   }
 
+  /** Picker mode for the video player: resolves with the chosen
+   * device, or null when the dialog is dismissed. Playback is
+   * NOT started here — the player registers its file by path,
+   * starts the session and owns the transport. */
+  openPicker(name: string, isVideo: boolean): Promise<Device | null> {
+    this.item = null;
+    this.pickIsVideo = isVideo;
+    this.element.hidden = false;
+    this.statusEl.textContent = `“${name}” — pick a device to cast to.`;
+    return new Promise<Device | null>((resolve) => {
+      this.pickResolve = resolve;
+      void this.scan();
+    });
+  }
+
   close(): void {
     this.element.hidden = true;
+    if (this.pickResolve) {
+      const resolve = this.pickResolve;
+      this.pickResolve = null;
+      resolve(null);
+    }
   }
 
   private async scan(): Promise<void> {
     this.listEl.replaceChildren();
     const scanning = document.createElement("div");
     scanning.className = "cast-empty";
-    scanning.textContent = "Scanning your network (Chromecast · AirPlay · Sonos)…";
+    scanning.textContent = "Scanning your network (Chromecast · AirPlay · Sonos · DLNA)…";
     this.listEl.appendChild(scanning);
     try {
       const [devices, missing] = await Promise.all([
@@ -155,18 +183,27 @@ export class CastDialog {
       empty.textContent =
         missing.length > 0
           ? "No cast devices found yet."
-          : "No cast devices found. Devices must be on the same Wi-Fi/LAN and awake.";
+          : "No cast devices found on this network. Devices have to be on the same Wi-Fi/LAN as this computer and awake — a TV in deep sleep won't answer discovery.";
       this.listEl.appendChild(empty);
       return;
     }
     for (const d of devices) {
       const row = document.createElement("button");
       row.className = "cast-device";
-      const isVideo = this.item ? isVideoName(this.item.name) : false;
+      const isVideo = this.item ? isVideoName(this.item.name) : this.pickIsVideo;
       row.textContent =
         `${KIND_ICON[d.kind] ?? "📡"} ${d.name} · ${KIND_LABEL[d.kind] ?? d.kind}` +
         (d.kind === "sonos" && isVideo ? " (audio only)" : "");
-      row.addEventListener("click", () => void this.play(d));
+      row.addEventListener("click", () => {
+        if (this.pickResolve) {
+          const resolve = this.pickResolve;
+          this.pickResolve = null;
+          this.close();
+          resolve(d);
+        } else {
+          void this.play(d);
+        }
+      });
       this.listEl.appendChild(row);
     }
   }
