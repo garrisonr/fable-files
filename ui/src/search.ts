@@ -15,6 +15,7 @@ import {
 } from "./api";
 import { ContextMenu } from "./contextmenu";
 import { errText } from "./toast";
+import { isPlayableName } from "./video";
 
 export interface SearchHooks {
   onNavigateToItem(item: Item): void;
@@ -30,6 +31,9 @@ export interface SearchHooks {
   /** Results are showing: the shell should hide the file view. */
   onResults(): void;
   onClear(): void;
+  /** Double-click on a playable hit (fix batch item 7): pop it
+   * out into the player window instead of previewing. */
+  onPopOutItem?(item: Item): void;
   /** "Re-index" button in the results header (Round 7.1). */
   onReindex?(): void;
   /** Save the current query + filter as a smart folder. */
@@ -131,6 +135,24 @@ export class SearchView {
   /** The last typed-search render, so the empty-state copy can be
    * rephrased the moment indexing state flips. */
   private lastResults: { q: string; hits: SearchHit[] } | null = null;
+  /** View cache (fix batch item 2 — the view caching law): a
+   * view's result set survives navigation. Switching back PAINTS
+   * the cache — no query, no duration re-probe, scroll restored.
+   * Entries die only when the DATA changes: the shell drops the
+   * whole cache on mutations and job completions, and a finished
+   * re-index drops it here. */
+  private viewCache = new Map<
+    string,
+    {
+      items: Item[] | null;
+      hits: SearchHit[] | null;
+      displayNames: Map<string, string> | null;
+      scrollTop: number;
+    }
+  >();
+  /** Cache key of the view currently on screen (scroll is saved
+   * under it whenever another view takes over). */
+  private currentViewKey: string | null = null;
 
   constructor(private hooks: SearchHooks) {
     this.el = document.createElement("div");
@@ -575,6 +597,7 @@ export class SearchView {
   }
 
   clear(): void {
+    this.saveScroll();
     window.clearTimeout(this.timer);
     this.input.value = "";
     this.lastQuery = "";
@@ -595,9 +618,44 @@ export class SearchView {
     this.hooks.onClear();
   }
 
+  /** Cache key fragment for a collection scope. */
+  private scopeKey(scope?: RomScope): string {
+    if (!scope) return "all";
+    return scope.mode === "drives"
+      ? `drives:${[...scope.drives].sort().join(",")}`
+      : scope.mode;
+  }
+
+  /** Remember how far the CURRENT view is scrolled before
+   * another view (or the file view) takes the screen. */
+  private saveScroll(): void {
+    if (!this.currentViewKey) return;
+    const e = this.viewCache.get(this.currentViewKey);
+    if (e) e.scrollTop = this.el.scrollTop;
+  }
+
+  /** Restore a freshly painted view's scroll position. */
+  private restoreScroll(key: string): void {
+    const e = this.viewCache.get(key);
+    if (!e || e.scrollTop <= 0) return;
+    const top = e.scrollTop;
+    requestAnimationFrame(() => {
+      this.el.scrollTop = top;
+    });
+  }
+
+  /** Data changed (fix batch item 2): every cached view is
+   * stale. Called by the shell on mutations and job completions;
+   * the next visit to each view re-gathers it. Navigation alone
+   * NEVER calls this. */
+  invalidateViewCache(): void {
+    this.viewCache.clear();
+  }
+
   /** A library re-index just finished: refresh what the user is
    * looking at so newly downloaded files appear without a restart. */
   rerunAfterIndex(): void {
+    this.viewCache.clear();
     if (!this.active) return;
     if (this.lastRom) {
       void this.runRomCollection(
@@ -647,11 +705,28 @@ export class SearchView {
     this.active = true;
     this.el.hidden = false;
     this.hooks.onResults();
-    this.renderLoading(q);
     try {
       const fa = await this.filterArgs();
+      // View cache (fix batch item 2): the same query + facets
+      // paints its last result set instantly — no round-trip.
+      const key = `q|${q}|${this.typeFilter ?? ""}|${this.scopeChoice}|${fa.pathPrefix ?? ""}|${this.afterDate}|${this.beforeDate}|${this.sizeFacet?.id ?? ""}`;
+      this.saveScroll();
+      const cached = this.viewCache.get(key);
+      this.currentViewKey = key;
+      if (cached?.hits) {
+        this.renderResults(q, cached.hits);
+        this.restoreScroll(key);
+        return;
+      }
+      this.renderLoading(q);
       const hits = await api.search(q, fa.scope, 50, this.typeFilter, fa);
       if (this.lastQuery !== q) return; // superseded
+      this.viewCache.set(key, {
+        items: null,
+        hits,
+        displayNames: null,
+        scrollTop: 0,
+      });
       this.renderResults(q, hits);
     } catch {
       if (this.lastQuery !== q) return;
@@ -673,6 +748,18 @@ export class SearchView {
     this.lastRom = null;
     this.displayNames = null;
     this.hooks.onResults();
+    // View cache (fix batch item 2): re-entering a smart folder
+    // paints its last result set instantly — the duration probe
+    // loop below runs ONCE per data change, not per visit.
+    const key = `rule|${name}|${rule.extensions.join(",")}|${rule.minDurationSecs ?? ""}|${this.scopeKey(scope)}`;
+    this.saveScroll();
+    const cached = this.viewCache.get(key);
+    this.currentViewKey = key;
+    if (cached?.items) {
+      this.renderItems(name, cached.items);
+      this.restoreScroll(key);
+      return;
+    }
     this.renderStatus(`Gathering “${name}”…`);
     try {
       let items: Item[] = [];
@@ -703,6 +790,12 @@ export class SearchView {
             : new Set<string | null>(scope.drives);
         items = items.filter((it) => allowed.has(it.location));
       }
+      this.viewCache.set(key, {
+        items,
+        hits: null,
+        displayNames: null,
+        scrollTop: 0,
+      });
       this.renderItems(name, items);
     } catch {
       this.renderStatus(`Could not gather “${name}”. Please try again.`);
@@ -725,6 +818,19 @@ export class SearchView {
     this.lastRom = { name, systemKey, scope };
     this.displayNames = null;
     this.hooks.onResults();
+    // View cache (fix batch item 2): a re-visit paints the
+    // collection instantly; identifications are cached backend-
+    // side too, but the gather itself is not free.
+    const key = `rom|${systemKey}|${this.scopeKey(scope)}`;
+    this.saveScroll();
+    const cached = this.viewCache.get(key);
+    this.currentViewKey = key;
+    if (cached?.items) {
+      this.displayNames = cached.displayNames;
+      this.renderItems(name, cached.items);
+      this.restoreScroll(key);
+      return;
+    }
     this.renderStatus(`Identifying ROMs for “${name}”…`);
     if (!this.romProgressWired) {
       this.romProgressWired = true;
@@ -746,6 +852,12 @@ export class SearchView {
         names.set(h.item.id, h.datName);
       }
       this.displayNames = names;
+      this.viewCache.set(key, {
+        items,
+        hits: null,
+        displayNames: names,
+        scrollTop: 0,
+      });
       this.renderItems(name, items);
       if (items.length === 0) {
         const note = document.createElement("p");
@@ -961,7 +1073,20 @@ export class SearchView {
           e.clientY,
         );
       });
-      row.addEventListener("dblclick", () => this.activate(hit.item));
+      row.addEventListener("dblclick", () => {
+        // Double-click law (fix batch item 7): a playable file
+        // pops out into the player window, playing. Everything
+        // else keeps activate() — folders navigate, files preview.
+        if (
+          hit.item.kind !== "folder" &&
+          this.hooks.onPopOutItem &&
+          isPlayableName(hit.item.name)
+        ) {
+          this.hooks.onPopOutItem(hit.item);
+        } else {
+          this.activate(hit.item);
+        }
+      });
       row.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
           this.activate(hit.item);

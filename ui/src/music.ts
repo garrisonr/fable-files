@@ -75,6 +75,11 @@ export class MusicPlayer {
    * here while detached; the local element stays silent. */
   private detachedPath: string | null = null;
   private detachedState: { t: number; playing: boolean } | null = null;
+  /** Tombstone watch (fix batch item 4): while a track is
+   * detached, verify the mini window still exists — if its close
+   * event never lands, the return runs from here instead of the
+   * card sitting inert forever. */
+  private detachWatch: number | null = null;
   /** A resume position to apply on the next loadedmetadata. */
   private pendingResume: { t: number; playing: boolean } | null = null;
   private detachBtn: HTMLButtonElement | null = null;
@@ -147,6 +152,7 @@ export class MusicPlayer {
         // player-closed follows, finds detachedPath already null,
         // and does nothing more.
         this.detachedPath = null;
+        this.stopDetachWatch();
         this.paintAttached();
         if (!this.overlay) return;
         const next = this.index + 1;
@@ -155,15 +161,48 @@ export class MusicPlayer {
         }
       }
     }).catch(() => undefined);
-    void onPlayerClosed((path) => {
-      if (path !== this.detachedPath) return;
-      this.detachedPath = null;
-      this.paintAttached();
-      if (!this.overlay) return; // the player itself was closed too
-      const st = this.detachedState;
-      this.detachedState = null;
-      void this.resumeAt(this.index, st?.t ?? 0, st?.playing ?? false);
-    }).catch(() => undefined);
+    void onPlayerClosed((path) => this.handleDetachWindowGone(path)).catch(
+      () => undefined,
+    );
+  }
+
+  /** The detach window is gone — close event or tombstone watch
+   * (fix batch item 4): resume the track here from its last
+   * streamed state. Idempotent: whichever path fires second
+   * finds detachedPath already null and does nothing. */
+  private handleDetachWindowGone(path: string): void {
+    if (path !== this.detachedPath) return;
+    this.detachedPath = null;
+    this.stopDetachWatch();
+    this.paintAttached();
+    if (!this.overlay) return; // the player itself was closed too
+    const st = this.detachedState;
+    this.detachedState = null;
+    void this.resumeAt(this.index, st?.t ?? 0, st?.playing ?? false);
+  }
+
+  private startDetachWatch(): void {
+    if (this.detachWatch !== null) return;
+    this.detachWatch = window.setInterval(() => {
+      const p = this.detachedPath;
+      if (!p) {
+        this.stopDetachWatch();
+        return;
+      }
+      void api
+        .playerWindowOpen(p)
+        .then((open) => {
+          if (!open) this.handleDetachWindowGone(p);
+        })
+        .catch(() => undefined);
+    }, 1200);
+  }
+
+  private stopDetachWatch(): void {
+    if (this.detachWatch !== null) {
+      window.clearInterval(this.detachWatch);
+      this.detachWatch = null;
+    }
   }
 
   /** Detach the current track into the always-on-top mini window
@@ -176,11 +215,20 @@ export class MusicPlayer {
     const t = this.audio.currentTime || 0;
     const playing = !this.audio.paused && !this.audio.ended;
     this.detachedState = { t, playing };
+    // Item 3: the art this panel is showing rides along to the
+    // mini window (a data URL the backend stashes at open time).
+    const artImg =
+      this.overlay?.querySelector<HTMLImageElement>(".music-art-img");
+    const art =
+      artImg && !artImg.hidden && artImg.src.startsWith("data:")
+        ? artImg.src
+        : null;
     void api
       .openPlayerWindow(path, item.name, {
         kind: "audio",
         start: t,
         autoplay: playing,
+        art,
       })
       .then(() => {
         this.detachedPath = path;
@@ -189,6 +237,7 @@ export class MusicPlayer {
         this.audio.removeAttribute("src");
         this.audio.load();
         this.paintDetached();
+        this.startDetachWatch();
       })
       .catch(() => undefined);
   }
@@ -303,6 +352,7 @@ export class MusicPlayer {
     // A detach window outlives the panel: it keeps playing on its
     // own, but its state stream no longer maps to this queue.
     this.detachedPath = null;
+    this.stopDetachWatch();
     this.detachedState = null;
     this.pendingResume = null;
     this.audio.pause();

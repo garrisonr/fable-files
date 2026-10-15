@@ -326,7 +326,14 @@ export const api = {
   openPlayerWindow: (
     path: string,
     name: string,
-    opts?: { kind?: "video" | "audio"; start?: number; autoplay?: boolean },
+    opts?: {
+      kind?: "video" | "audio";
+      start?: number;
+      autoplay?: boolean;
+      /** Cover-art data URL (fix batch item 3): stashed backend-
+       * side for the mini window to fetch — never in the URL. */
+      art?: string | null;
+    },
   ) =>
     invoke<void>("open_player_window", {
       path,
@@ -334,9 +341,17 @@ export const api = {
       kind: opts?.kind ?? "video",
       start: opts?.start ?? 0,
       autoplay: opts?.autoplay ?? false,
+      art: opts?.art ?? null,
     }),
   closePlayerWindow: (path: string) =>
     invoke<void>("close_player_window", { path }),
+  /** Tombstone guard (fix batch item 4): does this path's detach
+   * window actually still exist? */
+  playerWindowOpen: (path: string) =>
+    invoke<boolean>("player_window_open", { path }),
+  /** Artwork stashed for this path's detach window at open time. */
+  getPlayerArt: (path: string) =>
+    invoke<string | null>("get_player_art", { path }),
   makeAlias: (item: string) => invoke<string>("make_alias", { item }),
   convertImage: (item: string, format: string) =>
     invoke<string>("convert_image", { item, format }),

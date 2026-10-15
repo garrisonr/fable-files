@@ -12,7 +12,7 @@ import { errText } from "./toast";
  */
 import { Shell } from "./shell";
 import { VideoPlayer } from "./video";
-import { mediaSrc } from "./api";
+import { api, mediaSrc } from "./api";
 import { emit } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import "./styles.css";
@@ -87,8 +87,18 @@ function bootPlayer(params: URLSearchParams): void {
   });
   root.appendChild(player.el);
   // The window closing IS the surface closing: tear playback down
-  // with it (fix block item 3).
-  window.addEventListener("beforeunload", () => player.destroy());
+  // with it (fix block item 3) — but hand the final position home
+  // FIRST (fix batch item 4): a plain window close carries no
+  // ⤺ click, so without this the trip home resumes from the last
+  // streamed state (up to 5 s stale) instead of where it stopped.
+  window.addEventListener("beforeunload", () => {
+    void emit("player-state", {
+      path,
+      t: player.position(),
+      playing: player.isPlaying(),
+    }).catch(() => undefined);
+    player.destroy();
+  });
 }
 
 /** The audio detach window: a compact transport (the Music
@@ -107,6 +117,24 @@ function bootAudioPlayer(params: URLSearchParams): void {
 
   const wrap = document.createElement("div");
   wrap.className = "mini-audio";
+  // Cover art (fix batch item 3): the mini player wears the same
+  // face as the inline preview — art the sender resolved rides
+  // the open_player_window stash; the fallback is the embedded
+  // art for THIS path through the thumbnailer. A filename on a
+  // black card is not a player.
+  const art = document.createElement("img");
+  art.className = "mini-audio-art";
+  art.alt = "";
+  art.hidden = true;
+  const glyph = document.createElement("div");
+  glyph.className = "mini-audio-glyph";
+  glyph.textContent = "🎵";
+  art.addEventListener("error", () => {
+    art.hidden = true;
+    glyph.hidden = false;
+  });
+  const main = document.createElement("div");
+  main.className = "mini-audio-main";
   const title = document.createElement("div");
   title.className = "mini-audio-title";
   title.textContent = name;
@@ -130,8 +158,22 @@ function bootAudioPlayer(params: URLSearchParams): void {
   ret.textContent = "⤺";
   ret.title = "Back to the Music Player";
   bar.append(playBtn, seek, time, ret);
-  wrap.append(title, bar);
+  main.append(title, bar);
+  wrap.append(art, glyph, main);
   root.appendChild(wrap);
+  void (async () => {
+    try {
+      const stashed = await api.getPlayerArt(path);
+      const url = stashed ?? (await api.getThumbnail("", path, true));
+      if (url) {
+        art.src = url;
+        art.hidden = false;
+        glyph.hidden = true;
+      }
+    } catch {
+      // no art anywhere — the glyph stays
+    }
+  })();
 
   const audio = new Audio();
   audio.preload = "metadata";

@@ -32,6 +32,7 @@ import { LabelManager, saveLabelRules } from "./labels";
 import { loadLabelDefs, migrateLabelAssignments, saveLabelDefs } from "./labels";
 import { loadRomSystems, saveRomSystems, romsEnabled, romScopeOf, romSystemKey, setRomsEnabled, type RomSystem } from "./roms";
 import { MusicPlayer } from "./music";
+import { isPlayableName, isVideoName } from "./video";
 import { OpenWithDialog } from "./openwith";
 import type { ArchiveEntry } from "./api";
 import { TerminalPanel } from "./terminal";
@@ -426,7 +427,20 @@ export class Shell {
         this.searchView.clear(); // back to the file view before navigating
         this.openItem(item);
       },
-      onPreviewItem: (item) => void this.quickLook.open(item),
+      onPreviewItem: (item) => {
+        // Space on the hit already previewed (fix batch item 1):
+        // while its Quick Look media is inline, Space is
+        // play/pause — not a re-open that restarts the preview.
+        if (
+          this.quickLook.isOpen &&
+          this.quickLook.item?.id === item.id &&
+          this.quickLook.toggleMediaPlayback()
+        ) {
+          return;
+        }
+        void this.quickLook.open(item);
+      },
+      onPopOutItem: (item) => this.popOutItem(item),
       onTrashItems: (items) => {
         void this.trashItems(items).then(() => this.searchView.refresh());
       },
@@ -1076,6 +1090,12 @@ export class Shell {
         // 2026-10-14). Walk its real path from the location root.
         void this.openFolderByPath(item);
       }
+    } else if (isPlayableName(item.name) && item.provider_key) {
+      // Double-click law (fix batch item 7): playable media pops
+      // out into the Fable player window, playing — in EVERY
+      // view, no per-surface exceptions. Non-media keeps the OS
+      // default below.
+      this.popOutItem(item);
     } else if (Shell.isArchiveName(item.name)) {
       this.openArchive(item);
     } else {
@@ -1084,6 +1104,22 @@ export class Shell {
         .openItem(item.id)
         .catch(() => void this.quickLook.open(item));
     }
+  }
+
+  /** Pop a playable item out into its player window, playing
+   * (fix batch item 7) — the one door behind double-click in the
+   * file views and in search results alike. */
+  popOutItem(item: Item): void {
+    if (!item.provider_key) return;
+    void api
+      .openPlayerWindow(item.provider_key, item.name, {
+        kind: isVideoName(item.name) ? "video" : "audio",
+        start: 0,
+        autoplay: true,
+      })
+      .catch((err) =>
+        Toast.error(`Could not open the player: ${errText(err)}`),
+      );
   }
 
   /** Walk from a location's root to `targetDirPath`, building the
@@ -1273,6 +1309,12 @@ export class Shell {
   }
 
   private togglePreview(): void {
+    // Space while media Quick Look is open (fix batch item 1):
+    // play/pause. Space still closes the preview when what it
+    // shows is not playing media; Esc always closes.
+    if (this.quickLook.isOpen && this.quickLook.toggleMediaPlayback()) {
+      return;
+    }
     this.quickLook.toggle(this.activeSelected());
   }
 
@@ -1446,6 +1488,11 @@ export class Shell {
   }
 
   private refreshActiveDir(): void {
+    // Every mutation funnels through here (fix batch item 2):
+    // cached smart-folder / search views are DATA-stale now and
+    // re-gather on their next visit. Navigation alone never
+    // invalidates them — changes do.
+    this.searchView.invalidateViewCache();
     const t = this.activeTab;
     if (t) void this.loadDir(t);
   }

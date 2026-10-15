@@ -2384,10 +2384,29 @@ tr.row[style*="--label-color"] {
   color: var(--ufm-text-muted); padding: 1rem 1.25rem; text-align: center;
   font-size: 0.8125rem; line-height: 1.4;
 }
+/* Detached-playing placeholder (fix batch item 5): flat family
+   material — artwork, title, one quiet line, one bordered pill.
+   The old centered text + naked default button read as
+   early-2000s chrome under several themes; this card cannot. */
 .ql-detached {
-  display: flex; flex-direction: column; align-items: center; gap: 0.6rem;
-  padding: 2rem 1rem; color: var(--ufm-text-muted); text-align: center;
+  display: flex; align-items: center; gap: 0.85rem;
+  padding: 0.9rem; margin-bottom: 0.85rem; text-align: left;
+  border: 1px solid var(--ufm-border); border-radius: var(--ufm-radius);
+  background: color-mix(in srgb, var(--ufm-text) 4%, transparent);
 }
+.ql-detached-art { width: 64px; height: 64px; object-fit: cover; border-radius: 8px; flex: none; }
+.ql-detached-glyph {
+  width: 64px; height: 64px; flex: none; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center; font-size: 1.7rem;
+  background: color-mix(in srgb, var(--ufm-text) 7%, transparent);
+}
+.ql-detached-meta { flex: 1; min-width: 0; }
+.ql-detached-title {
+  font-weight: 600; color: var(--ufm-text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ql-detached-sub { color: var(--ufm-text-muted); font-size: 0.85rem; margin-top: 0.15rem; }
+.ql-media-detach { margin: 0.55rem 0 0.85rem; }
 .ql-cast { font-size: 0.95rem; }
 /* Quick Look audio player (Round 7.1) */
 .ql-audio { display: flex; flex-direction: column; gap: 0.6rem; margin-bottom: 0.85rem; }
@@ -3042,10 +3061,18 @@ select option { background-color: var(--ufm-surface); color: var(--ufm-text); }
 /* Detached state (UI round item 5): transport + queue are inert
    while the mini window owns playback. */
 .music-card.detached .music-bar, .music-card.detached .music-tracks { opacity: 0.45; pointer-events: none; }
-.ql-audio-detach { align-self: flex-start; padding: 0.3rem 0.8rem; border-radius: 999px; border: 1px solid var(--ufm-border); background: transparent; color: var(--ufm-text); cursor: pointer; font: inherit; font-size: 0.8125rem; }
-.ql-audio-detach:hover { background: color-mix(in srgb, var(--ufm-text) 8%, transparent); }
-/* The audio detach (mini) window body. */
-.mini-audio { display: flex; flex-direction: column; gap: 0.6rem; padding: 1rem 1.1rem; height: 100vh; box-sizing: border-box; justify-content: center; background: #101014; color: #f5f5f7; }
+.ql-audio-detach, .ql-detach-btn { align-self: flex-start; padding: 0.3rem 0.8rem; border-radius: 999px; border: 1px solid var(--ufm-border); background: transparent; color: var(--ufm-text); cursor: pointer; font: inherit; font-size: 0.8125rem; white-space: nowrap; }
+.ql-audio-detach:hover, .ql-detach-btn:hover { background: color-mix(in srgb, var(--ufm-text) 8%, transparent); }
+/* The audio detach (mini) window body — with its cover art
+   (fix batch item 3): art left, title + transport right. */
+.mini-audio { display: flex; flex-direction: row; align-items: center; gap: 0.9rem; padding: 1rem 1.1rem; height: 100vh; box-sizing: border-box; background: #101014; color: #f5f5f7; }
+.mini-audio-art { width: 84px; height: 84px; object-fit: cover; border-radius: 10px; flex: none; }
+.mini-audio-glyph {
+  width: 84px; height: 84px; flex: none; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center; font-size: 2.2rem;
+  background: rgb(255 255 255 / 0.07);
+}
+.mini-audio-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.6rem; }
 .mini-audio-title { font-weight: 600; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .mini-audio-bar { display: flex; align-items: center; gap: 0.6rem; }
 .music-tracks { overflow-y: auto; border: 1px solid var(--ufm-border); border-radius: var(--ufm-radius); }

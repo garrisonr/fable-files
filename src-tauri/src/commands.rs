@@ -5368,14 +5368,22 @@ fn query_encode(v: &str) -> String {
 #[tauri::command]
 pub async fn open_player_window(
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     path: String,
     name: String,
     kind: Option<String>,
     start: Option<f64>,
     autoplay: Option<bool>,
+    art: Option<String>,
 ) -> Cmd<()> {
     use tauri::{Emitter, Manager};
     let label = player_label(&path);
+    // Fix batch item 3: cover art rides the invoke channel (data
+    // URLs are far too long for the window URL) and waits in the
+    // stash for the mini window to pick up via `get_player_art`.
+    if let Some(a) = art {
+        state.player_art.lock().unwrap().insert(label.clone(), a);
+    }
     if let Some(w) = app.get_webview_window(&label) {
         let _ = w.set_focus();
         return Ok(());
@@ -5403,12 +5411,38 @@ pub async fn open_player_window(
         .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
     let app2 = app.clone();
     let path2 = path.clone();
+    let label2 = label.clone();
     window.on_window_event(move |event| {
         if matches!(event, tauri::WindowEvent::Destroyed) {
+            let st = app2.state::<AppState>();
+            st.player_art.lock().unwrap().remove(&label2);
             let _ = app2.emit("player-closed", path2.clone());
         }
     });
     Ok(())
+}
+
+/// Whether a detach player window for `path` currently exists.
+/// Fix batch item 4 (the tombstone guard): the "Playing in the
+/// detached window" placeholder polls this and brings playback
+/// home itself if the window vanished without its close event
+/// landing — a placeholder must never outlive its window.
+#[tauri::command]
+pub fn player_window_open(app: tauri::AppHandle, path: String) -> bool {
+    use tauri::Manager;
+    app.get_webview_window(&player_label(&path)).is_some()
+}
+
+/// Artwork stashed for this path's detach window at open time
+/// (fix batch item 3), or None when the caller had none.
+#[tauri::command]
+pub fn get_player_art(state: State<'_, AppState>, path: String) -> Option<String> {
+    state
+        .player_art
+        .lock()
+        .unwrap()
+        .get(&player_label(&path))
+        .cloned()
 }
 
 /// Close a pop-out player window (bring the video back to the preview).

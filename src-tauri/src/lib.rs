@@ -64,6 +64,11 @@ pub struct AppState {
     pub terminals: Mutex<
         std::collections::HashMap<String, commands::TerminalSession>,
     >,
+    /// Artwork handed to a detach (pop-out) player window, keyed by
+    /// the window's player label (fix batch item 3): the data URL
+    /// travels over the invoke channel, never through the window
+    /// URL, and the mini window fetches it via `get_player_art`.
+    pub player_art: Mutex<HashMap<String, String>>,
     /// Cancellation flags for running transcodes, by job id.
     /// Port of the built-in cast media server (started lazily).
     pub media_server_port: Mutex<Option<u16>>,
@@ -140,6 +145,7 @@ impl AppState {
                 bytes_done: 0,
             }),
             terminals: Mutex::new(std::collections::HashMap::new()),
+            player_art: Mutex::new(HashMap::new()),
             media_server_port: Mutex::new(None),
             media_files: std::sync::Arc::new(Mutex::new(
                 std::collections::HashMap::new(),
@@ -448,6 +454,8 @@ pub fn run() {
             commands::clipboard_read,
             commands::open_player_window,
             commands::close_player_window,
+            commands::player_window_open,
+            commands::get_player_art,
             commands::make_alias,
             commands::convert_image,
             commands::rotate_image_left,

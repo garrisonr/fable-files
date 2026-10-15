@@ -20,6 +20,27 @@ export function isVideoName(name: string): boolean {
   return VIDEO_EXTS.has(ext);
 }
 
+/** Audio extensions the players handle — the same set Quick Look
+ * has always used (fix batch: one list, so the double-click law
+ * and the previews can never disagree about what "playable"
+ * means). */
+export const AUDIO_EXTS = new Set([
+  "mp3", "flac", "ogg", "oga", "wav", "m4a", "m4b", "opus", "aac",
+  "aif", "aiff", "wma", "dsf", "dff",
+]);
+
+export function isAudioName(name: string): boolean {
+  const ext = name.includes(".")
+    ? name.slice(name.lastIndexOf(".") + 1).toLowerCase()
+    : "";
+  return AUDIO_EXTS.has(ext);
+}
+
+/** Playable media (fix batch item 7): video or audio. */
+export function isPlayableName(name: string): boolean {
+  return isVideoName(name) || isAudioName(name);
+}
+
 function fmtTime(sec: number): string {
   if (!isFinite(sec) || sec < 0) sec = 0;
   const m = Math.floor(sec / 60);
@@ -79,6 +100,12 @@ export class VideoPlayer {
   private pendingSeek: number | null = null;
   private wantPlay = false;
   private stateTimer: number | null = null;
+
+  /** The file this player is showing (hosts snapshot it before a
+   * re-render tears the player down — fix batch item 1). */
+  get sourcePath(): string {
+    return this.path;
+  }
 
   /** Current playback position in seconds — for a transcode stream
    * this is the position in the ORIGINAL file, not the stream. */
@@ -273,6 +300,13 @@ export class VideoPlayer {
           this.wantPlay = false;
           void this.video.play().catch(() => undefined);
         }
+      } else if (this.wantPlay) {
+        // Autoplay with no seek to land first (fix batch item 1):
+        // wantPlay used to be consumed ONLY inside the pending-seek
+        // branch, so a player opened at 0 with autoplay=true sat
+        // paused forever — Dickles' "Space opens a paused preview".
+        this.wantPlay = false;
+        void this.video.play().catch(() => undefined);
       }
       this.syncProgress();
     });
@@ -302,6 +336,10 @@ export class VideoPlayer {
   private onKey(e: KeyboardEvent): void {
     if (e.key === " " || e.key.toLowerCase() === "k") {
       e.preventDefault();
+      // The key is handled HERE (fix batch item 1): without the
+      // stop, the shell's document-level Space handler ALSO fires
+      // and the two toggles cancel out / close the preview.
+      e.stopPropagation();
       this.togglePlay();
     } else if (e.key === "ArrowRight") {
       this.video.currentTime = Math.min(
