@@ -60,6 +60,12 @@ fn main() {
             std::process::exit(fable_files_lib::commands::run_sync_headless(id));
         }
     }
+    // Headless background scheduler (Media Completion): `fable-files
+    // --background` is the quiet agent the systemd user unit runs at
+    // login — owns the completion schedules, no window, ever.
+    if args.iter().any(|a| a == "--background") {
+        std::process::exit(fable_files_lib::mediacomplete::run_background_agent());
+    }
     // Headless MCP "AI file clerk" (Phase 3): `fable-files mcp` serves
     // MCP over stdio until the client hangs up; `fable-files
     // --mcp-audit [n]` prints the newest audit rows. Neither starts

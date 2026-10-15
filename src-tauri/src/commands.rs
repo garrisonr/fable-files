@@ -2230,6 +2230,88 @@ fn execute_step(
                 }
             }
         }
+        ufm_jobs::StepOp::FetchArtwork {
+            video_path,
+            media_type,
+            tmdb_id,
+            season,
+            fanart,
+        } => {
+            // Media Completion artwork: data-only step — the TMDB
+            // key is read from the keyring at execution time (never
+            // stored in job snapshots). Placed sidecars are named in
+            // the Done journal note (the durable placement record).
+            let key = crate::mediares::tmdb_key_get();
+            match crate::mediacomplete::fetch_artwork(
+                std::path::Path::new(video_path),
+                media_type,
+                *tmdb_id,
+                *season,
+                *fanart,
+                key,
+                &|| flag(&handle.cancel),
+            ) {
+                crate::mediacomplete::FetchVerdict::Done(placed) => {
+                    StepOutcome::Done(Some(format!(
+                        "placed={}",
+                        placed.join(",")
+                    )))
+                }
+                crate::mediacomplete::FetchVerdict::Skipped(_) => {
+                    StepOutcome::Skipped
+                }
+                crate::mediacomplete::FetchVerdict::Failed(msg) => {
+                    StepOutcome::Failed(msg)
+                }
+            }
+        }
+        ufm_jobs::StepOp::FetchSubtitle {
+            video_path,
+            language,
+            media_type,
+            tmdb_id,
+            season,
+            episode,
+        } => {
+            // Media Completion subtitles: OpenSubtitles credentials
+            // resolve inside the client from the keyring at
+            // execution time. The Done note carries the API's own
+            // quota report — the job card shows the real allowance
+            // state, never an invented number.
+            match crate::mediacomplete::fetch_subtitle(
+                std::path::Path::new(video_path),
+                language,
+                media_type,
+                *tmdb_id,
+                *season,
+                *episode,
+            ) {
+                crate::mediacomplete::SubVerdict::Done { path, quota } => {
+                    let note = match quota.remaining {
+                        Some(r) => format!(
+                            "subtitle={path} opensubtitles_remaining={r}"
+                        ),
+                        None => format!("subtitle={path}"),
+                    };
+                    StepOutcome::Done(Some(note))
+                }
+                crate::mediacomplete::SubVerdict::Skipped(_) => {
+                    StepOutcome::Skipped
+                }
+                crate::mediacomplete::SubVerdict::QuotaReached(q) => {
+                    StepOutcome::Failed(format!(
+                        "OpenSubtitles download allowance reached{}",
+                        q.message
+                            .as_deref()
+                            .map(|m| format!(" — {m}"))
+                            .unwrap_or_default()
+                    ))
+                }
+                crate::mediacomplete::SubVerdict::Failed(msg) => {
+                    StepOutcome::Failed(msg)
+                }
+            }
+        }
     }
 }
 
@@ -3009,6 +3091,8 @@ fn job_signature(job: &ufm_jobs::Job) -> String {
             ufm_jobs::StepOp::Mkdir { .. } => {}
             ufm_jobs::StepOp::WriteFile { .. } => {}
             ufm_jobs::StepOp::FetchMedia { .. } => {}
+            ufm_jobs::StepOp::FetchArtwork { .. } => {}
+            ufm_jobs::StepOp::FetchSubtitle { .. } => {}
         }
     }
     if srcs.is_empty() {
@@ -11541,6 +11625,13 @@ fn build_organize_job(
     let mut dir_steps: std::collections::HashMap<PathBuf, Option<String>> =
         std::collections::HashMap::new();
     dir_steps.insert(root.to_path_buf(), None);
+    // Media Completion: (destination path, the step whose completion
+    // puts the file there, identity) — fetch steps hang off these.
+    let mut fetch_anchors: Vec<(
+        String,
+        String,
+        crate::mediares::IdentityView,
+    )> = Vec::new();
     for action in &plan.actions {
         let src = PathBuf::from(&action.src);
         let dst = PathBuf::from(&action.dst);
@@ -11582,7 +11673,7 @@ fn build_organize_job(
         planner.job.preview.files_affected += 1;
         planner.job.preview.bytes_to_move += size;
         if same_device(&src, &dst_parent) {
-            planner.add_step(
+            let move_step = planner.add_step(
                 format!("organize {}", src.display()),
                 ufm_jobs::StepOp::Move {
                     src: job_item(
@@ -11605,12 +11696,75 @@ fn build_organize_job(
                 true,
                 None,
             );
+            fetch_anchors.push((
+                action.dst.clone(),
+                move_step,
+                action.identity.clone(),
+            ));
         } else {
             let (_, _, del) =
                 planner.add_move_file(&src, &dst_parent, &new_name, size, dep);
             if let Some(s) = planner.job.steps.get_mut(&del) {
                 s.outcome = true;
                 s.outcome_path = Some(action.dst.clone());
+            }
+            fetch_anchors.push((
+                action.dst.clone(),
+                del,
+                action.identity.clone(),
+            ));
+        }
+    }
+    // Media Completion (Dickles, 2026-10-15): when the settings say
+    // so, every organized file also gets its poster (and subtitle)
+    // fetched AT its new home — each fetch step depends on the step
+    // that lands the file there, and is a NON-outcome step (the
+    // move is the undoable act; placed sidecars ride the job's
+    // placed-file record via their Done notes).
+    {
+        let base = state
+            .catalog_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        let mc = crate::mediacomplete::load_settings(&base);
+        let want_subs = mc.subtitles_on_organize
+            && crate::opensubs::creds_state().has_api_key;
+        if mc.artwork_on_organize || want_subs {
+            for (dst, anchor, idn) in &fetch_anchors {
+                if mc.artwork_on_organize {
+                    if let Some(tid) = idn.tmdb_id {
+                        planner.add_step(
+                            format!("fetch artwork for {}", dst),
+                            ufm_jobs::StepOp::FetchArtwork {
+                                video_path: dst.clone(),
+                                media_type: idn.media_type.clone(),
+                                tmdb_id: tid,
+                                season: idn.season.map(|s| s as u32),
+                                fanart: mc.fanart,
+                            },
+                            vec![anchor.clone()],
+                            false,
+                            None,
+                        );
+                    }
+                }
+                if want_subs {
+                    planner.add_step(
+                        format!("fetch subtitle for {}", dst),
+                        ufm_jobs::StepOp::FetchSubtitle {
+                            video_path: dst.clone(),
+                            language: mc.subtitle_language.clone(),
+                            media_type: idn.media_type.clone(),
+                            tmdb_id: idn.tmdb_id,
+                            season: idn.season.map(|s| s as u32),
+                            episode: idn.episode.map(|e| e as u32),
+                        },
+                        vec![anchor.clone()],
+                        false,
+                        None,
+                    );
+                }
             }
         }
     }
@@ -11643,6 +11797,398 @@ pub async fn mediares_start_organize(
     }
     let job = build_organize_job(&state, &root, &plan)?;
     start_job(app, &state, job)
+}
+
+// ---------------------------------------------------------------------------
+// Media Completion commands (Dickles, 2026-10-15): artwork and
+// subtitle settings + fetches, the OpenSubtitles account block, and
+// the background scheduler (agent control, runs, undo, pending).
+// ---------------------------------------------------------------------------
+
+fn mc_base(state: &AppState) -> PathBuf {
+    state
+        .catalog_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+pub fn mediacomplete_get_settings(
+    state: State<'_, AppState>,
+) -> Cmd<crate::mediacomplete::McSettings> {
+    Ok(crate::mediacomplete::load_settings(&mc_base(&state)))
+}
+
+#[tauri::command]
+pub fn mediacomplete_save_settings(
+    state: State<'_, AppState>,
+    settings: crate::mediacomplete::McSettings,
+) -> Cmd<crate::mediacomplete::McSettings> {
+    let base = mc_base(&state);
+    crate::mediacomplete::save_settings(&base, &settings)
+        .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(crate::mediacomplete::load_settings(&base))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McStatusView {
+    pub agent_running: bool,
+    pub agent_pid: Option<u32>,
+    pub agent_last_tick: Option<String>,
+    /// "systemd" | "autostart" | "none"
+    pub agent_install: String,
+    pub next_runs: Vec<(String, String)>,
+    pub opensubs: crate::opensubs::CredsState,
+}
+
+#[tauri::command]
+pub fn mediacomplete_get_status(
+    state: State<'_, AppState>,
+) -> Cmd<McStatusView> {
+    let base = mc_base(&state);
+    let st = crate::mediacomplete::agent_status(&base);
+    Ok(McStatusView {
+        agent_running: st.running,
+        agent_pid: st.pid,
+        agent_last_tick: st.last_tick,
+        agent_install: crate::mediacomplete::agent_install_kind().to_string(),
+        next_runs: st.next_runs,
+        opensubs: crate::opensubs::creds_state(),
+    })
+}
+
+#[tauri::command]
+pub fn mediacomplete_set_agent(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Cmd<String> {
+    let base = mc_base(&state);
+    let msg = crate::mediacomplete::set_agent_installed(&appimage_path(), enabled)
+        .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    let mut settings = crate::mediacomplete::load_settings(&base);
+    settings.agent_enabled = enabled;
+    crate::mediacomplete::save_settings(&base, &settings)
+        .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(msg)
+}
+
+#[tauri::command]
+pub fn opensubs_set_secret(
+    kind: String,
+    value: Option<String>,
+) -> Cmd<crate::opensubs::CredsState> {
+    if !matches!(
+        kind.as_str(),
+        "opensubs-apikey" | "opensubs-username" | "opensubs-password"
+    ) {
+        return Err(CommandError::from(UfmError::InvalidInput(format!(
+            "unknown secret kind: {kind}"
+        ))));
+    }
+    crate::opensubs::secret_set(&kind, value.as_deref())
+        .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(crate::opensubs::creds_state())
+}
+
+#[tauri::command]
+pub async fn opensubs_validate() -> Cmd<crate::opensubs::AccountView> {
+    let view = tauri::async_runtime::spawn_blocking(|| {
+        match crate::opensubs::OpenSubsClient::from_keyring() {
+            Ok(c) => c.validate(),
+            Err(e) => crate::opensubs::AccountView {
+                ok: false,
+                message: e,
+                account: None,
+                logged_in: false,
+            },
+        }
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("validate task failed: {e}")))
+    })?;
+    Ok(view)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McFetchView {
+    /// done | skipped | failed | quota
+    pub outcome: String,
+    pub message: String,
+    pub placed: Vec<String>,
+    pub quota: Option<crate::opensubs::QuotaState>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McArtworkRequest {
+    pub path: String,
+    pub media_type: String,
+    pub tmdb_id: i64,
+    pub season: Option<u32>,
+}
+
+#[tauri::command]
+pub async fn mediacomplete_fetch_artwork_now(
+    state: State<'_, AppState>,
+    req: McArtworkRequest,
+) -> Cmd<McFetchView> {
+    let base = mc_base(&state);
+    let view = tauri::async_runtime::spawn_blocking(move || {
+        let settings = crate::mediacomplete::load_settings(&base);
+        match crate::mediacomplete::fetch_artwork(
+            std::path::Path::new(&req.path),
+            &req.media_type,
+            req.tmdb_id,
+            req.season,
+            settings.fanart,
+            crate::mediares::tmdb_key_get(),
+            &|| false,
+        ) {
+            crate::mediacomplete::FetchVerdict::Done(placed) => McFetchView {
+                outcome: "done".into(),
+                message: format!("Placed {} artwork file(s).", placed.len()),
+                placed,
+                quota: None,
+            },
+            crate::mediacomplete::FetchVerdict::Skipped(m) => McFetchView {
+                outcome: "skipped".into(),
+                message: m,
+                placed: vec![],
+                quota: None,
+            },
+            crate::mediacomplete::FetchVerdict::Failed(m) => McFetchView {
+                outcome: "failed".into(),
+                message: m,
+                placed: vec![],
+                quota: None,
+            },
+        }
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("artwork task failed: {e}")))
+    })?;
+    Ok(view)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McSubtitleRequest {
+    pub path: String,
+    pub media_type: String,
+    pub tmdb_id: Option<i64>,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    pub language: Option<String>,
+}
+
+#[tauri::command]
+pub async fn mediacomplete_fetch_subtitle_now(
+    state: State<'_, AppState>,
+    req: McSubtitleRequest,
+) -> Cmd<McFetchView> {
+    let base = mc_base(&state);
+    let view = tauri::async_runtime::spawn_blocking(move || {
+        let settings = crate::mediacomplete::load_settings(&base);
+        let lang = req
+            .language
+            .clone()
+            .unwrap_or_else(|| settings.subtitle_language.clone());
+        match crate::mediacomplete::fetch_subtitle(
+            std::path::Path::new(&req.path),
+            &lang,
+            &req.media_type,
+            req.tmdb_id,
+            req.season,
+            req.episode,
+        ) {
+            crate::mediacomplete::SubVerdict::Done { path, quota } => {
+                let remaining = quota
+                    .remaining
+                    .map(|r| format!(" OpenSubtitles reports {r} download(s) left in the current window."))
+                    .unwrap_or_default();
+                McFetchView {
+                    outcome: "done".into(),
+                    message: format!("Subtitle saved beside the video.{remaining}"),
+                    placed: vec![path],
+                    quota: Some(quota),
+                }
+            }
+            crate::mediacomplete::SubVerdict::Skipped(m) => McFetchView {
+                outcome: "skipped".into(),
+                message: m,
+                placed: vec![],
+                quota: None,
+            },
+            crate::mediacomplete::SubVerdict::QuotaReached(q) => McFetchView {
+                outcome: "quota".into(),
+                message: q
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "OpenSubtitles download allowance reached".into()),
+                placed: vec![],
+                quota: Some(q),
+            },
+            crate::mediacomplete::SubVerdict::Failed(m) => McFetchView {
+                outcome: "failed".into(),
+                message: m,
+                placed: vec![],
+                quota: None,
+            },
+        }
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("subtitle task failed: {e}")))
+    })?;
+    Ok(view)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McRunView {
+    pub id: String,
+    pub schedule_name: String,
+    pub target: String,
+    pub started: String,
+    pub finished: Option<String>,
+    pub was_late: bool,
+    pub status: String,
+    pub summary: serde_json::Value,
+    pub pending: serde_json::Value,
+    pub quota: Option<serde_json::Value>,
+    pub can_undo: bool,
+}
+
+fn run_view(row: &ufm_catalog::MediaCompleteRunRow) -> McRunView {
+    McRunView {
+        id: row.id.clone(),
+        schedule_name: row.schedule_name.clone(),
+        target: row.target.clone(),
+        started: row.started.clone(),
+        finished: row.finished.clone(),
+        was_late: row.was_late,
+        status: row.status.clone(),
+        summary: serde_json::from_str(&row.summary_json)
+            .unwrap_or(serde_json::json!({})),
+        pending: serde_json::from_str(&row.pending_json)
+            .unwrap_or(serde_json::json!([])),
+        quota: row
+            .quota_json
+            .as_deref()
+            .and_then(|q| serde_json::from_str(q).ok()),
+        can_undo: row.undone_at.is_none() && row.status != "running",
+    }
+}
+
+#[tauri::command]
+pub fn mediacomplete_list_runs(
+    state: State<'_, AppState>,
+) -> Cmd<Vec<McRunView>> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
+    let rows = catalog
+        .recent_mediacomplete_runs(20)
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
+    Ok(rows.iter().map(run_view).collect())
+}
+
+#[tauri::command]
+pub async fn mediacomplete_run_now(
+    state: State<'_, AppState>,
+    schedule_id: String,
+) -> Cmd<McRunView> {
+    let base = mc_base(&state);
+    let settings = crate::mediacomplete::load_settings(&base);
+    let Some(sched) = settings
+        .schedules
+        .iter()
+        .find(|s| s.id == schedule_id)
+        .cloned()
+    else {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "no such schedule".into(),
+        )));
+    };
+    let row = tauri::async_runtime::spawn_blocking(move || {
+        crate::mediacomplete::run_completion(&sched, false)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("run task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    // Stamp the schedule's bookkeeping so the agent doesn't fire
+    // the same slot again tonight.
+    let mut settings = crate::mediacomplete::load_settings(&base);
+    if let Some(s) = settings.schedules.iter_mut().find(|s| s.id == schedule_id) {
+        s.last_started = Some(
+            chrono::Local::now()
+                .naive_local()
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string(),
+        );
+        s.last_status = Some(row.status.clone());
+        let _ = crate::mediacomplete::save_settings(&base, &settings);
+    }
+    Ok(run_view(&row))
+}
+
+#[tauri::command]
+pub async fn mediacomplete_undo_run(run_id: String) -> Cmd<String> {
+    let msg = tauri::async_runtime::spawn_blocking(move || {
+        crate::mediacomplete::undo_run(&run_id)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("undo task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(msg)
+}
+
+/// Confirm one pending item from a run's morning checklist: applies
+/// the mediares confirm (the identity becomes confirmed truth) and
+/// removes the entry from the run's pending list. The file itself
+/// completes on the NEXT run (or a manual Organize) — said plainly
+/// in the UI copy.
+#[tauri::command]
+pub async fn mediacomplete_confirm_pending(
+    state: State<'_, AppState>,
+    run_id: String,
+    path: String,
+    choice: crate::mediares::ConfirmChoice,
+) -> Cmd<crate::mediares::IdentityView> {
+    let catalog_path = state.catalog_path.clone();
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        let catalog = ufm_catalog::Catalog::open(&catalog_path)
+            .map_err(|e| format!("catalog open failed: {e}"))?;
+        let outcome =
+            crate::mediares::confirm(&catalog, std::path::Path::new(&path), &choice)?;
+        if let Some(mut row) = catalog
+            .mediacomplete_run(&run_id)
+            .map_err(|e| e.to_string())?
+        {
+            let mut pending: Vec<serde_json::Value> =
+                serde_json::from_str(&row.pending_json).unwrap_or_default();
+            pending.retain(|p| {
+                p.get("path").and_then(|x| x.as_str()) != Some(path.as_str())
+            });
+            row.pending_json = serde_json::Value::Array(pending).to_string();
+            let _ = catalog.upsert_mediacomplete_run(&row);
+        }
+        Ok::<_, String>(outcome)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("confirm task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(out)
 }
 
 #[cfg(test)]

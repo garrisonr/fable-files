@@ -228,27 +228,85 @@ export class MediaResDialog {
       row.identity !== null &&
       !row.identity.confirmed &&
       row.identity.source !== "name";
-    if (needsHuman || canQuickConfirm || row.identity === null) {
+    // Media Completion: artwork/subtitle fetches ride on the same
+    // trust rule as Organize — confirmed or Confident identities
+    // only, never a guess.
+    const canFetch =
+      row.identity !== null &&
+      (row.identity.confirmed ||
+        (row.identity.confidence !== null && row.identity.confidence >= 0.85));
+    if (needsHuman || canQuickConfirm || row.identity === null || canFetch) {
       const actions = el("div", "mrx-row-actions");
       if (canQuickConfirm) {
         const btn = el("button", "pill-btn mrx-confirm", "Confirm this match");
         btn.addEventListener("click", () => void this.confirmIdentity(row));
         actions.appendChild(btn);
       }
-      const detail = el("div", "mrx-detail");
-      detail.hidden = true;
-      const toggle = el(
-        "button",
-        "pill-btn",
-        row.candidates.length ? "Choose a match / correct…" : "Correct…",
-      );
-      toggle.addEventListener("click", () => {
-        detail.hidden = !detail.hidden;
-      });
-      actions.appendChild(toggle);
-      wrap.appendChild(actions);
-      this.renderDetail(detail, row);
-      wrap.appendChild(detail);
+      if (needsHuman || canQuickConfirm || row.identity === null) {
+        const detail = el("div", "mrx-detail");
+        detail.hidden = true;
+        const toggle = el(
+          "button",
+          "pill-btn",
+          row.candidates.length ? "Choose a match / correct…" : "Correct…",
+        );
+        toggle.addEventListener("click", () => {
+          detail.hidden = !detail.hidden;
+        });
+        actions.appendChild(toggle);
+        wrap.appendChild(actions);
+        this.renderDetail(detail, row);
+        wrap.appendChild(detail);
+      } else {
+        wrap.appendChild(actions);
+      }
+      if (canFetch && row.identity) {
+        const idn = row.identity;
+        if (idn.tmdbId !== null) {
+          const art = el("button", "pill-btn", "Fetch artwork");
+          art.addEventListener("click", async () => {
+            art.textContent = "Fetching…";
+            try {
+              const r = await api.mcFetchArtwork({
+                path: row.path,
+                mediaType: idn.mediaType,
+                tmdbId: idn.tmdbId as number,
+                season: idn.season,
+              });
+              if (r.outcome === "done")
+                Toast.success(`Artwork placed for ${row.name}.`);
+              else Toast.info(`${row.name}: ${r.message}`, 7000);
+            } catch (err) {
+              Toast.error(`Artwork failed: ${errText(err)}`);
+            } finally {
+              art.textContent = "Fetch artwork";
+            }
+          });
+          actions.appendChild(art);
+        }
+        const sub = el("button", "pill-btn", "Fetch subtitles");
+        sub.addEventListener("click", async () => {
+          sub.textContent = "Fetching…";
+          try {
+            const r = await api.mcFetchSubtitle({
+              path: row.path,
+              mediaType: idn.mediaType,
+              tmdbId: idn.tmdbId,
+              season: idn.season,
+              episode: idn.episode,
+              language: null,
+            });
+            if (r.outcome === "done")
+              Toast.success(`Subtitle saved for ${row.name}. ${r.message}`);
+            else Toast.info(`${row.name}: ${r.message}`, 7000);
+          } catch (err) {
+            Toast.error(`Subtitle failed: ${errText(err)}`);
+          } finally {
+            sub.textContent = "Fetch subtitles";
+          }
+        });
+        actions.appendChild(sub);
+      }
     }
     return wrap;
   }

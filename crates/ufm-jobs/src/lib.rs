@@ -99,6 +99,50 @@ pub enum StepOp {
         name: String,
         contents: String,
     },
+    /// Media Completion: fetch TMDB artwork sidecars for one
+    /// resolved video (poster.jpg / fanart.jpg / season posters, per
+    /// the naming all three servers read). Data-only like FetchMedia:
+    /// no URLs (the TMDB details call resolves image paths at
+    /// execution time), no credentials (the TMDB key, when one is
+    /// needed for the details call, is read from the OS keyring by
+    /// the executor). `video_path` is where the video lives WHEN THE
+    /// STEP RUNS — inside an Organize job that is the post-move path,
+    /// and the step depends on that move. The executor never
+    /// overwrites existing local artwork.
+    FetchArtwork {
+        /// Absolute path of the video file at execution time.
+        video_path: String,
+        /// "movie" | "episode" (catalog media_kind vocabulary).
+        media_type: String,
+        /// TMDB id of the confirmed match.
+        tmdb_id: i64,
+        /// Season number for episodes (season poster); None for movies.
+        season: Option<u32>,
+        /// Also fetch the backdrop as fanart.jpg (movies / show root).
+        fanart: bool,
+    },
+    /// Media Completion: fetch one subtitle from OpenSubtitles for
+    /// one resolved video and file it as a server sidecar
+    /// (`<stem>.<lang>.srt`, SDH/forced labelled). Matching is by
+    /// MOVIE HASH first (ufm_media::oshash), TMDB id / name as
+    /// fallback — all resolved at execution time; the user's
+    /// OpenSubtitles credentials are read from the OS keyring by the
+    /// executor and never enter a job snapshot. Existing subtitles
+    /// are never overwritten.
+    FetchSubtitle {
+        /// Absolute path of the video file at execution time.
+        video_path: String,
+        /// Preferred subtitle language code ("en" default).
+        language: String,
+        /// "movie" | "episode".
+        media_type: String,
+        /// TMDB id of the confirmed match, when known (fallback
+        /// search key).
+        tmdb_id: Option<i64>,
+        /// Season / episode numbers for TV fallback search.
+        season: Option<u32>,
+        episode: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -422,6 +466,69 @@ mod tests {
         // enum is serde-tagged, so a Copy step JSON is unaffected.
         let old = r#"{"id":"s0","label":"c","op":{"op":"mkdir","parent":{"id":"00000000-0000-0000-0000-000000000000","location":"00000000-0000-0000-0000-000000000000","name":"x","kind":"folder","size_bytes":null,"modified":null,"provider_key":null,"labels":[],"starred":false},"name":"y"},"depends_on":[],"state":"pending","compensation":null}"#;
         assert!(serde_json::from_str::<Step>(old).is_ok());
+    }
+
+    #[test]
+    fn fetch_artwork_and_subtitle_steps_round_trip() {
+        // Media Completion: the two fetch steps are data-only
+        // snapshots (no URLs, no credentials) and must survive the
+        // journal round trip exactly.
+        let art = Step {
+            id: "sa".into(),
+            label: "artwork".into(),
+            op: StepOp::FetchArtwork {
+                video_path: "/lib/Dune (2021)/Dune (2021).mkv".into(),
+                media_type: "movie".into(),
+                tmdb_id: 438631,
+                season: None,
+                fanart: true,
+            },
+            depends_on: vec!["mv1".into()],
+            state: StepState::Pending,
+            compensation: None,
+            outcome: false,
+            outcome_path: None,
+        };
+        let json = serde_json::to_string(&art).unwrap();
+        assert!(json.contains("\"op\":\"fetch_artwork\""), "tag: {json}");
+        let back: Step = serde_json::from_str(&json).unwrap();
+        match back.op {
+            StepOp::FetchArtwork { ref media_type, tmdb_id, fanart, .. } => {
+                assert_eq!(media_type, "movie");
+                assert_eq!(tmdb_id, 438631);
+                assert!(fanart);
+            }
+            _ => panic!("wrong variant after round trip"),
+        }
+
+        let sub = Step {
+            id: "ss".into(),
+            label: "subtitle".into(),
+            op: StepOp::FetchSubtitle {
+                video_path: "/lib/Show (2020)/Season 01/Show (2020) - S01E02.mkv".into(),
+                language: "en".into(),
+                media_type: "episode".into(),
+                tmdb_id: Some(95396),
+                season: Some(1),
+                episode: Some(2),
+            },
+            depends_on: vec![],
+            state: StepState::Pending,
+            compensation: None,
+            outcome: false,
+            outcome_path: None,
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        assert!(json.contains("\"op\":\"fetch_subtitle\""), "tag: {json}");
+        let back: Step = serde_json::from_str(&json).unwrap();
+        match back.op {
+            StepOp::FetchSubtitle { ref language, season, episode, .. } => {
+                assert_eq!(language, "en");
+                assert_eq!(season, Some(1));
+                assert_eq!(episode, Some(2));
+            }
+            _ => panic!("wrong variant after round trip"),
+        }
     }
 
     #[test]

@@ -9,7 +9,9 @@
 pub mod commands;
 pub mod library;
 pub mod mcp_server;
+pub mod mediacomplete;
 pub mod mediares;
+pub mod opensubs;
 pub mod rommedia;
 pub mod plugins;
 pub mod reader;
@@ -576,6 +578,18 @@ pub fn run() {
             commands::mediares_confirm,
             commands::mediares_plan_organize,
             commands::mediares_start_organize,
+            commands::mediacomplete_get_settings,
+            commands::mediacomplete_save_settings,
+            commands::mediacomplete_get_status,
+            commands::mediacomplete_set_agent,
+            commands::opensubs_set_secret,
+            commands::opensubs_validate,
+            commands::mediacomplete_fetch_artwork_now,
+            commands::mediacomplete_fetch_subtitle_now,
+            commands::mediacomplete_run_now,
+            commands::mediacomplete_list_runs,
+            commands::mediacomplete_undo_run,
+            commands::mediacomplete_confirm_pending,
             commands::media_url_for_path,
             commands::add_path_location,
             commands::remove_path_location,

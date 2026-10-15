@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod oshash;
 pub mod romdat;
 pub mod videoid;
 

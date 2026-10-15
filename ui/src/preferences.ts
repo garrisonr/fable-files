@@ -14,6 +14,7 @@ import type { ThemeInfo } from "./api";
 import { DISTRO_ENGINES } from "./themes";
 import { RomMediaSection } from "./rommedia";
 import { MediaResSection } from "./mediares";
+import { MediaCompleteSection } from "./mediacomplete";
 import { LibraryMemorySection } from "./library";
 import { PluginsSection } from "./plugins";
 import { TemplatesSection } from "./templates";
@@ -145,6 +146,12 @@ export class PreferencesDialog {
     const mresHost = document.createElement("div");
     dialog.appendChild(mresHost);
     void new MediaResSection().mount(mresHost);
+
+    // Media Completion (posters + subtitles + overnight scheduler):
+    // mounted right under Media Resolution — the trio reads as one.
+    const mcHost = document.createElement("div");
+    dialog.appendChild(mcHost);
+    void new MediaCompleteSection().mount(mcHost);
 
     // Library Memory (Indexer v2): remembered drives + retention,
     // same pattern — backend-owned state, mounted async.

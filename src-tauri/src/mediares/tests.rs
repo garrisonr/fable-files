@@ -205,6 +205,42 @@ fn scan_keyless_judges_and_confirm_unlocks_organize() {
 }
 
 #[test]
+fn tmdb_art_mapping_real_captured_values() {
+    // poster_path / backdrop_path values are the REAL ones from the
+    // live captures in research/ (Dune: Part Two movie search,
+    // Severance TV search + season) — the same fields the details
+    // responses carry.
+    let movie_details: serde_json::Value = serde_json::from_str(
+        r#"{"id":693134,"title":"Dune: Part Two",
+        "poster_path":"/6izwz7rsy95ARzTR3poZ8H6c5pp.jpg",
+        "backdrop_path":"/eZ239CUp1d6OryZEBPnO2n87gMG.jpg"}"#,
+    )
+    .unwrap();
+    let (poster, backdrop) = art_from_details(&movie_details);
+    assert_eq!(poster.as_deref(), Some("/6izwz7rsy95ARzTR3poZ8H6c5pp.jpg"));
+    assert_eq!(backdrop.as_deref(), Some("/eZ239CUp1d6OryZEBPnO2n87gMG.jpg"));
+
+    let season: serde_json::Value = serde_json::from_str(
+        r#"{"season_number":1,"poster_path":"/lFf6LLrQjYldcZItzOkGmMMigP7.jpg","episodes":[]}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        poster_from_season(&season).as_deref(),
+        Some("/lFf6LLrQjYldcZItzOkGmMMigP7.jpg")
+    );
+
+    // Missing/null art stays None — never an invented path.
+    let bare: serde_json::Value = serde_json::from_str(r#"{"id":1,"poster_path":null}"#).unwrap();
+    assert_eq!(art_from_details(&bare), (None, None));
+    assert_eq!(poster_from_season(&bare), None);
+
+    assert_eq!(
+        tmdb_image_url("w500", "/6izwz7rsy95ARzTR3poZ8H6c5pp.jpg"),
+        "https://image.tmdb.org/t/p/w500/6izwz7rsy95ARzTR3poZ8H6c5pp.jpg"
+    );
+}
+
+#[test]
 fn expand_inputs_walks_directories() {
     let (_cat, dir, _loc) = fixture();
     let sub = dir.join("Season 01");

@@ -116,6 +116,50 @@ pub struct McpAuditRow {
     pub duration_ms: i64,
 }
 
+/// One Media Completion run (scheduled or headless-invoked): the
+/// morning summary's row. JSON columns keep the detail schemaless —
+/// summary counts, the undo journal (every move + placed file),
+/// pending confirmations awaiting a human, and the subtitle quota
+/// state the run observed (API-reported values, never invented).
+#[derive(Debug, Clone)]
+pub struct MediaCompleteRunRow {
+    pub id: String,
+    pub schedule_id: Option<String>,
+    pub schedule_name: String,
+    pub target: String,
+    /// RFC 3339 start/finish.
+    pub started: String,
+    pub finished: Option<String>,
+    /// The run started after its scheduled slot (catch-up) — the
+    /// summary admits it ran late.
+    pub was_late: bool,
+    /// running | completed | completed_with_failures | failed | undone
+    pub status: String,
+    pub summary_json: String,
+    pub actions_json: String,
+    pub pending_json: String,
+    pub quota_json: Option<String>,
+    pub undone_at: Option<String>,
+}
+
+fn map_mc_run(r: &rusqlite::Row) -> rusqlite::Result<MediaCompleteRunRow> {
+    Ok(MediaCompleteRunRow {
+        id: r.get(0)?,
+        schedule_id: r.get(1)?,
+        schedule_name: r.get(2)?,
+        target: r.get(3)?,
+        started: r.get(4)?,
+        finished: r.get(5)?,
+        was_late: r.get::<_, i64>(6)? != 0,
+        status: r.get(7)?,
+        summary_json: r.get(8)?,
+        actions_json: r.get(9)?,
+        pending_json: r.get(10)?,
+        quota_json: r.get(11)?,
+        undone_at: r.get(12)?,
+    })
+}
+
 /// One duplicate-candidate group for `dedupe_analyze` (Phase 3):
 /// files sharing an identical byte size. Candidates only — content
 /// is NOT hashed, so equal size never proves equal content.
@@ -381,6 +425,32 @@ impl Catalog {
                     duration_ms INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_mcp_audit_seq ON mcp_audit (seq DESC);",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Media Completion: one row per scheduled (or manually
+        // invoked headless) completion run — the morning summary's
+        // durable home. The JSON columns carry the run's detail:
+        // summary counts, the undo journal (moves + placed files),
+        // pending confirmations, failures, and quota state. Rows are
+        // updated once (undo stamp); retention prunes old runs.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS mediacomplete_runs (
+                    id TEXT PRIMARY KEY,
+                    schedule_id TEXT,
+                    schedule_name TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    started TEXT NOT NULL,
+                    finished TEXT,
+                    was_late INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    summary_json TEXT NOT NULL DEFAULT '{}',
+                    actions_json TEXT NOT NULL DEFAULT '[]',
+                    pending_json TEXT NOT NULL DEFAULT '[]',
+                    quota_json TEXT,
+                    undone_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_mc_runs_started ON mediacomplete_runs (started DESC);",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
         Ok(())
@@ -1887,6 +1957,92 @@ impl Catalog {
         Ok(n as u64)
     }
 
+    // -----------------------------------------------------------------
+    // Media Completion runs — the scheduled pipeline's journal.
+    // -----------------------------------------------------------------
+
+    /// Insert (or replace) a completion run row. The runner writes
+    /// the row at start (status "running") and again at finish with
+    /// the full journal, so a crash mid-run still leaves evidence.
+    pub fn upsert_mediacomplete_run(&self, row: &MediaCompleteRunRow) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO mediacomplete_runs (id, schedule_id, schedule_name, target, started, finished, was_late, status, summary_json, actions_json, pending_json, quota_json, undone_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ON CONFLICT(id) DO UPDATE SET finished=excluded.finished, status=excluded.status, summary_json=excluded.summary_json, actions_json=excluded.actions_json, pending_json=excluded.pending_json, quota_json=excluded.quota_json, undone_at=excluded.undone_at",
+                params![
+                    row.id,
+                    row.schedule_id,
+                    row.schedule_name,
+                    row.target,
+                    row.started,
+                    row.finished,
+                    row.was_late as i64,
+                    row.status,
+                    row.summary_json,
+                    row.actions_json,
+                    row.pending_json,
+                    row.quota_json,
+                    row.undone_at
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn mediacomplete_run(&self, id: &str) -> Result<Option<MediaCompleteRunRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, schedule_id, schedule_name, target, started, finished, was_late, status, summary_json, actions_json, pending_json, quota_json, undone_at
+                 FROM mediacomplete_runs WHERE id = ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![id], map_mc_run)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        for row in rows {
+            return Ok(Some(row.map_err(|e| UfmError::Database(e.to_string()))?));
+        }
+        Ok(None)
+    }
+
+    /// The newest `limit` runs, newest first — the read path behind
+    /// the Preferences "Scheduled completion" run history.
+    pub fn recent_mediacomplete_runs(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MediaCompleteRunRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, schedule_id, schedule_name, target, started, finished, was_late, status, summary_json, actions_json, pending_json, quota_json, undone_at
+                 FROM mediacomplete_runs ORDER BY started DESC LIMIT ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit as i64], map_mc_run)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// Retention: keep only the newest `keep` runs.
+    pub fn prune_mediacomplete_runs(&self, keep: u64) -> Result<u64> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM mediacomplete_runs
+                 WHERE id NOT IN (SELECT id FROM mediacomplete_runs ORDER BY started DESC LIMIT ?1)",
+                params![keep as i64],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(n as u64)
+    }
+
     /// Duplicate candidates for MCP `dedupe_analyze`: groups of files
     /// (folders excluded, zero-byte excluded) sharing an identical
     /// byte size, biggest potential waste first. Report-only data —
@@ -2804,6 +2960,49 @@ mod tests {
         let one = cat.recent_jobs(1).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].title, "newer job");
+    }
+
+    #[test]
+    #[test]
+    fn mediacomplete_runs_upsert_recent_and_prune() {
+        let cat = Catalog::open_in_memory().unwrap();
+        assert!(cat.recent_mediacomplete_runs(10).unwrap().is_empty());
+        let mk = |id: &str, started: &str, status: &str| MediaCompleteRunRow {
+            id: id.into(),
+            schedule_id: Some("sched-1".into()),
+            schedule_name: "Overnight films".into(),
+            target: "/media/films".into(),
+            started: started.into(),
+            finished: None,
+            was_late: false,
+            status: status.into(),
+            summary_json: "{}".into(),
+            actions_json: "[]".into(),
+            pending_json: "[]".into(),
+            quota_json: None,
+            undone_at: None,
+        };
+        cat.upsert_mediacomplete_run(&mk("run-1", "2026-10-15T06:30:00Z", "running"))
+            .unwrap();
+        // Finish update replaces the same row (crash-evidence write,
+        // then the full journal).
+        let mut done = mk("run-1", "2026-10-15T06:30:00Z", "completed");
+        done.finished = Some("2026-10-15T06:47:00Z".into());
+        done.summary_json = "{\"organized\":3}".into();
+        done.actions_json = "[{\"kind\":\"move\",\"from\":\"/a\",\"to\":\"/b\"}]".into();
+        done.quota_json = Some("{\"remaining\":4}".into());
+        cat.upsert_mediacomplete_run(&done).unwrap();
+        cat.upsert_mediacomplete_run(&mk("run-2", "2026-10-16T06:30:00Z", "completed"))
+            .unwrap();
+        let rows = cat.recent_mediacomplete_runs(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "run-2"); // newest first
+        let one = cat.mediacomplete_run("run-1").unwrap().unwrap();
+        assert_eq!(one.status, "completed");
+        assert_eq!(one.summary_json, "{\"organized\":3}");
+        assert!(one.quota_json.is_some());
+        assert_eq!(cat.prune_mediacomplete_runs(1).unwrap(), 1);
+        assert_eq!(cat.recent_mediacomplete_runs(10).unwrap().len(), 1);
     }
 
     #[test]

@@ -186,6 +186,34 @@ impl TmdbClient {
         let v = self.get(&format!("/tv/{tv_id}/season/{season}"), &[])?;
         Ok(episodes_from_season(&v))
     }
+
+    /// Artwork paths for a movie: (poster_path, backdrop_path) from
+    /// the details call. Media Completion files these as poster.jpg
+    /// / fanart.jpg sidecars; the image CDN itself needs no key.
+    pub fn movie_art(&self, id: i64) -> Result<(Option<String>, Option<String>), String> {
+        let v = self.get(&format!("/movie/{id}"), &[])?;
+        Ok(art_from_details(&v))
+    }
+
+    /// Artwork paths for a show: (poster_path, backdrop_path).
+    pub fn tv_art(&self, id: i64) -> Result<(Option<String>, Option<String>), String> {
+        let v = self.get(&format!("/tv/{id}"), &[])?;
+        Ok(art_from_details(&v))
+    }
+
+    /// A season's own poster path (season posters live in the
+    /// Season folder as poster.jpg).
+    pub fn season_poster(&self, tv_id: i64, season: u32) -> Result<Option<String>, String> {
+        let v = self.get(&format!("/tv/{tv_id}/season/{season}"), &[])?;
+        Ok(poster_from_season(&v))
+    }
+}
+
+/// TMDB image CDN URL for an image path at a size segment
+/// ("w500" posters, "w1280" fanart are the house picks — sensible
+/// resolution: not the multi-MB original, not a thumbnail).
+pub fn tmdb_image_url(size: &str, path: &str) -> String {
+    format!("https://image.tmdb.org/t/p/{size}{path}")
 }
 
 /// Map a TMDB search response to candidates. Pure; tested against a
@@ -230,6 +258,26 @@ pub fn candidates_from_search(v: &serde_json::Value, media_type: &str) -> Vec<Tm
         });
     }
     out
+}
+
+/// (poster_path, backdrop_path) from a movie/TV details response.
+/// Pure; tested against the real captured field values.
+pub fn art_from_details(v: &serde_json::Value) -> (Option<String>, Option<String>) {
+    let s = |k: &str| {
+        v.get(k)
+            .and_then(|p| p.as_str())
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string())
+    };
+    (s("poster_path"), s("backdrop_path"))
+}
+
+/// The season's poster_path from a season response. Pure; tested.
+pub fn poster_from_season(v: &serde_json::Value) -> Option<String> {
+    v.get("poster_path")
+        .and_then(|p| p.as_str())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string())
 }
 
 /// Map a TMDB season response to its episode list. Pure; tested.
@@ -886,6 +934,10 @@ pub struct OrganizeAction {
     pub src: String,
     pub dst: String,
     pub rel: String,
+    /// The confirmed/Confident identity this move files under —
+    /// the Organize job builder hangs FetchArtwork / FetchSubtitle
+    /// steps off it (Media Completion).
+    pub identity: IdentityView,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -983,6 +1035,7 @@ pub fn plan_organize(
             src: pstr.clone(),
             dst: dst.to_string_lossy().into_owned(),
             rel: rel.to_string_lossy().into_owned(),
+            identity: idn,
         });
     }
     // Two sources wanting one destination: exclude BOTH (never pick

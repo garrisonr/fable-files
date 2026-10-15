@@ -634,6 +634,39 @@ export const api = {
     invoke<MediaresOrganizePlan>("mediares_plan_organize", { req }),
   mediaresStartOrganize: (req: MediaresScanRequest) =>
     invoke<JobStart>("mediares_start_organize", { req }),
+  // Media Completion: artwork + OpenSubtitles subtitles + the
+  // background scheduler. Secrets go in one-way (only presence and
+  // validation results come back); runs are the morning reports.
+  getMcSettings: () =>
+    invoke<McSettings>("mediacomplete_get_settings"),
+  saveMcSettings: (settings: McSettings) =>
+    invoke<McSettings>("mediacomplete_save_settings", { settings }),
+  getMcStatus: () => invoke<McStatus>("mediacomplete_get_status"),
+  setMcAgent: (enabled: boolean) =>
+    invoke<string>("mediacomplete_set_agent", { enabled }),
+  opensubsSetSecret: (kind: string, value: string | null) =>
+    invoke<OpensubsCreds>("opensubs_set_secret", { kind, value }),
+  opensubsValidate: () =>
+    invoke<OpensubsAccount>("opensubs_validate"),
+  mcFetchArtwork: (req: McArtworkRequest) =>
+    invoke<McFetchResult>("mediacomplete_fetch_artwork_now", { req }),
+  mcFetchSubtitle: (req: McSubtitleRequest) =>
+    invoke<McFetchResult>("mediacomplete_fetch_subtitle_now", { req }),
+  mcRunNow: (scheduleId: string) =>
+    invoke<McRun>("mediacomplete_run_now", { scheduleId }),
+  mcListRuns: () => invoke<McRun[]>("mediacomplete_list_runs"),
+  mcUndoRun: (runId: string) =>
+    invoke<string>("mediacomplete_undo_run", { runId }),
+  mcConfirmPending: (
+    runId: string,
+    path: string,
+    choice: MediaresConfirmRequest["choice"],
+  ) =>
+    invoke<MediaresIdentity>("mediacomplete_confirm_pending", {
+      runId,
+      path,
+      choice,
+    }),
   pauseJob: (job: string) => invoke<void>("pause_job", { job }),
   resumeJob: (job: string) => invoke<void>("resume_job", { job }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),
@@ -1029,6 +1062,119 @@ export interface MediaresScanResult {
   fixable: number;
   attention: number;
   truncated: boolean;
+}
+
+// ---------------------------------------------------------------------
+// Media Completion types (mirror mediacomplete.rs / opensubs.rs)
+// ---------------------------------------------------------------------
+
+export interface McSchedule {
+  id: string;
+  name: string;
+  target: string;
+  steps: { organize: boolean; artwork: boolean; subtitles: boolean };
+  time: string;
+  weekdays: boolean[];
+  idleMinutes: number;
+  requireOnAc: boolean;
+  enabled: boolean;
+  lastStarted: string | null;
+  lastStatus: string | null;
+}
+
+export interface McSettings {
+  artworkOnOrganize: boolean;
+  fanart: boolean;
+  subtitlesOnOrganize: boolean;
+  subtitleLanguage: string;
+  agentEnabled: boolean;
+  schedules: McSchedule[];
+}
+
+export interface OpensubsCreds {
+  hasApiKey: boolean;
+  hasLogin: boolean;
+  keyringOk: boolean;
+}
+
+export interface OpensubsAccount {
+  ok: boolean;
+  message: string;
+  account: string | null;
+  loggedIn: boolean;
+}
+
+export interface McStatus {
+  agentRunning: boolean;
+  agentPid: number | null;
+  agentLastTick: string | null;
+  agentInstall: string;
+  nextRuns: [string, string][];
+  opensubs: OpensubsCreds;
+}
+
+export interface OpensubsQuota {
+  remaining: number | null;
+  requests: number | null;
+  resetTime: string | null;
+  message: string | null;
+}
+
+export interface McFetchResult {
+  outcome: "done" | "skipped" | "failed" | "quota";
+  message: string;
+  placed: string[];
+  quota: OpensubsQuota | null;
+}
+
+export interface McArtworkRequest {
+  path: string;
+  mediaType: string;
+  tmdbId: number;
+  season: number | null;
+}
+
+export interface McSubtitleRequest {
+  path: string;
+  mediaType: string;
+  tmdbId: number | null;
+  season: number | null;
+  episode: number | null;
+  language: string | null;
+}
+
+export interface McRunSummary {
+  scanned?: number;
+  truncated?: boolean;
+  organized?: number;
+  artworkPlaced?: number;
+  subtitlesPlaced?: number;
+  pending?: number;
+  failures?: string[];
+  error?: string;
+}
+
+export interface McPendingItem {
+  path: string;
+  name: string;
+  parsed: MediaresParsed;
+  identity: MediaresIdentity | null;
+  candidates: MediaresCandidate[];
+  note: string | null;
+}
+
+export interface McRun {
+  id: string;
+  scheduleName: string;
+  target: string;
+  started: string;
+  finished: string | null;
+  wasLate: boolean;
+  status: string;
+  summary: McRunSummary;
+  pending: McPendingItem[];
+  quota: OpensubsQuota | null;
+  canUndo: boolean;
 }
 
 export interface MediaresConfirmRequest {
