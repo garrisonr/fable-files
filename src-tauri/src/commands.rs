@@ -4592,6 +4592,235 @@ pub struct PreviewTextResult {
     pub truncated: bool,
 }
 
+/// Split decoded document text into preview lines with the collapsing
+/// rules `preview_text` applies (blank runs folded, lines clipped).
+fn document_lines(text: &str, max: usize) -> (Vec<String>, bool) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut truncated = false;
+    for raw in text.lines() {
+        if lines.len() >= max {
+            truncated = true;
+            break;
+        }
+        let l = raw.trim_end();
+        if l.trim().is_empty()
+            && (lines.is_empty()
+                || lines.last().map(|p: &String| p.trim().is_empty()) == Some(true))
+        {
+            continue;
+        }
+        let l = if l.chars().count() > 500 {
+            format!("{}...", l.chars().take(500).collect::<String>())
+        } else {
+            l.to_string()
+        };
+        lines.push(l);
+    }
+    (lines, truncated)
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DocumentPreview {
+    /// "pdf" or "epub".
+    pub format: String,
+    pub title: Option<String>,
+    pub author: Option<String>,
+    /// "12 pages" / "24 chapters" — the document's extent, for the
+    /// metadata rows.
+    pub detail: Option<String>,
+    /// Hero image data URL: the PDF's rendered first page or the
+    /// EPUB's cover, when one could be produced.
+    pub image: Option<String>,
+    /// Opening text, line-split for the preview's text block.
+    pub lines: Vec<String>,
+    pub truncated: bool,
+    /// Plain-language reason the preview is limited, when it is.
+    pub note: Option<String>,
+}
+
+/// Rich document preview (Phase 4): a PDF's rendered first page or an
+/// EPUB's cover, plus title/author/extent and the opening text —
+/// decoded by ufm-preview (poppler-backed PDF, pure-Rust EPUB). The
+/// hero image rides the freedesktop thumbnail cache (x-large tier,
+/// md5(file-uri) naming, mtime freshness — the `get_thumbnail`
+/// pattern), so repeat opens are instant and grid thumbnails share
+/// the same render. Degradation is a note in the payload, never an
+/// error: the Quick Look card always paints.
+#[tauri::command]
+pub async fn preview_document(
+    state: State<'_, AppState>,
+    item: ItemId,
+) -> Cmd<DocumentPreview> {
+    let path = state
+        .item_paths
+        .lock()
+        .unwrap()
+        .get(&item)
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if ext != "pdf" && ext != "epub" {
+        return Err(CommandError::from(UfmError::InvalidInput(format!(
+            "no document preview for .{ext}"
+        ))));
+    }
+    tauri::async_runtime::spawn_blocking(move || build_document_preview(&path, &ext))
+        .await
+        .map_err(|e| CommandError::from(UfmError::Internal(format!("document task failed: {e}"))))?
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+fn build_document_preview(
+    path: &std::path::Path,
+    ext: &str,
+) -> std::result::Result<DocumentPreview, String> {
+    use base64::Engine;
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    // The x-large hero cache: same digest + freshness law as
+    // get_thumbnail, one tier up (freedesktop x-large = 512; the
+    // document heroes render up to 1000 px wide).
+    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let cache_dir = std::path::PathBuf::from(format!("{home}/.cache/thumbnails/x-large"));
+    let digest = format!("{:x}", md5::compute(file_uri(path).as_bytes()));
+    let cache_file = cache_dir.join(format!("{digest}.png"));
+    let src_mtime = meta.modified().ok();
+    let cache_fresh = cache_file
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .zip(src_mtime)
+        .map(|(cm, sm)| cm >= sm)
+        .unwrap_or(false);
+    let cached_image = if cache_fresh {
+        std::fs::read(&cache_file).ok().map(|data| {
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&data)
+            )
+        })
+    } else {
+        None
+    };
+    let cache_png = |png: &[u8]| {
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let tmp = cache_dir.join(format!("{digest}.tmp.png"));
+        if std::fs::write(&tmp, png).is_ok() {
+            let _ = std::fs::rename(&tmp, &cache_file);
+        }
+    };
+    let png_url = |png: &[u8]| {
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        )
+    };
+
+    match ext {
+        "pdf" => {
+            // A fresh cached page makes the render unnecessary; the
+            // metadata + text pass is the cheap remainder.
+            let p = if cached_image.is_some() {
+                ufm_preview::pdf::decode_pdf_metadata(path, meta.len())
+            } else {
+                ufm_preview::pdf::decode_pdf(path, meta.len(), 1000)
+            };
+            let image = cached_image.or_else(|| {
+                p.page_png.as_ref().map(|png| {
+                    cache_png(png);
+                    png_url(png)
+                })
+            });
+            let (lines, truncated) = document_lines(&p.text, 60);
+            Ok(DocumentPreview {
+                format: "pdf".into(),
+                title: p.title,
+                author: p.author,
+                detail: p.page_count.map(|n| {
+                    if n == 1 {
+                        "1 page".to_string()
+                    } else {
+                        format!("{n} pages")
+                    }
+                }),
+                image,
+                lines,
+                truncated,
+                note: p.note,
+            })
+        }
+        _ => {
+            // EPUB. Books are small; a runaway file gets a note, not a
+            // multi-hundred-MB read.
+            if meta.len() > 256 * 1024 * 1024 {
+                return Ok(DocumentPreview {
+                    format: "epub".into(),
+                    title: None,
+                    author: None,
+                    detail: None,
+                    image: None,
+                    lines: vec![],
+                    truncated: false,
+                    note: Some(
+                        "This book file is very large, so no preview was decoded — \
+                         double-click opens it in your reader."
+                            .into(),
+                    ),
+                });
+            }
+            let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            let p = ufm_preview::epub::decode_epub(&bytes);
+            let image = cached_image.or_else(|| {
+                p.cover.as_ref().and_then(|cover| {
+                    // Normalize the cover to PNG for the cache; a
+                    // cover the image crate can't read still shows,
+                    // served raw with its declared type (uncached).
+                    match image::load_from_memory(&cover.data) {
+                        Ok(img) => {
+                            let mut buf = std::io::Cursor::new(Vec::new());
+                            match img.write_to(&mut buf, image::ImageFormat::Png) {
+                                Ok(()) => {
+                                    let png = buf.into_inner();
+                                    cache_png(&png);
+                                    Some(png_url(&png))
+                                }
+                                Err(_) => None,
+                            }
+                        }
+                        Err(_) => Some(format!(
+                            "data:{};base64,{}",
+                            cover.media_type,
+                            base64::engine::general_purpose::STANDARD.encode(&cover.data)
+                        )),
+                    }
+                })
+            });
+            let (lines, truncated) = document_lines(&p.excerpt, 60);
+            Ok(DocumentPreview {
+                format: "epub".into(),
+                title: p.title,
+                author: p.author,
+                detail: if p.spine_count > 0 {
+                    Some(if p.spine_count == 1 {
+                        "1 chapter".to_string()
+                    } else {
+                        format!("{} chapters", p.spine_count)
+                    })
+                } else {
+                    None
+                },
+                image,
+                lines,
+                truncated,
+                note: p.note,
+            })
+        }
+    }
+}
+
 
 /// Get the OS trash directory path.
 /// Linux: ~/.local/share/Trash/files, macOS: ~/.Trash
@@ -5635,7 +5864,12 @@ pub async fn get_thumbnail(
             ext.as_str(),
             "mp3" | "flac" | "ogg" | "oga" | "opus" | "m4a" | "m4b" | "aac" | "aif" | "aiff" | "wav" | "wma" | "dsf" | "dff"
         );
-        if !is_image && !is_audio {
+        // Documents (Phase 4): a PDF thumbnails through its rendered
+        // first page, an EPUB through its cover — the ufm-preview
+        // decoders — so grids and galleries show the book/page, not
+        // a generic icon.
+        let is_document = matches!(ext.as_str(), "pdf" | "epub");
+        if !is_image && !is_audio && !is_document {
             return Err("not a thumbnail-able image".to_string());
         }
         let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
@@ -5665,6 +5899,21 @@ pub async fn get_thumbnail(
             std::fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
             let img = if is_image {
                 image::open(&path).map_err(|e| format!("decode: {e}"))?
+            } else if is_document && ext == "pdf" {
+                let p = ufm_preview::pdf::decode_pdf_page(&path, meta.len(), max_px);
+                let png = p
+                    .page_png
+                    .ok_or_else(|| "no page preview".to_string())?;
+                image::load_from_memory(&png).map_err(|e| format!("decode page: {e}"))?
+            } else if is_document {
+                if meta.len() > 256 * 1024 * 1024 {
+                    return Err("book too large to thumbnail".to_string());
+                }
+                let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                let p = ufm_preview::epub::decode_epub(&bytes);
+                let cover = p.cover.ok_or_else(|| "no cover image".to_string())?;
+                image::load_from_memory(&cover.data)
+                    .map_err(|e| format!("decode cover: {e}"))?
             } else {
                 // Embedded cover art: ffmpeg exposes an MP3's APIC,
                 // an MP4's covr and a FLAC/Vorbis picture as a video

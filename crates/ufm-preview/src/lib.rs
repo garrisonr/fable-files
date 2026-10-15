@@ -13,6 +13,9 @@ use std::path::Path;
 use ufm_core::Result;
 use ufm_vfs::{Item, ItemKind};
 
+pub mod epub;
+pub mod pdf;
+
 // ---------------------------------------------------------------------------
 // Preview kinds, in preference order. The registry picks the richest kind
 // a provider can serve for the item.
@@ -174,11 +177,105 @@ impl PreviewProvider for ExtensionProvider {
     }
 }
 
+/// Document provider (Phase 4): real PDF/EPUB decoders — see the
+/// [`pdf`] and [`epub`] modules. Claims the two formats the decoders
+/// serve and renders a structured payload (book/document metadata,
+/// page or chapter count, excerpt, plain-language note). Image bytes
+/// (rendered page, book cover) deliberately stay out of the payload:
+/// the shell fetches them through its cached document-preview path.
+pub struct DocumentProvider;
+
+/// Width the PDF first-page render targets when a consumer renders
+/// through this provider (the shell's Quick Look uses the same cap).
+pub const DOCUMENT_PREVIEW_WIDTH_PX: u32 = 1000;
+
+impl DocumentProvider {
+    fn extension(item: &Item) -> Option<String> {
+        Path::new(&item.name)
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+    }
+}
+
+#[async_trait]
+impl PreviewProvider for DocumentProvider {
+    fn name(&self) -> &'static str {
+        "document"
+    }
+
+    fn claims(&self, item: &Item) -> Option<PreviewKind> {
+        if item.kind == ItemKind::Folder {
+            return None;
+        }
+        match Self::extension(item).as_deref() {
+            Some("pdf" | "epub") => Some(PreviewKind::Document),
+            _ => None,
+        }
+    }
+
+    async fn render(&self, req: &PreviewRequest) -> Result<Preview> {
+        let ext = Self::extension(&req.item).unwrap_or_default();
+        let path = req
+            .item
+            .provider_key
+            .clone()
+            .unwrap_or_else(|| req.item.name.clone());
+        let payload = match ext.as_str() {
+            "pdf" => {
+                let size = req.item.size_bytes.unwrap_or(0);
+                let p = pdf::decode_pdf(Path::new(&path), size, DOCUMENT_PREVIEW_WIDTH_PX);
+                serde_json::json!({
+                    "format": "pdf",
+                    "title": p.title,
+                    "author": p.author,
+                    "pages": p.page_count,
+                    "has_page_image": p.page_png.is_some(),
+                    "encrypted": p.encrypted,
+                    "excerpt": p.text,
+                    "note": p.note,
+                })
+            }
+            "epub" => {
+                let bytes = std::fs::read(&path).unwrap_or_default();
+                let budget = req.byte_budget as usize;
+                let p = if bytes.len() > budget && budget > 0 {
+                    let mut p = epub::EpubPreview::default();
+                    p.note = Some(
+                        "This book is too large for a preview decode.".into(),
+                    );
+                    p
+                } else {
+                    epub::decode_epub(&bytes)
+                };
+                serde_json::json!({
+                    "format": "epub",
+                    "title": p.title,
+                    "author": p.author,
+                    "chapters": p.spine_count,
+                    "has_cover": p.cover.is_some(),
+                    "cover_media_type": p.cover.as_ref().map(|c| c.media_type.clone()),
+                    "drm_protected": p.drm_protected,
+                    "excerpt": p.excerpt,
+                    "note": p.note,
+                })
+            }
+            _ => serde_json::json!({}),
+        };
+        Ok(Preview {
+            kind: PreviewKind::Document,
+            payload_json: payload.to_string(),
+            title: req.item.name.clone(),
+        })
+    }
+}
+
 /// Registry pre-loaded with the built-in providers. The shell (and Tauri
 /// commands) should start from this, then register plugin providers on top.
 pub fn registry_with_builtins() -> PreviewRegistry {
     let mut registry = PreviewRegistry::new();
     registry.register(Box::new(ExtensionProvider));
+    registry.register(Box::new(DocumentProvider));
     registry
 }
 
@@ -288,5 +385,32 @@ mod tests {
         );
         assert_eq!(registry.best_kind(&item("a.xyz", ItemKind::File)), Some(PreviewKind::Hex));
         assert!(registry.provider_names().contains_key("extension"));
+    }
+
+    #[test]
+    fn document_provider_claims_only_pdf_and_epub() {
+        let p = DocumentProvider;
+        assert_eq!(p.claims(&item("book.pdf", ItemKind::File)), Some(PreviewKind::Document));
+        assert_eq!(p.claims(&item("book.EPUB", ItemKind::File)), Some(PreviewKind::Document));
+        assert_eq!(p.claims(&item("report.docx", ItemKind::File)), None);
+        assert_eq!(p.claims(&item("book.pdf", ItemKind::Folder)), None);
+        let registry = registry_with_builtins();
+        assert!(registry.provider_names().contains_key("document"));
+    }
+
+    #[tokio::test]
+    async fn document_render_of_missing_file_degrades_to_note() {
+        let p = DocumentProvider;
+        let req = PreviewRequest {
+            item: item("ghost.epub", ItemKind::File),
+            byte_budget: 1024 * 1024,
+            priority: PreviewPriority::Foreground,
+        };
+        let preview = p.render(&req).await.unwrap();
+        assert_eq!(preview.kind, PreviewKind::Document);
+        let payload: serde_json::Value =
+            serde_json::from_str(&preview.payload_json).unwrap();
+        assert_eq!(payload["format"], "epub");
+        assert!(payload["note"].is_string(), "payload: {payload}");
     }
 }

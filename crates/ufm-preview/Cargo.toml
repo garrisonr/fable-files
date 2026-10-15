@@ -8,5 +8,7 @@ license.workspace = true
 ufm-core.workspace = true
 ufm-vfs = { path = "../ufm-vfs" }
 serde.workspace = true
+serde_json = "1"
+flate2 = "1"
 async-trait.workspace = true
 tokio.workspace = true

@@ -692,6 +692,19 @@ export const api = {
     invoke<Array<{ path: string; name: string; modified: string }>>("get_recent_files", { limit }),
   previewText: (item: string, maxLines?: number) =>
     invoke<{ lines: string[]; truncated: boolean }>("preview_text", { item, maxLines }),
+  /** Phase 4: rich document preview — rendered first page (PDF) or
+   * cover (EPUB), book metadata, opening text, degradation note. */
+  previewDocument: (item: string) =>
+    invoke<{
+      format: string;
+      title: string | null;
+      author: string | null;
+      detail: string | null;
+      image: string | null;
+      lines: string[];
+      truncated: boolean;
+      note: string | null;
+    }>("preview_document", { item }),
   startIndexing: (location: string) =>
     invoke<unknown>("start_indexing", { location }),
   indexStatus: () => invoke<IndexState>("index_status"),

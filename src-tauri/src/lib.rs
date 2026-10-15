@@ -517,6 +517,7 @@ pub fn run() {
             commands::open_item,
             commands::set_executable,
             commands::preview_text,
+            commands::preview_document,
             commands::get_item_path,
             commands::get_recent_files,
             commands::get_image_preview,

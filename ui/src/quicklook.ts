@@ -380,6 +380,76 @@ export class QuickLook {
     return m ? parseFloat(m[1]) : this.closedX();
   }
 
+  /** Phase 4 rich document preview: a PDF's rendered first page or
+   * an EPUB's cover as the card hero, the book's own title/author as
+   * headline/subline (the audio-tags pattern), page/chapter count in
+   * the metadata rows, the opening text below, and any plain-language
+   * note (DRM, oversize, unreadable) last. The metadata card paints
+   * instantly; a quiet "Rendering…" line holds the hero's place
+   * until the decode lands. Returns false only when the decode
+   * failed outright, so the caller falls back to text extraction. */
+  private async renderDocumentPreview(
+    item: Item,
+    card: HTMLElement,
+    dl: HTMLElement,
+    name: HTMLElement,
+  ): Promise<boolean> {
+    const loading = document.createElement("p");
+    loading.className = "ql-doc-loading";
+    loading.textContent =
+      item.name.toLowerCase().endsWith(".pdf")
+        ? "Rendering first page…"
+        : "Opening book…";
+    card.appendChild(loading);
+    let doc: Awaited<ReturnType<typeof api.previewDocument>>;
+    try {
+      doc = await api.previewDocument(item.id);
+    } catch {
+      loading.remove();
+      return false;
+    }
+    loading.remove();
+    if (doc.image) {
+      const img = document.createElement("img");
+      img.className = "ql-doc-hero";
+      img.src = doc.image;
+      img.alt = doc.title ?? item.name;
+      card.insertBefore(img, card.firstChild);
+      card.classList.add("has-photo");
+    }
+    if (doc.title && doc.title !== item.name) {
+      name.textContent = doc.title;
+    }
+    if (doc.author) {
+      const subEl = document.createElement("div");
+      subEl.className = "ql-sub";
+      subEl.textContent = doc.author;
+      name.after(subEl);
+    }
+    if (doc.detail) {
+      const dt = document.createElement("dt");
+      dt.textContent = "Length";
+      const dd = document.createElement("dd");
+      dd.textContent = doc.detail;
+      dl.appendChild(dt);
+      dl.appendChild(dd);
+    }
+    if (doc.lines.length > 0) {
+      const pre = document.createElement("pre");
+      pre.className = "ql-text-preview";
+      pre.textContent =
+        doc.lines.join("\n") + (doc.truncated ? "\n… (truncated)" : "");
+      card.appendChild(pre);
+    }
+    if (doc.note) {
+      const note = document.createElement("p");
+      note.className = "ql-doc-note";
+      note.textContent = doc.note;
+      card.appendChild(note);
+    }
+    return true;
+  }
+
   private async renderCard(item: Item, kind: PreviewKind | null): Promise<void> {
     // Carry snapshot (fix batch item 1): a re-render for the SAME
     // media — the preview-kind round-trip re-renders every open —
@@ -455,9 +525,18 @@ export class QuickLook {
       // extracts readable text from docx/odt/epub/pdf in preview_text.
       // Round 7.2: ods/odp join (same ODF content.xml mechanism).
       const docExts = ["docx", "odt", "ods", "odp", "epub", "pdf"];
+      // Phase 4: PDFs and EPUBs get the RICH document preview first —
+      // rendered first page / book cover hero, book metadata, opening
+      // text (see renderDocumentPreview). The plain text extraction
+      // below remains the fallback if the decode fails outright.
+      let richDocument = false;
+      if (kind === "document" && (ext === "pdf" || ext === "epub")) {
+        richDocument = await this.renderDocumentPreview(item, card, dl, name);
+      }
       if (
-        (kind === "native" && textExts.includes(ext)) ||
-        (kind === "document" && docExts.includes(ext))
+        !richDocument &&
+        ((kind === "native" && textExts.includes(ext)) ||
+          (kind === "document" && docExts.includes(ext)))
       ) {
         try {
           const result = await api.previewText(item.id, 50);
