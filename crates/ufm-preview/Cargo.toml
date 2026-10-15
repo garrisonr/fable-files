@@ -12,3 +12,9 @@ serde_json = "1"
 flate2 = "1"
 async-trait.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+# The encrypted-PDF fixture (pdf.rs tests) implements the Standard
+# Security Handler, which needs MD5. Already in the workspace lock
+# (ufm-media, src-tauri) — no new crate enters the tree.
+md5 = "0.7"

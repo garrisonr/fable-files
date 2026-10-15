@@ -256,6 +256,34 @@ export interface ChapterView {
   chapterCount: number;
 }
 
+/** PDF Reader — the opening handshake for one document. */
+export interface PdfOutlineEntry {
+  title: string;
+  /** 1-based page the bookmark points at. */
+  page: number;
+  depth: number;
+}
+
+export interface PdfOpen {
+  title: string | null;
+  author: string | null;
+  pageCount: number;
+  encrypted: boolean;
+  note: string | null;
+  outline: PdfOutlineEntry[];
+  startPage: number;
+  zoomMode: string;
+  pageWidthPts: number | null;
+  pageHeightPts: number | null;
+}
+
+export interface PdfPageView {
+  index: number;
+  image: string;
+  width: number;
+  height: number;
+}
+
 /** Library Memory settings (Preferences): how long Fable remembers
  *  a disconnected drive's files. null = Forever. */
 export interface LibrarySettings {
@@ -901,6 +929,12 @@ export const api = {
     invoke<ChapterView>("read_chapter", { path, index }),
   setReadingProgress: (path: string, chapter: number, fontScale?: number) =>
     invoke<void>("set_reading_progress", { path, chapter, fontScale }),
+  /** PDF Reader — paginated documents in the same shell. */
+  openPdf: (path: string) => invoke<PdfOpen>("open_pdf", { path }),
+  readPdfPage: (path: string, page: number, widthPx: number) =>
+    invoke<PdfPageView>("read_pdf_page", { path, page, widthPx }),
+  setPdfProgress: (path: string, page: number, zoomMode?: string) =>
+    invoke<void>("set_pdf_progress", { path, page, zoomMode }),
   openItem: (item: string) => invoke<void>("open_item", { item }),
   setExecutable: (item: string, executable: boolean) => invoke<void>("set_executable", { item, executable }),
 };

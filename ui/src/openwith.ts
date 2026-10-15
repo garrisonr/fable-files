@@ -59,7 +59,10 @@ export class OpenWithDialog {
 
     // Phase 6: EPUBs can open in the built-in reader. It is not a
     // system app, so the "Always use" checkbox doesn't apply to it.
-    if (item.name.toLowerCase().endsWith(".epub")) {
+    // PDF Reader build: PDFs get the same entry, routed to the
+    // paginated reader.
+    const lowerItemName = item.name.toLowerCase();
+    if (lowerItemName.endsWith(".epub") || lowerItemName.endsWith(".pdf")) {
       const b = document.createElement("button");
       b.className = "ow-app";
       const name = document.createElement("span");
@@ -77,8 +80,13 @@ export class OpenWithDialog {
             (await api.getItemPath(item.id).catch(() => null));
           this.close();
           if (!path) return;
-          const m = await import("./reader");
-          m.openReader(path);
+          if (lowerItemName.endsWith(".pdf")) {
+            const m = await import("./pdfreader");
+            m.openPdfReader(path);
+          } else {
+            const m = await import("./reader");
+            m.openReader(path);
+          }
         })();
       });
       list.appendChild(b);

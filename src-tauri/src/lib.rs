@@ -685,6 +685,9 @@ pub fn run() {
             reader::open_book,
             reader::read_chapter,
             reader::set_reading_progress,
+            reader::open_pdf,
+            reader::read_pdf_page,
+            reader::set_pdf_progress,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Fable Files");

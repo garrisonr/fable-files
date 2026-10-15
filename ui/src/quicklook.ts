@@ -449,7 +449,11 @@ export class QuickLook {
     }
     // Phase 6: an EPUB opens in the built-in reader from here —
     // an explicit door; double-click still opens the OS default app.
-    if (item.name.toLowerCase().endsWith(".epub")) {
+    // PDF Reader build: PDFs take the same door into the paginated
+    // reader.
+    const lowerName = item.name.toLowerCase();
+    if (lowerName.endsWith(".epub") || lowerName.endsWith(".pdf")) {
+      const isPdf = lowerName.endsWith(".pdf");
       const readBtn = document.createElement("button");
       readBtn.className = "ql-detach-btn ql-read-btn";
       readBtn.textContent = "Read";
@@ -461,8 +465,13 @@ export class QuickLook {
             (await api.getItemPath(item.id).catch(() => null));
           if (!path) return;
           this.close();
-          const m = await import("./reader");
-          m.openReader(path);
+          if (isPdf) {
+            const m = await import("./pdfreader");
+            m.openPdfReader(path);
+          } else {
+            const m = await import("./reader");
+            m.openReader(path);
+          }
         })();
       });
       card.appendChild(readBtn);
