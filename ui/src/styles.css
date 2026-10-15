@@ -2255,6 +2255,20 @@ body[data-layout="tv"] .cell-icon {
   display: inline-block; width: 9px; height: 9px; border-radius: 50%;
   margin-right: 7px; vertical-align: 0;
 }
+
+/* ——— Phase 2: Collections sidebar + search-hit stars ——— */
+.side-star { color: var(--ufm-accent); font-size: 0.8rem; flex: none; }
+.side-glyph { font-size: 0.8rem; flex: none; }
+.side-count {
+  margin-left: auto; color: var(--ufm-text-muted); font-size: 0.75rem;
+  font-variant-numeric: tabular-nums; flex: none;
+}
+.side-missing {
+  color: var(--ufm-danger, #c0392b); font-size: 0.72rem; flex: none;
+}
+.hit-star {
+  color: var(--ufm-accent); margin-right: 0.35rem; font-size: 0.75rem;
+}
 .label-dots {
   display: flex; gap: 3px; justify-content: center;
   margin-top: 3px; pointer-events: none;

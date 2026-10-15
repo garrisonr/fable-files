@@ -39,6 +39,9 @@ pub enum FacetField {
     MediaTitle,
     MediaPerson,
     MediaPlatform,
+    /// `starred:yes` — user metadata, lives in the catalog (path_stars),
+    /// not in the name index; extracted and post-filtered by the caller.
+    Starred,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -90,6 +93,7 @@ fn parse_atom(atom: &str) -> Result<Query> {
         let field = match field.to_lowercase().as_str() {
             "type" => FacetField::Type,
             "label" => FacetField::Label,
+            "starred" | "star" => FacetField::Starred,
             "size" => FacetField::Size,
             "modified" => FacetField::Modified,
             "title" => FacetField::MediaTitle,
@@ -146,7 +150,14 @@ fn split_top_level<'a>(input: &'a str, sep: &str) -> Vec<&'a str> {
 pub fn to_fts(q: &Query) -> String {
     match q {
         Query::Text(s) => words(s).join(" "),
-        // MVP: facets are plain text over the indexed name.
+        // Label/Starred facets are user metadata, not name text: they
+        // render EMPTY here and are executed by the caller as catalog
+        // post-filters (see metadata_facets). Other facets keep the
+        // MVP plain-text-over-name rendering.
+        Query::Facet {
+            field: FacetField::Label | FacetField::Starred,
+            ..
+        } => String::new(),
         Query::Facet { value, .. } => words(value).join(" "),
         Query::And(parts) => {
             // Positive parts first, negations last: FTS5's NOT is binary and
@@ -187,6 +198,45 @@ pub fn to_fts(q: &Query) -> String {
         // Bare NOT: no left operand exists in FTS5 — match nothing.
         Query::Not(_) => String::new(),
     }
+}
+
+/// Collect the positive user-metadata facets of a query: `label:`
+/// values (AND semantics — an item must carry every label) and the
+/// `starred:` expectation (`Some(true)` / `Some(false)`), gathered
+/// from the top-level And chain only. Facets inside Or/Not are NOT
+/// extracted (they keep their legacy rendering); a negated metadata
+/// facet is a documented non-feature of the v1 language.
+pub fn metadata_facets(q: &Query) -> (Vec<String>, Option<bool>) {
+    fn walk(q: &Query, labels: &mut Vec<String>, starred: &mut Option<bool>) {
+        match q {
+            Query::And(parts) => {
+                for p in parts {
+                    walk(p, labels, starred);
+                }
+            }
+            Query::Facet {
+                field: FacetField::Label,
+                value,
+                ..
+            } => {
+                if !value.is_empty() {
+                    labels.push(value.clone());
+                }
+            }
+            Query::Facet {
+                field: FacetField::Starred,
+                value,
+                ..
+            } => {
+                let v = value.to_lowercase();
+                *starred = Some(!matches!(v.as_str(), "no" | "false" | "0" | "off"));
+            }
+            _ => {}
+        }
+    }
+    let (mut labels, mut starred) = (Vec::new(), None);
+    walk(q, &mut labels, &mut starred);
+    (labels, starred)
 }
 
 /// Split raw text into FTS5-safe prefix terms: fragments on whitespace and
@@ -402,5 +452,33 @@ mod tests {
         let hits = cat.search_fts(&to_fts(&q), 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0.name, "quarterly report.pdf");
+    }
+
+    #[test]
+    fn starred_facet_parses_and_extracts() {
+        let q = parse("starred:yes").unwrap();
+        assert_eq!(metadata_facets(&q), (vec![], Some(true)));
+        let q = parse("star:no").unwrap();
+        assert_eq!(metadata_facets(&q), (vec![], Some(false)));
+        let q = parse("label:taxes AND starred:yes AND report").unwrap();
+        assert_eq!(
+            metadata_facets(&q),
+            (vec!["taxes".to_string()], Some(true))
+        );
+    }
+
+    #[test]
+    fn metadata_facets_render_empty_in_fts() {
+        // A label-only query must NOT degrade to a name search.
+        assert_eq!(to_fts(&parse("label:taxes").unwrap()), "");
+        assert_eq!(to_fts(&parse("starred:yes").unwrap()), "");
+        // Mixed: the text part survives, the metadata parts drop out.
+        assert_eq!(
+            to_fts(&parse("label:taxes AND report").unwrap()),
+            "report*"
+        );
+        // Negated metadata facets are not extracted (documented v1 limit).
+        let q = parse("report AND NOT label:draft").unwrap();
+        assert_eq!(metadata_facets(&q).0.len(), 0);
     }
 }

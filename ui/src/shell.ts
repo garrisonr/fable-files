@@ -63,6 +63,7 @@ import {
   goUp,
   makeTab,
   navigate,
+  type DirState,
   type Tab,
   type ViewMode,
 } from "./tabs";
@@ -160,12 +161,20 @@ export class Shell {
   private mediaRename = new MediaRenameDialog();
   private musicPlayer = new MusicPlayer();
   private labelList!: HTMLElement;
+  private collectionList!: HTMLElement;
+  /** Phase 2: collections snapshot for the sidebar + item menu
+   * (refreshed by buildSidebar and after every mutation). */
+  private collectionsCache: import("./api").CollectionInfo[] = [];
+  /** Phase 2: last location whose view profile was applied, per tab
+   * — a location's profile applies on ENTRY, not on every load. */
+  private profileLocByTab = new Map<number, string>();
   private smartList!: HTMLElement;
   private romsHead!: HTMLElement;
   private romsList!: HTMLElement;
   /** Chevron spans of the collapsible sidebar sections (Round 7.2:
    * kept so boot can re-apply durable collapse prefs to the DOM). */
   private labelChevEl: HTMLElement | null = null;
+  private collectionChevEl: HTMLElement | null = null;
   private romsChevEl: HTMLElement | null = null;
   /** Durable UI prefs (backend sidecar via api.getUiPrefs). */
   private uiPrefs: Record<string, unknown> = {};
@@ -321,6 +330,44 @@ export class Shell {
       },
       onToggleLabel: (items, label, on) =>
         void this.toggleLabel(items, label, on),
+      onToggleStar: (items, on) => void this.toggleStarItems(items, on),
+      onListCollections: () =>
+        this.collectionsCache
+          .filter((c) => c.kind === "manual")
+          .map((c) => ({ id: c.id, name: c.name })),
+      onAddToCollection: (items, id) => {
+        const c = this.collectionsCache.find((x) => x.id === id);
+        void this.addItemsToCollection(items, id, c?.name ?? "collection");
+      },
+      onNewCollection: (items) => {
+        void (async () => {
+          const created = await this.createCollectionFlow();
+          if (created) {
+            await this.addItemsToCollection(items, created.id, created.name);
+          }
+        })();
+      },
+      inCollectionView: () => this.currentCollectionId() !== null,
+      onRemoveFromCollection: (items) => {
+        const id = this.currentCollectionId();
+        if (!id) return;
+        void (async () => {
+          try {
+            await api.removeFromCollection(
+              id,
+              items.map((i) => i.id),
+            );
+            void this.buildSidebar();
+            this.refreshActiveDir();
+            Toast.success(
+              `Removed ${items.length} item${items.length === 1 ? "" : "s"} from the collection.`,
+            );
+          } catch (err) {
+            Toast.error(`Remove failed: ${errText(err)}`);
+          }
+        })();
+      },
+      onViewStateChange: () => this.saveViewProfile(),
       onManageLabels: () =>
         this.labelManager.open(() => {
           void this.buildSidebar();
@@ -804,6 +851,40 @@ export class Shell {
       labelChev.style.transform = nowHidden ? "rotate(-90deg)" : "";
       this.setCollapsedPref("ff-labels-collapsed", nowHidden);
     });
+    // Phase 2: Collections — collapsible, mirroring Labels exactly.
+    // Right-click the header to make a new one.
+    const collHead = document.createElement("button");
+    collHead.className = "side-head side-collapse";
+    collHead.setAttribute("aria-label", "Toggle Collections section");
+    const collHeadText = document.createElement("span");
+    collHeadText.textContent = "Collections";
+    const collChev = document.createElement("span");
+    collChev.className = "side-chev";
+    collChev.textContent = "▾";
+    collHead.append(collHeadText, collChev);
+    this.collectionChevEl = collChev;
+    collHead.title = "Right-click to create a collection";
+    collHead.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.ctxMenu.open(e.clientX, e.clientY, [
+        {
+          label: "New Collection…",
+          action: () => void this.createCollectionFlow(),
+        },
+      ]);
+    });
+    this.collectionList = document.createElement("div");
+    this.collectionList.className = "side-list";
+    const collsCollapsed = this.prefCollapsed("ff-collections-collapsed");
+    this.collectionList.hidden = collsCollapsed;
+    collChev.style.transform = collsCollapsed ? "rotate(-90deg)" : "";
+    collHead.addEventListener("click", () => {
+      const nowHidden = !this.collectionList.hidden;
+      this.collectionList.hidden = nowHidden;
+      collChev.style.transform = nowHidden ? "rotate(-90deg)" : "";
+      this.setCollapsedPref("ff-collections-collapsed", nowHidden);
+    });
     const smartHead = document.createElement("h2");
     smartHead.className = "side-head";
     smartHead.textContent = "Smart Folders";
@@ -850,6 +931,8 @@ export class Shell {
       this.favList,
       labelHead,
       this.labelList,
+      collHead,
+      this.collectionList,
       smartHead,
       this.smartList,
       this.romsHead,
@@ -990,9 +1073,18 @@ export class Shell {
     const isCurrent = (): boolean => this.loadSeqByTab.get(tab) === seq;
     let items: Item[];
     let gone = false;
+    let collectionMissing: string[] = [];
     try {
       if (dir.dirId.startsWith("label:")) {
         items = await api.listItemsByLabel(dir.dirId.slice("label:".length));
+      } else if (dir.dirId.startsWith("collection:")) {
+        const contents = await api.collectionItems(
+          dir.dirId.slice("collection:".length),
+        );
+        items = contents.items;
+        collectionMissing = contents.missing;
+      } else if (dir.dirId === "starred:") {
+        items = await api.starredItems();
       } else if (dir.dirId.startsWith("archive:")) {
         items = await this.archiveItems(dir.dirId);
       } else {
@@ -1014,11 +1106,21 @@ export class Shell {
     tab.dirGone = gone;
     if (!isCurrent()) return; // stale load finished late — discard it
     tab.items = items;
+    // Per-location view memory: entering a location restores its
+    // remembered view mode + sort before anything renders.
+    await this.applyViewProfile(tab, dir);
+    if (!isCurrent()) return;
     if (tab === this.activeTab) {
       this.renderActiveView();
       this.renderCrumbs();
       this.renderNavButtons();
       this.renderStatus();
+      if (collectionMissing.length > 0) {
+        Toast.info(
+          `${collectionMissing.length} item${collectionMissing.length === 1 ? " in this collection no longer exists" : "s in this collection no longer exist"} — right-click the collection in the sidebar to clean up.`,
+          5000,
+        );
+      }
     }
   }
 
@@ -1078,8 +1180,12 @@ export class Shell {
       return;
     }
     if (item.kind === "folder") {
-      if (dir.dirId.startsWith("label:")) {
-        // A labeled folder opens at its real location.
+      if (
+        dir.dirId.startsWith("label:") ||
+        dir.dirId.startsWith("collection:") ||
+        dir.dirId === "starred:"
+      ) {
+        // A folder in a cross-location view opens at its real location.
         this.navigateTo({
           locationId: item.location,
           dirId: item.id,
@@ -1526,7 +1632,12 @@ export class Shell {
     const tab = this.activeTab;
     if (!tab) return;
     const dir = currentDir(tab);
-    if (dir.dirId.startsWith("label:") || dir.dirId.startsWith("archive:")) {
+    if (
+      dir.dirId.startsWith("label:") ||
+      dir.dirId.startsWith("collection:") ||
+      dir.dirId === "starred:" ||
+      dir.dirId.startsWith("archive:")
+    ) {
       Toast.error("Can't paste into this view.");
       return;
     }
@@ -1770,6 +1881,200 @@ export class Shell {
     });
   }
 
+  // ------------------------------------------------ Phase 2: collections
+
+  private openCollection(id: string, name: string): void {
+    if (this.searchView.active) this.searchView.clear();
+    const dirId = `collection:${id}`;
+    this.navigateTo({
+      locationId: "",
+      dirId,
+      crumbs: [{ dirId, name }],
+    });
+  }
+
+  private openStarred(): void {
+    if (this.searchView.active) this.searchView.clear();
+    const dirId = "starred:";
+    this.navigateTo({
+      locationId: "",
+      dirId,
+      crumbs: [{ dirId, name: "★ Starred" }],
+    });
+  }
+
+  /** The collection the active tab is browsing, if any. */
+  private currentCollectionId(): string | null {
+    const tab = this.activeTab;
+    if (!tab) return null;
+    const dir = currentDir(tab);
+    return dir.dirId.startsWith("collection:")
+      ? dir.dirId.slice("collection:".length)
+      : null;
+  }
+
+  private async createCollectionFlow(): Promise<{
+    id: string;
+    name: string;
+  } | null> {
+    const name = await promptDialog(
+      "New Collection",
+      "e.g. Tax documents",
+      "",
+    );
+    if (!name) return null;
+    try {
+      const id = await api.createCollection(name);
+      void this.buildSidebar();
+      Toast.success(`Collection “${name}” created.`);
+      return { id, name };
+    } catch (err) {
+      Toast.error(`Couldn't create collection: ${errText(err)}`);
+      return null;
+    }
+  }
+
+  private async renameCollectionFlow(
+    c: import("./api").CollectionInfo,
+  ): Promise<void> {
+    const name = await promptDialog("Rename Collection", "", c.name);
+    if (!name || name === c.name) return;
+    try {
+      await api.renameCollection(c.id, name);
+      void this.buildSidebar();
+      Toast.success(`Renamed to “${name}”.`);
+    } catch (err) {
+      Toast.error(`Rename failed: ${errText(err)}`);
+    }
+  }
+
+  private async deleteCollectionFlow(
+    c: import("./api").CollectionInfo,
+  ): Promise<void> {
+    const ok = await confirmDialog(
+      `Delete collection “${c.name}”?`,
+      "The collection goes away. The files in it are not touched.",
+      "Delete Collection",
+      true,
+    );
+    if (!ok) return;
+    try {
+      await api.deleteCollection(c.id);
+      // If the active tab is browsing it, fall back to the first location.
+      if (this.currentCollectionId() === c.id && this.locations[0]) {
+        const loc = this.locations[0];
+        this.navigateTo({
+          locationId: loc.id,
+          dirId: loc.root_item,
+          crumbs: [{ dirId: loc.root_item, name: loc.display_name }],
+        });
+      }
+      void this.buildSidebar();
+      Toast.success(`Collection “${c.name}” deleted.`);
+    } catch (err) {
+      Toast.error(`Delete failed: ${errText(err)}`);
+    }
+  }
+
+  private async cleanCollectionMissing(
+    c: import("./api").CollectionInfo,
+  ): Promise<void> {
+    try {
+      const contents = await api.collectionItems(c.id);
+      if (contents.missing.length > 0) {
+        await api.removeCollectionPaths(c.id, contents.missing);
+      }
+      void this.buildSidebar();
+      if (this.currentCollectionId() === c.id) this.refreshActiveDir();
+      Toast.success(
+        `Removed ${contents.missing.length} missing entr${contents.missing.length === 1 ? "y" : "ies"} from “${c.name}”.`,
+      );
+    } catch (err) {
+      Toast.error(`Cleanup failed: ${errText(err)}`);
+    }
+  }
+
+  private async addItemsToCollection(
+    items: Item[],
+    id: string,
+    name: string,
+  ): Promise<void> {
+    try {
+      await api.addToCollection(
+        id,
+        items.map((i) => i.id),
+      );
+      void this.buildSidebar();
+      Toast.success(
+        `Added ${items.length} item${items.length === 1 ? "" : "s"} to “${name}”.`,
+      );
+    } catch (err) {
+      Toast.error(`Couldn't add to collection: ${errText(err)}`);
+    }
+  }
+
+  /** Item-menu star toggle: set semantics built on the backend
+   * toggle (only items whose state differs are flipped). */
+  private async toggleStarItems(items: Item[], on: boolean): Promise<void> {
+    try {
+      for (const item of items) {
+        if (item.starred === on) continue;
+        item.starred = await api.toggleStar(item.id);
+      }
+      this.refreshActiveViewOnly();
+    } catch (err) {
+      Toast.error(`Star failed: ${errText(err)}`);
+      this.refreshActiveDir();
+    }
+  }
+
+  /** Re-render the active view in place (star/label state changed,
+   * no reload needed). */
+  private refreshActiveViewOnly(): void {
+    if (this.activeTab && !this.searchView.active) this.renderActiveView();
+    if (this.searchView.active) this.searchView.refresh();
+  }
+
+  // ------------------------------------------- Phase 2: view profiles
+
+  /** Apply a location's remembered view profile on ENTRY (once per
+   * location per tab): view mode + sort, restored from the catalog. */
+  private async applyViewProfile(tab: Tab, dir: DirState): Promise<void> {
+    if (!dir.locationId || dir.dirId.includes(":")) return;
+    if (this.profileLocByTab.get(tab.id) === dir.locationId) return;
+    this.profileLocByTab.set(tab.id, dir.locationId);
+    const profile = await api
+      .getViewProfile(dir.locationId)
+      .catch(() => null);
+    if (!profile) return;
+    const modes = ["grid", "list", "columns", "gallery"] as const;
+    if ((modes as readonly string[]).includes(profile.view_mode)) {
+      tab.view = profile.view_mode as Tab["view"];
+    }
+    if (["name", "size", "modified"].includes(profile.sort_key)) {
+      tab.sort = profile.sort_key as Tab["sort"];
+    }
+    tab.sortDir = profile.sort_dir < 0 ? -1 : 1;
+  }
+
+  /** Persist the active tab's view state as its location's profile.
+   * Only real location dirs have profiles — pseudo views (labels,
+   * collections, search) never overwrite a location's memory. */
+  private saveViewProfile(): void {
+    const tab = this.activeTab;
+    if (!tab) return;
+    const dir = currentDir(tab);
+    if (!dir.locationId || dir.dirId.includes(":")) return;
+    void api
+      .setViewProfile(dir.locationId, {
+        view_mode: tab.view,
+        sort_key: tab.sort,
+        sort_dir: tab.sortDir,
+        show_extensions: true,
+      })
+      .catch(() => undefined);
+  }
+
   /** Prepopulated rule folders (Dickles, 2026-10-13). Music keeps
    * only clips longer than 30 s; Movies only features over 70 min;
    * Documents excludes .md/.txt by his explicit order. */
@@ -2010,6 +2315,13 @@ export class Shell {
     this.romsList.hidden = roms;
     if (this.romsChevEl) {
       this.romsChevEl.style.transform = roms ? "rotate(-90deg)" : "";
+    }
+    const collections = this.prefCollapsed("ff-collections-collapsed");
+    if (this.collectionList) this.collectionList.hidden = collections;
+    if (this.collectionChevEl) {
+      this.collectionChevEl.style.transform = collections
+        ? "rotate(-90deg)"
+        : "";
     }
   }
 
@@ -3146,6 +3458,100 @@ export class Shell {
       });
       this.labelList.appendChild(b);
     }
+    // Phase 2: Collections — ★ Starred first, then manual
+    // collections with member counts. Rows are drop doors.
+    this.collectionList.innerHTML = "";
+    {
+      const b = document.createElement("button");
+      b.className = "side-item";
+      const star = document.createElement("span");
+      star.className = "side-star";
+      star.textContent = "★";
+      const label = document.createElement("span");
+      label.textContent = "Starred";
+      b.append(star, label);
+      b.addEventListener("click", () => this.openStarred());
+      this.collectionList.appendChild(b);
+    }
+    const collections = await api
+      .listCollections()
+      .catch(() => this.collectionsCache);
+    this.collectionsCache = collections;
+    const manual = collections.filter((c) => c.kind === "manual");
+    if (manual.length === 0) {
+      const p = document.createElement("p");
+      p.className = "side-empty";
+      p.textContent =
+        "Group any files together — right-click a file, or this heading.";
+      this.collectionList.appendChild(p);
+    }
+    for (const c of manual) {
+      const b = document.createElement("button");
+      b.className = "side-item";
+      const glyph = document.createElement("span");
+      glyph.className = "side-glyph";
+      glyph.textContent = "🗂";
+      const label = document.createElement("span");
+      label.textContent = c.name;
+      b.append(glyph, label);
+      if (c.member_count > 0) {
+        const count = document.createElement("span");
+        count.className = "side-count";
+        count.textContent = String(c.member_count);
+        b.appendChild(count);
+      }
+      if (c.missing_count > 0) {
+        const miss = document.createElement("span");
+        miss.className = "side-missing";
+        miss.textContent = `${c.missing_count} missing`;
+        miss.title =
+          "These members' files moved or were deleted outside Fable.";
+        b.appendChild(miss);
+      }
+      b.addEventListener("click", () => this.openCollection(c.id, c.name));
+      b.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const entries: Parameters<typeof this.ctxMenu.open>[2] = [
+          {
+            label: `Rename “${c.name}”…`,
+            action: () => void this.renameCollectionFlow(c),
+          },
+        ];
+        if (c.missing_count > 0) {
+          entries.push({
+            label: `Remove ${c.missing_count} missing entr${c.missing_count === 1 ? "y" : "ies"}`,
+            action: () => void this.cleanCollectionMissing(c),
+          });
+        }
+        entries.push(
+          { separator: true, label: "", action: () => {} },
+          {
+            label: `Delete “${c.name}”`,
+            danger: true,
+            action: () => void this.deleteCollectionFlow(c),
+          },
+        );
+        this.ctxMenu.open(e.clientX, e.clientY, entries);
+      });
+      // Drop door: drag a file or folder onto the row to add it.
+      b.addEventListener("dragover", (e) => {
+        if (!dragState.item) return;
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+        b.classList.add("drop-hover");
+      });
+      b.addEventListener("dragleave", () =>
+        b.classList.remove("drop-hover"),
+      );
+      b.addEventListener("drop", (e) => {
+        e.preventDefault();
+        b.classList.remove("drop-hover");
+        const it = dragState.item;
+        if (it) void this.addItemsToCollection([it], c.id, c.name);
+      });
+      this.collectionList.appendChild(b);
+    }
     // Smart folders: saved searches.
     this.smartList.innerHTML = "";
     const folders = Shell.loadSmartFolders();
@@ -3435,6 +3841,7 @@ export class Shell {
       if (mode === "columns") this.columnsView.reset(tab);
       else this.galleryView.render();
     }
+    this.saveViewProfile();
     this.renderStatus();
   }
 

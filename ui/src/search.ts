@@ -1142,6 +1142,14 @@ export class SearchView {
       // still shows the real file path.
       name.textContent =
         this.displayNames?.get(hit.item.id) ?? hit.item.name;
+      // Phase 2: starred hits carry their ★ (same accent as lists).
+      if (hit.item.starred) {
+        const star = document.createElement("span");
+        star.className = "hit-star";
+        star.textContent = "★";
+        star.title = "Starred";
+        name.prepend(star);
+      }
 
       const path = document.createElement("span");
       path.className = "hit-path";

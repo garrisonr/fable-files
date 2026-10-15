@@ -748,13 +748,20 @@ pub async fn list_dir(
         })
         .collect::<Vec<Item>>();
     let mut items = items;
-    // Hydrate user labels (path-keyed in the catalog).
+    // Hydrate user metadata (labels + stars, both path-keyed in the
+    // catalog). Stars come from one batch query for the whole listing.
     if let Ok(catalog) = ufm_catalog::Catalog::open(&state.catalog_path) {
+        let keys: Vec<String> = items
+            .iter()
+            .filter_map(|i| i.provider_key.clone())
+            .collect();
+        let starred = catalog.starred_paths(&keys).unwrap_or_default();
         for item in items.iter_mut() {
             if let Some(pk) = &item.provider_key {
                 if let Ok(labels) = catalog.labels_for_path(pk) {
                     item.labels = labels;
                 }
+                item.starred = starred.contains(pk);
             }
         }
     }
@@ -3453,9 +3460,40 @@ pub async fn search(
         Ok(q) => q,
         Err(_) => return Ok(Vec::new()),
     };
+    // User-metadata facets (label:, starred:) are NOT name text — they
+    // execute against the catalog stores, either as a post-filter over
+    // FTS rows or, when no name terms remain, as the candidate seed.
+    let (label_facets, starred_facet) = ufm_search::metadata_facets(&query);
+    let has_metadata = !label_facets.is_empty() || starred_facet.is_some();
     let fts_query = ufm_search::to_fts(&query);
     if fts_query.trim().is_empty() {
-        return Ok(Vec::new());
+        if !has_metadata {
+            return Ok(Vec::new());
+        }
+        // Metadata-only query: seed from the label/star stores, apply
+        // the remaining facets as filters, then the shared tail.
+        let seeded = {
+            let catalog = state.catalog.lock().unwrap();
+            let mut items = if let Some(first) = label_facets.first() {
+                catalog
+                    .items_by_label(first)
+                    .map_err(CommandError::from)?
+            } else {
+                catalog.starred_items().map_err(CommandError::from)?
+            };
+            items.retain(|item| {
+                metadata_match(&catalog, item, &label_facets, starred_facet)
+            });
+            if let Some(exts) = exts {
+                items.retain(|item| name_in_type(&item.name, exts));
+            }
+            items.truncate(limit as usize);
+            items
+                .into_iter()
+                .map(|item| (item, 0.0))
+                .collect::<Vec<(Item, f64)>>()
+        };
+        return finish_search(state, seeded, scope, path_prefix.as_deref(), modified_after.as_deref(), modified_before.as_deref());
     }
     // With a type filter, over-fetch so filtering still fills the page.
     let fetch = if exts.is_some() { (limit * 8).min(400) } else { limit };
@@ -3470,7 +3508,43 @@ pub async fn search(
         rows.retain(|(item, _)| name_in_type(&item.name, exts));
         rows.truncate(limit as usize);
     }
+    if has_metadata {
+        let catalog = state.catalog.lock().unwrap();
+        rows.retain(|(item, _)| {
+            metadata_match(&catalog, item, &label_facets, starred_facet)
+        });
+    }
     finish_search(state, rows, scope, path_prefix.as_deref(), modified_after.as_deref(), modified_before.as_deref())
+}
+
+/// Does an item satisfy the extracted metadata facets? Label facets
+/// are ANDed (the item must carry every label, case-insensitively);
+/// the starred facet compares against `path_stars`.
+fn metadata_match(
+    catalog: &ufm_catalog::Catalog,
+    item: &Item,
+    labels: &[String],
+    starred: Option<bool>,
+) -> bool {
+    let Some(pk) = item.provider_key.as_deref() else {
+        return labels.is_empty() && starred != Some(true);
+    };
+    for want in labels {
+        match catalog.labels_for_path(pk) {
+            Ok(have) => {
+                if !have.iter().any(|h| h.eq_ignore_ascii_case(want)) {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    if let Some(want) = starred {
+        if catalog.is_starred_path(pk).unwrap_or(false) != want {
+            return false;
+        }
+    }
+    true
 }
 
 /// Shared tail of `search`: apply the location scope, cache result paths
@@ -3535,6 +3609,23 @@ fn finish_search(
                 item.id = id;
                 item_paths.insert(id, path);
                 item_locations.insert(id, item.location);
+            }
+        }
+    }
+
+    // Hydrate user metadata (labels + stars) onto the hits — the
+    // FTS rows carry neither, and the UI renders both.
+    {
+        let catalog = state.catalog.lock().unwrap();
+        let keys: Vec<String> = rows
+            .iter()
+            .filter_map(|(i, _)| i.provider_key.clone())
+            .collect();
+        let starred = catalog.starred_paths(&keys).unwrap_or_default();
+        for (item, _) in rows.iter_mut() {
+            if let Some(pk) = &item.provider_key {
+                item.labels = catalog.labels_for_path(pk).unwrap_or_default();
+                item.starred = starred.contains(pk);
             }
         }
     }
@@ -3825,23 +3916,323 @@ pub async fn theme_contrast_report(
 // Organization — tags, stars, collections
 // ---------------------------------------------------------------------------
 
+/// Resolve a UI item to its provider_key (the absolute path for
+/// local files) — the identity every Phase 2 metadata store keys on.
+fn item_provider_key(state: &AppState, item: ItemId) -> Cmd<String> {
+    let paths = state.item_paths.lock().unwrap();
+    paths
+        .get(&item)
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            CommandError::from(UfmError::NotFound(format!("unknown item {item}")))
+        })
+}
+
+/// Reconcile catalog-resolved items with the shell's stable path-id
+/// cache (the `list_items_by_label` pattern), so follow-up commands
+/// (open, trash, star, …) resolve the same ids the UI already holds.
+fn reconcile_item_ids(state: &AppState, found: Vec<Item>) -> Vec<Item> {
+    let mut path_ids = state.path_ids.lock().unwrap();
+    let mut item_paths = state.item_paths.lock().unwrap();
+    let mut item_locations = state.item_locations.lock().unwrap();
+    let mut out = Vec::new();
+    for mut item in found {
+        if let Some(pk) = item.provider_key.clone() {
+            let id = *path_ids
+                .entry(std::path::PathBuf::from(&pk))
+                .or_insert(item.id);
+            item.id = id;
+            item_paths.insert(id, std::path::PathBuf::from(&pk));
+            item_locations.insert(id, item.location);
+        }
+        out.push(item);
+    }
+    out
+}
+
+fn open_catalog(state: &AppState) -> Cmd<ufm_catalog::Catalog> {
+    ufm_catalog::Catalog::open(&state.catalog_path).map_err(CommandError::from)
+}
+
+/// Apply a label to an item. Labels live in the path-keyed catalog
+/// store (the same one the sidebar Labels system writes), so a tag
+/// applied here is the label seen everywhere.
 #[tauri::command]
 pub async fn tag_item(
-    _state: State<'_, AppState>,
-    _item: ItemId,
-    _label: String,
+    state: State<'_, AppState>,
+    item: ItemId,
+    label: String,
 ) -> Cmd<()> {
+    let pk = item_provider_key(&state, item)?;
+    open_catalog(&state)?
+        .tag_path(&pk, &label)
+        .map_err(CommandError::from)?;
+    Ok(())
+}
+
+/// Remove a label from an item (the untag half of `tag_item`).
+#[tauri::command]
+pub async fn untag_item(
+    state: State<'_, AppState>,
+    item: ItemId,
+    label: String,
+) -> Cmd<()> {
+    let pk = item_provider_key(&state, item)?;
+    open_catalog(&state)?
+        .untag_path(&pk, &label)
+        .map_err(CommandError::from)?;
+    Ok(())
+}
+
+/// Star/unstar an item; returns the NEW starred state. Stars persist
+/// in the catalog (`path_stars`) and render as ★ in every list.
+#[tauri::command]
+pub async fn toggle_star(state: State<'_, AppState>, item: ItemId) -> Cmd<bool> {
+    let pk = item_provider_key(&state, item)?;
+    open_catalog(&state)?
+        .toggle_star_path(&pk)
+        .map_err(CommandError::from)
+}
+
+/// Every starred item in the catalog (the sidebar Starred view).
+#[tauri::command]
+pub async fn starred_items(state: State<'_, AppState>) -> Cmd<Vec<Item>> {
+    let found = open_catalog(&state)?
+        .starred_items()
+        .map_err(CommandError::from)?;
+    Ok(reconcile_item_ids(&state, found))
+}
+
+#[derive(Debug, Serialize)]
+pub struct CollectionInfo {
+    pub id: CollectionId,
+    pub name: String,
+    /// manual | saved_search | smart
+    pub kind: String,
+    pub member_count: u64,
+    /// Members whose path no longer resolves to a catalog item.
+    pub missing_count: u64,
+}
+
+fn collection_info(row: ufm_catalog::CollectionRow) -> Cmd<CollectionInfo> {
+    let id = uuid::Uuid::parse_str(&row.id)
+        .map(CollectionId)
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
+    Ok(CollectionInfo {
+        id,
+        name: row.name,
+        kind: row.kind,
+        member_count: row.member_count,
+        missing_count: row.missing_count,
+    })
+}
+
+/// All collections with live membership counts (sidebar list).
+#[tauri::command]
+pub async fn list_collections(
+    state: State<'_, AppState>,
+) -> Cmd<Vec<CollectionInfo>> {
+    let rows = open_catalog(&state)?
+        .list_collections()
+        .map_err(CommandError::from)?;
+    rows.into_iter().map(collection_info).collect()
+}
+
+#[tauri::command]
+pub async fn get_collection(
+    state: State<'_, AppState>,
+    id: CollectionId,
+) -> Cmd<CollectionInfo> {
+    let rows = open_catalog(&state)?
+        .list_collections()
+        .map_err(CommandError::from)?;
+    rows.into_iter()
+        .find(|r| r.id == id.to_string())
+        .ok_or_else(|| {
+            CommandError::from(UfmError::NotFound(format!("unknown collection {id}")))
+        })
+        .and_then(collection_info)
+}
+
+/// Create a manual collection; returns its id.
+#[tauri::command]
+pub async fn create_collection(
+    state: State<'_, AppState>,
+    name: String,
+) -> Cmd<CollectionId> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "collection name is empty".into(),
+        )));
+    }
+    let id = CollectionId::new();
+    open_catalog(&state)?
+        .create_collection(&id, &name, "manual")
+        .map_err(CommandError::from)?;
+    Ok(id)
+}
+
+#[tauri::command]
+pub async fn rename_collection(
+    state: State<'_, AppState>,
+    id: CollectionId,
+    name: String,
+) -> Cmd<()> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "collection name is empty".into(),
+        )));
+    }
+    open_catalog(&state)?
+        .rename_collection(&id, &name)
+        .map_err(CommandError::from)?;
+    Ok(())
+}
+
+/// Delete a collection. Member files are never touched — only the
+/// membership list goes away.
+#[tauri::command]
+pub async fn delete_collection(
+    state: State<'_, AppState>,
+    id: CollectionId,
+) -> Cmd<()> {
+    open_catalog(&state)?
+        .delete_collection(&id)
+        .map_err(CommandError::from)?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn toggle_star(_state: State<'_, AppState>, _item: ItemId) -> Cmd<bool> {
-    Ok(false)
+pub async fn add_to_collection(
+    state: State<'_, AppState>,
+    id: CollectionId,
+    items: Vec<ItemId>,
+) -> Cmd<()> {
+    let catalog = open_catalog(&state)?;
+    for item in items {
+        let pk = item_provider_key(&state, item)?;
+        catalog
+            .add_collection_member(&id, &pk)
+            .map_err(CommandError::from)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn list_collections(_state: State<'_, AppState>) -> Cmd<Vec<CollectionId>> {
-    Ok(vec![])
+pub async fn remove_from_collection(
+    state: State<'_, AppState>,
+    id: CollectionId,
+    items: Vec<ItemId>,
+) -> Cmd<()> {
+    let catalog = open_catalog(&state)?;
+    for item in items {
+        let pk = item_provider_key(&state, item)?;
+        catalog
+            .remove_collection_member(&id, &pk)
+            .map_err(CommandError::from)?;
+    }
+    Ok(())
+}
+
+/// Remove members by raw path — the way out for *missing* members,
+/// whose items no longer exist to be resolved by id.
+#[tauri::command]
+pub async fn remove_collection_paths(
+    state: State<'_, AppState>,
+    id: CollectionId,
+    paths: Vec<String>,
+) -> Cmd<()> {
+    let catalog = open_catalog(&state)?;
+    for pk in paths {
+        catalog
+            .remove_collection_member(&id, &pk)
+            .map_err(CommandError::from)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub struct CollectionContents {
+    pub items: Vec<Item>,
+    /// Member paths that no longer resolve (moved/deleted elsewhere).
+    pub missing: Vec<String>,
+}
+
+/// A collection's contents: resolved items plus the honest list of
+/// member paths that no longer resolve to a file.
+#[tauri::command]
+pub async fn collection_items(
+    state: State<'_, AppState>,
+    id: CollectionId,
+) -> Cmd<CollectionContents> {
+    let (items, missing) = open_catalog(&state)?
+        .collection_items(&id)
+        .map_err(CommandError::from)?;
+    Ok(CollectionContents {
+        items: reconcile_item_ids(&state, items),
+        missing,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewProfileDto {
+    /// grid | list | columns | gallery
+    pub view_mode: String,
+    /// name | size | modified
+    pub sort_key: String,
+    /// 1 ascending, -1 descending.
+    pub sort_dir: i32,
+    pub show_extensions: bool,
+}
+
+/// The remembered view profile for a location, if one was saved.
+#[tauri::command]
+pub async fn get_view_profile(
+    state: State<'_, AppState>,
+    location: LocationId,
+) -> Cmd<Option<ViewProfileDto>> {
+    let row = open_catalog(&state)?
+        .view_profile(&location)
+        .map_err(CommandError::from)?;
+    Ok(row.map(|r| {
+        let sort: serde_json::Value =
+            serde_json::from_str(&r.sort_json).unwrap_or_default();
+        ViewProfileDto {
+            view_mode: r.view_mode,
+            sort_key: sort
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("name")
+                .to_string(),
+            sort_dir: sort.get("dir").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
+            show_extensions: r.show_extensions,
+        }
+    }))
+}
+
+/// Remember how a location likes to be looked at (per-location view
+/// memory: mode + sort, restored on the next visit).
+#[tauri::command]
+pub async fn set_view_profile(
+    state: State<'_, AppState>,
+    location: LocationId,
+    profile: ViewProfileDto,
+) -> Cmd<()> {
+    let sort_json = serde_json::json!({ "key": profile.sort_key, "dir": profile.sort_dir })
+        .to_string();
+    open_catalog(&state)?
+        .set_view_profile(
+            &location,
+            &ufm_catalog::ViewProfileRow {
+                view_mode: profile.view_mode,
+                sort_json,
+                show_extensions: profile.show_extensions,
+            },
+        )
+        .map_err(CommandError::from)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -5350,6 +5741,14 @@ pub async fn rename_item(
     }
     std::fs::rename(&path, &dest)
         .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
+    // Carry Phase 2 metadata (stars, collection memberships) to the
+    // new path — the rename already succeeded, so this is best-effort.
+    if let Ok(catalog) = ufm_catalog::Catalog::open(&state.catalog_path) {
+        let _ = catalog.rekey_path(
+            &path.to_string_lossy(),
+            &dest.to_string_lossy(),
+        );
+    }
     Ok(dest.to_string_lossy().to_string())
 }
 

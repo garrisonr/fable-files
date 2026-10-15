@@ -60,6 +60,29 @@ pub struct MediaIdentityRow {
     pub evidence_json: String,
 }
 
+/// One collection as the sidebar lists it (Phase 2): identity plus
+/// live membership counts. `missing_count` counts member paths that
+/// no longer resolve to a catalog item (moved/deleted outside Fable).
+#[derive(Debug, Clone)]
+pub struct CollectionRow {
+    pub id: String,
+    pub name: String,
+    /// manual | saved_search | smart
+    pub kind: String,
+    pub member_count: u64,
+    pub missing_count: u64,
+}
+
+/// A stored per-location view profile (Phase 2): how a location
+/// likes to be looked at. `sort_json` is `{"key":…,"dir":…}` shaped
+/// by the UI; the catalog treats it as opaque text.
+#[derive(Debug, Clone)]
+pub struct ViewProfileRow {
+    pub view_mode: String,
+    pub sort_json: String,
+    pub show_extensions: bool,
+}
+
 impl Catalog {
     /// Open (or create) the catalog. WAL mode + foreign keys, always.
     pub fn open(path: &std::path::Path) -> Result<Self> {
@@ -221,6 +244,53 @@ impl Catalog {
                 );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Phase 2 (collections / stars / view profiles made real):
+        // stars are path-keyed exactly like labels (path_labels) — the
+        // provider_key is the identity that survives re-indexing.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS path_stars (
+                    provider_key TEXT PRIMARY KEY,
+                    starred_at TEXT NOT NULL
+                );",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        // collection_members shipped (migration 1) keyed by item_id with
+        // ON DELETE CASCADE — a design that cannot survive a file move:
+        // the moved file's old item row is deleted (delete_unseen) and
+        // the cascade wiped its memberships. Rebuild path-keyed:
+        // membership stores the provider_key and resolves to the live
+        // item at read time. Rows that still resolve are copied across;
+        // the old table was never writable through any command, so in
+        // practice this copies nothing — but it is correct if it does.
+        let members_path_keyed: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('collection_members') WHERE name = 'provider_key'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !members_path_keyed {
+            self.conn
+                .execute_batch(
+                    "CREATE TABLE collection_members_pk (
+                        collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+                        provider_key TEXT NOT NULL,
+                        added_at TEXT,
+                        PRIMARY KEY (collection_id, provider_key)
+                    );
+                    INSERT OR IGNORE INTO collection_members_pk (collection_id, provider_key)
+                        SELECT cm.collection_id, i.provider_key
+                        FROM collection_members cm
+                        JOIN items i ON i.id = cm.item_id
+                        WHERE i.provider_key IS NOT NULL;
+                    DROP TABLE collection_members;
+                    ALTER TABLE collection_members_pk RENAME TO collection_members;",
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -914,6 +984,407 @@ impl Catalog {
                 .execute(
                     "INSERT OR IGNORE INTO collections (id, name, kind) VALUES (?1, ?2, 'smart')",
                     params![uuid::Uuid::new_v4().to_string(), name],
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 — stars, manual collections, view profiles.
+    //
+    // All user metadata is keyed by provider_key (the absolute path for
+    // local files), exactly like path_labels: the provider_key is the
+    // identity that survives re-indexing (items keep stable ids per
+    // (location_id, provider_key)), and read paths resolve keys back
+    // to live items. Keys that no longer resolve are reported, never
+    // silently dropped.
+    // ------------------------------------------------------------------
+
+    fn hydrate_item(
+        &self,
+        id: &str,
+        location_id: &str,
+        name: String,
+        kind_s: &str,
+        size_bytes: Option<i64>,
+        modified_s: Option<String>,
+        provider_key: Option<String>,
+    ) -> Result<ufm_vfs::Item> {
+        let parse_id = |s: &str, what: &str| {
+            uuid::Uuid::parse_str(s)
+                .map_err(|e| UfmError::Database(format!("bad {what} id {s:?}: {e}")))
+        };
+        let (labels, starred) = match &provider_key {
+            Some(pk) => (
+                self.labels_for_path(pk).unwrap_or_default(),
+                self.is_starred_path(pk).unwrap_or(false),
+            ),
+            None => (Vec::new(), false),
+        };
+        Ok(ufm_vfs::Item {
+            id: ufm_core::ItemId(parse_id(id, "item")?),
+            location: ufm_core::LocationId(parse_id(location_id, "location")?),
+            name,
+            kind: parse_kind(kind_s),
+            size_bytes: size_bytes.map(|v| v as u64),
+            modified: modified_s.and_then(|m| {
+                chrono::DateTime::parse_from_rfc3339(&m)
+                    .ok()
+                    .map(|d| d.with_timezone(&chrono::Utc))
+            }),
+            provider_key,
+            labels,
+            starred,
+        })
+    }
+
+    /// Run `sql` selecting the standard item columns and hydrate the
+    /// rows into Items (labels + starred populated).
+    fn items_by_query(&self, sql: &str, param: &str) -> Result<Vec<ufm_vfs::Item>> {
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![param], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut items = Vec::new();
+        for row in rows {
+            let (id, location_id, name, kind_s, size, modified, pk) =
+                row.map_err(|e| UfmError::Database(e.to_string()))?;
+            items.push(self.hydrate_item(&id, &location_id, name, &kind_s, size, modified, pk)?);
+        }
+        Ok(items)
+    }
+
+    // -- Stars -------------------------------------------------------
+
+    pub fn set_star_path(&self, provider_key: &str, on: bool) -> Result<()> {
+        if on {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO path_stars (provider_key, starred_at) VALUES (?1, ?2)",
+                    params![provider_key, chrono::Utc::now().to_rfc3339()],
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+        } else {
+            self.conn
+                .execute(
+                    "DELETE FROM path_stars WHERE provider_key = ?1",
+                    params![provider_key],
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Flip the star for a path; returns the NEW state.
+    pub fn toggle_star_path(&self, provider_key: &str) -> Result<bool> {
+        let now = !self.is_starred_path(provider_key)?;
+        self.set_star_path(provider_key, now)?;
+        Ok(now)
+    }
+
+    pub fn is_starred_path(&self, provider_key: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM path_stars WHERE provider_key = ?1",
+                params![provider_key],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .map_err(|e| UfmError::Database(e.to_string()))
+    }
+
+    /// Which of `keys` are starred — one query for list hydration.
+    pub fn starred_paths(
+        &self,
+        keys: &[String],
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut out = std::collections::HashSet::new();
+        if keys.is_empty() {
+            return Ok(out);
+        }
+        let mut stmt = self
+            .conn
+            .prepare("SELECT provider_key FROM path_stars")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let all = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let wanted: std::collections::HashSet<&str> =
+            keys.iter().map(|k| k.as_str()).collect();
+        for row in all {
+            let pk = row.map_err(|e| UfmError::Database(e.to_string()))?;
+            if wanted.contains(pk.as_str()) {
+                out.insert(pk);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every catalog item currently starred (the Starred view).
+    pub fn starred_items(&self) -> Result<Vec<ufm_vfs::Item>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes,
+                        i.modified, i.provider_key
+                 FROM items AS i
+                 JOIN path_stars AS ps ON ps.provider_key = i.provider_key
+                 ORDER BY i.name COLLATE NOCASE",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut items = Vec::new();
+        for row in rows {
+            let (id, location_id, name, kind_s, size, modified, pk) =
+                row.map_err(|e| UfmError::Database(e.to_string()))?;
+            items.push(self.hydrate_item(&id, &location_id, name, &kind_s, size, modified, pk)?);
+        }
+        Ok(items)
+    }
+
+    // -- Collections -------------------------------------------------
+
+    /// All collections with live membership counts (sidebar list).
+    pub fn list_collections(&self) -> Result<Vec<CollectionRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT c.id, c.name, c.kind,
+                        (SELECT COUNT(*) FROM collection_members m WHERE m.collection_id = c.id),
+                        (SELECT COUNT(*) FROM collection_members m
+                          WHERE m.collection_id = c.id
+                            AND NOT EXISTS (SELECT 1 FROM items i WHERE i.provider_key = m.provider_key))
+                 FROM collections c
+                 ORDER BY c.name COLLATE NOCASE",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CollectionRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    member_count: row.get::<_, i64>(3)? as u64,
+                    missing_count: row.get::<_, i64>(4)? as u64,
+                })
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    pub fn rename_collection(&self, id: &CollectionId, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE collections SET name = ?2 WHERE id = ?1",
+                params![id.to_string(), name],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete a collection; its members go with it (FK cascade),
+    /// the files themselves are never touched.
+    pub fn delete_collection(&self, id: &CollectionId) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM collections WHERE id = ?1",
+                params![id.to_string()],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn add_collection_member(
+        &self,
+        id: &CollectionId,
+        provider_key: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO collection_members (collection_id, provider_key, added_at)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    id.to_string(),
+                    provider_key,
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn remove_collection_member(
+        &self,
+        id: &CollectionId,
+        provider_key: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM collection_members WHERE collection_id = ?1 AND provider_key = ?2",
+                params![id.to_string(), provider_key],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Member provider_keys of a collection, in add order.
+    pub fn collection_member_keys(&self, id: &CollectionId) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT provider_key FROM collection_members
+                 WHERE collection_id = ?1 ORDER BY added_at, provider_key",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![id.to_string()], |row| row.get::<_, String>(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// Resolve a collection's members to live items. Returns
+    /// (resolved items in name order, member keys that no longer
+    /// resolve — moved or deleted outside Fable's sight).
+    pub fn collection_items(
+        &self,
+        id: &CollectionId,
+    ) -> Result<(Vec<ufm_vfs::Item>, Vec<String>)> {
+        let items = self.items_by_query(
+            "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes,
+                    i.modified, i.provider_key
+             FROM items AS i
+             JOIN collection_members AS m ON m.provider_key = i.provider_key
+             WHERE m.collection_id = ?1
+             ORDER BY i.name COLLATE NOCASE",
+            &id.to_string(),
+        )?;
+        let keys = self.collection_member_keys(id)?;
+        let resolved: std::collections::HashSet<&str> = items
+            .iter()
+            .filter_map(|i| i.provider_key.as_deref())
+            .collect();
+        let missing = keys
+            .into_iter()
+            .filter(|k| !resolved.contains(k.as_str()))
+            .collect();
+        Ok((items, missing))
+    }
+
+    // -- View profiles ------------------------------------------------
+
+    pub fn view_profile(&self, location: &LocationId) -> Result<Option<ViewProfileRow>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT view_mode, sort_json, show_extensions FROM view_profiles WHERE location_id = ?1",
+                params![location.to_string()],
+                |r| {
+                    Ok(ViewProfileRow {
+                        view_mode: r.get(0)?,
+                        sort_json: r.get(1)?,
+                        show_extensions: r.get::<_, i64>(2)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| UfmError::Database(e.to_string()))
+    }
+
+    pub fn set_view_profile(
+        &self,
+        location: &LocationId,
+        profile: &ViewProfileRow,
+    ) -> Result<()> {
+        // view_profiles.location_id is an FK to locations; profile keys
+        // are runtime location ids that may not be catalog locations,
+        // so ensure a minimal row (invisible to the UI: its sidebar
+        // reads AppState, not this table).
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO locations (id, provider, display_name, capabilities_json)
+                 VALUES (?1, 'view-profile', ?1, '{}')",
+                params![location.to_string()],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO view_profiles (location_id, show_extensions, view_mode, sort_json)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    location.to_string(),
+                    profile.show_extensions as i64,
+                    profile.view_mode,
+                    profile.sort_json
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    // -- Path re-keying (in-app rename/move) --------------------------
+
+    /// A file or folder was renamed/moved inside Fable: carry its
+    /// stars and collection memberships to the new path. Prefix-aware:
+    /// descendants of a renamed folder follow. (Labels deliberately
+    /// keep their existing behavior — this serves the Phase 2 stores.)
+    pub fn rekey_path(&self, old: &str, new: &str) -> Result<()> {
+        if old == new {
+            return Ok(());
+        }
+        let old_prefix = format!("{old}/");
+        // substr() is 1-indexed on characters: the matched prefix
+        // occupies chars 1..=prefix_len INCLUDING its trailing slash,
+        // and the remainder starts AT that slash (char prefix_len),
+        // so `new || remainder` keeps exactly one separator.
+        let prefix_len = old_prefix.chars().count() as i64;
+        for table in ["path_stars", "collection_members"] {
+            self.conn
+                .execute(
+                    &format!("UPDATE {table} SET provider_key = ?2 WHERE provider_key = ?1"),
+                    params![old, new],
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            self.conn
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET provider_key = ?1 || substr(provider_key, ?2)
+                         WHERE substr(provider_key, 1, ?3) = ?4"
+                    ),
+                    params![new, prefix_len, prefix_len, old_prefix],
                 )
                 .map_err(|e| UfmError::Database(e.to_string()))?;
         }
@@ -2238,5 +2709,163 @@ mod library_memory_tests {
         cat.vacuum().unwrap();
         assert!(cat.database_size_bytes().unwrap() > 0);
         assert_eq!(cat.integrity_check().unwrap(), "ok");
+    }
+}
+
+#[cfg(test)]
+mod phase2_tests {
+    use super::*;
+    use ufm_core::{CollectionId, ItemId, LocationId};
+    use ufm_vfs::{Item, ItemKind};
+
+    fn item_at(location: LocationId, name: &str, path: &str) -> Item {
+        Item {
+            id: ItemId::new(),
+            location,
+            name: name.into(),
+            kind: ItemKind::File,
+            size_bytes: Some(10),
+            modified: None,
+            provider_key: Some(path.into()),
+            labels: vec![],
+            starred: false,
+        }
+    }
+
+    fn location(id: LocationId) -> ufm_vfs::Location {
+        ufm_vfs::Location {
+            id,
+            provider: "local".into(),
+            display_name: "test".into(),
+            capabilities: ufm_vfs::Capabilities {
+                read: true,
+                ..Default::default()
+            },
+            protected: ufm_vfs::ProtectionTier::None,
+        }
+    }
+
+    fn seeded() -> (Catalog, LocationId, Item, Item) {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&location(loc)).unwrap();
+        let a = item_at(loc, "alpha.txt", "/docs/alpha.txt");
+        let b = item_at(loc, "beta.txt", "/docs/beta.txt");
+        cat.insert_item(&a).unwrap();
+        cat.insert_item(&b).unwrap();
+        (cat, loc, a, b)
+    }
+
+    #[test]
+    fn star_roundtrip_and_listing() {
+        let (cat, _loc, _a, _b) = seeded();
+        assert!(!cat.is_starred_path("/docs/alpha.txt").unwrap());
+        assert!(cat.toggle_star_path("/docs/alpha.txt").unwrap());
+        assert!(cat.is_starred_path("/docs/alpha.txt").unwrap());
+        let items = cat.starred_items().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "alpha.txt");
+        assert!(items[0].starred, "hydrated item carries its star");
+        assert!(!cat.toggle_star_path("/docs/alpha.txt").unwrap());
+        assert!(cat.starred_items().unwrap().is_empty());
+    }
+
+    #[test]
+    fn collections_crud_members_and_missing() {
+        let (cat, _loc, _a, _b) = seeded();
+        let id = CollectionId::new();
+        cat.create_collection(&id, "Reading", "manual").unwrap();
+        cat.add_collection_member(&id, "/docs/alpha.txt").unwrap();
+        cat.add_collection_member(&id, "/docs/beta.txt").unwrap();
+        cat.add_collection_member(&id, "/docs/gone.txt").unwrap();
+        // Duplicate add is a no-op.
+        cat.add_collection_member(&id, "/docs/alpha.txt").unwrap();
+
+        let (items, missing) = cat.collection_items(&id).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(missing, vec!["/docs/gone.txt".to_string()]);
+
+        let rows = cat.list_collections().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].member_count, 3);
+        assert_eq!(rows[0].missing_count, 1);
+
+        cat.rename_collection(&id, "Reading 2026").unwrap();
+        assert_eq!(cat.list_collections().unwrap()[0].name, "Reading 2026");
+
+        cat.remove_collection_member(&id, "/docs/gone.txt").unwrap();
+        assert_eq!(cat.list_collections().unwrap()[0].missing_count, 0);
+
+        cat.delete_collection(&id).unwrap();
+        assert!(cat.list_collections().unwrap().is_empty());
+        // Files themselves untouched.
+        assert_eq!(cat.starred_items().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn membership_survives_reindex_and_rekey() {
+        let (cat, _loc, a, _b) = seeded();
+        let id = CollectionId::new();
+        cat.create_collection(&id, "Keep", "manual").unwrap();
+        cat.add_collection_member(&id, "/docs/alpha.txt").unwrap();
+        cat.set_star_path("/docs/alpha.txt", true).unwrap();
+
+        // Re-index the same path: stable id, membership + star intact.
+        let mut again = a.clone();
+        again.id = ItemId::new(); // the walk mints a fresh id; catalog keeps the stable one
+        again.size_bytes = Some(11);
+        cat.insert_item(&again).unwrap();
+        let (items, missing) = cat.collection_items(&id).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(missing.is_empty());
+        assert!(cat.is_starred_path("/docs/alpha.txt").unwrap());
+
+        // In-app rename re-keys both stores.
+        cat.rekey_path("/docs/alpha.txt", "/docs/alpha-renamed.txt")
+            .unwrap();
+        assert!(cat.is_starred_path("/docs/alpha-renamed.txt").unwrap());
+        assert_eq!(
+            cat.collection_member_keys(&id).unwrap(),
+            vec!["/docs/alpha-renamed.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn rekey_moves_folder_children() {
+        let (cat, _loc, _a, _b) = seeded();
+        let id = CollectionId::new();
+        cat.create_collection(&id, "Folder", "manual").unwrap();
+        cat.add_collection_member(&id, "/docs/beta.txt").unwrap();
+        cat.set_star_path("/docs/beta.txt", true).unwrap();
+        cat.rekey_path("/docs", "/papers").unwrap();
+        assert!(cat.is_starred_path("/papers/beta.txt").unwrap());
+        assert_eq!(
+            cat.collection_member_keys(&id).unwrap(),
+            vec!["/papers/beta.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn view_profile_roundtrip() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        assert!(cat.view_profile(&loc).unwrap().is_none());
+        let profile = ViewProfileRow {
+            view_mode: "list".into(),
+            sort_json: "{\"key\":\"modified\",\"dir\":-1}".into(),
+            show_extensions: false,
+        };
+        cat.set_view_profile(&loc, &profile).unwrap();
+        let got = cat.view_profile(&loc).unwrap().unwrap();
+        assert_eq!(got.view_mode, "list");
+        assert_eq!(got.sort_json, profile.sort_json);
+        assert!(!got.show_extensions);
+        // Overwrite wins.
+        let p2 = ViewProfileRow {
+            view_mode: "grid".into(),
+            ..profile
+        };
+        cat.set_view_profile(&loc, &p2).unwrap();
+        assert_eq!(cat.view_profile(&loc).unwrap().unwrap().view_mode, "grid");
     }
 }

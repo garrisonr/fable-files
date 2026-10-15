@@ -46,6 +46,18 @@ export interface FileViewHooks {
   onSetWallpaper?(item: Item): void;
   onToggleLabel?(items: Item[], label: string, on: boolean): void;
   onManageLabels?(): void;
+  // Phase 2 — stars + collections + view-profile memory.
+  onToggleStar?(items: Item[], on: boolean): void;
+  /** Sync snapshot of the user's collections for the item menu. */
+  onListCollections?(): { id: string; name: string }[];
+  onAddToCollection?(items: Item[], collectionId: string): void;
+  onNewCollection?(items: Item[]): void;
+  /** True while browsing inside a collection (menu swaps Add→Remove). */
+  inCollectionView?(): boolean;
+  onRemoveFromCollection?(items: Item[]): void;
+  /** Sort or view mode changed — the shell persists the location's
+   *  view profile from this. */
+  onViewStateChange?(): void;
   onExtractArchive?(item: Item, toDir: boolean): void;
   onTranscode?(item: Item, preset: string): void;
   onMetadata?(item: Item): void;
@@ -424,6 +436,36 @@ export async function showItemMenu(
       items.push(sep, ...tools);
     }
   }
+  // Phase 2: star + collections — the organize cluster, directly
+  // above Labels in the family grouping.
+  if (hooks.onToggleStar) {
+    items.push(sep);
+    const allStarred = targets.every((t) => t.starred);
+    items.push({
+      label: "Star",
+      checked: allStarred,
+      action: () => hooks.onToggleStar!(targets, !allStarred),
+    });
+  }
+  if (hooks.inCollectionView?.() && hooks.onRemoveFromCollection) {
+    items.push({
+      label: "Remove from Collection",
+      action: () => hooks.onRemoveFromCollection!(targets),
+    });
+  } else if (hooks.onAddToCollection && hooks.onListCollections) {
+    for (const c of hooks.onListCollections()) {
+      items.push({
+        label: `Add to “${c.name}”`,
+        action: () => hooks.onAddToCollection!(targets, c.id),
+      });
+    }
+    if (hooks.onNewCollection) {
+      items.push({
+        label: "New Collection…",
+        action: () => hooks.onNewCollection!(targets),
+      });
+    }
+  }
   if (hooks.onToggleLabel || hooks.onManageLabels) {
     items.push(sep);
     const defs = loadLabelDefs();
@@ -618,6 +660,7 @@ export class FileView {
     const tab = this.tab();
     if (tab.view === mode) return;
     tab.view = mode;
+    this.hooks.onViewStateChange?.();
     const apply = () => this.render();
     if (reducedMotion()) {
       fadeTo(this.el, 0, () => {
@@ -650,6 +693,7 @@ export class FileView {
       tab.sort = key;
       tab.sortDir = 1;
     }
+    this.hooks.onViewStateChange?.();
     this.render();
   }
 

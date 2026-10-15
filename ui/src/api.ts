@@ -158,6 +158,32 @@ export interface SearchHit {
   volume_last_seen?: string | null;
 }
 
+/** Phase 2: one collection as the sidebar lists it. */
+export interface CollectionInfo {
+  id: string;
+  name: string;
+  /** manual | saved_search | smart */
+  kind: string;
+  member_count: number;
+  /** Members whose path no longer resolves to a file. */
+  missing_count: number;
+}
+
+/** Phase 2: a collection's resolved contents plus its missing paths. */
+export interface CollectionContents {
+  items: Item[];
+  missing: string[];
+}
+
+/** Phase 2: per-location remembered view state. */
+export interface ViewProfile {
+  view_mode: string;
+  sort_key: string;
+  /** 1 ascending, -1 descending. */
+  sort_dir: number;
+  show_extensions: boolean;
+}
+
 /** One item's volume badge (rule/smart-folder results). */
 export interface ItemVolumeBadge {
   item_id: string;
@@ -420,6 +446,34 @@ export const api = {
     invoke<void>("delete_path_label", { label }),
   listItemsByLabel: (label: string) =>
     invoke<Item[]>("list_items_by_label", { label }),
+  // Phase 2 — tags/stars by item, collections, view profiles.
+  tagItem: (item: string, label: string) =>
+    invoke<void>("tag_item", { item, label }),
+  untagItem: (item: string, label: string) =>
+    invoke<void>("untag_item", { item, label }),
+  toggleStar: (item: string) => invoke<boolean>("toggle_star", { item }),
+  starredItems: () => invoke<Item[]>("starred_items"),
+  listCollections: () => invoke<CollectionInfo[]>("list_collections"),
+  getCollection: (id: string) =>
+    invoke<CollectionInfo>("get_collection", { id }),
+  createCollection: (name: string) =>
+    invoke<string>("create_collection", { name }),
+  renameCollection: (id: string, name: string) =>
+    invoke<void>("rename_collection", { id, name }),
+  deleteCollection: (id: string) =>
+    invoke<void>("delete_collection", { id }),
+  addToCollection: (id: string, items: string[]) =>
+    invoke<void>("add_to_collection", { id, items }),
+  removeFromCollection: (id: string, items: string[]) =>
+    invoke<void>("remove_from_collection", { id, items }),
+  removeCollectionPaths: (id: string, paths: string[]) =>
+    invoke<void>("remove_collection_paths", { id, paths }),
+  collectionItems: (id: string) =>
+    invoke<CollectionContents>("collection_items", { id }),
+  getViewProfile: (location: string) =>
+    invoke<ViewProfile | null>("get_view_profile", { location }),
+  setViewProfile: (location: string, profile: ViewProfile) =>
+    invoke<void>("set_view_profile", { location, profile }),
   mediaUrlForPath: (path: string) =>
     invoke<string>("media_url_for_path", { path }),
   ruleItems: (
