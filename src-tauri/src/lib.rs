@@ -9,6 +9,7 @@
 pub mod commands;
 pub mod library;
 pub mod mcp_server;
+pub mod mediares;
 pub mod rommedia;
 
 use serde::{Deserialize, Serialize};
@@ -565,6 +566,13 @@ pub fn run() {
             commands::rom_media_report,
             commands::confirm_rom_media_match,
             commands::rom_media_art,
+            commands::mediares_get_settings,
+            commands::mediares_set_key,
+            commands::mediares_validate_key,
+            commands::mediares_scan,
+            commands::mediares_confirm,
+            commands::mediares_plan_organize,
+            commands::mediares_start_organize,
             commands::media_url_for_path,
             commands::add_path_location,
             commands::remove_path_location,

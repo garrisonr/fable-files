@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod romdat;
+pub mod videoid;
 
 // ---------------------------------------------------------------------------
 // MediaIdentity — what the classifier decided a file is, with evidence.

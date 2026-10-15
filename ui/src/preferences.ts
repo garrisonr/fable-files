@@ -13,6 +13,7 @@
 import type { ThemeInfo } from "./api";
 import { DISTRO_ENGINES } from "./themes";
 import { RomMediaSection } from "./rommedia";
+import { MediaResSection } from "./mediares";
 import { LibraryMemorySection } from "./library";
 
 export interface PreferencesHooks {
@@ -136,6 +137,12 @@ export class PreferencesDialog {
     const mediaHost = document.createElement("div");
     dialog.appendChild(mediaHost);
     void new RomMediaSection().mount(mediaHost, hooks);
+
+    // Media Resolution (film/TV → media servers): the TMDB key
+    // block, taught properly per the guidance law.
+    const mresHost = document.createElement("div");
+    dialog.appendChild(mresHost);
+    void new MediaResSection().mount(mresHost);
 
     // Library Memory (Indexer v2): remembered drives + retention,
     // same pattern — backend-owned state, mounted async.

@@ -24,7 +24,7 @@ import { QuickLook } from "./quicklook";
 import { ContextMenu } from "./contextmenu";
 import { Toast, confirmDialog, promptDialog, errText} from "./toast";
 import { SearchView, fmtDay } from "./search";
-import { MediaRenameDialog } from "./mediarename";
+import { MediaResDialog } from "./mediares";
 import { PropertiesDialog } from "./properties";
 import { FolderPicker, type PickerShortcut } from "./picker";
 import { RenameDialog } from "./rename";
@@ -158,7 +158,7 @@ export class Shell {
   private renameDialog = new RenameDialog();
   private labelManager = new LabelManager();
   private searchOpenWith = new OpenWithDialog();
-  private mediaRename = new MediaRenameDialog();
+  private mediaRename = new MediaResDialog();
   private musicPlayer = new MusicPlayer();
   private labelList!: HTMLElement;
   private collectionList!: HTMLElement;

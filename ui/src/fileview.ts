@@ -283,8 +283,17 @@ export async function showItemMenu(
     items.push({
       label:
         targets.length === 1
-          ? "Rename for Media Player..."
-          : `Rename ${targets.length} for Media Player...`,
+          ? "Resolve for Media Servers..."
+          : `Resolve ${targets.length} for Media Servers...`,
+      action: () => hooks.onMediaRename!(targets),
+    });
+  if (
+    hooks.onMediaRename &&
+    targets.length === 1 &&
+    targets[0].kind === "folder"
+  )
+    items.push({
+      label: "Resolve Media in this Folder...",
       action: () => hooks.onMediaRename!(targets),
     });
   if (hooks.onCompress)

@@ -58,6 +58,15 @@ pub struct MediaIdentityRow {
     pub platform: Option<String>,
     pub sha1: Option<String>,
     pub evidence_json: String,
+    /// Film/TV identity (Media Resolution); NULL for ROM rows.
+    pub year: Option<i64>,
+    pub tmdb_id: Option<i64>,
+    pub season: Option<i64>,
+    pub episode: Option<i64>,
+    pub episode_end: Option<i64>,
+    pub confidence: Option<f64>,
+    /// The user confirmed (or hand-corrected) this identity.
+    pub confirmed: bool,
 }
 
 /// One collection as the sidebar lists it (Phase 2): identity plus
@@ -246,6 +255,34 @@ impl Catalog {
             self.conn
                 .execute("ALTER TABLE items ADD COLUMN duration_secs REAL", [])
                 .map_err(|e| UfmError::Database(e.to_string()))?;
+        }
+        // Media Resolution (film/TV identity): media_identities gains
+        // the episode + confidence columns. ROM rows never set them;
+        // the ROM upsert path is untouched.
+        for (col, decl) in [
+            ("season", "INTEGER"),
+            ("episode", "INTEGER"),
+            ("episode_end", "INTEGER"),
+            ("confidence", "REAL"),
+            ("confirmed", "INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            let has: bool = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('media_identities') WHERE name = ?1",
+                    params![col],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|c| c > 0)
+                .unwrap_or(false);
+            if !has {
+                self.conn
+                    .execute(
+                        &format!("ALTER TABLE media_identities ADD COLUMN {col} {decl}"),
+                        [],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+            }
         }
         // ROM media enrichment: cached per-(rom, media type) lookup
         // results. Lives beside media_identities; cascade misses are
@@ -915,7 +952,8 @@ impl Catalog {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT item_id, media_kind, title, platform, sha1, match_evidence_json
+                "SELECT item_id, media_kind, title, platform, sha1, match_evidence_json,
+                        year, tmdb_id, season, episode, episode_end, confidence, confirmed
                  FROM media_identities WHERE item_id = ?1",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
@@ -928,6 +966,13 @@ impl Catalog {
                     platform: row.get(3)?,
                     sha1: row.get(4)?,
                     evidence_json: row.get(5)?,
+                    year: row.get(6)?,
+                    tmdb_id: row.get(7)?,
+                    season: row.get(8)?,
+                    episode: row.get(9)?,
+                    episode_end: row.get(10)?,
+                    confidence: row.get(11)?,
+                    confirmed: row.get::<_, i64>(12)? != 0,
                 })
             })
             .map_err(|e| UfmError::Database(e.to_string()))?;
@@ -965,6 +1010,103 @@ impl Catalog {
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    /// Insert or replace a FILM/TV identity (Media Resolution): the
+    /// TMDB-matched (or user-confirmed) truth about one video file.
+    /// `media_kind` is "movie" | "episode". Distinct from the ROM
+    /// upsert above, which never touches these columns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_video_identity(
+        &self,
+        item_id: &ItemId,
+        media_kind: &str,
+        title: Option<&str>,
+        year: Option<i64>,
+        tmdb_id: Option<i64>,
+        season: Option<i64>,
+        episode: Option<i64>,
+        episode_end: Option<i64>,
+        confidence: Option<f64>,
+        confirmed: bool,
+        evidence_json: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO media_identities
+                 (item_id, media_kind, title, year, tmdb_id, platform, sha1,
+                  match_evidence_json, season, episode, episode_end, confidence, confirmed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    item_id.to_string(),
+                    media_kind,
+                    title,
+                    year,
+                    tmdb_id,
+                    evidence_json,
+                    season,
+                    episode,
+                    episode_end,
+                    confidence,
+                    if confirmed { 1_i64 } else { 0 },
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Resolve a catalog item by its provider_key (for local files,
+    /// the absolute path — the identity that survives re-indexing).
+    pub fn item_by_provider_key(
+        &self,
+        provider_key: &str,
+    ) -> Result<Option<ufm_vfs::Item>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, location_id, name, kind, size_bytes, modified, provider_key
+                 FROM items WHERE provider_key = ?1 LIMIT 1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![provider_key], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        match rows.next() {
+            Some(r) => {
+                let (id, location_id, name, kind_s, size_bytes, modified_s, pk) =
+                    r.map_err(|e| UfmError::Database(e.to_string()))?;
+                let parse_id = |s: &str, what: &str| {
+                    uuid::Uuid::parse_str(s)
+                        .map_err(|e| UfmError::Database(format!("bad {what} id {s:?}: {e}")))
+                };
+                Ok(Some(ufm_vfs::Item {
+                    id: ufm_core::ItemId(parse_id(&id, "item")?),
+                    location: ufm_core::LocationId(parse_id(&location_id, "location")?),
+                    name,
+                    kind: parse_kind(&kind_s),
+                    size_bytes: size_bytes.map(|s| s as u64),
+                    modified: modified_s.and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&chrono::Utc))
+                    }),
+                    provider_key: pk,
+                    labels: Vec::new(),
+                    starred: false,
+                }))
+            }
+            None => Ok(None),
+        }
     }
 
     /// ROM collection membership: items with a stored DAT identification
@@ -2436,6 +2578,57 @@ mod tests {
         assert_eq!(cat.labels_for(&id).unwrap(), vec!["receipts", "taxes-2026"]);
         cat.untag(&id, "receipts").unwrap();
         assert_eq!(cat.labels_for(&id).unwrap(), vec!["taxes-2026"]);
+    }
+
+    #[test]
+    fn video_identity_roundtrip_and_path_lookup() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let mut ep = named_item(loc, "Severance.S01E01.mkv", ItemKind::File);
+        ep.provider_key = Some("/tv/Severance.S01E01.mkv".into());
+        cat.insert_item(&ep).unwrap();
+        cat.upsert_video_identity(
+            &ep.id,
+            "episode",
+            Some("Severance"),
+            Some(2022),
+            Some(95396),
+            Some(1),
+            Some(1),
+            Some(1),
+            Some(0.97),
+            true,
+            r#"{"source":"tmdb","size":10,"modified":null}"#,
+        )
+        .unwrap();
+        let row = cat.media_identity_for(&ep.id).unwrap().unwrap();
+        assert_eq!(row.media_kind, "episode");
+        assert_eq!(row.title.as_deref(), Some("Severance"));
+        assert_eq!(row.year, Some(2022));
+        assert_eq!(row.tmdb_id, Some(95396));
+        assert_eq!(row.season, Some(1));
+        assert_eq!(row.episode, Some(1));
+        assert_eq!(row.episode_end, Some(1));
+        assert_eq!(row.confidence, Some(0.97));
+        assert!(row.confirmed);
+        // Path lookup resolves the same item.
+        let found = cat
+            .item_by_provider_key("/tv/Severance.S01E01.mkv")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, ep.id);
+        assert!(cat.item_by_provider_key("/nope.mkv").unwrap().is_none());
+        // A ROM upsert on another item leaves video columns alone.
+        let mut rom = named_item(loc, "game.zip", ItemKind::File);
+        rom.provider_key = Some("/roms/game.zip".into());
+        cat.insert_item(&rom).unwrap();
+        cat.upsert_media_identity(&rom.id, "rom", Some("Game"), Some("nes"), None, "{}")
+            .unwrap();
+        let rrow = cat.media_identity_for(&rom.id).unwrap().unwrap();
+        assert_eq!(rrow.tmdb_id, None);
+        assert_eq!(rrow.season, None);
+        assert!(!rrow.confirmed);
     }
 
     #[test]

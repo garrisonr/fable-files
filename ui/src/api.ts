@@ -552,6 +552,24 @@ export const api = {
     invoke<string>("confirm_rom_media_match", { req }),
   romMediaArt: (itemIds: string[]) =>
     invoke<Record<string, string>>("rom_media_art", { itemIds }),
+  // Media Resolution (film/TV → Plex/Emby/Jellyfin): TMDB key lives
+  // in the OS keyring — only its presence ever comes back. Scan is
+  // parse + match + compliance; Organize is a journaled job planned
+  // from the same deterministic plan the preview shows.
+  getMediaresSettings: () =>
+    invoke<MediaresSettingsView>("mediares_get_settings"),
+  setMediaresKey: (value: string | null) =>
+    invoke<string>("mediares_set_key", { value }),
+  validateMediaresKey: () =>
+    invoke<MediaresValidate>("mediares_validate_key"),
+  mediaresScan: (req: MediaresScanRequest) =>
+    invoke<MediaresScanResult>("mediares_scan", { req }),
+  mediaresConfirm: (req: MediaresConfirmRequest) =>
+    invoke<MediaresIdentity>("mediares_confirm", { req }),
+  mediaresPlanOrganize: (req: MediaresScanRequest) =>
+    invoke<MediaresOrganizePlan>("mediares_plan_organize", { req }),
+  mediaresStartOrganize: (req: MediaresScanRequest) =>
+    invoke<JobStart>("mediares_start_organize", { req }),
   pauseJob: (job: string) => invoke<void>("pause_job", { job }),
   resumeJob: (job: string) => invoke<void>("resume_job", { job }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),
@@ -825,6 +843,110 @@ export interface RomMediaConfirmRequest {
   mediaType: string;
   source: string;
   url: string;
+}
+
+/** Media Resolution (mirrors mediares.rs / ufm-media videoid). */
+export interface MediaresSettingsView {
+  hasKey: boolean;
+  keyringOk: boolean;
+}
+
+export interface MediaresValidate {
+  ok: boolean;
+  message: string;
+}
+
+export interface MediaresScanRequest {
+  root: string;
+  paths: string[];
+}
+
+/** videoid::ParsedVideo — serde field names are the Rust ones. */
+export interface MediaresParsed {
+  kind: "movie" | "episode" | "unknown";
+  title: string;
+  year: number | null;
+  season: number | null;
+  episode_first: number | null;
+  episode_last: number | null;
+  part: string | null;
+  episode_title_hint: string | null;
+  absolute_episode: number | null;
+  air_date: string | null;
+  explicit_tmdb_id: number | null;
+  explicit_imdb_id: string | null;
+  edition: string | null;
+  tags: string[];
+  flags: string[];
+}
+
+export interface MediaresIdentity {
+  mediaType: string;
+  tmdbId: number | null;
+  title: string;
+  year: number | null;
+  season: number | null;
+  episode: number | null;
+  episodeEnd: number | null;
+  confidence: number | null;
+  confirmed: boolean;
+  source: string;
+  episodeTitles: string[];
+}
+
+export interface MediaresCandidate {
+  candidate: {
+    id: number;
+    media_type: string;
+    title: string;
+    original_title: string;
+    year: number | null;
+    popularity: number;
+  };
+  score: number;
+  tier: "confident" | "probable" | "unknown";
+  reasons: string[];
+}
+
+export interface MediaresScanRow {
+  path: string;
+  name: string;
+  itemId: string | null;
+  parsed: MediaresParsed;
+  state: "ready" | "fixable" | "attention";
+  identity: MediaresIdentity | null;
+  candidates: MediaresCandidate[];
+  targetRel: string | null;
+  note: string | null;
+}
+
+export interface MediaresScanResult {
+  root: string;
+  hasKey: boolean;
+  rows: MediaresScanRow[];
+  ready: number;
+  fixable: number;
+  attention: number;
+  truncated: boolean;
+}
+
+export interface MediaresConfirmRequest {
+  path: string;
+  choice: {
+    mediaType: string;
+    tmdbId: number | null;
+    title: string;
+    year: number | null;
+    season: number | null;
+    episode: number | null;
+    episodeEnd: number | null;
+    episodeTitles: string[];
+  };
+}
+
+export interface MediaresOrganizePlan {
+  actions: Array<{ src: string; dst: string; rel: string }>;
+  excluded: Array<{ path: string; reason: string }>;
 }
 
 export interface RomMediaCandidate {

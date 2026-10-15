@@ -11388,6 +11388,247 @@ pub fn rom_media_art(
         .map_err(CommandError::from)
 }
 
+// ---------------------------------------------------------------------------
+// Media Resolution (mediares.rs): TMDB key management (keyring only),
+// the folder resolution scan, confirm/correct, and the journaled
+// Organize job. The plan function IS the preview: start_organize
+// replans deterministically, so what the user saw is what runs.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn mediares_get_settings() -> Cmd<crate::mediares::SettingsView> {
+    Ok(crate::mediares::settings_view())
+}
+
+#[tauri::command]
+pub fn mediares_set_key(value: Option<String>) -> Cmd<String> {
+    crate::mediares::tmdb_key_set(value.as_deref())
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    Ok(match value.as_deref() {
+        Some(v) if !v.trim().is_empty() => "Saved to the system keyring.".into(),
+        _ => "Removed from the system keyring.".into(),
+    })
+}
+
+#[tauri::command]
+pub async fn mediares_validate_key() -> Cmd<crate::mediares::ValidateResult> {
+    let key = crate::mediares::tmdb_key_get().ok_or_else(|| {
+        CommandError::from(UfmError::InvalidInput(
+            "no TMDB key saved yet".into(),
+        ))
+    })?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::mediares::TmdbClient::new(key).validate()
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("validation task failed: {e}")))
+    })?;
+    Ok(result)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaresScanRequest {
+    pub root: String,
+    pub paths: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn mediares_scan(
+    state: State<'_, AppState>,
+    req: MediaresScanRequest,
+) -> Cmd<crate::mediares::ScanResult> {
+    let catalog_path = state.catalog_path.clone();
+    let key = crate::mediares::tmdb_key_get();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let catalog = ufm_catalog::Catalog::open(&catalog_path)
+            .map_err(|e| format!("catalog open failed: {e}"))?;
+        crate::mediares::scan(&catalog, Path::new(&req.root), &req.paths, key)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("scan task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(result)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaresConfirmRequest {
+    pub path: String,
+    pub choice: crate::mediares::ConfirmChoice,
+}
+
+#[tauri::command]
+pub async fn mediares_confirm(
+    state: State<'_, AppState>,
+    req: MediaresConfirmRequest,
+) -> Cmd<crate::mediares::IdentityView> {
+    let catalog_path = state.catalog_path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let catalog = ufm_catalog::Catalog::open(&catalog_path)
+            .map_err(|e| format!("catalog open failed: {e}"))?;
+        crate::mediares::confirm(&catalog, Path::new(&req.path), &req.choice)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("confirm task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn mediares_plan_organize(
+    state: State<'_, AppState>,
+    req: MediaresScanRequest,
+) -> Cmd<crate::mediares::OrganizePlan> {
+    let catalog_path = state.catalog_path.clone();
+    let plan = tauri::async_runtime::spawn_blocking(move || {
+        let catalog = ufm_catalog::Catalog::open(&catalog_path)
+            .map_err(|e| format!("catalog open failed: {e}"))?;
+        crate::mediares::plan_organize(&catalog, Path::new(&req.root), &req.paths)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("plan task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(plan)
+}
+
+/// Build the Organize job from a plan: one Mkdir chain per target
+/// folder + one Move per file, every Move an outcome step (the undo
+/// feed). Cross-device files decompose via the planner's verified
+/// move, exactly like a hand-planned move job.
+fn build_organize_job(
+    state: &AppState,
+    root: &Path,
+    plan: &crate::mediares::OrganizePlan,
+) -> Cmd<ufm_jobs::Job> {
+    let location = location_for_path(state, root);
+    let mut planner = PathPlanner {
+        job: ufm_jobs::Job::new(
+            format!(
+                "Organize {} file{} for media servers",
+                plan.actions.len(),
+                if plan.actions.len() == 1 { "" } else { "s" }
+            ),
+            ufm_jobs::JobPreview::default(),
+        ),
+        seq: 0,
+        location,
+    };
+    // abs dir -> step id that creates it (None = already on disk)
+    let mut dir_steps: std::collections::HashMap<PathBuf, Option<String>> =
+        std::collections::HashMap::new();
+    dir_steps.insert(root.to_path_buf(), None);
+    for action in &plan.actions {
+        let src = PathBuf::from(&action.src);
+        let dst = PathBuf::from(&action.dst);
+        let dst_parent = dst
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| root.to_path_buf());
+        // Ensure the destination chain exists as steps.
+        let mut dep: Option<String> = None;
+        if let Ok(rel_parent) = dst_parent.strip_prefix(root) {
+            let mut cur = root.to_path_buf();
+            for comp in rel_parent.components() {
+                cur = cur.join(comp.as_os_str());
+                if let Some(existing) = dir_steps.get(&cur) {
+                    if existing.is_some() {
+                        dep = existing.clone();
+                    }
+                    continue;
+                }
+                if cur.is_dir() {
+                    dir_steps.insert(cur.clone(), None);
+                } else {
+                    let parent_dep = dep.clone();
+                    let id = planner.add_mkdir(
+                        cur.parent().unwrap_or(root),
+                        &comp.as_os_str().to_string_lossy(),
+                        parent_dep,
+                    );
+                    dir_steps.insert(cur.clone(), Some(id.clone()));
+                    dep = Some(id);
+                }
+            }
+        }
+        let new_name = dst
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let size = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+        planner.job.preview.files_affected += 1;
+        planner.job.preview.bytes_to_move += size;
+        if same_device(&src, &dst_parent) {
+            planner.add_step(
+                format!("organize {}", src.display()),
+                ufm_jobs::StepOp::Move {
+                    src: job_item(
+                        ItemId::new(),
+                        location,
+                        &src,
+                        ItemKind::File,
+                        Some(size),
+                    ),
+                    dst_parent: job_item(
+                        ItemId::new(),
+                        location,
+                        &dst_parent,
+                        ItemKind::Folder,
+                        None,
+                    ),
+                    new_name,
+                },
+                dep.into_iter().collect(),
+                true,
+                None,
+            );
+        } else {
+            let (_, _, del) =
+                planner.add_move_file(&src, &dst_parent, &new_name, size, dep);
+            if let Some(s) = planner.job.steps.get_mut(&del) {
+                s.outcome = true;
+                s.outcome_path = Some(action.dst.clone());
+            }
+        }
+    }
+    Ok(planner.job)
+}
+
+#[tauri::command]
+pub async fn mediares_start_organize(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    req: MediaresScanRequest,
+) -> Cmd<JobStart> {
+    let catalog_path = state.catalog_path.clone();
+    let root = PathBuf::from(&req.root);
+    let root_for_plan = root.clone();
+    let plan = tauri::async_runtime::spawn_blocking(move || {
+        let catalog = ufm_catalog::Catalog::open(&catalog_path)
+            .map_err(|e| format!("catalog open failed: {e}"))?;
+        crate::mediares::plan_organize(&catalog, &root_for_plan, &req.paths)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("plan task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    if plan.actions.is_empty() {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "nothing to organize — every file was excluded (see the preview)".into(),
+        )));
+    }
+    let job = build_organize_job(&state, &root, &plan)?;
+    start_job(app, &state, job)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
