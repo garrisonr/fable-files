@@ -111,7 +111,7 @@ named, with whose call it is).
 | Typography per design law; adaptive phone→desktop→TV | Implemented | Measure-capped serif column, full-bleed when narrow, A−/A+ steppers, Esc/arrow keys |
 | Opens from Quick Look "Read" + Open With ▸ Fable Reader | Implemented | quicklook.ts / openwith.ts; double-click default UNCHANGED (explicit doors only) |
 | DRM books | Implemented (honesty) | Plain-language note; metadata still shown; no fake chapters |
-| **PDF reader** | **Missing — CUT, flagged for Dickles' ruling** | Phase 4 renders a PDF's first page in Quick Look; a full PDF reading surface is not built. Named in the Phase 6 audit; not silently dropped. |
+| **PDF reader** | Implemented (2026-10-15, PDF Reader build 2c0adbf0) | Poppler-backed paginated reader in the EPUB reader shell: page navigation, zoom, text layer where the PDF carries one. Supersedes the earlier "Missing — CUT" note from the Phase 6 audit — Dickles ordered it built at 07:40 EDT and it shipped same-day. |
 
 ### Platform promises
 | Promise | Status | Evidence |
@@ -129,7 +129,7 @@ The pre-campaign external audits (Gemini ~38%, Copilot ~35–40%
 implemented) scored plugins, folder templates, and the ebook reader
 as ghostware — correctly, at the time. After Phase 6: plugins
 Partial (runtime real, one capability wired), folder templates
-Implemented, reader Implemented for EPUB with the PDF reader a named
-cut. The final external re-audit (next queue item) re-scores the
+Implemented, reader Implemented for EPUB and (since 2026-10-15) PDF.
+The final external re-audit (next queue item) re-scores the
 whole surface from its own packet; this table is the internal
 counterpart it will be checked against.
