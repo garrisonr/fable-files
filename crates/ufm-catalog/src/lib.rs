@@ -203,6 +203,24 @@ impl Catalog {
                 );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Indexer v2 (Library Memory): persistent per-volume records.
+        // A volume's identity is its FILESYSTEM UUID; where it has
+        // been mounted is history, never identity (the same drive at
+        // a new mount point is the same volume). Items resolve to a
+        // volume by longest-prefix match of provider_key against the
+        // current mounts, then this table's mount history.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS volumes (
+                    fs_uuid TEXT PRIMARY KEY,
+                    label TEXT,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    last_indexed TEXT,
+                    mount_history_json TEXT NOT NULL DEFAULT '[]'
+                );",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
         Ok(())
     }
 
@@ -1171,6 +1189,410 @@ impl Catalog {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Indexer v2 — Library Memory: volumes, manifests, purge, job hygiene.
+// ---------------------------------------------------------------------------
+
+/// One recorded mount of a volume (a path it has been seen at).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MountSighting {
+    pub path: String,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+/// A persistent per-volume record (Library Memory). Identity is the
+/// filesystem UUID; labels and mount points are observations.
+#[derive(Debug, Clone)]
+pub struct VolumeRecord {
+    pub fs_uuid: String,
+    pub label: Option<String>,
+    /// RFC 3339: first time this volume was ever observed.
+    pub first_seen: String,
+    /// RFC 3339: most recent time this volume was observed MOUNTED.
+    pub last_seen: String,
+    /// RFC 3339: most recent completed index of a root on this volume.
+    pub last_indexed: Option<String>,
+    pub mount_history: Vec<MountSighting>,
+}
+
+/// Outcome of a terminal-job slimming pass (catalog hygiene).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlimReport {
+    pub jobs_slimmed: u64,
+    pub bytes_freed: u64,
+}
+
+impl Catalog {
+    /// Record that volume `fs_uuid` is mounted at `mount_point` at
+    /// `at` (RFC 3339). Creates the record on first sight; refreshes
+    /// label/last_seen afterwards and merges the mount point into
+    /// the history (same path updates its last_seen, a new path is
+    /// appended — identity never changes with the mount point).
+    pub fn record_volume_sighting(
+        &self,
+        fs_uuid: &str,
+        label: Option<&str>,
+        mount_point: &str,
+        at: &str,
+    ) -> Result<()> {
+        let existing = self.volume(fs_uuid)?;
+        match existing {
+            None => {
+                let history = vec![MountSighting {
+                    path: mount_point.to_string(),
+                    first_seen: at.to_string(),
+                    last_seen: at.to_string(),
+                }];
+                let history_json = serde_json::to_string(&history)
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                self.conn
+                    .execute(
+                        "INSERT INTO volumes (fs_uuid, label, first_seen, last_seen, last_indexed, mount_history_json)
+                         VALUES (?1, ?2, ?3, ?3, NULL, ?4)",
+                        params![fs_uuid, label, at, history_json],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+            }
+            Some(mut rec) => {
+                if label.is_some() {
+                    rec.label = label.map(|s| s.to_string());
+                }
+                rec.last_seen = at.to_string();
+                match rec.mount_history.iter_mut().find(|m| m.path == mount_point) {
+                    Some(m) => m.last_seen = at.to_string(),
+                    None => rec.mount_history.push(MountSighting {
+                        path: mount_point.to_string(),
+                        first_seen: at.to_string(),
+                        last_seen: at.to_string(),
+                    }),
+                }
+                let history_json = serde_json::to_string(&rec.mount_history)
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                self.conn
+                    .execute(
+                        "UPDATE volumes SET label = ?2, last_seen = ?3, mount_history_json = ?4
+                         WHERE fs_uuid = ?1",
+                        params![fs_uuid, rec.label, rec.last_seen, history_json],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark a volume as indexed at `at` (a completed index run over
+    /// one of its roots). Also refreshes last_seen — it was mounted.
+    pub fn mark_volume_indexed(&self, fs_uuid: &str, at: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE volumes SET last_indexed = ?2, last_seen = ?3 WHERE fs_uuid = ?1",
+                params![fs_uuid, at, at],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn volume(&self, fs_uuid: &str) -> Result<Option<VolumeRecord>> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT fs_uuid, label, first_seen, last_seen, last_indexed, mount_history_json
+                 FROM volumes WHERE fs_uuid = ?1",
+                params![fs_uuid],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        match row {
+            None => Ok(None),
+            Some((fs_uuid, label, first_seen, last_seen, last_indexed, history_json)) => {
+                let mount_history: Vec<MountSighting> =
+                    serde_json::from_str(&history_json).unwrap_or_default();
+                Ok(Some(VolumeRecord {
+                    fs_uuid,
+                    label,
+                    first_seen,
+                    last_seen,
+                    last_indexed,
+                    mount_history,
+                }))
+            }
+        }
+    }
+
+    /// Every remembered volume, most recently seen first.
+    pub fn volumes(&self) -> Result<Vec<VolumeRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT fs_uuid FROM volumes ORDER BY last_seen DESC")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        drop(stmt);
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(v) = self.volume(&id)? {
+                out.push(v);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Remove a volume record (its items must already be purged —
+    /// see `purge_items_under_prefixes`).
+    pub fn delete_volume(&self, fs_uuid: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM volumes WHERE fs_uuid = ?1", params![fs_uuid])
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// The incremental-index manifest for one location: provider_key
+    /// -> (size_bytes, modified RFC 3339) for every stored item. The
+    /// indexer diffs its walk against this; unchanged entries skip
+    /// the catalog write entirely. The manifest is derived from the
+    /// catalog itself — the source of truth — so no sidecar state
+    /// can poison it.
+    pub fn manifest_for_location(
+        &self,
+        location: &LocationId,
+    ) -> Result<std::collections::HashMap<String, (Option<i64>, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT provider_key, size_bytes, modified FROM items
+                 WHERE location_id = ?1 AND provider_key IS NOT NULL",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![location.to_string()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = std::collections::HashMap::new();
+        for row in rows {
+            let (pk, size, modified) = row.map_err(|e| UfmError::Database(e.to_string()))?;
+            out.insert(pk, (size, modified));
+        }
+        Ok(out)
+    }
+
+    /// SQL fragment + params matching items at or under any of
+    /// `prefixes` (a prefix matches itself or prefix + "/..."). Uses
+    /// substr comparison, never LIKE, so mount paths containing
+    /// LIKE metacharacters stay literal.
+    fn prefix_predicate(prefixes: &[String]) -> (String, Vec<rusqlite::types::Value>) {
+        let mut parts = Vec::new();
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        for (i, p) in prefixes.iter().enumerate() {
+            let a = i * 2 + 1;
+            let b = i * 2 + 2;
+            parts.push(format!(
+                "(i.provider_key = ?{a} OR substr(i.provider_key, 1, length(?{b}) + 1) = ?{b} || '/')"
+            ));
+            values.push(rusqlite::types::Value::Text(p.clone()));
+            values.push(rusqlite::types::Value::Text(p.clone()));
+        }
+        (parts.join(" OR "), values)
+    }
+
+    /// How many catalog items live at or under any of `prefixes`.
+    pub fn item_count_under_prefixes(&self, prefixes: &[String]) -> Result<u64> {
+        if prefixes.is_empty() {
+            return Ok(0);
+        }
+        let (pred, values) = Self::prefix_predicate(prefixes);
+        let sql = format!(
+            "SELECT COUNT(*) FROM items AS i WHERE i.provider_key IS NOT NULL AND ({pred})"
+        );
+        let n: i64 = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(values.iter()), |r| r.get(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(n as u64)
+    }
+
+    /// Delete every item at or under any of `prefixes`, together
+    /// with everything that hangs off those items (FTS entries,
+    /// labels, path labels, ROM-media cache rows; FK cascades take
+    /// labels/collection members/media identities). This is the
+    /// Forget / retention-prune / rebuild purge. Runs as one
+    /// transaction: a crash mid-purge rolls back rather than leaving
+    /// a half-forgotten volume. Returns the item count deleted.
+    pub fn purge_items_under_prefixes(&self, prefixes: &[String]) -> Result<u64> {
+        if prefixes.is_empty() {
+            return Ok(0);
+        }
+        let (pred, values) = Self::prefix_predicate(prefixes);
+        let select_sql = format!(
+            "SELECT i.rowid, i.id, i.name, i.provider_key FROM items AS i
+             WHERE i.provider_key IS NOT NULL AND ({pred})"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&select_sql)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(values.iter()), |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut victims: Vec<(i64, String, String, String)> = Vec::new();
+        for row in rows {
+            victims.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        drop(stmt);
+        if victims.is_empty() {
+            return Ok(0);
+        }
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let work = (|| -> Result<()> {
+            for (rowid, id, name, pk) in &victims {
+                self.conn
+                    .execute(
+                        "INSERT INTO items_fts (items_fts, rowid, name) VALUES ('delete', ?1, ?2)",
+                        params![rowid, name],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                self.conn
+                    .execute(
+                        "DELETE FROM rom_media WHERE item_id = ?1",
+                        params![id],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                self.conn
+                    .execute(
+                        "DELETE FROM path_labels WHERE provider_key = ?1",
+                        params![pk],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                self.conn
+                    .execute("DELETE FROM items WHERE id = ?1", params![id])
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+            }
+            Ok(())
+        })();
+        match work {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                Ok(victims.len() as u64)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Catalog hygiene (Indexer v2): slim the snapshots of TERMINAL
+    /// jobs (completed / cancelled / failed). A finished job never
+    /// resumes, so its steps map — the replay payload, and by far
+    /// the largest part of the blob — is dropped; title, state,
+    /// created, preview (the summary), outcomes (the audit/undo
+    /// feed) and the step tallies are kept, so every reader sees the
+    /// same job, only smaller. Unfinished jobs are never touched:
+    /// their steps are how they resume. Idempotent — slimmed jobs
+    /// are skipped on later passes.
+    pub fn slim_terminal_job_blobs(&self) -> Result<SlimReport> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT job_id, job_json FROM jobs
+                 WHERE state IN ('completed', 'cancelled', 'failed')",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut pending: Vec<(String, String)> = Vec::new();
+        for row in rows {
+            pending.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        drop(stmt);
+        let mut report = SlimReport::default();
+        for (job_id, old_json) in pending {
+            // A blob that no longer parses is left exactly as found —
+            // slimming must never become the thing that loses data.
+            let mut job: ufm_jobs::Job = match serde_json::from_str(&old_json) {
+                Ok(j) => j,
+                Err(_) => continue,
+            };
+            if job.steps_slimmed || job.steps.is_empty() {
+                continue;
+            }
+            job.step_counts = Some(ufm_jobs::StepCounts::tally(&job.steps));
+            job.steps.clear();
+            job.steps_slimmed = true;
+            let new_json = match serde_json::to_string(&job) {
+                Ok(j) => j,
+                Err(_) => continue,
+            };
+            if new_json.len() < old_json.len() {
+                self.conn
+                    .execute(
+                        "UPDATE jobs SET job_json = ?2 WHERE job_id = ?1",
+                        params![job_id, new_json],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                report.jobs_slimmed += 1;
+                report.bytes_freed += (old_json.len() - new_json.len()) as u64;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Reclaim free pages (after a material slimming or purge).
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn
+            .execute_batch("VACUUM")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Current database size in bytes (page_count × page_size) —
+    /// the number VACUUM actually shrinks.
+    pub fn database_size_bytes(&self) -> Result<u64> {
+        let pages: i64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let size: i64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok((pages * size) as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1620,5 +2042,201 @@ mod job_tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+}
+
+#[cfg(test)]
+mod library_memory_tests {
+    use super::*;
+    use ufm_core::{ItemId, LocationId};
+    use ufm_jobs::{Job, JobPreview, JobState, Step, StepOp, StepState};
+
+    fn loc() -> (LocationId, ufm_vfs::Location) {
+        let id = LocationId::new();
+        (
+            id,
+            ufm_vfs::Location {
+                id,
+                provider: "local".into(),
+                display_name: "test".into(),
+                capabilities: ufm_vfs::Capabilities {
+                    read: true,
+                    ..Default::default()
+                },
+                protected: ufm_vfs::ProtectionTier::None,
+            },
+        )
+    }
+
+    fn file_item(location: LocationId, path: &str, size: u64) -> ufm_vfs::Item {
+        ufm_vfs::Item {
+            id: ItemId::new(),
+            location,
+            name: path.rsplit('/').next().unwrap_or(path).into(),
+            kind: ufm_vfs::ItemKind::File,
+            size_bytes: Some(size),
+            modified: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            provider_key: Some(path.into()),
+            labels: vec![],
+            starred: false,
+        }
+    }
+
+    #[test]
+    fn volume_sightings_merge_mount_history() {
+        let cat = Catalog::open_in_memory().unwrap();
+        cat.record_volume_sighting(
+            "uuid-1",
+            Some("Desk SSD"),
+            "/media/richard/Desk SSD",
+            "2026-10-01T10:00:00Z",
+        )
+        .unwrap();
+        // Same mount again: history stays one entry, last_seen moves.
+        cat.record_volume_sighting(
+            "uuid-1",
+            Some("Desk SSD"),
+            "/media/richard/Desk SSD",
+            "2026-10-05T10:00:00Z",
+        )
+        .unwrap();
+        // Same drive, new mount point: SAME volume, history grows.
+        cat.record_volume_sighting(
+            "uuid-1",
+            None,
+            "/run/media/richard/Desk SSD",
+            "2026-10-09T10:00:00Z",
+        )
+        .unwrap();
+        let v = cat.volume("uuid-1").unwrap().unwrap();
+        assert_eq!(v.label.as_deref(), Some("Desk SSD"));
+        assert_eq!(v.first_seen, "2026-10-01T10:00:00Z");
+        assert_eq!(v.last_seen, "2026-10-09T10:00:00Z");
+        assert_eq!(v.mount_history.len(), 2);
+        assert_eq!(v.mount_history[0].last_seen, "2026-10-05T10:00:00Z");
+        cat.mark_volume_indexed("uuid-1", "2026-10-09T11:00:00Z").unwrap();
+        let v = cat.volume("uuid-1").unwrap().unwrap();
+        assert_eq!(v.last_indexed.as_deref(), Some("2026-10-09T11:00:00Z"));
+        assert_eq!(cat.volumes().unwrap().len(), 1);
+        cat.delete_volume("uuid-1").unwrap();
+        assert!(cat.volume("uuid-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn manifest_and_prefix_purge() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let (id, location) = loc();
+        cat.insert_location(&location).unwrap();
+        cat.insert_item(&file_item(id, "/media/desk/a.txt", 10)).unwrap();
+        cat.insert_item(&file_item(id, "/media/desk/sub/b.txt", 20)).unwrap();
+        cat.insert_item(&file_item(id, "/home/richard/c.txt", 30)).unwrap();
+
+        let manifest = cat.manifest_for_location(&id).unwrap();
+        assert_eq!(manifest.len(), 3);
+        let (size, modified) = &manifest["/media/desk/a.txt"];
+        assert_eq!(*size, Some(10));
+        assert_eq!(modified.as_deref(), Some("2026-10-01T12:00:00+00:00"));
+
+        // Prefix matching: exact-boundary semantics — "/media/desk"
+        // must not swallow "/media/desk2".
+        cat.insert_item(&file_item(id, "/media/desk2/d.txt", 40)).unwrap();
+        assert_eq!(
+            cat.item_count_under_prefixes(&["/media/desk".to_string()])
+                .unwrap(),
+            2
+        );
+        let purged = cat
+            .purge_items_under_prefixes(&["/media/desk".to_string()])
+            .unwrap();
+        assert_eq!(purged, 2);
+        // Survivors: the home file and the desk2 file; FTS is clean.
+        assert_eq!(cat.manifest_for_location(&id).unwrap().len(), 2);
+        assert!(cat.search_fts("a*", 10).unwrap().is_empty());
+        assert_eq!(cat.search_fts("c*", 10).unwrap().len(), 1);
+        assert_eq!(cat.search_fts("d*", 10).unwrap().len(), 1);
+        // Purging nothing is a no-op, not an error.
+        assert_eq!(
+            cat.purge_items_under_prefixes(&["/media/desk".to_string()])
+                .unwrap(),
+            0
+        );
+        assert_eq!(cat.purge_items_under_prefixes(&[]).unwrap(), 0);
+    }
+
+    fn bloated_job(state: JobState, steps: usize) -> Job {
+        let mut job = Job::new("Copy richard", JobPreview::default());
+        job.state = state;
+        for i in 0..steps {
+            job.add_step(Step {
+                id: format!("s{i:05}"),
+                label: format!("copy file {i}"),
+                op: StepOp::Copy {
+                    src: file_item(LocationId::new(), &format!("/src/{i}.bin"), 100),
+                    dst_parent: file_item(LocationId::new(), "/dst", 0),
+                    new_name: format!("{i}.bin"),
+                },
+                depends_on: vec![],
+                state: StepState::Done,
+                compensation: None,
+                outcome: false,
+                outcome_path: None,
+            });
+        }
+        job.outcomes.push(ufm_jobs::JobOutcome {
+            step_id: "s00000".into(),
+            src_path: "/src/0.bin".into(),
+            result_path: Some("/dst/0.bin".into()),
+            trash_name: None,
+        });
+        job
+    }
+
+    #[test]
+    fn slimming_touches_terminal_jobs_only_and_keeps_the_audit() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let cancelled = bloated_job(JobState::Cancelled, 50);
+        let running = bloated_job(JobState::Running, 50);
+        let paused = bloated_job(JobState::Paused, 50);
+        cat.upsert_job(&cancelled).unwrap();
+        cat.upsert_job(&running).unwrap();
+        cat.upsert_job(&paused).unwrap();
+
+        let report = cat.slim_terminal_job_blobs().unwrap();
+        assert_eq!(report.jobs_slimmed, 1);
+        assert!(report.bytes_freed > 0);
+
+        // Terminal job: steps gone, tallies + audit intact.
+        let slim = cat.load_job(&cancelled.id).unwrap().unwrap();
+        assert!(slim.steps.is_empty());
+        assert!(slim.steps_slimmed);
+        let counts = slim.step_counts.unwrap();
+        assert_eq!(counts.total, 50);
+        assert_eq!(counts.done, 50);
+        assert_eq!(slim.outcomes.len(), 1);
+        assert_eq!(slim.title, "Copy richard");
+        assert_eq!(slim.state, JobState::Cancelled);
+
+        // Unfinished jobs: byte-for-byte the same job back.
+        for original in [&running, &paused] {
+            let loaded = cat.load_job(&original.id).unwrap().unwrap();
+            assert_eq!(loaded.steps.len(), 50);
+            assert!(!loaded.steps_slimmed);
+        }
+        // Unfinished filter still sees exactly the live two.
+        assert_eq!(cat.unfinished_jobs().unwrap().len(), 2);
+
+        // Idempotent: a second pass slims nothing.
+        let again = cat.slim_terminal_job_blobs().unwrap();
+        assert_eq!(again.jobs_slimmed, 0);
+        assert_eq!(again.bytes_freed, 0);
+
+        // Vacuum runs clean on a live schema.
+        cat.vacuum().unwrap();
+        assert!(cat.database_size_bytes().unwrap() > 0);
+        assert_eq!(cat.integrity_check().unwrap(), "ok");
     }
 }

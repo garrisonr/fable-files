@@ -74,10 +74,16 @@ pub struct LocationSummary {
 // list_dir resolves them, never written to the catalog or the sidecar).
 // ---------------------------------------------------------------------------
 
-struct MountedVolume {
-    name: String,
-    path: String,
-    removable: bool,
+pub(crate) struct MountedVolume {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) removable: bool,
+    /// Indexer v2: the filesystem UUID (lsblk UUID) — the volume's
+    /// durable identity for Library Memory. None when lsblk reports
+    /// none (rare; such volumes simply aren't remembered).
+    pub(crate) uuid: Option<String>,
+    /// The raw filesystem label, when the volume has one.
+    pub(crate) label: Option<String>,
 }
 
 /// One mounted-filesystem candidate collected from the lsblk tree.
@@ -91,6 +97,9 @@ struct MountCandidate {
     /// way rm/tran are) — the human name of last resort before ids.
     model: Option<String>,
     removable: bool,
+    /// Filesystem UUID of THIS node (never inherited — a partition's
+    /// UUID is its own; the LUKS mapper node carries the fs UUID).
+    uuid: Option<String>,
 }
 
 fn collect_mounts(
@@ -137,6 +146,11 @@ fn collect_mounts(
                         .filter(|s| !s.is_empty()),
                     model: model.clone(),
                     removable: rm || usb,
+                    uuid: node
+                        .get("uuid")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
                 });
             }
         }
@@ -148,12 +162,18 @@ fn collect_mounts(
     }
 }
 
-fn enumerate_mounted_volumes() -> Vec<MountedVolume> {
+/// Every mounted filesystem lsblk can see, one entry per device —
+/// INCLUDING the system mounts ("/", "/boot") that the sidebar hides.
+/// Library Memory (Indexer v2) works from this full set: the root
+/// filesystem is a volume too (Home lives on it), it just never
+/// appears in the sidebar. Pseudo mounts (/snap, /sys, /proc, /dev)
+/// are excluded here for everyone.
+fn collect_filesystems() -> Vec<MountCandidate> {
     let out = match std::process::Command::new("lsblk")
         .args([
             "-J",
             "-o",
-            "NAME,TYPE,RM,TRAN,MOUNTPOINTS,LABEL,PARTLABEL,MODEL,FSTYPE",
+            "NAME,TYPE,RM,TRAN,MOUNTPOINTS,LABEL,PARTLABEL,MODEL,FSTYPE,UUID",
         ])
         .output()
     {
@@ -170,13 +190,9 @@ fn enumerate_mounted_volumes() -> Vec<MountedVolume> {
             collect_mounts(d, false, false, false, None, &mut candidates);
         }
     }
-    // Drop system / pseudo mounts: the sidebar is for browsable volumes.
     candidates.retain(|c| {
         let mp = c.mountpoint.as_str();
-        mp != "/"
-            && mp != "/boot"
-            && mp != "/boot/efi"
-            && !mp.starts_with("/snap/")
+        !mp.starts_with("/snap/")
             && !mp.starts_with("/var/lib/snapd")
             && !mp.starts_with("/sys")
             && !mp.starts_with("/proc")
@@ -196,39 +212,161 @@ fn enumerate_mounted_volumes() -> Vec<MountedVolume> {
             }
         }
     }
-    let mut volumes: Vec<MountedVolume> = by_device
-        .into_values()
-        .map(|c| {
-            // Display-name chain (UI round, Dickles' ruling): the
-            // volume LABEL first, then the device / partition name,
-            // then the disk's model, and only as a last resort a
-            // SHORTENED id — a raw 36-char UUID in the sidebar (his
-            // LUKS superdog) names nothing a human recognizes.
-            let name = c
-                .label
-                .clone()
-                .or(c.partlabel.clone())
-                .or(c.model.clone())
-                .unwrap_or_else(|| {
-                    let base = std::path::Path::new(&c.mountpoint)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| c.mountpoint.clone());
-                    if base.chars().count() > 12 {
-                        format!("{}…", base.chars().take(8).collect::<String>())
-                    } else {
-                        base
-                    }
-                });
-            MountedVolume {
-                name,
-                path: c.mountpoint,
-                removable: c.removable,
+    by_device.into_values().collect()
+}
+
+/// Display-name chain (UI round, Dickles' ruling): the volume LABEL
+/// first, then the device / partition name, then the disk's model,
+/// and only as a last resort a SHORTENED id — a raw 36-char UUID in
+/// the sidebar (his LUKS superdog) names nothing a human recognizes.
+fn volume_display_name(c: &MountCandidate) -> String {
+    c.label
+        .clone()
+        .or(c.partlabel.clone())
+        .or(c.model.clone())
+        .unwrap_or_else(|| {
+            let base = std::path::Path::new(&c.mountpoint)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| c.mountpoint.clone());
+            if base.chars().count() > 12 {
+                format!("{}…", base.chars().take(8).collect::<String>())
+            } else {
+                base
             }
         })
+}
+
+fn mounted_volume_of(c: MountCandidate) -> MountedVolume {
+    MountedVolume {
+        name: volume_display_name(&c),
+        path: c.mountpoint.clone(),
+        removable: c.removable,
+        uuid: c.uuid.clone(),
+        label: c.label.clone(),
+    }
+}
+
+/// All currently mounted filesystems (system mounts included) —
+/// the live truth Library Memory badges and retention check against.
+pub(crate) fn current_filesystems() -> Vec<MountedVolume> {
+    collect_filesystems().into_iter().map(mounted_volume_of).collect()
+}
+
+fn enumerate_mounted_volumes() -> Vec<MountedVolume> {
+    // The sidebar set: browsable volumes only, no system mounts.
+    let mut volumes: Vec<MountedVolume> = collect_filesystems()
+        .into_iter()
+        .filter(|c| {
+            let mp = c.mountpoint.as_str();
+            mp != "/" && mp != "/boot" && mp != "/boot/efi"
+        })
+        .map(mounted_volume_of)
         .collect();
     volumes.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     volumes
+}
+
+// ---------------------------------------------------------------------------
+// Library Memory (Indexer v2): volume sightings + item -> volume badges.
+// A volume's catalog STAYS when it disconnects; these helpers are how
+// the rest of the app knows which volume an item lives on and whether
+// that volume is here right now.
+// ---------------------------------------------------------------------------
+
+/// Record every currently-mounted filesystem in the catalog's
+/// volumes table (creating records on first sight). Returns the
+/// mounted set so callers can resolve online state without a second
+/// enumeration.
+pub(crate) fn record_volume_sightings(catalog: &ufm_catalog::Catalog) -> Vec<MountedVolume> {
+    let mounted = current_filesystems();
+    let now = chrono::Utc::now().to_rfc3339();
+    for v in &mounted {
+        if let Some(uuid) = &v.uuid {
+            let label = v.label.as_deref().unwrap_or(v.name.as_str());
+            let _ = catalog.record_volume_sighting(uuid, Some(label), &v.path, &now);
+        }
+    }
+    mounted
+}
+
+/// True when `path` is `prefix` itself or lives under it
+/// (prefix-boundary aware; "/" contains every absolute path).
+pub(crate) fn path_under(path: &str, prefix: &str) -> bool {
+    if prefix == "/" {
+        return path.starts_with('/');
+    }
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+/// Which volume an item path lives on, and whether it's connected.
+#[derive(Debug, Clone)]
+pub(crate) struct VolumeBadge {
+    pub label: String,
+    pub offline: bool,
+    /// RFC 3339 — when the volume was last seen mounted. Set for
+    /// offline badges (and online ones whose record exists).
+    pub last_seen: Option<String>,
+}
+
+/// Resolve an item's absolute path to its volume. Live mounts win
+/// (longest mount-point prefix); failing that, the remembered mount
+/// history of every known volume (again longest prefix) marks the
+/// item offline. None = the path is on no known volume (cloud /
+/// network locations, paths never indexed from a real volume).
+pub(crate) fn volume_badge_for_path(
+    mounted: &[MountedVolume],
+    volumes: &[ufm_catalog::VolumeRecord],
+    path: &str,
+) -> Option<VolumeBadge> {
+    let mut best: Option<&MountedVolume> = None;
+    for v in mounted {
+        if path_under(path, &v.path)
+            && best.is_none_or(|b| v.path.len() > b.path.len())
+        {
+            best = Some(v);
+        }
+    }
+    if let Some(v) = best {
+        let record = v
+            .uuid
+            .as_ref()
+            .and_then(|u| volumes.iter().find(|r| &r.fs_uuid == u));
+        return Some(VolumeBadge {
+            label: record
+                .and_then(|r| r.label.clone())
+                .unwrap_or_else(|| v.name.clone()),
+            offline: false,
+            last_seen: record.map(|r| r.last_seen.clone()),
+        });
+    }
+    let mut best: Option<(&ufm_catalog::VolumeRecord, usize)> = None;
+    for rec in volumes {
+        for m in &rec.mount_history {
+            if path_under(path, &m.path)
+                && best.is_none_or(|(_, len)| m.path.len() > len)
+            {
+                best = Some((rec, m.path.len()));
+            }
+        }
+    }
+    best.map(|(rec, _)| VolumeBadge {
+        label: rec
+            .label
+            .clone()
+            .unwrap_or_else(|| "Unnamed drive".to_string()),
+        offline: true,
+        last_seen: Some(rec.last_seen.clone()),
+    })
+}
+
+/// "Oct 9, 2026" for badge/error copy; falls back to the raw date
+/// part when the timestamp doesn't parse.
+pub(crate) fn human_date(rfc3339: &str) -> String {
+    match chrono::DateTime::parse_from_rfc3339(rfc3339) {
+        Ok(dt) => dt.format("%b %-d, %Y").to_string(),
+        Err(_) => rfc3339.chars().take(10).collect(),
+    }
 }
 
 /// Deterministic UUID for a volume seed string (FNV-1a 128-bit): the
@@ -347,6 +485,15 @@ pub async fn list_locations(state: State<'_, AppState>) -> Cmd<Vec<LocationSumma
     let volumes = tauri::async_runtime::spawn_blocking(enumerate_mounted_volumes)
         .await
         .unwrap_or_default();
+    // Library Memory: every location listing is also a sighting —
+    // the volumes table learns what is mounted right now (records
+    // are created on first sight and last_seen refreshes). The
+    // catalog keeps OFFLINE volumes' rows regardless; this only
+    // updates identity/history.
+    {
+        let catalog = state.catalog.lock().unwrap();
+        record_volume_sightings(&catalog);
+    }
     let vol_paths: std::collections::HashSet<String> =
         volumes.iter().map(|v| v.path.clone()).collect();
 
@@ -3070,24 +3217,39 @@ pub async fn list_jobs(state: State<'_, AppState>) -> Cmd<Vec<JobSummary>> {
     snaps.sort_by_key(|j| j.created);
     Ok(snaps
         .iter()
-        .map(|j| JobSummary {
-            job_id: j.id.to_string(),
-            title: j.title.clone(),
-            state: job_state_name(j.state).to_string(),
-            steps_done: j
-                .steps
-                .values()
-                .filter(|s| {
-                    matches!(
-                        s.state,
-                        ufm_jobs::StepState::Done | ufm_jobs::StepState::Skipped
-                    )
-                })
-                .count(),
-            steps_total: j.steps.len(),
-            bytes_done: job_bytes_done(j),
-            bytes_total: j.preview.bytes_to_move,
-            packed: j.packed,
+        .map(|j| {
+            // Slimmed snapshots (Indexer v2 hygiene) carry tallies
+            // instead of the steps map — report from those so the
+            // card stays truthful after slimming.
+            let (steps_done, steps_total) = if j.steps.is_empty() {
+                match &j.step_counts {
+                    Some(c) => ((c.done + c.skipped) as usize, c.total as usize),
+                    None => (0, 0),
+                }
+            } else {
+                (
+                    j.steps
+                        .values()
+                        .filter(|s| {
+                            matches!(
+                                s.state,
+                                ufm_jobs::StepState::Done | ufm_jobs::StepState::Skipped
+                            )
+                        })
+                        .count(),
+                    j.steps.len(),
+                )
+            };
+            JobSummary {
+                job_id: j.id.to_string(),
+                title: j.title.clone(),
+                state: job_state_name(j.state).to_string(),
+                steps_done,
+                steps_total,
+                bytes_done: job_bytes_done(j),
+                bytes_total: j.preview.bytes_to_move,
+                packed: j.packed,
+            }
         })
         .collect())
 }
@@ -3223,6 +3385,17 @@ pub struct SearchHit {
     pub item: Item,
     /// bm25 score from the catalog; lower = better match.
     pub rank: f64,
+    /// Library Memory: the volume this file lives on (its display
+    /// label), when the path resolves to a known volume. Files on
+    /// disconnected drives stay in the results — this + the two
+    /// fields below are how the UI badges them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_label: Option<String>,
+    /// True when that volume is not currently connected.
+    pub volume_offline: bool,
+    /// RFC 3339: when that volume was last seen mounted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_last_seen: Option<String>,
 }
 
 /// File-type categories for the advanced-search filter.
@@ -3366,9 +3539,30 @@ fn finish_search(
         }
     }
 
+    // Library Memory: resolve each hit's volume once per search
+    // (one enumeration + one volumes read, not per hit).
+    let mounted = current_filesystems();
+    let volumes = state
+        .catalog
+        .lock()
+        .unwrap()
+        .volumes()
+        .unwrap_or_default();
     Ok(rows
         .into_iter()
-        .map(|(item, rank)| SearchHit { item, rank })
+        .map(|(item, rank)| {
+            let badge = item
+                .provider_key
+                .as_deref()
+                .and_then(|pk| volume_badge_for_path(&mounted, &volumes, pk));
+            SearchHit {
+                item,
+                rank,
+                volume_label: badge.as_ref().map(|b| b.label.clone()),
+                volume_offline: badge.as_ref().is_some_and(|b| b.offline),
+                volume_last_seen: badge.and_then(|b| b.last_seen),
+            }
+        })
         .collect())
 }
 
@@ -3417,9 +3611,9 @@ pub async fn start_indexing(
     location: LocationId,
 ) -> Cmd<IndexState> {
     // Idempotent: a second call while running returns the current state,
-    // never a duplicate walk. Checkpoint resume inside the Indexer makes a
-    // re-run after completion cheap (already-indexed roots return zeroed
-    // stats without re-walking).
+    // never a duplicate walk. Re-runs are incremental (Indexer v2): the
+    // walk diffs against the catalog manifest, so an unchanged library
+    // costs a traversal, not a rewrite.
     let (already_running, snapshot) = claim_index_slot(&state.index_state);
     if already_running {
         return Ok(snapshot);
@@ -3445,6 +3639,7 @@ pub async fn start_indexing(
 
     let catalog_path = state.catalog_path.clone();
     let checkpoint_path = state.checkpoint_path.clone();
+    let root_for_mark = root.clone();
     // The background task re-enters state through the owned AppHandle, so the
     // borrow of `state` never escapes this command.
     tauri::async_runtime::spawn(async move {
@@ -3461,6 +3656,9 @@ pub async fn start_indexing(
                         index.dirs_done = stats.dirs_done;
                         index.files_done = stats.files_done;
                         index.bytes_done = stats.bytes_done;
+                        index.files_unchanged = stats.files_unchanged;
+                        index.files_updated = stats.files_updated;
+                        index.files_removed = stats.files_removed;
                     }
                     index.clone()
                 };
@@ -3470,15 +3668,20 @@ pub async fn start_indexing(
         })
         .await;
         let state = app.state::<AppState>();
+        let mut run_ok = false;
         {
             let mut index = state.index_state.lock().unwrap();
             match indexed {
                 Ok(Ok(stats)) => {
+                    run_ok = true;
                     *index = IndexState {
                         running: false,
                         dirs_done: stats.dirs_done,
                         files_done: stats.files_done,
                         bytes_done: stats.bytes_done,
+                        files_unchanged: stats.files_unchanged,
+                        files_updated: stats.files_updated,
+                        files_removed: stats.files_removed,
                     };
                 }
                 Ok(Err(e)) => {
@@ -3489,6 +3692,25 @@ pub async fn start_indexing(
                     tracing::error!(target: "ufm", "index task failed: {join_err}");
                     index.running = false;
                 }
+            }
+        }
+        if run_ok {
+            // Library Memory: the volume this root lives on was just
+            // indexed — refresh its sighting and stamp last_indexed.
+            let catalog = state.catalog.lock().unwrap();
+            let mounted = record_volume_sightings(&catalog);
+            let root_s = root_for_mark.to_string_lossy().into_owned();
+            let mut best: Option<&MountedVolume> = None;
+            for v in &mounted {
+                if path_under(&root_s, &v.path)
+                    && best.is_none_or(|b| v.path.len() > b.path.len())
+                {
+                    best = Some(v);
+                }
+            }
+            if let Some(uuid) = best.and_then(|v| v.uuid.clone()) {
+                let _ = catalog
+                    .mark_volume_indexed(&uuid, &chrono::Utc::now().to_rfc3339());
             }
         }
         let payload = state.index_state.lock().unwrap().clone();
@@ -3682,6 +3904,32 @@ pub async fn open_item(state: State<'_, AppState>, item: ItemId) -> Cmd<()> {
         .get(&item)
         .cloned()
         .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
+    // Library Memory: a file on a disconnected drive gets a
+    // plain-language answer, never a dead click or a raw OS error.
+    if !path.exists() {
+        let path_s = path.to_string_lossy().into_owned();
+        let (mounted, volumes) = {
+            let catalog = state.catalog.lock().unwrap();
+            (current_filesystems(), catalog.volumes().unwrap_or_default())
+        };
+        if let Some(badge) = volume_badge_for_path(&mounted, &volumes, &path_s) {
+            if badge.offline {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path_s.clone());
+                let seen = badge
+                    .last_seen
+                    .as_deref()
+                    .map(human_date)
+                    .unwrap_or_else(|| "a while ago".to_string());
+                return Err(CommandError::from(UfmError::NotFound(format!(
+                    "“{name}” is on “{label}”, which isn't connected right now (last seen {seen}). Connect the drive and try again.",
+                    label = badge.label
+                ))));
+            }
+        }
+    }
     tauri::async_runtime::spawn_blocking(move || open::that(&path))
         .await
         .map_err(|e| {
@@ -5991,6 +6239,41 @@ pub struct RuleItemsResult {
     pub items: Vec<Item>,
     pub probed: u32,
     pub remaining: u32,
+    /// Library Memory: volume badges for the returned items, keyed
+    /// by (remapped) item id — smart folders badge offline files
+    /// exactly like search results do.
+    pub badges: Vec<ItemVolumeBadge>,
+}
+
+/// One item's volume badge (see SearchHit's volume fields).
+#[derive(Debug, Clone, Serialize)]
+pub struct ItemVolumeBadge {
+    pub item_id: String,
+    pub volume_label: String,
+    pub offline: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
+}
+
+/// Badges for a set of items, resolved in one enumeration + one
+/// volumes read (shared by the rule/smart-folder surfaces).
+fn badges_for_items(catalog: &ufm_catalog::Catalog, items: &[Item]) -> Vec<ItemVolumeBadge> {
+    let mounted = current_filesystems();
+    let volumes = catalog.volumes().unwrap_or_default();
+    let mut out = Vec::new();
+    for item in items {
+        if let Some(pk) = item.provider_key.as_deref() {
+            if let Some(b) = volume_badge_for_path(&mounted, &volumes, pk) {
+                out.push(ItemVolumeBadge {
+                    item_id: item.id.to_string(),
+                    volume_label: b.label,
+                    offline: b.offline,
+                    last_seen: b.last_seen,
+                });
+            }
+        }
+    }
+    out
 }
 
 #[derive(serde::Serialize)]
@@ -6107,10 +6390,12 @@ pub async fn rule_items(
     )?;
     items.truncate(limit.unwrap_or(1000) as usize);
     let items = remap_session_items(state.inner(), items);
+    let badges = badges_for_items(&catalog, &items);
     Ok(RuleItemsResult {
         items,
         probed,
         remaining,
+        badges,
     })
 }
 
@@ -10120,6 +10405,162 @@ fn rom_media_base(state: &AppState) -> std::path::PathBuf {
         .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// Library Memory (Indexer v2) — remembered volumes + retention.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn get_library_settings(
+    state: State<'_, AppState>,
+) -> Cmd<crate::library::LibrarySettings> {
+    Ok(crate::library::load_settings(&rom_media_base(&state)))
+}
+
+#[tauri::command]
+pub fn set_library_settings(
+    state: State<'_, AppState>,
+    settings: crate::library::LibrarySettings,
+) -> Cmd<crate::library::LibrarySettings> {
+    crate::library::save_settings(&rom_media_base(&state), &settings)
+        .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    // A shorter window may make volumes prunable right now — run
+    // the same pass startup runs.
+    prune_now(&state);
+    Ok(settings)
+}
+
+/// The retention pass: record sightings, then prune expired
+/// OFFLINE volumes. An empty enumeration skips pruning entirely —
+/// "can't see anything" is never read as "everything is gone".
+fn prune_now(state: &AppState) {
+    let catalog = state.catalog.lock().unwrap();
+    let mounted = record_volume_sightings(&catalog);
+    if mounted.is_empty() {
+        return;
+    }
+    let mounted_uuids: std::collections::HashSet<String> =
+        mounted.iter().filter_map(|v| v.uuid.clone()).collect();
+    let settings = crate::library::load_settings(&rom_media_base(state));
+    let pruned = crate::library::prune_expired_volumes(
+        &catalog,
+        &settings,
+        &mounted_uuids,
+        chrono::Utc::now(),
+    );
+    if !pruned.is_empty() {
+        let _ = catalog.vacuum();
+    }
+}
+
+#[tauri::command]
+pub async fn list_volumes(
+    state: State<'_, AppState>,
+) -> Cmd<Vec<crate::library::VolumeSummary>> {
+    let settings = crate::library::load_settings(&rom_media_base(&state));
+    let catalog = state.catalog.lock().unwrap();
+    let mounted = record_volume_sightings(&catalog);
+    let records = catalog.volumes().map_err(CommandError::from)?;
+    Ok(records
+        .iter()
+        .map(|rec| {
+            let online_mount = mounted
+                .iter()
+                .find(|v| v.uuid.as_deref() == Some(rec.fs_uuid.as_str()))
+                .map(|v| v.path.as_str());
+            crate::library::summarize(&catalog, rec, online_mount, &settings)
+        })
+        .collect())
+}
+
+/// Forget a drive: purge every catalog row remembered from it and
+/// drop its volume record. Refused while the drive is connected
+/// (its files are live data, not memory) and for the system volume.
+#[tauri::command]
+pub async fn forget_volume(state: State<'_, AppState>, fs_uuid: String) -> Cmd<u64> {
+    let catalog = state.catalog.lock().unwrap();
+    let record = catalog
+        .volume(&fs_uuid)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| {
+            CommandError::from(UfmError::NotFound(format!("unknown volume {fs_uuid}")))
+        })?;
+    if crate::library::is_system_volume(&record) {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "Your main drive is always remembered — it's where your files live."
+                .into(),
+        )));
+    }
+    let mounted = current_filesystems();
+    if mounted
+        .iter()
+        .any(|v| v.uuid.as_deref() == Some(fs_uuid.as_str()))
+    {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "That drive is connected right now. Unplug it first — Fable never forgets a drive that's here.".into(),
+        )));
+    }
+    let prefixes = crate::library::volume_prefixes(&record);
+    let purged = catalog
+        .purge_items_under_prefixes(&prefixes)
+        .map_err(CommandError::from)?;
+    catalog.delete_volume(&fs_uuid).map_err(CommandError::from)?;
+    // Drop any retention override for the forgotten volume.
+    let base = rom_media_base(&state);
+    let mut settings = crate::library::load_settings(&base);
+    if settings.overrides.remove(&fs_uuid).is_some() {
+        let _ = crate::library::save_settings(&base, &settings);
+    }
+    Ok(purged)
+}
+
+/// Rebuild one volume's index from scratch: purge its remembered
+/// rows and clear the resume checkpoint so the next walk is a true
+/// full walk. Returns the volume's current mount point; the caller
+/// starts indexing on the matching location.
+#[tauri::command]
+pub async fn rebuild_volume(state: State<'_, AppState>, fs_uuid: String) -> Cmd<String> {
+    {
+        let index = state.index_state.lock().unwrap();
+        if index.running {
+            return Err(CommandError::from(UfmError::InvalidInput(
+                "Indexing is already running — wait for it to finish, then rebuild."
+                    .into(),
+            )));
+        }
+    }
+    let mount_point = {
+        let mounted = current_filesystems();
+        mounted
+            .iter()
+            .find(|v| v.uuid.as_deref() == Some(fs_uuid.as_str()))
+            .map(|v| v.path.clone())
+            .ok_or_else(|| {
+                CommandError::from(UfmError::NotFound(
+                    "That drive isn't connected right now — connect it to rebuild its index."
+                        .into(),
+                ))
+            })?
+    };
+    let catalog = state.catalog.lock().unwrap();
+    let record = catalog
+        .volume(&fs_uuid)
+        .map_err(CommandError::from)?
+        .ok_or_else(|| {
+            CommandError::from(UfmError::NotFound(format!("unknown volume {fs_uuid}")))
+        })?;
+    let prefixes = crate::library::volume_prefixes(&record);
+    catalog
+        .purge_items_under_prefixes(&prefixes)
+        .map_err(CommandError::from)?;
+    drop(catalog);
+    // The rebuild must not inherit resume state: a pruned walk over
+    // a purged catalog would re-add nothing. Clearing the shared
+    // checkpoint is safe — worst case, other locations lose resume
+    // pruning and re-walk incrementally instead.
+    let _ = std::fs::remove_file(&state.checkpoint_path);
+    Ok(mount_point)
+}
+
 #[tauri::command]
 pub fn get_rom_media_settings(
     state: State<'_, AppState>,
@@ -10836,6 +11277,9 @@ mod tests {
             dirs_done: 0,
             files_done: 0,
             bytes_done: 0,
+            files_unchanged: 0,
+            files_updated: 0,
+            files_removed: 0,
         }));
         let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut handles = Vec::new();
@@ -10863,6 +11307,9 @@ mod tests {
             dirs_done: 0,
             files_done: 0,
             bytes_done: 0,
+            files_unchanged: 0,
+            files_updated: 0,
+            files_removed: 0,
         });
         let (already, snap) = claim_index_slot(&slot);
         assert!(!already && snap.running);

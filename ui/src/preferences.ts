@@ -7,12 +7,13 @@
  * owns no storage: every control writes through the shell's hooks
  * into the durable ui-prefs sidecar / the existing stores, so a
  * preference set here is the same preference the rest of the app
- * reads. Indexer retention settings are NOT here — they belong to
- * Indexer v2 and arrive with it.
+ * reads. Library Memory (Indexer v2) mounts its own section below
+ * Game Media — remembered drives and how long they're kept.
  */
 import type { ThemeInfo } from "./api";
 import { DISTRO_ENGINES } from "./themes";
 import { RomMediaSection } from "./rommedia";
+import { LibraryMemorySection } from "./library";
 
 export interface PreferencesHooks {
   /** Backend (built-in) themes from list_themes. */
@@ -32,6 +33,9 @@ export interface PreferencesHooks {
   setRomsOn(on: boolean): void;
   /** Folder chooser for the Game Media section (the shell's picker). */
   pickFolder(initial: string | null): Promise<string | null>;
+  /** Library Memory: rebuild one connected volume's index from
+   *  scratch (the shell owns locations + the index tracker). */
+  rebuildVolume(fsUuid: string): Promise<void>;
   sectionCollapsed(key: string): boolean;
   setSectionCollapsed(key: string, collapsed: boolean): void;
   showShortcuts(): void;
@@ -132,6 +136,12 @@ export class PreferencesDialog {
     const mediaHost = document.createElement("div");
     dialog.appendChild(mediaHost);
     void new RomMediaSection().mount(mediaHost, hooks);
+
+    // Library Memory (Indexer v2): remembered drives + retention,
+    // same pattern — backend-owned state, mounted async.
+    const libHost = document.createElement("div");
+    dialog.appendChild(libHost);
+    void new LibraryMemorySection().mount(libHost, hooks);
 
     const foot = document.createElement("div");
     foot.className = "prefs-foot";

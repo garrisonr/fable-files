@@ -114,7 +114,13 @@ export class IndexTracker {
       const files = s.files_done.toLocaleString();
       const more =
         this.queue.length > 1 ? ` (${this.queue.length} locations)` : "";
-      this.onStatus(`Indexing… ${files} files${more}`);
+      // Indexer v2: re-indexes are incremental — say how much of
+      // the walk verified in place instead of being rewritten.
+      const fresh =
+        s.files_unchanged > 0
+          ? ` · ${s.files_unchanged.toLocaleString()} already up to date`
+          : "";
+      this.onStatus(`Indexing… ${files} files${fresh}${more}`);
       this.onObserve?.(true, s.files_done);
       return;
     }

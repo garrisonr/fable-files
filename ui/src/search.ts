@@ -11,6 +11,7 @@ import {
   formatBytes,
   onRomIdentifyProgress,
   type Item,
+  type ItemVolumeBadge,
   type RomScope,
   type SearchHit,
 } from "./api";
@@ -36,6 +37,10 @@ export interface SearchHooks {
   /** Double-click on a playable hit (fix batch item 7): pop it
    * out into the player window instead of previewing. */
   onPopOutItem?(item: Item): void;
+  /** A hit on a disconnected drive was activated (Indexer v2):
+   * the shell shows the plain-language "that drive isn't
+   * connected" state instead of a dead click. */
+  onOfflineItem?(hit: SearchHit): void;
   /** "Re-index" button in the results header (Round 7.1). */
   onReindex?(): void;
   /** Save the current query + filter as a smart folder. */
@@ -43,6 +48,19 @@ export interface SearchHooks {
 }
 
 const DEBOUNCE_MS = 120;
+
+/** "Oct 9, 2026" from an RFC 3339 timestamp (badges, toasts). */
+export function fmtDay(iso: string | null | undefined): string {
+  if (!iso) return "a while ago";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime())
+    ? "a while ago"
+    : d.toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+      });
+}
 
 const SEARCH_ICON_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.8-3.8"/></svg>`;
 
@@ -150,6 +168,8 @@ export class SearchView {
       hits: SearchHit[] | null;
       displayNames: Map<string, string> | null;
       scrollTop: number;
+      /** Library Memory badges for `items` (rule views). */
+      badges?: ItemVolumeBadge[] | null;
     }
   >();
   /** Cache key of the view currently on screen (scroll is saved
@@ -572,7 +592,15 @@ export class SearchView {
     });
   }
 
-  private activate(item: Item): void {
+  /** Activate a hit (Enter / double-click / Space): a hit on a
+   *  disconnected drive gets the friendly not-connected state —
+   *  never a dead click, a failed preview, or a broken pop-out. */
+  private activateHit(hit: SearchHit): void {
+    if (hit.volume_offline) {
+      this.hooks.onOfflineItem?.(hit);
+      return;
+    }
+    const item = hit.item;
     if (item.kind === "folder") this.hooks.onNavigateToItem(item);
     else this.hooks.onPreviewItem(item);
   }
@@ -758,13 +786,14 @@ export class SearchView {
     const cached = this.viewCache.get(key);
     this.currentViewKey = key;
     if (cached?.items) {
-      this.renderItems(name, cached.items);
+      this.renderItems(name, cached.items, cached.badges ?? undefined);
       this.restoreScroll(key);
       return;
     }
     this.renderStatus(`Gathering “${name}”…`);
     try {
       let items: Item[] = [];
+      let badges: ItemVolumeBadge[] = [];
       for (let pass = 0; pass < 40; pass++) {
         const res = await api.ruleItems(
           rule.extensions,
@@ -773,6 +802,7 @@ export class SearchView {
           250,
         );
         items = res.items;
+        badges = res.badges ?? [];
         if (res.remaining === 0) break;
         this.renderStatus(
           `Reading media durations for “${name}”… (${items.length} so far)`,
@@ -797,8 +827,9 @@ export class SearchView {
         hits: null,
         displayNames: null,
         scrollTop: 0,
+        badges,
       });
-      this.renderItems(name, items);
+      this.renderItems(name, items, badges);
     } catch {
       this.renderStatus(`Could not gather “${name}”. Please try again.`);
     }
@@ -988,8 +1019,22 @@ export class SearchView {
   }
 
   /** Render a fixed item list (rule folders) with the results grammar. */
-  private renderItems(heading: string, items: Item[]): void {
-    this.hits = items.map((item) => ({ item, rank: 0 }));
+  private renderItems(
+    heading: string,
+    items: Item[],
+    badges?: ItemVolumeBadge[],
+  ): void {
+    const badgeById = new Map((badges ?? []).map((b) => [b.item_id, b]));
+    this.hits = items.map((item) => {
+      const b = badgeById.get(item.id);
+      return {
+        item,
+        rank: 0,
+        volume_label: b?.volume_label ?? null,
+        volume_offline: b?.offline ?? false,
+        volume_last_seen: b?.last_seen ?? null,
+      };
+    });
     this.selected.clear();
     this.anchor = -1;
     this.deleteArmed = false;
@@ -1110,6 +1155,17 @@ export class SearchView {
           ? "Folder"
           : formatBytes(hit.item.size_bytes);
 
+      // Library Memory badge: this file lives on a drive that
+      // isn't connected right now. It stays in the results — the
+      // badge (an inline pill in the meta cell, family material)
+      // says where it lives and when it was last here.
+      if (hit.volume_offline) {
+        row.classList.add("offline");
+        const badge = document.createElement("span");
+        badge.className = "hit-badge";
+        badge.textContent = `On ${hit.volume_label ?? "a drive"} · last seen ${fmtDay(hit.volume_last_seen)}`;
+        meta.appendChild(badge);
+      }
       row.append(name, path, meta);
       row.addEventListener("mousedown", (e) => {
       if (e.button !== 0) return;
@@ -1137,22 +1193,25 @@ export class SearchView {
         // Double-click law (fix batch item 7): a playable file
         // pops out into the player window, playing. Everything
         // else keeps activate() — folders navigate, files preview.
+        // Offline hits never reach either path (activateHit).
         if (
+          !hit.volume_offline &&
           hit.item.kind !== "folder" &&
           this.hooks.onPopOutItem &&
           isPlayableName(hit.item.name)
         ) {
           this.hooks.onPopOutItem(hit.item);
         } else {
-          this.activate(hit.item);
+          this.activateHit(hit);
         }
       });
       row.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
-          this.activate(hit.item);
+          this.activateHit(hit);
         } else if (e.key === " ") {
           e.preventDefault();
-          this.hooks.onPreviewItem(hit.item);
+          if (hit.volume_offline) this.hooks.onOfflineItem?.(hit);
+          else this.hooks.onPreviewItem(hit.item);
         } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
           e.preventDefault();
           this.focusHit(i + (e.key === "ArrowDown" ? 1 : -1));

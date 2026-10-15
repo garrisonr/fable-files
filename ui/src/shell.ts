@@ -23,7 +23,7 @@ import { reducedMotion, animateFromLive, liveOpacity } from "./motion";
 import { QuickLook } from "./quicklook";
 import { ContextMenu } from "./contextmenu";
 import { Toast, confirmDialog, promptDialog, errText} from "./toast";
-import { SearchView } from "./search";
+import { SearchView, fmtDay } from "./search";
 import { MediaRenameDialog } from "./mediarename";
 import { PropertiesDialog } from "./properties";
 import { FolderPicker, type PickerShortcut } from "./picker";
@@ -441,6 +441,13 @@ export class Shell {
         void this.quickLook.open(item);
       },
       onPopOutItem: (item) => this.popOutItem(item),
+      onOfflineItem: (hit) => {
+        // Library Memory: plain language, never a dead click.
+        Toast.info(
+          `“${hit.item.name}” is on “${hit.volume_label ?? "a drive"}”, which isn't connected right now (last seen ${fmtDay(hit.volume_last_seen)}). Connect the drive and try again.`,
+          6000,
+        );
+      },
       onTrashItems: (items) => {
         void this.trashItems(items).then(() => this.searchView.refresh());
       },
@@ -3490,6 +3497,17 @@ export class Shell {
     this.preferencesDialog.open({
       pickFolder: async (_initial: string | null) =>
         this.picker.pick("Choose a folder", [], null),
+      rebuildVolume: async (fsUuid: string) => {
+        // Backend purges the volume's rows + clears resume state;
+        // then refresh locations (the volume's location id is
+        // path-derived) and queue a fresh full walk for it.
+        const mountPoint = await api.rebuildVolume(fsUuid);
+        this.locations = await api
+          .listLocations()
+          .catch(() => this.locations);
+        const loc = this.locations.find((l) => l.path === mountPoint);
+        if (loc) void this.indexTracker.reindexAll([loc.id]);
+      },
       backendThemes: () => this.themeManager.list,
       activeTheme: () => this.themeManager.active,
       resolvedEngine: () => {

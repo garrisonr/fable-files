@@ -150,6 +150,45 @@ export interface Item {
 export interface SearchHit {
   item: Item;
   rank: number;
+  /** Library Memory: the volume this file lives on, when known.
+   *  Files on disconnected drives stay in the results, badged. */
+  volume_label?: string | null;
+  volume_offline?: boolean;
+  /** RFC 3339: when that volume was last seen mounted. */
+  volume_last_seen?: string | null;
+}
+
+/** One item's volume badge (rule/smart-folder results). */
+export interface ItemVolumeBadge {
+  item_id: string;
+  volume_label: string;
+  offline: boolean;
+  last_seen?: string | null;
+}
+
+/** Library Memory settings (Preferences): how long Fable remembers
+ *  a disconnected drive's files. null = Forever. */
+export interface LibrarySettings {
+  retention_days: number | null;
+  overrides: Record<string, number | null>;
+}
+
+/** A remembered volume, as Preferences lists it. */
+export interface VolumeSummary {
+  fs_uuid: string;
+  label: string;
+  online: boolean;
+  mount_point: string | null;
+  /** RFC 3339. */
+  last_seen: string;
+  last_indexed: string | null;
+  item_count: number;
+  /** The root filesystem: always remembered, never pruned. */
+  is_system: boolean;
+  /** Retention in force for this volume (null = Forever). */
+  retention_days: number | null;
+  has_override: boolean;
+  override_days: number | null;
 }
 
 export interface SyncSchedule {
@@ -171,6 +210,11 @@ export interface IndexState {
   dirs_done: number;
   files_done: number;
   bytes_done: number;
+  /** Indexer v2 (incremental): entries verified in place, entries
+   *  rewritten, catalog rows removed — see indexing.ts. */
+  files_unchanged: number;
+  files_updated: number;
+  files_removed: number;
 }
 
 /** PreviewKind from ufm-preview (serialized snake_case). */
@@ -212,6 +256,8 @@ export interface RuleItemsResult {
   items: Item[];
   probed: number;
   remaining: number;
+  /** Library Memory: volume badges for `items`, by item id. */
+  badges: ItemVolumeBadge[];
 }
 
 export interface RuleOutcome {
@@ -595,6 +641,17 @@ export const api = {
   startIndexing: (location: string) =>
     invoke<unknown>("start_indexing", { location }),
   indexStatus: () => invoke<IndexState>("index_status"),
+  /** Library Memory (Indexer v2): remembered volumes + retention. */
+  getLibrarySettings: () => invoke<LibrarySettings>("get_library_settings"),
+  setLibrarySettings: (settings: LibrarySettings) =>
+    invoke<LibrarySettings>("set_library_settings", { settings }),
+  listVolumes: () => invoke<VolumeSummary[]>("list_volumes"),
+  /** Purge a disconnected drive's remembered files. Resolves with
+   *  the number of catalog rows forgotten. */
+  forgetVolume: (fsUuid: string) => invoke<number>("forget_volume", { fsUuid }),
+  /** Purge a connected volume's rows + reset resume state so the
+   *  next walk is a true full walk. Resolves with its mount point. */
+  rebuildVolume: (fsUuid: string) => invoke<string>("rebuild_volume", { fsUuid }),
   openItem: (item: string) => invoke<void>("open_item", { item }),
   setExecutable: (item: string, executable: boolean) => invoke<void>("set_executable", { item, executable }),
 };

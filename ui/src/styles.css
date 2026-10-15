@@ -3213,6 +3213,20 @@ select option { background-color: var(--ufm-surface); color: var(--ufm-text); }
 .rm-report-dialog { width: min(52rem, calc(100vw - 3rem)); }
 .rm-report-body { max-height: calc(100vh - 12rem); overflow-y: auto; }
 .rm-report-system { margin-bottom: 1.25rem; }
+
+/* --- Library Memory (Indexer v2): offline badges + Preferences --- */
+.hit-badge { display: inline-block; margin-left: 0.5rem; padding: 0.0625rem 0.5rem; border: 1px solid var(--ufm-border); border-radius: 999px; background: color-mix(in srgb, var(--ufm-text) 4%, transparent); color: var(--ufm-text-muted); font-size: 0.6875rem; font-weight: 600; white-space: nowrap; vertical-align: 0.0625rem; }
+.search-hit.offline .hit-name { color: var(--ufm-text-muted); }
+.lib-body { margin-bottom: 0.5rem; }
+.lib-select { font: inherit; font-size: 0.8125rem; padding: 0.375rem 0.5rem; border-radius: 8px; border: 1px solid var(--ufm-border); background: var(--ufm-content-canvas); color: var(--ufm-text); }
+.lib-vol { border: 1px solid var(--ufm-border); border-radius: 12px; padding: 0.75rem 0.875rem; margin: 0.5rem 0; background: color-mix(in srgb, var(--ufm-text) 3%, transparent); }
+.lib-vol-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.lib-vol-name { font-size: 0.875rem; font-weight: 700; }
+.lib-state { font-size: 0.6875rem; font-weight: 600; padding: 0.0625rem 0.5rem; border-radius: 999px; border: 1px solid var(--ufm-border); color: var(--ufm-text-muted); }
+.lib-state.on { color: var(--ufm-accent); border-color: color-mix(in srgb, var(--ufm-accent) 45%, var(--ufm-border)); }
+.lib-vol-meta { margin: 0.25rem 0 0.5rem; }
+.lib-vol-controls { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+.lib-forget.armed { color: var(--ufm-danger, #c0392b); border-color: var(--ufm-danger, #c0392b); font-weight: 700; }
 .rm-coverage { font-size: 0.8125rem; font-weight: 600; color: var(--ufm-text-muted); margin: 0.25rem 0 0.5rem; }
 .rm-report-row { display: flex; gap: 0.75rem; align-items: flex-start; justify-content: space-between; padding: 0.5rem 0.625rem; border: 1px solid var(--ufm-border); border-radius: 10px; margin: 0.375rem 0; }
 .rm-report-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }

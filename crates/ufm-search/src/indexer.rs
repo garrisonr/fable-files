@@ -18,6 +18,18 @@
 //! - Unreadable directories, vanished files, and symlinks never abort the
 //!   run: they are skipped (symlinks are recorded as `Symlink`, never
 //!   followed).
+//!
+//! Indexer v2 (Library Memory): a re-walk is INCREMENTAL. Before
+//! walking, the indexer loads the catalog's own manifest for the
+//! location (provider_key -> size + modified) and diffs every entry
+//! against it: an entry whose size and mtime match is verified in
+//! place — no catalog write, no FTS churn — and counted in
+//! `files_unchanged`. The manifest derives from the catalog itself
+//! (the source of truth), never from the checkpoint file, so a lost
+//! or poisoned checkpoint can only cost time, never correctness:
+//! worst case the diff finds nothing and the run degenerates to a
+//! full re-walk. Deletions reconcile via `delete_unseen` after any
+//! complete (unpruned) traversal, exactly as before.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -35,6 +47,16 @@ pub struct IndexStats {
     pub files_done: u64,
     /// Sum of `size_bytes` of files inserted during this run.
     pub bytes_done: u64,
+    /// Indexer v2 (incremental): entries — files and directories —
+    /// whose size + mtime already matched the catalog manifest and
+    /// were verified WITHOUT a catalog write.
+    pub files_unchanged: u64,
+    /// Indexer v2: of the entries written this run, how many
+    /// replaced an existing catalog row (the rest were brand new).
+    pub files_updated: u64,
+    /// Indexer v2: catalog rows removed by the post-walk reconcile
+    /// (entries that no longer exist on disk).
+    pub files_removed: u64,
 }
 
 /// On-disk checkpoint. `completed_dirs` holds canonical absolute paths of
@@ -78,6 +100,10 @@ pub struct Indexer {
     /// Cumulative totals, restored from the checkpoint and re-persisted.
     files_done: u64,
     bytes_done: u64,
+    /// Indexer v2 cumulative incremental counters (progress reports).
+    files_unchanged: u64,
+    files_updated: u64,
+    files_removed: u64,
     progress: Option<ProgressCallback>,
 }
 
@@ -93,6 +119,9 @@ impl Indexer {
             session_completed: HashSet::new(),
             files_done: 0,
             bytes_done: 0,
+            files_unchanged: 0,
+            files_updated: 0,
+            files_removed: 0,
             progress: None,
         };
         me.load_checkpoint()?;
@@ -111,6 +140,9 @@ impl Indexer {
                 dirs_done: self.completed_dirs.len() as u64,
                 files_done: self.files_done,
                 bytes_done: self.bytes_done,
+                files_unchanged: self.files_unchanged,
+                files_updated: self.files_updated,
+                files_removed: self.files_removed,
             });
         }
     }
@@ -141,6 +173,34 @@ impl Indexer {
         let mut stats = IndexStats::default();
         let mut completed_this_run: u64 = 0;
 
+        // Indexer v2: the incremental manifest — what the catalog
+        // already knows about this location. A failed load degrades
+        // to an empty manifest (a full re-walk), never to an error:
+        // the diff is an optimization with a correctness floor.
+        let manifest = self
+            .catalog
+            .manifest_for_location(&location.id)
+            .unwrap_or_default();
+        let entry_unchanged = |item: &ufm_vfs::Item| -> bool {
+            match item
+                .provider_key
+                .as_ref()
+                .and_then(|pk| manifest.get(pk))
+            {
+                Some((msize, mmodified)) => {
+                    item.size_bytes.map(|s| s as i64) == *msize
+                        && item.modified.map(|m| m.to_rfc3339()).as_deref()
+                            == mmodified.as_deref()
+                }
+                None => false,
+            }
+        };
+        let entry_known = |item: &ufm_vfs::Item| -> bool {
+            item.provider_key
+                .as_ref()
+                .is_some_and(|pk| manifest.contains_key(pk))
+        };
+
         // Index the root dir itself (name = location display name).
         let mut root_item =
             ufm_vfs::item_from_path(location.id, &canon).ok_or_else(|| UfmError::Provider {
@@ -148,7 +208,18 @@ impl Indexer {
                 message: format!("cannot stat index root {}", canon.display()),
             })?;
         root_item.name = location.display_name.clone();
-        self.catalog.insert_item(&root_item)?;
+        // The manifest comparison is size + mtime only, so the
+        // display-name substitution above never causes a spurious
+        // rewrite: an unchanged root skips its insert and keeps the
+        // stored display name.
+        if entry_unchanged(&root_item) {
+            stats.files_unchanged += 1;
+            self.files_unchanged += 1;
+        } else {
+            // The root is a directory: a changed root is re-inserted
+            // silently (files_updated counts files, not dirs).
+            self.catalog.insert_item(&root_item)?;
+        }
         stats.dirs_done += 1;
 
         // Snapshot for the prune closure: it cannot borrow `self` while the
@@ -206,10 +277,27 @@ impl Indexer {
             let is_dir = entry.file_type().is_dir();
             match ufm_vfs::item_from_path(location.id, path) {
                 Some(item) => {
-                    if fresh_walk {
-                        if let Some(pk) = &item.provider_key {
-                            seen.insert(pk.clone());
+                    // The seen-set is populated on every walk now
+                    // (the incremental diff needs it for accounting),
+                    // but delete_unseen below still only runs on a
+                    // complete traversal (fresh_walk).
+                    if let Some(pk) = &item.provider_key {
+                        seen.insert(pk.clone());
+                    }
+                    if entry_unchanged(&item) {
+                        // Verified against the catalog manifest:
+                        // no write, no FTS churn.
+                        stats.files_unchanged += 1;
+                        self.files_unchanged += 1;
+                        if is_dir {
+                            dir_stack.push((path.to_string_lossy().into_owned(), depth));
+                            stats.dirs_done += 1;
                         }
+                        continue;
+                    }
+                    if entry_known(&item) && !is_dir {
+                        stats.files_updated += 1;
+                        self.files_updated += 1;
                     }
                     self.catalog.insert_item(&item)?;
                     if is_dir {
@@ -243,7 +331,9 @@ impl Indexer {
         }
         if fresh_walk {
             // The walk saw everything: rows for vanished files go away.
-            let _ = self.catalog.delete_unseen(&location.id, &seen)?;
+            let removed = self.catalog.delete_unseen(&location.id, &seen)?;
+            stats.files_removed = removed;
+            self.files_removed += removed;
         }
         self.write_checkpoint(true)?;
         self.session_completed.insert(canon_s);
@@ -440,17 +530,87 @@ mod tests {
         assert_eq!(dirs.len(), 3);
 
         // Second run on a NEW Indexer, same paths: the first run
-        // COMPLETED, so this is a fresh re-walk with identical totals —
-        // files added since the first run must be picked up (that was
-        // the stale-index bug), and upserts keep the catalog deduped.
+        // COMPLETED, so this is a fresh re-walk — but Indexer v2
+        // makes it INCREMENTAL: every entry diffs clean against the
+        // catalog manifest, so nothing is rewritten (that is what
+        // makes the re-walk cheap), the traversal still visits
+        // everything (dirs_done matches), and the catalog stays
+        // deduped. Files added since the first run must still be
+        // picked up — see incremental_reindex_diffs_changes.
         let mut ix2 = Indexer::open(&catalog_path, &checkpoint_path).unwrap();
         let s2 = ix2.index_root(&root, &location).unwrap();
-        assert_eq!(s2, s1, "a completed run licenses a fresh re-walk, not a prune");
+        assert_eq!(s2.dirs_done, s1.dirs_done, "the re-walk still traverses");
+        assert_eq!(s2.files_done, 0, "nothing needed writing");
+        assert_eq!(s2.bytes_done, 0);
+        assert_eq!(s2.files_unchanged, 7, "root + a + b + 4 files verified in place");
+        assert_eq!(s2.files_updated, 0);
+        assert_eq!(s2.files_removed, 0);
+        {
+            let cat = ufm_catalog::Catalog::open(&catalog_path).unwrap();
+            assert_eq!(cat.location_count().unwrap(), 1);
+            assert_eq!(
+                cat.manifest_for_location(&location.id).unwrap().len(),
+                7,
+                "no duplicates after the incremental re-walk"
+            );
+        }
 
         // Third run on the SAME Indexer: within one session a root is
         // walked once — the fast path still returns zeroed stats.
         let s3 = ix2.index_root(&root, &location).unwrap();
         assert_eq!(s3, IndexStats::default());
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn incremental_reindex_diffs_changes() {
+        let work = scratch_dir("incremental");
+        let root = fixture_tree();
+        let catalog_path = work.join("catalog.db");
+        let checkpoint_path = work.join("checkpoint.json");
+        let location = test_location();
+
+        {
+            let mut ix = Indexer::open(&catalog_path, &checkpoint_path).unwrap();
+            let s1 = ix.index_root(&root, &location).unwrap();
+            assert_eq!(s1.files_done, 4);
+            assert_eq!(s1.files_unchanged, 0, "first index of a volume is full");
+        }
+
+        // Mutate the tree: one file changed (different size), one
+        // added, one deleted.
+        std::fs::write(root.join("a").join("f1.txt"), b"aaa-CHANGED-longer").unwrap();
+        std::fs::write(root.join("a").join("f4.txt"), b"new!").unwrap();
+        std::fs::remove_file(root.join("top.md")).unwrap();
+
+        let s2 = {
+            let mut ix = Indexer::open(&catalog_path, &checkpoint_path).unwrap();
+            ix.index_root(&root, &location).unwrap()
+        };
+        assert_eq!(s2.files_updated, 1, "f1.txt changed size");
+        assert_eq!(s2.files_done, 2, "the changed file + the new file were written");
+        assert_eq!(s2.files_removed, 1, "top.md vanished from disk");
+        // Unchanged: b + f2 + f3. The root and a/ are re-inserted
+        // silently — adding/removing entries moved their mtimes,
+        // which is correct (their contents did change).
+        assert_eq!(s2.files_unchanged, 3, "b + f2 + f3 verified in place");
+
+        // The catalog agrees with the disk afterwards.
+        let cat = ufm_catalog::Catalog::open(&catalog_path).unwrap();
+        assert!(cat.search_fts("top", 10).unwrap().is_empty());
+        assert_eq!(cat.search_fts("f4", 10).unwrap().len(), 1);
+        let manifest = cat.manifest_for_location(&location.id).unwrap();
+        assert_eq!(manifest.len(), 7, "7 entries: 3 dirs + f1, f2, f3, f4");
+        let f1_key = root
+            .canonicalize()
+            .unwrap()
+            .join("a")
+            .join("f1.txt")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(manifest[&f1_key].0, Some(18), "f1's new size is catalogued");
 
         std::fs::remove_dir_all(&work).ok();
         std::fs::remove_dir_all(&root).ok();
@@ -473,11 +633,16 @@ mod tests {
         ix.reset().unwrap();
         drop(ix);
 
-        // A fresh Indexer after reset re-walks from scratch with identical
-        // totals; INSERT OR REPLACE keeps the catalog deduplicated.
+        // A fresh Indexer after reset re-walks from scratch. The
+        // CATALOG survives a checkpoint reset, so Indexer v2's
+        // manifest diff verifies every entry in place (identical
+        // traversal totals, zero writes) and the catalog stays
+        // deduplicated — the idempotency this test exists to prove.
         let mut ix2 = Indexer::open(&catalog_path, &checkpoint_path).unwrap();
         let s2 = ix2.index_root(&root, &location).unwrap();
-        assert_eq!(s1, s2);
+        assert_eq!(s2.dirs_done, s1.dirs_done);
+        assert_eq!(s2.files_done, 0);
+        assert_eq!(s2.files_unchanged, 7);
         let hits = ix2.catalog.search_fts("f1*", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0.name, "f1.txt");

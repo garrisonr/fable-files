@@ -125,6 +125,49 @@ pub struct Job {
     /// `serde(default)` keeps older snapshots loadable.
     #[serde(default)]
     pub packed: bool,
+    /// Indexer v2 (catalog hygiene): step tallies captured when a
+    /// TERMINAL job's snapshot is slimmed — the steps map (the replay
+    /// payload, only ever needed to resume an unfinished job) is
+    /// dropped and these counts keep the job card truthful.
+    /// `serde(default)` keeps older snapshots loadable.
+    #[serde(default)]
+    pub step_counts: Option<StepCounts>,
+    /// True once this snapshot has been slimmed (see `step_counts`).
+    /// A slimmed job is terminal by construction — recovery only
+    /// loads unfinished jobs, and unfinished jobs are never slimmed.
+    #[serde(default)]
+    pub steps_slimmed: bool,
+}
+
+/// Tallies of a job's steps by state, recorded at slimming time so a
+/// slimmed snapshot still reports truthful totals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepCounts {
+    pub total: u64,
+    pub done: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub pending: u64,
+}
+
+impl StepCounts {
+    /// Tally a steps map (used by the slimming pass and by summaries
+    /// that must agree with it).
+    pub fn tally(steps: &HashMap<String, Step>) -> Self {
+        let mut c = Self {
+            total: steps.len() as u64,
+            ..Default::default()
+        };
+        for s in steps.values() {
+            match s.state {
+                StepState::Done => c.done += 1,
+                StepState::Skipped => c.skipped += 1,
+                StepState::Failed => c.failed += 1,
+                StepState::Pending | StepState::Running => c.pending += 1,
+            }
+        }
+        c
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +213,8 @@ impl Job {
             preview,
             outcomes: Vec::new(),
             packed: false,
+            step_counts: None,
+            steps_slimmed: false,
         }
     }
 
@@ -532,6 +577,36 @@ mod tests {
         jv.as_object_mut().unwrap().remove("packed");
         let jback: Job = serde_json::from_value(jv).unwrap();
         assert!(!jback.packed);
+    }
+
+    #[test]
+    fn step_counts_default_and_tally() {
+        // Indexer v2 hygiene: snapshots written before slimming
+        // existed load with no counts and steps_slimmed = false.
+        let job = sample_job();
+        assert_eq!(job.step_counts, None);
+        assert!(!job.steps_slimmed);
+        let mut jv = serde_json::to_value(&job).unwrap();
+        jv.as_object_mut().unwrap().remove("step_counts");
+        jv.as_object_mut().unwrap().remove("steps_slimmed");
+        let jback: Job = serde_json::from_value(jv).unwrap();
+        assert_eq!(jback.step_counts, None);
+        assert!(!jback.steps_slimmed);
+
+        // Tally: sample_job has s1 Pending, s2 Pending, s3 Pending.
+        let counts = StepCounts::tally(&job.steps);
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.pending, 3);
+        assert_eq!(counts.done, 0);
+        let mut job2 = sample_job();
+        job2.steps.get_mut("s1").unwrap().state = StepState::Done;
+        job2.steps.get_mut("s2").unwrap().state = StepState::Skipped;
+        job2.steps.get_mut("s3").unwrap().state = StepState::Failed;
+        let counts = StepCounts::tally(&job2.steps);
+        assert_eq!(
+            counts,
+            StepCounts { total: 3, done: 1, skipped: 1, failed: 1, pending: 0 }
+        );
     }
 
     #[test]

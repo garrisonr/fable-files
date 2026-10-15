@@ -7,6 +7,7 @@
 //! from the running app) and then managed for the command layer.
 
 pub mod commands;
+pub mod library;
 pub mod rommedia;
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,17 @@ pub struct IndexState {
     pub dirs_done: u64,
     pub files_done: u64,
     pub bytes_done: u64,
+    /// Indexer v2 (incremental): entries verified against the
+    /// catalog manifest without a rewrite this run.
+    #[serde(default)]
+    pub files_unchanged: u64,
+    /// Indexer v2: existing entries rewritten (size/mtime changed).
+    #[serde(default)]
+    pub files_updated: u64,
+    /// Indexer v2: catalog rows removed by the reconcile (files
+    /// that no longer exist on disk).
+    #[serde(default)]
+    pub files_removed: u64,
 }
 
 /// Shared application state: the catalog, registries, and services.
@@ -125,6 +137,55 @@ impl AppState {
         let catalog =
             Catalog::open(&catalog_path).map_err(|e| format!("open catalog: {e}"))?;
 
+        // Indexer v2 — catalog hygiene: slim the snapshots of jobs
+        // that FINISHED in earlier sessions (their step DAGs are
+        // replay payloads nothing will ever resume; summaries and
+        // outcome audits stay). VACUUM only when the saving is
+        // material. Best-effort by design: hygiene must never block
+        // startup.
+        match catalog.slim_terminal_job_blobs() {
+            Ok(report) if report.jobs_slimmed > 0 => {
+                eprintln!(
+                    "fable-files: slimmed {} finished job snapshots, freeing {} bytes",
+                    report.jobs_slimmed, report.bytes_freed
+                );
+                if report.bytes_freed >= 8 * 1024 * 1024 {
+                    let _ = catalog.vacuum();
+                }
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("fable-files: job slimming skipped: {e}"),
+        }
+
+        // Indexer v2 — Library Memory: record which volumes are
+        // mounted right now, then prune remembered volumes whose
+        // retention window closed while they were away. An empty
+        // enumeration means lsblk failed — skip pruning entirely
+        // rather than mistake "can't see anything" for "everything
+        // is gone".
+        {
+            let mounted = commands::record_volume_sightings(&catalog);
+            if !mounted.is_empty() {
+                let mounted_uuids: std::collections::HashSet<String> =
+                    mounted.iter().filter_map(|v| v.uuid.clone()).collect();
+                let settings = library::load_settings(&base);
+                let pruned = library::prune_expired_volumes(
+                    &catalog,
+                    &settings,
+                    &mounted_uuids,
+                    chrono::Utc::now(),
+                );
+                if !pruned.is_empty() {
+                    eprintln!(
+                        "fable-files: retention pruned {} volume(s): {}",
+                        pruned.len(),
+                        pruned.join(", ")
+                    );
+                    let _ = catalog.vacuum();
+                }
+            }
+        }
+
         let state = Self {
             catalog: Mutex::new(catalog),
             catalog_path,
@@ -144,6 +205,9 @@ impl AppState {
                 dirs_done: 0,
                 files_done: 0,
                 bytes_done: 0,
+                files_unchanged: 0,
+                files_updated: 0,
+                files_removed: 0,
             }),
             terminals: Mutex::new(std::collections::HashMap::new()),
             player_art: Mutex::new(HashMap::new()),
@@ -425,6 +489,11 @@ pub fn run() {
             commands::search,
             commands::start_indexing,
             commands::index_status,
+            commands::get_library_settings,
+            commands::set_library_settings,
+            commands::list_volumes,
+            commands::forget_volume,
+            commands::rebuild_volume,
             commands::list_themes,
             commands::apply_theme,
             commands::theme_contrast_report,
