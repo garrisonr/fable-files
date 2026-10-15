@@ -9,6 +9,7 @@
 pub mod commands;
 pub mod library;
 pub mod mcp_server;
+pub mod auditor;
 pub mod mediacomplete;
 pub mod mediares;
 pub mod opensubs;
@@ -590,6 +591,19 @@ pub fn run() {
             commands::mediacomplete_list_runs,
             commands::mediacomplete_undo_run,
             commands::mediacomplete_confirm_pending,
+            commands::auditor_get_settings,
+            commands::auditor_save_settings,
+            commands::auditor_run_now,
+            commands::auditor_list_runs,
+            commands::auditor_list_flags,
+            commands::auditor_open_count,
+            commands::auditor_resolve,
+            commands::auditor_list_dismissals,
+            commands::auditor_delete_dismissal,
+            commands::auditor_list_rules,
+            commands::auditor_delete_rule,
+            commands::auditor_list_user_words,
+            commands::auditor_add_user_word,
             commands::media_url_for_path,
             commands::add_path_location,
             commands::remove_path_location,

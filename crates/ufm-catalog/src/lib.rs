@@ -160,6 +160,83 @@ fn map_mc_run(r: &rusqlite::Row) -> rusqlite::Result<MediaCompleteRunRow> {
     })
 }
 
+/// One File Auditor run (manual or scheduled): the summary's durable
+/// home. `summary_json` carries the counts per family, how much was
+/// scanned, whether the walk truncated, and honest notes (e.g. a
+/// checker that could not run because its tool was absent).
+#[derive(Debug, Clone)]
+pub struct AuditorRunRow {
+    pub id: String,
+    pub schedule_id: Option<String>,
+    pub schedule_name: String,
+    pub target: String,
+    pub started: String,
+    pub finished: Option<String>,
+    pub was_late: bool,
+    /// running | completed | failed
+    pub status: String,
+    pub summary_json: String,
+}
+
+fn map_auditor_run(r: &rusqlite::Row) -> rusqlite::Result<AuditorRunRow> {
+    Ok(AuditorRunRow {
+        id: r.get(0)?,
+        schedule_id: r.get(1)?,
+        schedule_name: r.get(2)?,
+        target: r.get(3)?,
+        started: r.get(4)?,
+        finished: r.get(5)?,
+        was_late: r.get::<_, i64>(6)? != 0,
+        status: r.get(7)?,
+        summary_json: r.get(8)?,
+    })
+}
+
+/// One File Auditor finding — a checklist row. `lane` is `certain`
+/// (stated as fact: signature, hash, or deterministic rule) or
+/// `question` (a heuristic the user is ASKED about — never asserted).
+/// `class_key` is the ask-lane identity: answers scoped "all similar"
+/// or "never for this class" write `auditor_rules` rows keyed by it.
+/// `proposal_json`: {"kind":"rename","to":...} |
+/// {"kind":"trash"} | {"kind":"convert","convertKind":"flac"|"hevc"|"png","replace":bool,...} |
+/// {"kind":"none"}.
+#[derive(Debug, Clone)]
+pub struct AuditorFlagRow {
+    pub id: String,
+    pub run_id: String,
+    pub path: String,
+    /// typo | pattern | corrupt | compat | space | junk | clutter |
+    /// style | editions | cold
+    pub family: String,
+    /// certain | question
+    pub lane: String,
+    pub class_key: String,
+    pub title: String,
+    pub detail: String,
+    pub proposal_json: Option<String>,
+    /// open | confirmed | dismissed | superseded
+    pub state: String,
+    pub created: String,
+    pub updated: String,
+}
+
+fn map_auditor_flag(r: &rusqlite::Row) -> rusqlite::Result<AuditorFlagRow> {
+    Ok(AuditorFlagRow {
+        id: r.get(0)?,
+        run_id: r.get(1)?,
+        path: r.get(2)?,
+        family: r.get(3)?,
+        lane: r.get(4)?,
+        class_key: r.get(5)?,
+        title: r.get(6)?,
+        detail: r.get(7)?,
+        proposal_json: r.get(8)?,
+        state: r.get(9)?,
+        created: r.get(10)?,
+        updated: r.get(11)?,
+    })
+}
+
 /// One duplicate-candidate group for `dedupe_analyze` (Phase 3):
 /// files sharing an identical byte size. Candidates only — content
 /// is NOT hashed, so equal size never proves equal content.
@@ -451,6 +528,67 @@ impl Catalog {
                     undone_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_mc_runs_started ON mediacomplete_runs (started DESC);",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        // File Auditor: runs (the summary's durable home, mirroring
+        // mediacomplete_runs), flags (the checklist — one row per
+        // finding, with its lane, its ask-lane class identity, and
+        // its lifecycle state), dismissals (the permanent "this one
+        // is OK" memory, per path + family), rules (class-level law
+        // made by ask-lane answers), user words (confirmed names —
+        // the typo hunt's proper-noun ground truth), and the content
+        // hash cache that makes re-audits cheap.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS auditor_runs (
+                    id TEXT PRIMARY KEY,
+                    schedule_id TEXT,
+                    schedule_name TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    started TEXT NOT NULL,
+                    finished TEXT,
+                    was_late INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    summary_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_auditor_runs_started ON auditor_runs (started DESC);
+                CREATE TABLE IF NOT EXISTS auditor_flags (
+                    id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    family TEXT NOT NULL,
+                    lane TEXT NOT NULL,
+                    class_key TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT '',
+                    proposal_json TEXT,
+                    state TEXT NOT NULL DEFAULT 'open',
+                    created TEXT NOT NULL,
+                    updated TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_auditor_flags_state ON auditor_flags (state);
+                CREATE INDEX IF NOT EXISTS idx_auditor_flags_path ON auditor_flags (path);
+                CREATE TABLE IF NOT EXISTS auditor_dismissals (
+                    path TEXT NOT NULL,
+                    family TEXT NOT NULL,
+                    created TEXT NOT NULL,
+                    PRIMARY KEY (path, family)
+                );
+                CREATE TABLE IF NOT EXISTS auditor_rules (
+                    class_key TEXT PRIMARY KEY,
+                    decision TEXT NOT NULL,
+                    created TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS auditor_user_words (
+                    word TEXT PRIMARY KEY,
+                    created TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS auditor_hashes (
+                    path TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    mtime TEXT NOT NULL,
+                    sha256 TEXT NOT NULL
+                );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
         Ok(())
@@ -2041,6 +2179,364 @@ impl Catalog {
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
         Ok(n as u64)
+    }
+
+    // ------------------------------------------------------------------
+    // File Auditor: runs, flags, dismissals, rules, user words, hashes.
+    // ------------------------------------------------------------------
+
+    pub fn upsert_auditor_run(&self, row: &AuditorRunRow) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO auditor_runs (id, schedule_id, schedule_name, target, started, finished, was_late, status, summary_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id) DO UPDATE SET finished=excluded.finished, status=excluded.status, summary_json=excluded.summary_json",
+                params![
+                    row.id,
+                    row.schedule_id,
+                    row.schedule_name,
+                    row.target,
+                    row.started,
+                    row.finished,
+                    row.was_late as i64,
+                    row.status,
+                    row.summary_json
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn auditor_run(&self, id: &str) -> Result<Option<AuditorRunRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, schedule_id, schedule_name, target, started, finished, was_late, status, summary_json
+                 FROM auditor_runs WHERE id = ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![id], map_auditor_run)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        for row in rows {
+            return Ok(Some(row.map_err(|e| UfmError::Database(e.to_string()))?));
+        }
+        Ok(None)
+    }
+
+    pub fn recent_auditor_runs(&self, limit: u32) -> Result<Vec<AuditorRunRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, schedule_id, schedule_name, target, started, finished, was_late, status, summary_json
+                 FROM auditor_runs ORDER BY started DESC LIMIT ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit as i64], map_auditor_run)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    pub fn prune_auditor_runs(&self, keep: u64) -> Result<u64> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM auditor_runs
+                 WHERE id NOT IN (SELECT id FROM auditor_runs ORDER BY started DESC LIMIT ?1)",
+                params![keep as i64],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(n as u64)
+    }
+
+    pub fn insert_auditor_flag(&self, row: &AuditorFlagRow) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO auditor_flags (id, run_id, path, family, lane, class_key, title, detail, proposal_json, state, created, updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    row.id,
+                    row.run_id,
+                    row.path,
+                    row.family,
+                    row.lane,
+                    row.class_key,
+                    row.title,
+                    row.detail,
+                    row.proposal_json,
+                    row.state,
+                    row.created,
+                    row.updated
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn auditor_flag(&self, id: &str) -> Result<Option<AuditorFlagRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, run_id, path, family, lane, class_key, title, detail, proposal_json, state, created, updated
+                 FROM auditor_flags WHERE id = ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![id], map_auditor_flag)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        for row in rows {
+            return Ok(Some(row.map_err(|e| UfmError::Database(e.to_string()))?));
+        }
+        Ok(None)
+    }
+
+    /// Flags by state (`None` = every state), newest first.
+    pub fn auditor_flags(&self, state: Option<&str>, limit: u32) -> Result<Vec<AuditorFlagRow>> {
+        const COLS: &str = "id, run_id, path, family, lane, class_key, title, detail, proposal_json, state, created, updated";
+        let mut out = Vec::new();
+        match state {
+            Some(s) => {
+                let mut stmt = self
+                    .conn
+                    .prepare(&format!(
+                        "SELECT {COLS} FROM auditor_flags WHERE state = ?1 ORDER BY created DESC LIMIT ?2"
+                    ))
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                let rows = stmt
+                    .query_map(params![s, limit as i64], map_auditor_flag)
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                for row in rows {
+                    out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+                }
+            }
+            None => {
+                let mut stmt = self
+                    .conn
+                    .prepare(&format!(
+                        "SELECT {COLS} FROM auditor_flags ORDER BY created DESC LIMIT ?1"
+                    ))
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                let rows = stmt
+                    .query_map(params![limit as i64], map_auditor_flag)
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                for row in rows {
+                    out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn auditor_open_flag_count(&self) -> Result<u64> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM auditor_flags WHERE state = 'open'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(n as u64)
+    }
+
+    pub fn set_auditor_flag_state(&self, id: &str, state: &str, updated: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE auditor_flags SET state = ?2, updated = ?3 WHERE id = ?1",
+                params![id, state, updated],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Open flags whose path is `target` itself or lives under it —
+    /// the supersede candidate set when a fresh run covers a target.
+    pub fn open_auditor_flags_under(&self, target: &str) -> Result<Vec<AuditorFlagRow>> {
+        let prefix = format!("{}/", target.trim_end_matches('/'));
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, run_id, path, family, lane, class_key, title, detail, proposal_json, state, created, updated
+                 FROM auditor_flags WHERE state = 'open' AND (path = ?1 OR path LIKE ?2 ESCAPE '\\')
+                 ORDER BY created DESC",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let like = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_") + "%";
+        let rows = stmt
+            .query_map(params![target, like], map_auditor_flag)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    // Dismissals: the permanent per-(path, family) "this one is OK".
+
+    pub fn add_auditor_dismissal(&self, path: &str, family: &str, created: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO auditor_dismissals (path, family, created) VALUES (?1, ?2, ?3)",
+                params![path, family, created],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn auditor_is_dismissed(&self, path: &str, family: &str) -> Result<bool> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM auditor_dismissals WHERE path = ?1 AND family = ?2",
+                params![path, family],
+                |r| r.get(0),
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(n > 0)
+    }
+
+    /// All dismissals as (path, family, created), path order.
+    pub fn auditor_dismissals(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, family, created FROM auditor_dismissals ORDER BY path, family")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_auditor_dismissal(&self, path: &str, family: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM auditor_dismissals WHERE path = ?1 AND family = ?2",
+                params![path, family],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    // Rules: class-level law from ask-lane answers.
+    // decision: "accept" (this class is fine / apply the standing
+    // verdict) or "suppress" (never flag this class again).
+
+    pub fn set_auditor_rule(&self, class_key: &str, decision: &str, created: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO auditor_rules (class_key, decision, created) VALUES (?1, ?2, ?3)",
+                params![class_key, decision, created],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn auditor_rule(&self, class_key: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT decision FROM auditor_rules WHERE class_key = ?1")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![class_key], |r| r.get::<_, String>(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        for row in rows {
+            return Ok(Some(row.map_err(|e| UfmError::Database(e.to_string()))?));
+        }
+        Ok(None)
+    }
+
+    /// All rules as (class_key, decision, created), key order.
+    pub fn auditor_rules(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT class_key, decision, created FROM auditor_rules ORDER BY class_key")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_auditor_rule(&self, class_key: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM auditor_rules WHERE class_key = ?1",
+                params![class_key],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    // User words: confirmed ground truth for the typo hunt.
+
+    pub fn add_auditor_user_word(&self, word: &str, created: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO auditor_user_words (word, created) VALUES (?1, ?2)",
+                params![word.to_lowercase(), created],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn auditor_user_words(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT word FROM auditor_user_words ORDER BY word")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    // Hash cache: one SHA-256 per (path, size, mtime) — a changed
+    // file invalidates by key mismatch, never by deletion passes.
+
+    pub fn auditor_hash(&self, path: &str, size: u64, mtime: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT sha256 FROM auditor_hashes WHERE path = ?1 AND size = ?2 AND mtime = ?3")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![path, size as i64, mtime], |r| r.get::<_, String>(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        for row in rows {
+            return Ok(Some(row.map_err(|e| UfmError::Database(e.to_string()))?));
+        }
+        Ok(None)
+    }
+
+    pub fn set_auditor_hash(&self, path: &str, size: u64, mtime: &str, sha256: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO auditor_hashes (path, size, mtime, sha256) VALUES (?1, ?2, ?3, ?4)",
+                params![path, size as i64, mtime, sha256],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
     }
 
     /// Duplicate candidates for MCP `dedupe_analyze`: groups of files
@@ -3658,5 +4154,97 @@ mod phase2_tests {
         };
         cat.set_view_profile(&loc, &p2).unwrap();
         assert_eq!(cat.view_profile(&loc).unwrap().unwrap().view_mode, "grid");
+    }
+
+    #[test]
+    fn auditor_runs_and_flags_roundtrip() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let run = AuditorRunRow {
+            id: "run-1".into(),
+            schedule_id: None,
+            schedule_name: "Manual audit".into(),
+            target: "/data".into(),
+            started: "2026-10-15T03:00:00".into(),
+            finished: None,
+            was_late: false,
+            status: "running".into(),
+            summary_json: "{}".into(),
+        };
+        cat.upsert_auditor_run(&run).unwrap();
+        let mut done = run.clone();
+        done.status = "completed".into();
+        done.finished = Some("2026-10-15T03:05:00".into());
+        done.summary_json = "{\"flags\":2}".into();
+        cat.upsert_auditor_run(&done).unwrap();
+        let got = cat.auditor_run("run-1").unwrap().unwrap();
+        assert_eq!(got.status, "completed");
+        assert_eq!(got.summary_json, "{\"flags\":2}");
+        assert_eq!(cat.recent_auditor_runs(10).unwrap().len(), 1);
+
+        let flag = |id: &str, path: &str, family: &str| AuditorFlagRow {
+            id: id.into(),
+            run_id: "run-1".into(),
+            path: path.into(),
+            family: family.into(),
+            lane: "certain".into(),
+            class_key: format!("{family}:x"),
+            title: "t".into(),
+            detail: "d".into(),
+            proposal_json: None,
+            state: "open".into(),
+            created: "2026-10-15T03:01:00".into(),
+            updated: "2026-10-15T03:01:00".into(),
+        };
+        cat.insert_auditor_flag(&flag("f1", "/data/a.txt", "corrupt")).unwrap();
+        cat.insert_auditor_flag(&flag("f2", "/data/sub/b.txt", "junk")).unwrap();
+        cat.insert_auditor_flag(&flag("f3", "/other/c.txt", "junk")).unwrap();
+        assert_eq!(cat.auditor_open_flag_count().unwrap(), 3);
+        assert_eq!(cat.auditor_flags(Some("open"), 10).unwrap().len(), 3);
+        // Under-target listing respects the folder boundary.
+        let under = cat.open_auditor_flags_under("/data").unwrap();
+        assert_eq!(under.len(), 2);
+        // State transitions stick.
+        cat.set_auditor_flag_state("f1", "dismissed", "2026-10-15T04:00:00").unwrap();
+        assert_eq!(cat.auditor_open_flag_count().unwrap(), 2);
+        assert_eq!(cat.auditor_flag("f1").unwrap().unwrap().state, "dismissed");
+        // Retention keeps the newest run only.
+        let mut run2 = run.clone();
+        run2.id = "run-2".into();
+        run2.started = "2026-10-16T03:00:00".into();
+        cat.upsert_auditor_run(&run2).unwrap();
+        assert_eq!(cat.prune_auditor_runs(1).unwrap(), 1);
+        assert!(cat.auditor_run("run-1").unwrap().is_none());
+    }
+
+    #[test]
+    fn auditor_memory_tables_roundtrip() {
+        let cat = Catalog::open_in_memory().unwrap();
+        // Dismissals: permanent until explicitly removed.
+        assert!(!cat.auditor_is_dismissed("/x/f.txt", "typo").unwrap());
+        cat.add_auditor_dismissal("/x/f.txt", "typo", "2026-10-15T03:00:00").unwrap();
+        assert!(cat.auditor_is_dismissed("/x/f.txt", "typo").unwrap());
+        assert!(!cat.auditor_is_dismissed("/x/f.txt", "junk").unwrap());
+        assert_eq!(cat.auditor_dismissals().unwrap().len(), 1);
+        cat.delete_auditor_dismissal("/x/f.txt", "typo").unwrap();
+        assert!(!cat.auditor_is_dismissed("/x/f.txt", "typo").unwrap());
+        // Rules: class-level law.
+        assert!(cat.auditor_rule("junk:exe-in-video-folder").unwrap().is_none());
+        cat.set_auditor_rule("junk:exe-in-video-folder", "suppress", "2026-10-15T03:00:00").unwrap();
+        assert_eq!(
+            cat.auditor_rule("junk:exe-in-video-folder").unwrap().as_deref(),
+            Some("suppress")
+        );
+        assert_eq!(cat.auditor_rules().unwrap().len(), 1);
+        cat.delete_auditor_rule("junk:exe-in-video-folder").unwrap();
+        assert!(cat.auditor_rule("junk:exe-in-video-folder").unwrap().is_none());
+        // User words normalize to lowercase.
+        cat.add_auditor_user_word("Richrd", "2026-10-15T03:00:00").unwrap();
+        assert_eq!(cat.auditor_user_words().unwrap(), vec!["richrd".to_string()]);
+        // Hash cache keys on (path, size, mtime) exactly.
+        assert!(cat.auditor_hash("/x/a.bin", 10, "m1").unwrap().is_none());
+        cat.set_auditor_hash("/x/a.bin", 10, "m1", "abc123").unwrap();
+        assert_eq!(cat.auditor_hash("/x/a.bin", 10, "m1").unwrap().as_deref(), Some("abc123"));
+        assert!(cat.auditor_hash("/x/a.bin", 11, "m1").unwrap().is_none());
+        assert!(cat.auditor_hash("/x/a.bin", 10, "m2").unwrap().is_none());
     }
 }

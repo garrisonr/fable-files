@@ -3360,3 +3360,39 @@ select option { background-color: var(--ufm-surface); color: var(--ufm-text); }
 }
 .mc-sched-head, .mc-run-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .mc-pending { background: rgba(255, 196, 0, 0.06); }
+
+/* File Auditor (2026-10-15): the review surface — a wide sheet on
+   the props-overlay pattern, checklist cards with the two lanes
+   (Fact / Question) badged, and the memory managers. */
+.au-dialog {
+  width: min(52rem, calc(100vw - 3rem));
+  max-height: calc(100vh - 4rem);
+  overflow-y: auto;
+}
+.au-body { display: block; }
+.au-target { flex: 1 1 16rem; }
+.au-fam { margin: 14px 0 6px; font-size: 12.5px; font-weight: 600; color: var(--ufm-text-muted); }
+.au-famrow { margin: 2px 0 8px; }
+.au-famrow .prefs-note { margin: 2px 0 0 24px; }
+.au-flag {
+  border: 1px solid var(--border, rgba(128,128,128,.25));
+  border-radius: 10px; padding: 10px 12px; margin: 8px 0;
+}
+.au-flag-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.au-lane {
+  border: 1px solid var(--ufm-border); border-radius: 999px;
+  padding: 0.05rem 0.5rem; font-size: 0.6875rem; font-weight: 700;
+  letter-spacing: 0.04em; text-transform: uppercase; white-space: nowrap;
+}
+.au-lane-fact { color: var(--ufm-accent); }
+.au-lane-ask { color: var(--ufm-text-muted); background: rgba(255, 196, 0, 0.10); }
+.au-path {
+  font-family: ui-monospace, monospace; font-size: 0.75rem;
+  color: var(--ufm-text-muted); word-break: break-all; margin-top: 2px;
+}
+.au-detail { margin: 6px 0 2px; font-size: 0.875rem; line-height: 1.45; }
+.au-actions { margin-top: 8px; align-items: center; }
+.au-scope { max-width: 13rem; }
+.au-history { margin-top: 8px; }
+.au-history summary { cursor: pointer; font-size: 0.8125rem; color: var(--ufm-text-muted); }
+.au-dismiss-path { word-break: break-all; }

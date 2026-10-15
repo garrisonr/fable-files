@@ -27,6 +27,7 @@ import { showPluginRunDialog } from "./plugins";
 import { SearchView, fmtDay } from "./search";
 import { MediaResDialog } from "./mediares";
 import { PropertiesDialog } from "./properties";
+import { AuditorPanel } from "./auditor";
 import { FolderPicker, type PickerShortcut } from "./picker";
 import { RenameDialog } from "./rename";
 import { LabelManager, saveLabelRules } from "./labels";
@@ -154,6 +155,8 @@ export class Shell {
   private indexTracker: IndexTracker;
   private ctxMenu = new ContextMenu();
   private propertiesDialog = new PropertiesDialog();
+  private auditorPanel = new AuditorPanel();
+  private auditorBadgeEl: HTMLElement | null = null;
   private fontScale = 1.0;
   private picker = new FolderPicker();
   private renameDialog = new RenameDialog();
@@ -893,6 +896,27 @@ export class Shell {
       collChev.style.transform = nowHidden ? "rotate(-90deg)" : "";
       this.setCollapsedPref("ff-collections-collapsed", nowHidden);
     });
+    // File Auditor (Dickles, 2026-10-15): a special section — one
+    // entry row with the open-flag count as a calm badge. The
+    // section itself is the overlay review surface (auditor.ts).
+    const auditorHead = document.createElement("h2");
+    auditorHead.className = "side-head";
+    auditorHead.textContent = "File Auditor";
+    const auditorRow = document.createElement("button");
+    auditorRow.className = "side-item";
+    const auditorGlyph = document.createElement("span");
+    auditorGlyph.className = "side-glyph";
+    auditorGlyph.textContent = "🧾";
+    const auditorLabel = document.createElement("span");
+    auditorLabel.textContent = "Review findings";
+    const auditorBadge = document.createElement("span");
+    auditorBadge.className = "side-count";
+    auditorBadge.textContent = "";
+    this.auditorBadgeEl = auditorBadge;
+    auditorRow.append(auditorGlyph, auditorLabel, auditorBadge);
+    auditorRow.title =
+      "Audit folders and drives for typos, pattern breaks, corruption, duplicates, junk and drift — findings wait here for your verdict";
+    auditorRow.addEventListener("click", () => this.openAuditor());
     const smartHead = document.createElement("h2");
     smartHead.className = "side-head";
     smartHead.textContent = "Smart Folders";
@@ -941,6 +965,8 @@ export class Shell {
       this.labelList,
       collHead,
       this.collectionList,
+      auditorHead,
+      auditorRow,
       smartHead,
       this.smartList,
       this.romsHead,
@@ -948,6 +974,7 @@ export class Shell {
       locHead,
       this.sidebarList,
     );
+    void this.refreshAuditorBadge();
 
     const main = document.createElement("main");
     main.className = "main";
@@ -3995,6 +4022,28 @@ export class Shell {
     if (this.locations.length === 0) return;
     Toast.show("Re-indexing the library…", "info");
     void this.indexTracker.reindexAll(this.locations.map((l) => l.id));
+  }
+
+  /** File Auditor: the sidebar badge carries the open-flag count
+   * (proactive, calm — a number, never a red alert). Refreshed when
+   * the sidebar builds, when the panel closes, and whenever the
+   * panel reports a change. */
+  private async refreshAuditorBadge(): Promise<void> {
+    try {
+      const n = await api.auditorOpenCount();
+      if (this.auditorBadgeEl) {
+        this.auditorBadgeEl.textContent = n > 0 ? String(n) : "";
+      }
+    } catch {
+      // The badge is a courtesy — a failed count stays blank.
+    }
+  }
+
+  private openAuditor(): void {
+    this.auditorPanel.open({
+      pickFolder: async () => this.picker.pick("Choose a folder", [], null),
+      refreshBadge: () => void this.refreshAuditorBadge(),
+    });
   }
 
   /** Preferences (UI round item 1): the settings surface. Every

@@ -143,6 +143,24 @@ pub enum StepOp {
         season: Option<u32>,
         episode: Option<u32>,
     },
+    /// File Auditor: convert one media file beside itself with
+    /// ffmpeg — the execution arm of the Auditor's space-saving
+    /// proposals, always a separately confirmed job (the Auditor
+    /// proposes; the user disposes). `kind`: "flac" (WAV → FLAC,
+    /// lossless), "hevc" (H.264 → H.265 in an .mkv, a generational
+    /// re-encode), "png" (BMP/TIFF → PNG, lossless). The output name
+    /// rides in the step so the plan the user confirmed is the plan
+    /// that runs; the executor never overwrites an existing output,
+    /// and its Done note records `before=<bytes> after=<bytes>` so
+    /// the job reports the true saving. Replacing the original is
+    /// the PLANNER's choice, expressed as a separate dependent
+    /// Delete{use_trash:true} step — this step only converts.
+    ConvertMedia {
+        src: Item,
+        dst_name: String,
+        /// "flac" | "hevc" | "png"
+        kind: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -526,6 +544,34 @@ mod tests {
                 assert_eq!(language, "en");
                 assert_eq!(season, Some(1));
                 assert_eq!(episode, Some(2));
+            }
+            _ => panic!("wrong variant after round trip"),
+        }
+    }
+
+    #[test]
+    fn convert_media_step_roundtrips() {
+        let step = Step {
+            id: "cv1".into(),
+            label: "convert to FLAC".into(),
+            op: StepOp::ConvertMedia {
+                src: item("song", ItemKind::File),
+                dst_name: "song.flac".into(),
+                kind: "flac".into(),
+            },
+            depends_on: vec![],
+            state: StepState::Pending,
+            compensation: None,
+            outcome: false,
+            outcome_path: None,
+        };
+        let json = serde_json::to_string(&step).unwrap();
+        assert!(json.contains("\"op\":\"convert_media\""), "tag: {json}");
+        let back: Step = serde_json::from_str(&json).unwrap();
+        match back.op {
+            StepOp::ConvertMedia { ref dst_name, ref kind, .. } => {
+                assert_eq!(dst_name, "song.flac");
+                assert_eq!(kind, "flac");
             }
             _ => panic!("wrong variant after round trip"),
         }

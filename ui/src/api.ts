@@ -667,6 +667,36 @@ export const api = {
       path,
       choice,
     }),
+  // File Auditor: settings + schedules, runs (summaries), flags
+  // (the checklist), resolutions, and the memory managers
+  // (dismissals / standing rules / taught words).
+  getAuditorSettings: () =>
+    invoke<AuditorSettings>("auditor_get_settings"),
+  saveAuditorSettings: (settings: AuditorSettings) =>
+    invoke<AuditorSettings>("auditor_save_settings", { settings }),
+  auditorRunNow: (target: string, scheduleId: string | null) =>
+    invoke<AuditorRun>("auditor_run_now", { target, scheduleId }),
+  auditorListRuns: () => invoke<AuditorRun[]>("auditor_list_runs"),
+  auditorListFlags: (stateFilter: string | null) =>
+    invoke<AuditorFlag[]>("auditor_list_flags", { stateFilter }),
+  auditorOpenCount: () => invoke<number>("auditor_open_count"),
+  auditorResolve: (
+    flagId: string,
+    resolution: string,
+    scope: string | null,
+  ) =>
+    invoke<string>("auditor_resolve", { flagId, resolution, scope }),
+  auditorListDismissals: () =>
+    invoke<AuditorDismissal[]>("auditor_list_dismissals"),
+  auditorDeleteDismissal: (path: string, family: string) =>
+    invoke<void>("auditor_delete_dismissal", { path, family }),
+  auditorListRules: () => invoke<AuditorRule[]>("auditor_list_rules"),
+  auditorDeleteRule: (classKey: string) =>
+    invoke<void>("auditor_delete_rule", { classKey }),
+  auditorListUserWords: () =>
+    invoke<string[]>("auditor_list_user_words"),
+  auditorAddUserWord: (word: string) =>
+    invoke<string[]>("auditor_add_user_word", { word }),
   pauseJob: (job: string) => invoke<void>("pause_job", { job }),
   resumeJob: (job: string) => invoke<void>("resume_job", { job }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),
@@ -1175,6 +1205,98 @@ export interface McRun {
   pending: McPendingItem[];
   quota: OpensubsQuota | null;
   canUndo: boolean;
+}
+
+export interface AuditorFamilies {
+  typo: boolean;
+  pattern: boolean;
+  corrupt: boolean;
+  /** Opt-in: names that can't travel to Windows/macOS. */
+  compat: boolean;
+  space: boolean;
+  junk: boolean;
+  clutter: boolean;
+  style: boolean;
+  editions: boolean;
+  cold: boolean;
+}
+
+export interface AuditorSchedule {
+  id: string;
+  name: string;
+  target: string;
+  time: string;
+  weekdays: boolean[];
+  idleMinutes: number;
+  requireOnAc: boolean;
+  enabled: boolean;
+  lastStarted: string | null;
+  lastStatus: string | null;
+}
+
+export interface AuditorSettings {
+  families: AuditorFamilies;
+  staleDays: number;
+  coldYears: number;
+  schedules: AuditorSchedule[];
+}
+
+export interface AuditorRunSummary {
+  scannedFiles?: number;
+  scannedDirs?: number;
+  truncated?: boolean;
+  notes?: string[];
+  families?: Record<string, number>;
+  flagsNew?: number;
+  flagsCarried?: number;
+  flagsSuperseded?: number;
+  flagsOpen?: number;
+}
+
+export interface AuditorRun {
+  id: string;
+  scheduleName: string;
+  target: string;
+  started: string;
+  finished: string | null;
+  wasLate: boolean;
+  status: string;
+  summary: AuditorRunSummary;
+}
+
+export interface AuditorProposal {
+  kind: "none" | "rename" | "trash" | "convert";
+  to?: string;
+  convertKind?: string;
+  dstName?: string;
+  replace?: boolean;
+  estSaving?: number;
+}
+
+export interface AuditorFlag {
+  id: string;
+  runId: string;
+  path: string;
+  family: string;
+  lane: "certain" | "question";
+  classKey: string;
+  title: string;
+  detail: string;
+  proposal: AuditorProposal | null;
+  state: string;
+  created: string;
+}
+
+export interface AuditorDismissal {
+  path: string;
+  family: string;
+  created: string;
+}
+
+export interface AuditorRule {
+  classKey: string;
+  decision: string;
+  created: string;
 }
 
 export interface MediaresConfirmRequest {

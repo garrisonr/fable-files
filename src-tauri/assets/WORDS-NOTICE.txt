@@ -1,0 +1,29 @@
+words-en.txt.gz — the File Auditor's bundled English word list.
+
+Provenance: derived from SCOWL (Spell Checker Oriented Word Lists),
+en_US list, version 2020.12.07, as distributed by the Debian
+"wamerican" package (/usr/share/dict/american-english). The bundled
+file is a normalized derivative: lowercased, split on non-letters,
+pure a-z entries of length >= 2, deduplicated and sorted
+(73,581 words). The application ships this list itself and never
+reads a system dictionary at runtime.
+
+SCOWL copyright and license (from the SCOWL README, as reproduced
+in /usr/share/doc/wamerican/copyright):
+
+  The collective work is Copyright 2000-2011 by Kevin Atkinson.
+
+  Copyright 2000-2011 by Kevin Atkinson
+
+  Permission to use, copy, modify, distribute and sell these word
+  lists, the associated scripts, the output created from the scripts,
+  and its documentation for any purpose is hereby granted without fee,
+  provided that the above copyright notice appears in all copies and
+  that both that copyright notice and this permission notice appear in
+  supporting documentation. Kevin Atkinson makes no representations
+  about the suitability of this array for any purpose. It is provided
+  "as is" without express or implied warranty.
+
+SCOWL also credits Alan Beale (12Dicts) and the ENABLE word list
+contributors; see http://wordlist.aspell.net/ for the full SCOWL
+documentation and acknowledgements.

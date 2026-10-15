@@ -1048,6 +1048,10 @@ pub fn run_background_agent() -> i32 {
             let _ = save_settings(&base, &settings);
         }
         write_agent_status(&base, &settings, now_local());
+        // File Auditor: scheduled audits ride this same loop (its
+        // own tick converts schedules into this module's tested
+        // state machine — one heartbeat for both).
+        crate::auditor::agent_tick(&base);
         std::thread::sleep(std::time::Duration::from_secs(30));
     }
 }

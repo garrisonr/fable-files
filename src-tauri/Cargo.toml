@@ -44,6 +44,10 @@ md5 = "0.7"
 open = "5"
 portable-pty = "0.8"
 sha2 = "0.10"
+# File Auditor: decompresses the bundled SCOWL word list
+# (assets/words-en.txt.gz) at runtime. Already in the lockfile via
+# zip tooling — declaring it directly changes no versions.
+flate2 = "1"
 libc = "0.2"
 tracing-subscriber.workspace = true
 

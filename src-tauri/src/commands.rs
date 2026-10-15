@@ -2312,7 +2312,108 @@ fn execute_step(
                 }
             }
         }
+        ufm_jobs::StepOp::ConvertMedia { src, dst_name, kind } => {
+            // File Auditor conversion: ffmpeg beside the original,
+            // never overwriting. The Done note records the TRUE
+            // before/after byte counts (before=<n> after=<n>) so the
+            // job card reports the real saving against the
+            // Auditor's labeled estimate.
+            let src_path = Path::new(src.provider_key.as_deref().unwrap_or_default());
+            let Some(parent) = src_path.parent() else {
+                return StepOutcome::Failed("source has no folder".into());
+            };
+            let dst_path = parent.join(dst_name);
+            if dst_path.exists() {
+                return StepOutcome::Failed(format!(
+                    "{} already exists — nothing was overwritten",
+                    dst_path.display()
+                ));
+            }
+            match exec_convert(src_path, &dst_path, kind, handle) {
+                Ok((before, after)) => {
+                    *bytes_done += after;
+                    StepOutcome::Done(Some(format!(
+                        "converted={} before={before} after={after}",
+                        dst_path.display()
+                    )))
+                }
+                Err(e) => StepOutcome::Failed(e),
+            }
+        }
     }
+}
+
+/// File Auditor: run one ffmpeg conversion to completion,
+/// honoring the job's cancel flag. Returns (before, after) byte
+/// counts. A missing ffmpeg is a plain-language failure, never a
+/// dependency error dialog (NO DEPENDENCY ERRORS law — the Auditor
+/// only proposes conversions ffmpeg's presence makes plausible,
+/// and this stays graceful if that changes).
+fn exec_convert(
+    src: &Path,
+    dst: &Path,
+    kind: &str,
+    handle: &JobHandle,
+) -> std::result::Result<(u64, u64), String> {
+    use std::sync::atomic::Ordering;
+    let src_s = src.to_string_lossy().into_owned();
+    let dst_s = dst.to_string_lossy().into_owned();
+    let args: Vec<&str> = match kind {
+        "flac" => vec![
+            "-hide_banner", "-loglevel", "error", "-nostdin", "-i", &src_s, "-c:a", "flac",
+            &dst_s,
+        ],
+        "hevc" => vec![
+            "-hide_banner", "-loglevel", "error", "-nostdin", "-i", &src_s, "-c:v",
+            "libx265", "-crf", "24", "-preset", "medium", "-c:a", "copy", "-c:s", "copy",
+            &dst_s,
+        ],
+        "png" => vec![
+            "-hide_banner", "-loglevel", "error", "-nostdin", "-i", &src_s, &dst_s,
+        ],
+        other => return Err(format!("unknown conversion kind: {other}")),
+    };
+    let before = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    let mut child = match std::process::Command::new("ffmpeg")
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            return Err(
+                "ffmpeg isn't available on this machine, so the conversion couldn't run. The original file was left untouched."
+                    .into(),
+            )
+        }
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    let _ = std::fs::remove_file(dst);
+                    return Err(
+                        "the conversion failed — the original file was left untouched."
+                            .into(),
+                    );
+                }
+                break;
+            }
+            Ok(None) => {
+                if handle.cancel.load(Ordering::Relaxed) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_file(dst);
+                    return Err("cancelled; partial output removed".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let after = std::fs::metadata(dst).map(|m| m.len()).unwrap_or(0);
+    Ok((before, after))
 }
 
 // ---------------------------------------------------------------------------
@@ -3093,6 +3194,10 @@ fn job_signature(job: &ufm_jobs::Job) -> String {
             ufm_jobs::StepOp::FetchMedia { .. } => {}
             ufm_jobs::StepOp::FetchArtwork { .. } => {}
             ufm_jobs::StepOp::FetchSubtitle { .. } => {}
+            ufm_jobs::StepOp::ConvertMedia { src, dst_name, kind } => {
+                op = "convert";
+                srcs.push(format!("{}>{dst_name}:{kind}", key(src)));
+            }
         }
     }
     if srcs.is_empty() {
@@ -12189,6 +12294,543 @@ pub async fn mediacomplete_confirm_pending(
     })?
     .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// File Auditor commands (Dickles, 2026-10-15): settings, runs, the
+// checklist (flags), resolutions (the confirm / ask-lane / dismissal
+// machinery), and the memory managers. Every fix lands as a
+// journaled job through start_job — the Auditor proposes, the user
+// disposes, the journal remembers.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditorRunView {
+    pub id: String,
+    pub schedule_name: String,
+    pub target: String,
+    pub started: String,
+    pub finished: Option<String>,
+    pub was_late: bool,
+    pub status: String,
+    pub summary: serde_json::Value,
+}
+
+fn auditor_run_view(row: &ufm_catalog::AuditorRunRow) -> AuditorRunView {
+    AuditorRunView {
+        id: row.id.clone(),
+        schedule_name: row.schedule_name.clone(),
+        target: row.target.clone(),
+        started: row.started.clone(),
+        finished: row.finished.clone(),
+        was_late: row.was_late,
+        status: row.status.clone(),
+        summary: serde_json::from_str(&row.summary_json)
+            .unwrap_or_else(|_| serde_json::json!({})),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditorFlagView {
+    pub id: String,
+    pub run_id: String,
+    pub path: String,
+    pub family: String,
+    pub lane: String,
+    pub class_key: String,
+    pub title: String,
+    pub detail: String,
+    pub proposal: Option<serde_json::Value>,
+    pub state: String,
+    pub created: String,
+}
+
+fn auditor_flag_view(row: &ufm_catalog::AuditorFlagRow) -> AuditorFlagView {
+    AuditorFlagView {
+        id: row.id.clone(),
+        run_id: row.run_id.clone(),
+        path: row.path.clone(),
+        family: row.family.clone(),
+        lane: row.lane.clone(),
+        class_key: row.class_key.clone(),
+        title: row.title.clone(),
+        detail: row.detail.clone(),
+        proposal: row
+            .proposal_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok()),
+        state: row.state.clone(),
+        created: row.created.clone(),
+    }
+}
+
+fn auditor_catalog(state: &AppState) -> Cmd<ufm_catalog::Catalog> {
+    ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))
+}
+
+#[tauri::command]
+pub fn auditor_get_settings(
+    state: State<'_, AppState>,
+) -> Cmd<crate::auditor::AuditorSettings> {
+    Ok(crate::auditor::load_settings(&mc_base(&state)))
+}
+
+#[tauri::command]
+pub fn auditor_save_settings(
+    state: State<'_, AppState>,
+    settings: crate::auditor::AuditorSettings,
+) -> Cmd<crate::auditor::AuditorSettings> {
+    let base = mc_base(&state);
+    crate::auditor::save_settings(&base, &settings)
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    Ok(crate::auditor::load_settings(&base))
+}
+
+#[tauri::command]
+pub async fn auditor_run_now(
+    state: State<'_, AppState>,
+    target: String,
+    schedule_id: Option<String>,
+) -> Cmd<AuditorRunView> {
+    let base = mc_base(&state);
+    let catalog_path = state.catalog_path.clone();
+    let settings = crate::auditor::load_settings(&base);
+    let (name, late) = match &schedule_id {
+        Some(id) => settings
+            .schedules
+            .iter()
+            .find(|s| &s.id == id)
+            .map(|s| (s.name.clone(), false))
+            .unwrap_or_else(|| ("Scheduled audit".to_string(), false)),
+        None => ("Manual audit".to_string(), false),
+    };
+    let sid = schedule_id.clone();
+    let row = tauri::async_runtime::spawn_blocking(move || {
+        let catalog = ufm_catalog::Catalog::open(&catalog_path)
+            .map_err(|e| format!("catalog open failed: {e}"))?;
+        let probe = crate::auditor::FfprobeProbe::new();
+        crate::auditor::run_audit(
+            &catalog,
+            &crate::auditor::RunRequest {
+                target,
+                schedule_id: sid,
+                schedule_name: name,
+                late,
+            },
+            &settings,
+            &probe,
+        )
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("audit task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    if let Some(id) = &schedule_id {
+        let mut settings = crate::auditor::load_settings(&base);
+        if let Some(s) = settings.schedules.iter_mut().find(|s| &s.id == id) {
+            s.last_started = Some(crate::auditor::stamp(crate::auditor::now_local()));
+            s.last_status = Some(row.status.clone());
+            let _ = crate::auditor::save_settings(&base, &settings);
+        }
+    }
+    Ok(auditor_run_view(&row))
+}
+
+#[tauri::command]
+pub fn auditor_list_runs(state: State<'_, AppState>) -> Cmd<Vec<AuditorRunView>> {
+    let catalog = auditor_catalog(&state)?;
+    let rows = catalog
+        .recent_auditor_runs(20)
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
+    Ok(rows.iter().map(auditor_run_view).collect())
+}
+
+#[tauri::command]
+pub fn auditor_list_flags(
+    state: State<'_, AppState>,
+    state_filter: Option<String>,
+) -> Cmd<Vec<AuditorFlagView>> {
+    let catalog = auditor_catalog(&state)?;
+    let rows = catalog
+        .auditor_flags(state_filter.as_deref(), 1000)
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
+    Ok(rows.iter().map(auditor_flag_view).collect())
+}
+
+#[tauri::command]
+pub fn auditor_open_count(state: State<'_, AppState>) -> Cmd<u64> {
+    let catalog = auditor_catalog(&state)?;
+    catalog
+        .auditor_open_flag_count()
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))
+}
+
+fn auditor_step(
+    id: &str,
+    label: String,
+    op: ufm_jobs::StepOp,
+    outcome: bool,
+    depends_on: Vec<String>,
+) -> ufm_jobs::Step {
+    ufm_jobs::Step {
+        id: id.to_string(),
+        label,
+        op,
+        depends_on,
+        state: ufm_jobs::StepState::Pending,
+        compensation: None,
+        outcome,
+        outcome_path: None,
+    }
+}
+
+/// Build the journaled job a flag's plan calls for.
+fn auditor_fix_job(flag: &ufm_catalog::AuditorFlagRow) -> Cmd<ufm_jobs::Job> {
+    use ufm_jobs::{Job, JobPreview, StepOp};
+    let path = PathBuf::from(&flag.path);
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+        CommandError::from(UfmError::InvalidInput(format!(
+            "{} is no longer there ({e})",
+            flag.path
+        )))
+    })?;
+    let kind = if meta.is_dir() {
+        ItemKind::Folder
+    } else {
+        ItemKind::File
+    };
+    let item = job_item(
+        ItemId::new(),
+        LocationId::new(),
+        &path,
+        kind,
+        Some(meta.len()),
+    );
+    let name = item.name.clone();
+    let job = match crate::auditor::plan_for(flag) {
+        crate::auditor::FixPlan::Rename { to_name } => {
+            let parent_path = path.parent().ok_or_else(|| {
+                CommandError::from(UfmError::InvalidInput("no parent folder".into()))
+            })?;
+            let dst = parent_path.join(&to_name);
+            if dst.exists() {
+                return Err(CommandError::from(UfmError::InvalidInput(format!(
+                    "“{to_name}” already exists in that folder — nothing was renamed"
+                ))));
+            }
+            let parent_item = job_item(
+                ItemId::new(),
+                LocationId::new(),
+                parent_path,
+                ItemKind::Folder,
+                None,
+            );
+            let mut j = Job::new(
+                format!("Rename {name} → {to_name}"),
+                JobPreview::default(),
+            );
+            j.add_step(auditor_step(
+                "s0001",
+                format!("rename to {to_name}"),
+                StepOp::Move {
+                    src: item,
+                    dst_parent: parent_item,
+                    new_name: to_name,
+                },
+                true,
+                vec![],
+            ));
+            j
+        }
+        crate::auditor::FixPlan::Trash => {
+            let mut j = Job::new(format!("Trash {name}"), JobPreview::default());
+            j.add_step(auditor_step(
+                "s0001",
+                format!("move {name} to trash"),
+                StepOp::Delete {
+                    target: item,
+                    use_trash: true,
+                },
+                true,
+                vec![],
+            ));
+            j
+        }
+        crate::auditor::FixPlan::Convert {
+            dst_name,
+            kind,
+            replace,
+        } => {
+            let mut j = Job::new(
+                format!("Convert {name} ({kind})"),
+                JobPreview::default(),
+            );
+            j.add_step(auditor_step(
+                "s0001",
+                format!("convert to {dst_name}"),
+                StepOp::ConvertMedia {
+                    src: item.clone(),
+                    dst_name,
+                    kind,
+                },
+                true,
+                vec![],
+            ));
+            if replace {
+                j.add_step(auditor_step(
+                    "s0002",
+                    format!("move original {name} to trash"),
+                    StepOp::Delete {
+                        target: item,
+                        use_trash: true,
+                    },
+                    false,
+                    vec!["s0001".to_string()],
+                ));
+            }
+            j
+        }
+        crate::auditor::FixPlan::None => {
+            return Err(CommandError::from(UfmError::InvalidInput(
+                "this flag has no fix to apply — use “Move to Trash” or “It's OK”"
+                    .into(),
+            )));
+        }
+    };
+    Ok(job)
+}
+
+/// Trash job for proposal-less flags (copy chains, cold files…) —
+/// refused for folders except the empty-folder family it exists
+/// for, so a series-gap flag (whose path IS a folder) can never
+/// trash a tree by accident.
+fn auditor_trash_job(flag: &ufm_catalog::AuditorFlagRow) -> Cmd<ufm_jobs::Job> {
+    use ufm_jobs::{Job, JobPreview, StepOp};
+    let path = PathBuf::from(&flag.path);
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+        CommandError::from(UfmError::InvalidInput(format!(
+            "{} is no longer there ({e})",
+            flag.path
+        )))
+    })?;
+    if meta.is_dir() && flag.class_key != "clutter:empty-folder" {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "that flag is about a whole folder — its files are listed individually; nothing was trashed"
+                .into(),
+        )));
+    }
+    let kind = if meta.is_dir() {
+        ItemKind::Folder
+    } else {
+        ItemKind::File
+    };
+    let item = job_item(
+        ItemId::new(),
+        LocationId::new(),
+        &path,
+        kind,
+        Some(meta.len()),
+    );
+    let mut j = Job::new(format!("Trash {}", item.name), JobPreview::default());
+    j.add_step(auditor_step(
+        "s0001",
+        "move to trash".into(),
+        StepOp::Delete {
+            target: item,
+            use_trash: true,
+        },
+        true,
+        vec![],
+    ));
+    Ok(j)
+}
+
+/// Resolve one checklist item.
+/// resolution: "apply" (run the plan as a job) | "trash_it" |
+/// "ok" (dismissal memory). scope (for "ok" and ask-lane answers):
+/// "one" | "similar" | "never" — "similar"/"never" write a
+/// standing class rule and close every open flag of that class.
+#[tauri::command]
+pub async fn auditor_resolve(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    flag_id: String,
+    resolution: String,
+    scope: Option<String>,
+) -> Cmd<String> {
+    let catalog = auditor_catalog(&state)?;
+    let flag = catalog
+        .auditor_flag(&flag_id)
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?
+        .ok_or_else(|| {
+            CommandError::from(UfmError::InvalidInput("no such flag".into()))
+        })?;
+    let now = crate::auditor::stamp(crate::auditor::now_local());
+    let set_state = |catalog: &ufm_catalog::Catalog, state_name: &str| {
+        let _ = catalog.set_auditor_flag_state(&flag.id, state_name, &now);
+    };
+    match resolution.as_str() {
+        "apply" => {
+            let job = auditor_fix_job(&flag)?;
+            start_job(app, &state, job).map(|_| {
+                set_state(&catalog, "confirmed");
+                "fix started as a job — watch it in Transfers".to_string()
+            })
+        }
+        "trash_it" => {
+            let job = auditor_trash_job(&flag)?;
+            start_job(app, &state, job).map(|_| {
+                set_state(&catalog, "confirmed");
+                "moved to trash as a job".to_string()
+            })
+        }
+        "ok" => {
+            let scope = scope.as_deref().unwrap_or("one");
+            match scope {
+                "similar" | "never" => {
+                    // A typo verdict teaches the dictionary the
+                    // token itself — the strongest form of the rule.
+                    if flag.family == "typo" {
+                        if let Some(token) = flag.class_key.strip_prefix("typo:") {
+                            let _ = catalog.add_auditor_user_word(token, &now);
+                        }
+                    }
+                    let decision = if scope == "never" { "suppress" } else { "accept" };
+                    catalog
+                        .set_auditor_rule(&flag.class_key, decision, &now)
+                        .map_err(|e| {
+                            CommandError::from(UfmError::Internal(e.to_string()))
+                        })?;
+                    // Close every open flag of this class.
+                    let open = catalog
+                        .auditor_flags(Some("open"), 5000)
+                        .unwrap_or_default();
+                    for other in open.iter().filter(|f| f.class_key == flag.class_key) {
+                        let _ = catalog.set_auditor_flag_state(
+                            &other.id,
+                            "dismissed",
+                            &now,
+                        );
+                    }
+                    set_state(&catalog, "dismissed");
+                    Ok(if scope == "never" {
+                        "got it — files like this won't be flagged again".into()
+                    } else {
+                        "got it — this is fine, for all files like this".into()
+                    })
+                }
+                _ => {
+                    catalog
+                        .add_auditor_dismissal(&flag.path, &flag.family, &now)
+                        .map_err(|e| {
+                            CommandError::from(UfmError::Internal(e.to_string()))
+                        })?;
+                    set_state(&catalog, "dismissed");
+                    Ok("remembered — this one won't be flagged again".into())
+                }
+            }
+        }
+        other => Err(CommandError::from(UfmError::InvalidInput(format!(
+            "unknown resolution: {other}"
+        )))),
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditorDismissalView {
+    pub path: String,
+    pub family: String,
+    pub created: String,
+}
+
+#[tauri::command]
+pub fn auditor_list_dismissals(
+    state: State<'_, AppState>,
+) -> Cmd<Vec<AuditorDismissalView>> {
+    let catalog = auditor_catalog(&state)?;
+    let rows = catalog
+        .auditor_dismissals()
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
+    Ok(rows
+        .into_iter()
+        .map(|(path, family, created)| AuditorDismissalView {
+            path,
+            family,
+            created,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn auditor_delete_dismissal(
+    state: State<'_, AppState>,
+    path: String,
+    family: String,
+) -> Cmd<()> {
+    let catalog = auditor_catalog(&state)?;
+    catalog
+        .delete_auditor_dismissal(&path, &family)
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditorRuleView {
+    pub class_key: String,
+    pub decision: String,
+    pub created: String,
+}
+
+#[tauri::command]
+pub fn auditor_list_rules(state: State<'_, AppState>) -> Cmd<Vec<AuditorRuleView>> {
+    let catalog = auditor_catalog(&state)?;
+    let rows = catalog
+        .auditor_rules()
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
+    Ok(rows
+        .into_iter()
+        .map(|(class_key, decision, created)| AuditorRuleView {
+            class_key,
+            decision,
+            created,
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn auditor_delete_rule(state: State<'_, AppState>, class_key: String) -> Cmd<()> {
+    let catalog = auditor_catalog(&state)?;
+    catalog
+        .delete_auditor_rule(&class_key)
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))
+}
+
+#[tauri::command]
+pub fn auditor_list_user_words(state: State<'_, AppState>) -> Cmd<Vec<String>> {
+    let catalog = auditor_catalog(&state)?;
+    catalog
+        .auditor_user_words()
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))
+}
+
+#[tauri::command]
+pub fn auditor_add_user_word(
+    state: State<'_, AppState>,
+    word: String,
+) -> Cmd<Vec<String>> {
+    let catalog = auditor_catalog(&state)?;
+    let now = crate::auditor::stamp(crate::auditor::now_local());
+    catalog
+        .add_auditor_user_word(word.trim(), &now)
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
+    catalog
+        .auditor_user_words()
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))
 }
 
 #[cfg(test)]
