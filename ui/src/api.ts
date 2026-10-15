@@ -55,6 +55,14 @@ export interface MetaTag {
   value: string;
 }
 
+/** What a start_* transfer command returns (UI round): the job id,
+ * plus alreadyRunning when the submission was folded into an
+ * identical active job by the double-submit guard. */
+export interface JobStart {
+  jobId: string;
+  alreadyRunning: boolean;
+}
+
 /** One registered job, as `list_jobs` reports it (Phase 1 inc-2). */
 export interface JobSummary {
   job_id: string;
@@ -64,6 +72,8 @@ export interface JobSummary {
   steps_total: number;
   bytes_done: number;
   bytes_total: number;
+  /** UI round (packed transfer): show the card's packed label. */
+  packed: boolean;
 }
 
 /** Per-source record of what a finished job actually did — the undo
@@ -253,6 +263,30 @@ export async function onPlayerClosed(
   return listen<string>("player-closed", (e) => cb(e.payload));
 }
 
+/** Playback state handed between the main window and a detach
+ * (pop-out) window (UI round): position in seconds + whether it was
+ * playing. `player-state` streams from the detach window while it
+ * plays; `player-return` is the final handoff when it comes home. */
+export interface PlayerState {
+  path: string;
+  t: number;
+  playing: boolean;
+  /** The detach window finished the track (audio queue advance). */
+  ended?: boolean;
+}
+
+export async function onPlayerState(
+  cb: (s: PlayerState) => void,
+): Promise<() => void> {
+  return listen<PlayerState>("player-state", (e) => cb(e.payload));
+}
+
+export async function onPlayerReturn(
+  cb: (s: PlayerState) => void,
+): Promise<() => void> {
+  return listen<PlayerState>("player-return", (e) => cb(e.payload));
+}
+
 export const api = {
   listLocations: () => invoke<LocationSummary[]>("list_locations"),
   /** Durable UI prefs (Round 7.2): backend sidecar, survives where
@@ -284,8 +318,23 @@ export const api = {
     invoke<void>("clipboard_write", { paths, cut }),
   clipboardRead: () =>
     invoke<{ paths: string[]; cut: boolean }>("clipboard_read"),
-  openPlayerWindow: (path: string, name: string) =>
-    invoke<void>("open_player_window", { path, name }),
+  /** Open the detach (pop-out) player window. UI round: the
+   * window is an always-on-top mini with transport controls, and it
+   * receives the current playback state so playback continues from
+   * `start` seconds instead of restarting (bidirectional handoff —
+   * state comes back via player-state / player-return events). */
+  openPlayerWindow: (
+    path: string,
+    name: string,
+    opts?: { kind?: "video" | "audio"; start?: number; autoplay?: boolean },
+  ) =>
+    invoke<void>("open_player_window", {
+      path,
+      name,
+      kind: opts?.kind ?? "video",
+      start: opts?.start ?? 0,
+      autoplay: opts?.autoplay ?? false,
+    }),
   closePlayerWindow: (path: string) =>
     invoke<void>("close_player_window", { path }),
   makeAlias: (item: string) => invoke<string>("make_alias", { item }),
@@ -336,31 +385,35 @@ export const api = {
   cancelTranscode: (id: string) => invoke<void>("cancel_transcode", { id }),
   // Transfer jobs (Phase 1 inc-1/inc-2): journaled, pausable,
   // resumable copy/move/delete through the ufm-jobs engine. All
-  // start_* commands return the JobId; progress arrives as
-  // `job-progress` events (see jobs.ts).
+  // start_* commands return a JobStart; progress arrives as
+  // `job-progress` events (see jobs.ts). UI round: an identical
+  // submission while a job is active folds into it — the backend
+  // answers with the EXISTING job's id and alreadyRunning=true
+  // (double-submit guard; doors toast + focus instead of tracking
+  // a twin).
   startCopy: (sources: string[], dstParent: string) => {
     const req: CopyRequest = { sources, dstParent };
-    return invoke<string>("start_copy", { req });
+    return invoke<JobStart>("start_copy", { req });
   },
   startCopyFromPaths: (sources: string[], dstDir: string) => {
     const req: CopyPathsRequest = { sources, dstDir };
-    return invoke<string>("start_copy_from_paths", { req });
+    return invoke<JobStart>("start_copy_from_paths", { req });
   },
   startMove: (sources: string[], dstDir: string) => {
     const req: MoveRequest = { sources, dstDir };
-    return invoke<string>("start_move", { req });
+    return invoke<JobStart>("start_move", { req });
   },
   startMoveFromPaths: (sources: string[], dstDir: string) => {
     const req: MovePathsRequest = { sources, dstDir };
-    return invoke<string>("start_move_from_paths", { req });
+    return invoke<JobStart>("start_move_from_paths", { req });
   },
   startDelete: (sources: string[], useTrash: boolean) => {
     const req: DeleteRequest = { sources, useTrash };
-    return invoke<string>("start_delete", { req });
+    return invoke<JobStart>("start_delete", { req });
   },
   startDeleteFromPaths: (paths: string[], useTrash: boolean) => {
     const req: DeletePathsRequest = { paths, useTrash };
-    return invoke<string>("start_delete_from_paths", { req });
+    return invoke<JobStart>("start_delete_from_paths", { req });
   },
   // ROM Lists: DAT-based identification + collection membership.
   identifyRoms: () => invoke<RomIdentifyStats>("identify_roms"),

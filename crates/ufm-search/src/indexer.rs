@@ -65,6 +65,16 @@ pub struct Indexer {
     catalog: ufm_catalog::Catalog,
     checkpoint_path: PathBuf,
     completed_dirs: HashSet<String>,
+    /// Roots THIS Indexer instance has fully walked. Only these may
+    /// take the zeroed-stats fast path. A checkpoint loaded from
+    /// disk must never fast-path a root: the writer can persist the
+    /// root itself in a resumable (run_complete = false) checkpoint
+    /// when a run dies during the final drain, and trusting it made
+    /// a location permanently invisible — every later re-index
+    /// returned instantly with zero stats while whole subtrees
+    /// (btrfs sibling subvolumes on Dickles' superdog) had never
+    /// been walked (P0-2, 2026-10-14).
+    session_completed: HashSet<String>,
     /// Cumulative totals, restored from the checkpoint and re-persisted.
     files_done: u64,
     bytes_done: u64,
@@ -80,6 +90,7 @@ impl Indexer {
             catalog,
             checkpoint_path: checkpoint_path.to_path_buf(),
             completed_dirs: HashSet::new(),
+            session_completed: HashSet::new(),
             files_done: 0,
             bytes_done: 0,
             progress: None,
@@ -107,8 +118,10 @@ impl Indexer {
     /// Index `root` into the catalog under `location`. The location row is
     /// inserted first; the root directory itself is indexed as an Item named
     /// after the location's display name with `provider_key` = the canonical
-    /// root path. Returns this run's totals; a fully-indexed root returns
-    /// zeroed stats without touching the filesystem beyond the root stat.
+    /// root path. Returns this run's totals; a root this Indexer already
+    /// walked in this session returns zeroed stats without touching the
+    /// filesystem beyond the root stat (a checkpoint on disk never earns
+    /// that fast path — see `session_completed`).
     pub fn index_root(&mut self, root: &Path, location: &Location) -> Result<IndexStats> {
         self.catalog.insert_location(location)?;
         let canon = root.canonicalize().map_err(|e| UfmError::Provider {
@@ -117,8 +130,11 @@ impl Indexer {
         })?;
         let canon_s = canon.to_string_lossy().into_owned();
 
-        // Resume fast path: the whole root already completed.
-        if self.completed_dirs.contains(&canon_s) {
+        // Session fast path: THIS Indexer already walked the whole
+        // root. Loaded checkpoint state deliberately does NOT count
+        // (see session_completed): it is a prune filter, never proof
+        // of completion.
+        if self.session_completed.contains(&canon_s) {
             return Ok(IndexStats::default());
         }
 
@@ -214,19 +230,23 @@ impl Indexer {
         }
 
         // Drain: everything still stacked is fully visited now.
+        // Deliberately NO cadence checkpoints here (P0-2): the drain
+        // pops the root itself last, and a resumable checkpoint
+        // written mid-drain could persist the root as "completed"
+        // if the process dies in this window — the exact poison
+        // that hid superdog's sibling subvolumes. A crash here just
+        // leaves the previous mid-walk checkpoint behind, and the
+        // resume re-walks the tail.
         while let Some((done, _)) = dir_stack.pop() {
             self.completed_dirs.insert(done);
             completed_this_run += 1;
-            if completed_this_run % CHECKPOINT_EVERY_DIRS == 0 {
-                self.write_checkpoint(false)?;
-                self.report_progress();
-            }
         }
         if fresh_walk {
             // The walk saw everything: rows for vanished files go away.
             let _ = self.catalog.delete_unseen(&location.id, &seen)?;
         }
         self.write_checkpoint(true)?;
+        self.session_completed.insert(canon_s);
         self.report_progress();
         Ok(stats)
     }

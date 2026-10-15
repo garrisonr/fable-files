@@ -624,7 +624,14 @@ export class DuplicatesDialog {
     // .trashinfo Path= RAW, so these items now restore to the right
     // place via untrash (trash_path_internal URL-encoded it — §7.4).
     try {
-      const jobId = await api.startDeleteFromPaths(chosen, true);
+      const start = await api.startDeleteFromPaths(chosen, true);
+      if (start.alreadyRunning) {
+        // Double-submit guard (UI round): the identical trash job
+        // is already running — say so, don't track a twin.
+        Toast.info("That delete is already running");
+        return;
+      }
+      const jobId = start.jobId;
       const count = chosen.length;
       if (this.onTrackJob) {
         this.onTrackJob(jobId, `Trash ${count} duplicates`, async (error) => {

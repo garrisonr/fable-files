@@ -4,14 +4,24 @@
  * Phase 1 transfer jobs (the `job-progress` contract: journaled
  * copy/move/delete with pause/resume/cancel). Spring-in per the
  * design law; each row: name, live progress bar, percent, controls.
+ *
+ * UI round — rows tell the truth: the name follows the backend job
+ * title (operation + source name, e.g. "Copy richard"), and a detail
+ * line under it shows what the engine actually knows — the file
+ * being processed right now, bytes done of total, items done of
+ * total. A bare "Copy — 0%" for an hours-long tree copy is how the
+ * panel lied during the 2026-10-14 twin-job incident; the data was
+ * in the event payload all along, the row just never rendered it.
  */
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { springTo, reducedMotion } from "./motion";
-import { api, type JobSummary } from "./api";
+import { api, formatBytes, type JobSummary } from "./api";
 
 interface JobRow {
   root: HTMLDivElement;
+  name: HTMLDivElement;
+  detail: HTMLDivElement;
   bar: HTMLDivElement;
   pct: HTMLSpanElement;
   cancel: HTMLButtonElement;
@@ -28,6 +38,8 @@ interface JobProgress {
   steps_total: number;
   bytes_done: number;
   bytes_total: number;
+  /** UI round (packed transfer): the engine streamed this job. */
+  packed?: boolean;
   current: string | null;
   done: boolean;
   error: string | null;
@@ -119,6 +131,28 @@ export class JobsPanel {
     });
   }
 
+  /** Surface an already-running job (UI round double-submit guard):
+   * the panel comes forward and the job's row pulses, so a folded
+   * duplicate submission lands the user's eye on the ONE job that
+   * is actually running. */
+  focusJob(jobId: string): void {
+    this.show();
+    const key = `job:${jobId}`;
+    const flash = () => {
+      const row = this.rows.get(key);
+      if (!row) return;
+      row.root.scrollIntoView({ block: "nearest" });
+      if (reducedMotion()) return;
+      row.root.classList.remove("job-flash");
+      // Restart the pulse even if it is already applied.
+      void row.root.offsetWidth;
+      row.root.classList.add("job-flash");
+      window.setTimeout(() => row.root.classList.remove("job-flash"), 1700);
+    };
+    if (this.rows.has(key)) flash();
+    else void this.hydrate().then(flash);
+  }
+
   /** Startup hydration (inc-2 §3.2): surface every non-terminal job
    * the backend still holds — above all a job crash-recovery left
    * Paused, which appears here with a ▶ so the user can resume it
@@ -141,7 +175,7 @@ export class JobsPanel {
             : j.steps_total > 0
               ? (j.steps_done / j.steps_total) * 100
               : 0;
-        this.paintRow(row, pct, j.state);
+        this.paintRow(row, pct, j.state, JobsPanel.progressDetail(j));
       }
     }
   }
@@ -152,6 +186,9 @@ export class JobsPanel {
     const name = document.createElement("div");
     name.className = "job-name";
     name.textContent = label;
+    const detail = document.createElement("div");
+    detail.className = "job-detail";
+    detail.hidden = true;
     const track = document.createElement("div");
     track.className = "job-track";
     const bar = document.createElement("div");
@@ -170,19 +207,57 @@ export class JobsPanel {
       pause.className = "icon-btn job-pause";
       pause.textContent = "⏸";
       pause.title = "Pause";
-      root.append(name, track, pct, pause, cancel);
+      root.append(name, detail, track, pct, pause, cancel);
     } else {
-      root.append(name, track, pct, cancel);
+      root.append(name, detail, track, pct, cancel);
     }
     this.list.appendChild(root);
-    const row: JobRow = { root, bar, pct, cancel, pause, paused: false };
+    const row: JobRow = { root, name, detail, bar, pct, cancel, pause, paused: false };
     this.rows.set(id, row);
     return row;
   }
 
+  /** The row's truth line, composed only from numbers the engine
+   * actually emits: the file being processed now (basename — the
+   * full path stays in the row tooltip), bytes done of total when
+   * the total is known, items done of total for multi-step jobs.
+   * Empty string when the engine knows nothing yet — the line hides
+   * rather than dressing a guess up as progress. */
+  private static progressDetail(p: {
+    current?: string | null;
+    bytes_done: number;
+    bytes_total: number;
+    steps_done: number;
+    steps_total: number;
+    packed?: boolean;
+  }): string {
+    const parts: string[] = [];
+    if (p.current) {
+      const base = p.current.split("/").pop();
+      if (base) parts.push(base);
+    }
+    // Packed transfer (UI round): the one label the magic gets —
+    // the numbers stay identical in both modes.
+    if (p.packed) parts.push("Packed transfer");
+    if (p.bytes_total > 0) {
+      parts.push(`${formatBytes(p.bytes_done)} of ${formatBytes(p.bytes_total)}`);
+    }
+    if (p.steps_total > 1) {
+      parts.push(
+        `${p.steps_done.toLocaleString()} of ${p.steps_total.toLocaleString()} items`,
+      );
+    }
+    return parts.join(" · ");
+  }
+
   /** Paint a transfer row from a state + percent: the bar freezes
    * while paused and the pause affordance flips to ▶. */
-  private paintRow(row: JobRow, percent: number, state: string): void {
+  private paintRow(
+    row: JobRow,
+    percent: number,
+    state: string,
+    detail?: string,
+  ): void {
     const clamped = Math.max(0, Math.min(100, percent));
     row.bar.style.width = `${clamped}%`;
     row.paused = state === "paused";
@@ -193,6 +268,10 @@ export class JobsPanel {
     row.pct.textContent = row.paused
       ? "⏸ Paused"
       : `${Math.floor(clamped)}%`;
+    if (detail !== undefined) {
+      row.detail.textContent = detail;
+      row.detail.hidden = detail === "";
+    }
   }
 
   private onJobProgress(p: JobProgress): void {
@@ -209,6 +288,9 @@ export class JobsPanel {
       row = this.rows.get(key);
       if (!row) return;
     }
+    // The backend title is the truth (operation + source name);
+    // the label a door passed at start time is only a first guess.
+    if (p.title) row.name.textContent = p.title;
     if (p.current) row.root.title = p.current;
     if (!p.done) {
       const pct =
@@ -217,7 +299,7 @@ export class JobsPanel {
           : p.steps_total > 0
             ? (p.steps_done / p.steps_total) * 100
             : 0;
-      this.paintRow(row, pct, p.state);
+      this.paintRow(row, pct, p.state, JobsPanel.progressDetail(p));
       return;
     }
     this.rows.delete(key);

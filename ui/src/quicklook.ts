@@ -22,7 +22,7 @@ import {
   type Item,
   type PreviewKind,
 } from "./api";
-import { onPlayerClosed } from "./api";
+import { onPlayerClosed, onPlayerReturn, onPlayerState } from "./api";
 import { VideoPlayer, isVideoName } from "./video";
 import { audioTags, folderArtUrl } from "./audiometa";
 import { fadeTo, reducedMotion, springTo } from "./motion";
@@ -35,6 +35,13 @@ export class QuickLook {
   private requestToken = 0;
   /** Path whose video is currently playing in a pop-out window. */
   private detachedFor: string | null = null;
+  /** Path whose audio is currently playing in a detach window. */
+  private detachedAudioFor: string | null = null;
+  /** Latest known playback state per detached path (UI round
+   * item 5): seeded at detach time, refreshed by the detach
+   * window's player-state stream — the inline player resumes from
+   * here when the media comes home. */
+  private detachedState = new Map<string, { t: number; playing: boolean }>();
   private currentKind: PreviewKind | null = null;
   /** Live Quick Look audio element (Round 7.1): tracked so playback
    * can be stopped deterministically — a detached <audio> element
@@ -93,8 +100,21 @@ export class QuickLook {
       if (this.detachedFor === path) {
         this.detachedFor = null;
         if (this.openItem) void this.renderCard(this.openItem, this.currentKind);
+      } else if (this.detachedAudioFor === path) {
+        this.detachedAudioFor = null;
+        if (this.openItem) void this.renderCard(this.openItem, this.currentKind);
       }
     }).catch(() => undefined);
+    // Detach-window state stream (UI round item 5): keep the
+    // resume cache at the position playback ACTUALLY reached, so
+    // the trip home lands mid-sentence, not at the detach point.
+    const cacheState = (s: { path: string; t: number; playing: boolean }) => {
+      if (s.path === this.detachedFor || s.path === this.detachedAudioFor) {
+        this.detachedState.set(s.path, { t: s.t, playing: s.playing });
+      }
+    };
+    void onPlayerState(cacheState).catch(() => undefined);
+    void onPlayerReturn(cacheState).catch(() => undefined);
   }
 
   get isOpen(): boolean {
@@ -277,11 +297,28 @@ export class QuickLook {
           holder.append(p, btn);
           card.insertBefore(holder, dl);
         } else {
+          // Resume state from a previous detach of this path, if
+          // any (consumed on use).
+          const resume = this.detachedState.get(vpath);
+          if (resume) this.detachedState.delete(vpath);
           const player = new VideoPlayer({
             path: vpath,
+            startAt: resume?.t ?? 0,
+            autoPlay: resume?.playing ?? false,
             onDetach: () => {
+              // Bidirectional handoff (UI round item 5): the
+              // detach window continues from THIS position and
+              // play state; the cache is seeded so even an
+              // instantly-killed window resumes sanely.
+              const t = player.position();
+              const playing = player.isPlaying();
+              this.detachedState.set(vpath, { t, playing });
               void api
-                .openPlayerWindow(vpath, item.name)
+                .openPlayerWindow(vpath, item.name, {
+                  kind: "video",
+                  start: t,
+                  autoplay: playing,
+                })
                 .then(() => {
                   this.detachedFor = vpath;
                   if (this.openItem === item) {
@@ -306,6 +343,19 @@ export class QuickLook {
       ];
       if (audioExts.includes(ext) && item.provider_key) {
         const apath = item.provider_key;
+        if (this.detachedAudioFor === apath) {
+          const holder = document.createElement("div");
+          holder.className = "ql-detached";
+          const p = document.createElement("p");
+          p.textContent = "🎵 Playing in the detached window";
+          const btn = document.createElement("button");
+          btn.textContent = "Bring it back here";
+          btn.addEventListener("click", () => {
+            void api.closePlayerWindow(apath);
+          });
+          holder.append(p, btn);
+          card.insertBefore(holder, dl);
+        } else {
         const holder = document.createElement("div");
         holder.className = "ql-audio";
         const art = document.createElement("img");
@@ -327,9 +377,52 @@ export class QuickLook {
         holder.append(art, glyph, audio);
         card.insertBefore(holder, dl);
         this.audioEl = audio;
+        // Detach (UI round item 5, media parity): the same
+        // always-on-top mini window the video player gets, with
+        // the same position handoff in both directions.
+        const detachBtn = document.createElement("button");
+        detachBtn.className = "ql-audio-detach";
+        detachBtn.textContent = "⧉ Detach";
+        detachBtn.title = "Play in a detachable mini window";
+        detachBtn.addEventListener("click", () => {
+          const t = audio.currentTime || 0;
+          const playing = !audio.paused && !audio.ended;
+          this.detachedState.set(apath, { t, playing });
+          void api
+            .openPlayerWindow(apath, item.name, {
+              kind: "audio",
+              start: t,
+              autoplay: playing,
+            })
+            .then(() => {
+              this.detachedAudioFor = apath;
+              if (this.openItem === item) {
+                void this.renderCard(item, this.currentKind);
+              }
+            })
+            .catch(() => undefined);
+        });
+        holder.appendChild(detachBtn);
         void mediaSrc(apath).then((url) => {
           audio.src = url;
         });
+        // Resume state from a previous detach of this path, if
+        // any (consumed on use).
+        const resume = this.detachedState.get(apath);
+        if (resume) {
+          this.detachedState.delete(apath);
+          audio.addEventListener("loadedmetadata", () => {
+            try {
+              audio.currentTime = Math.min(
+                resume.t,
+                Math.max(0, audio.duration - 0.25),
+              );
+            } catch {
+              // not seekable yet — plays from the top instead
+            }
+            if (resume.playing) void audio.play().catch(() => undefined);
+          });
+        }
         void (async () => {
           try {
             // Art order (7.1 design, inc-2 item 9): folder art FIRST
@@ -366,6 +459,7 @@ export class QuickLook {
             name.after(subEl);
           }
         });
+        }
       }
       const imgExts = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff", "ico"];
       if (imgExts.includes(ext)) {

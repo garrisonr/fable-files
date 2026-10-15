@@ -36,6 +36,18 @@ export interface VideoPlayerOpts {
   onDetach?: () => void;
   /** Show a "back to preview" button; called when clicked. */
   onReturn?: () => void;
+  /** Detach handoff (UI round item 5): start position in seconds —
+   * a detached player continues from where the inline one was, and
+   * an inline player resuming from a detach starts where the mini
+   * window left off. */
+  startAt?: number;
+  /** Detach handoff: keep playing once the source is ready. */
+  autoPlay?: boolean;
+  /** Detach window only: stream playback state home (on play /
+   * pause / seek / end, and every few seconds while playing) so a
+   * reattach — or a plain window close — resumes at the position
+   * playback actually reached. */
+  onState?: (t: number, playing: boolean) => void;
 }
 
 export class VideoPlayer {
@@ -62,6 +74,39 @@ export class VideoPlayer {
   /** Set by destroy(): late async continuations (mediaSrc, transcode
    * spin-up) must not resurrect a torn-down player. */
   private destroyed = false;
+  /** Detach handoff state (UI round item 5). */
+  private onStateCb: ((t: number, playing: boolean) => void) | null = null;
+  private pendingSeek: number | null = null;
+  private wantPlay = false;
+  private stateTimer: number | null = null;
+
+  /** Current playback position in seconds — for a transcode stream
+   * this is the position in the ORIGINAL file, not the stream. */
+  position(): number {
+    return this.transcoding
+      ? this.streamStart + this.video.currentTime
+      : this.video.currentTime;
+  }
+
+  isPlaying(): boolean {
+    return !this.video.paused && !this.video.ended;
+  }
+
+  private emitState(): void {
+    this.onStateCb?.(this.position(), this.isPlaying());
+  }
+
+  private armStateTimer(): void {
+    if (!this.onStateCb || this.stateTimer !== null) return;
+    this.stateTimer = window.setInterval(() => this.emitState(), 5000);
+  }
+
+  private stopStateTimer(): void {
+    if (this.stateTimer !== null) {
+      window.clearInterval(this.stateTimer);
+      this.stateTimer = null;
+    }
+  }
 
   /** Tear the player down completely (fix block item 3): pause, drop
    * the source, cancel the watchdog + control-hide timers, leave
@@ -70,6 +115,7 @@ export class VideoPlayer {
    * may outlive its surface. Hosts MUST call this. */
   destroy(): void {
     this.destroyed = true;
+    this.stopStateTimer();
     if (this.hideTimer !== null) {
       window.clearTimeout(this.hideTimer);
       this.hideTimer = null;
@@ -94,6 +140,9 @@ export class VideoPlayer {
 
   constructor(opts: VideoPlayerOpts) {
     this.path = opts.path;
+    this.onStateCb = opts.onState ?? null;
+    if (opts.startAt && opts.startAt > 0) this.pendingSeek = opts.startAt;
+    this.wantPlay = opts.autoPlay ?? false;
     this.el = document.createElement("div");
     this.el.className = "vp" + (opts.standalone ? " vp-standalone" : "");
 
@@ -188,11 +237,16 @@ export class VideoPlayer {
     this.video.addEventListener("play", () => {
       this.playBtn.textContent = "⏸";
       this.armHideTimer();
+      this.emitState();
+      this.armStateTimer();
     });
     this.video.addEventListener("pause", () => {
       this.playBtn.textContent = "▶";
       this.showControls(true);
+      this.emitState();
+      this.stopStateTimer();
     });
+    this.video.addEventListener("seeked", () => this.emitState());
     this.video.addEventListener("timeupdate", () => {
       this.checkFrame();
       this.syncProgress();
@@ -200,11 +254,35 @@ export class VideoPlayer {
     this.video.addEventListener("loadedmetadata", () => {
       const d = this.video.duration;
       if (isFinite(d) && d > 0 && !this.transcoding) this.origDuration = d;
+      // Detach handoff: land at the handed-off position, then
+      // honor the handed-off play state.
+      if (this.pendingSeek !== null && !this.transcoding) {
+        const target = Math.min(
+          this.pendingSeek,
+          Math.max(0, (isFinite(d) ? d : 0) - 0.25),
+        );
+        this.pendingSeek = null;
+        try {
+          this.video.currentTime = target;
+        } catch {
+          // not seekable yet — the transcode fallback (if it
+          // engages) starts from the same pending position
+          this.pendingSeek = target;
+        }
+        if (this.wantPlay) {
+          this.wantPlay = false;
+          void this.video.play().catch(() => undefined);
+        }
+      }
       this.syncProgress();
     });
     this.video.addEventListener("loadeddata", () => this.checkFrame());
     this.video.addEventListener("canplay", () => this.checkFrame());
-    this.video.addEventListener("ended", () => this.showControls(true));
+    this.video.addEventListener("ended", () => {
+      this.showControls(true);
+      this.emitState();
+      this.stopStateTimer();
+    });
     this.video.addEventListener("error", () => this.enterFallback());
 
     // Interaction: click toggles play, double-click fullscreen,
@@ -357,6 +435,13 @@ export class VideoPlayer {
   }
 
   private async startTranscode(startSecs: number): Promise<void> {
+    // A detach handoff position that native playback never got to
+    // apply is exactly where the transcode stream should start.
+    if (this.pendingSeek !== null) {
+      startSecs = this.pendingSeek;
+      this.pendingSeek = null;
+      this.wantPlay = false; // startTranscode always plays
+    }
     this.showLoading();
     const url = await transcodeSrc(this.path, startSecs);
     if (this.destroyed) return;

@@ -343,6 +343,17 @@ th[data-sort]:focus-visible {
   color: var(--ufm-text-muted);
 }
 
+/* Location name + storage gauge stack (UI round item 7). */
+.side-item.side-loc { align-items: center; }
+.side-loc-main { display: flex; flex-direction: column; gap: 3px; flex: 1 1 auto; min-width: 0; }
+.side-loc-main > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.side-gauge { display: block; height: 4px; border-radius: 2px; background: color-mix(in srgb, var(--ufm-text) 14%, transparent); overflow: hidden; }
+.side-gauge-fill { display: block; height: 100%; width: 0%; border-radius: 2px; background: var(--ufm-accent); transition: width 300ms ease; }
+/* Alarm red ONLY for a low boot drive (Dickles' color law) — the
+   class is set exclusively for mount_point "/" running low. */
+.side-gauge.alarm .side-gauge-fill { background: #d70015; }
+@media (prefers-reduced-motion: reduce) { .side-gauge-fill { transition: none; } }
+
 /* Inline eject on removable volume rows (Round 7.2). */
 .side-eject {
   margin-left: 0.25rem;
@@ -494,7 +505,8 @@ th[data-sort]:focus-visible {
 
 .fileview-scroller.grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr));
+  /* Cell pitch follows the icon-size preference (UI round item 3a). */
+  grid-template-columns: repeat(auto-fill, minmax(var(--fv-cell, 6.5rem), 1fr));
   gap: 0.25rem;
   padding: 0.75rem;
   align-content: start;
@@ -525,8 +537,8 @@ th[data-sort]:focus-visible {
 }
 
 .cell-icon {
-  width: 3rem;
-  height: 3rem;
+  width: var(--fv-icon, 3rem);
+  height: var(--fv-icon, 3rem);
   color: var(--ufm-text-muted);
   flex: 0 0 auto;
 }
@@ -1620,8 +1632,8 @@ body[data-layout="tv"] .cell-icon {
 
 /* ----------------------------------------------------------- thumbnails */
 .cell-thumb {
-  width: 56px;
-  height: 56px;
+  width: var(--fv-thumb, 56px);
+  height: var(--fv-thumb, 56px);
   object-fit: cover;
   border-radius: 8px;
   box-shadow: 0 1px 4px rgb(0 0 0 / 0.25);
@@ -1876,6 +1888,47 @@ body[data-layout="tv"] .cell-icon {
   font-size: 56px;
   line-height: 1;
 }
+
+/* Preferences + theme gallery + shortcuts (UI round items 1, 2, 3b). */
+.prefs-dialog, .shortcuts-card {
+  background: var(--ufm-surface, var(--ufm-content-canvas));
+  color: var(--ufm-text);
+  border: 1px solid var(--ufm-border);
+  border-radius: 18px;
+  box-shadow: 0 24px 70px rgb(0 0 0 / 0.35);
+  width: min(46rem, calc(100vw - 3rem));
+  max-height: calc(100vh - 4rem);
+  overflow-y: auto;
+  padding: 1.25rem 1.5rem 1.5rem;
+  text-align: left;
+  animation: props-pop 220ms cubic-bezier(0.2, 0.9, 0.25, 1.2);
+}
+.prefs-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem; }
+.prefs-title { font-size: 1.25rem; font-weight: 700; letter-spacing: -0.02em; margin: 0; }
+.prefs-section { font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ufm-text-muted); margin: 1.25rem 0 0.5rem; }
+.prefs-subhead { font-size: 0.8125rem; font-weight: 600; color: var(--ufm-text-muted); margin: 0.75rem 0 0.375rem; }
+.prefs-note { font-size: 0.8125rem; color: var(--ufm-text-muted); margin: 0.375rem 0 0.75rem; }
+.prefs-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr)); gap: 0.625rem; }
+.prefs-theme-card { appearance: none; border: 2px solid transparent; background: color-mix(in srgb, var(--ufm-text) 4%, transparent); border-radius: 12px; padding: 0.5rem; cursor: pointer; font: inherit; color: inherit; text-align: left; }
+.prefs-theme-card:hover { background: color-mix(in srgb, var(--ufm-text) 8%, transparent); }
+.prefs-theme-card.active { border-color: var(--ufm-accent); }
+.prefs-theme-mock { height: 3.75rem; border-radius: 8px; overflow: hidden; padding: 0.4375rem; display: flex; flex-direction: column; gap: 0.3125rem; margin-bottom: 0.5rem; box-shadow: inset 0 0 0 1px rgb(0 0 0 / 0.12); }
+.prefs-theme-bar { height: 0.4375rem; border-radius: 3px; width: 55%; }
+.prefs-theme-line { height: 0.375rem; border-radius: 3px; width: 85%; opacity: 0.85; }
+.prefs-theme-line.short { width: 60%; opacity: 0.55; }
+.prefs-theme-glyph { font-size: 1.5rem; font-weight: 700; color: var(--ufm-text-muted); display: flex; align-items: center; justify-content: center; height: 100%; }
+.prefs-theme-name { font-size: 0.8125rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prefs-theme-meta { font-size: 0.6875rem; color: var(--ufm-text-muted); }
+.prefs-row { display: flex; align-items: center; gap: 0.625rem; padding: 0.4375rem 0; font-size: 0.875rem; }
+.prefs-row-label { flex: 1 1 auto; }
+.prefs-step { font-size: 1rem; width: 2rem; height: 2rem; }
+.prefs-step-value { min-width: 4.5rem; text-align: center; font-variant-numeric: tabular-nums; color: var(--ufm-text-muted); }
+.prefs-toggle { cursor: pointer; flex-wrap: wrap; }
+.prefs-toggle input[type="checkbox"] { width: 1.125rem; height: 1.125rem; accent-color: var(--ufm-accent); }
+.prefs-toggle-note { flex-basis: 100%; padding-left: 1.75rem; margin: 0; }
+.prefs-foot { display: flex; justify-content: space-between; gap: 0.75rem; margin-top: 1.25rem; }
+.shortcuts-row { display: flex; align-items: baseline; gap: 0.875rem; padding: 0.25rem 0; font-size: 0.875rem; }
+.shortcuts-key { flex: 0 0 11rem; font-family: inherit; font-size: 0.8125rem; font-weight: 600; background: color-mix(in srgb, var(--ufm-text) 8%, transparent); border: 1px solid var(--ufm-border); border-radius: 6px; padding: 0.125rem 0.5rem; text-align: center; }
 
 .about-title {
   margin: 0.625rem 0 0.25rem;
@@ -2390,27 +2443,39 @@ tr.row[style*="--label-color"] {
 .term-body { flex: 1; min-height: 0; padding: 4px 6px; }
 .term-body .xterm { height: 100%; }
 
-/* ——— jobs panel ——— */
+/* ——— jobs dock ——— */
+/* Docked at the bottom of the main column, directly above the
+   status bar (UI round, Dickles' screenshot: the old floating
+   panel covered the indexing readout). In-flow chrome: it takes
+   layout space, pushes the viewport up, and can never occlude the
+   status bar. Cards spend WIDTH (a row, growing to a cap, then
+   scrolling sideways) instead of stacking height; the card itself
+   keeps its name + truth-line detail + progress grid. */
 .jobs-panel {
-  position: fixed; right: 16px; bottom: 16px; z-index: 1400;
-  width: min(22rem, calc(100vw - 2rem));
+  flex: 0 0 auto;
+  max-height: 40vh;
+  overflow-y: auto;
   background: color-mix(in srgb, var(--ufm-surface) 78%, transparent);
   backdrop-filter: blur(18px) saturate(150%);
-  border: 1px solid var(--ufm-border);
-  border-radius: 14px;
-  box-shadow: 0 18px 50px rgb(0 0 0 / 0.35);
-  padding: 0.6rem 0.75rem;
+  border-top: 1px solid var(--ufm-border);
+  padding: 0.5rem 0.75rem 0.6rem;
   color: var(--ufm-text);
 }
 .jobs-panel[hidden] { display: none; }
 .jobs-head { font-size: 0.75rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ufm-text-muted); margin-bottom: 0.4rem; }
-.jobs-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.jobs-list { display: flex; flex-direction: row; flex-wrap: nowrap; gap: 0.75rem; overflow-x: auto; padding-bottom: 0.2rem; }
+.jobs-list .job-row { flex: 1 1 18rem; min-width: 16rem; max-width: 28rem; }
 .job-row { display: grid; grid-template-columns: 1fr auto auto; gap: 0.25rem 0.5rem; align-items: center; }
 .job-row-xfer { grid-template-columns: 1fr auto auto auto; }
 .job-name { font-size: 0.8125rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; grid-column: 1 / -1; }
 .job-track { height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--ufm-text) 14%, transparent); overflow: hidden; }
 .job-bar { height: 100%; width: 0%; background: var(--ufm-accent); border-radius: 3px; transition: width 200ms ease; }
 .job-pct { font-size: 0.75rem; font-variant-numeric: tabular-nums; color: var(--ufm-text-muted); }
+.job-detail { font-size: 0.75rem; color: var(--ufm-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; grid-column: 1 / -1; font-variant-numeric: tabular-nums; }
+.job-detail[hidden] { display: none; }
+.job-row.job-flash { animation: job-flash-pulse 1.6s ease-out; border-radius: 8px; }
+@keyframes job-flash-pulse { 0%, 55% { background: color-mix(in srgb, var(--ufm-accent) 20%, transparent); } 100% { background: transparent; } }
+@media (prefers-reduced-motion: reduce) { .job-row.job-flash { animation: none; } }
 .job-cancel { grid-row: 1; grid-column: 3; }
 
 /* ——— shared big-dialog shell ——— */
@@ -2921,6 +2986,17 @@ select option { background-color: var(--ufm-surface); color: var(--ufm-text); }
 .search-hit.selected { background: color-mix(in srgb, var(--ufm-accent) 42%, transparent); box-shadow: inset 3px 0 0 var(--ufm-accent); }
 .row.selected, .cell.selected { background: color-mix(in srgb, var(--ufm-accent) 32%, transparent); }
 .search-filters { display: flex; gap: .9rem; align-items: center; flex-wrap: wrap; padding: .45rem 1rem; border-bottom: 1px solid var(--ufm-border); }
+/* Facet popover (UI round item 3c): kind / date / size in one surface. */
+.search-facets-btn { margin-left: auto; }
+.search-facets { display: flex; gap: 1.25rem; flex-wrap: wrap; align-items: flex-start; margin: 0.5rem 0.75rem 0; padding: 0.75rem; border: 1px solid var(--ufm-border); border-radius: var(--ufm-radius-md); background: color-mix(in srgb, var(--ufm-text) 4%, transparent); }
+.search-facets[hidden] { display: none; }
+.search-facet-group { display: flex; flex-direction: column; gap: 0.125rem; min-width: 9rem; }
+.search-facet-title { font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ufm-text-muted); margin-bottom: 0.25rem; }
+.search-facet-opt { appearance: none; border: none; background: transparent; color: var(--ufm-text); font: inherit; font-size: 0.8125rem; text-align: left; padding: 0.25rem 0.5rem; border-radius: calc(var(--ufm-radius-md) / 2); cursor: pointer; }
+.search-facet-opt:hover { background: color-mix(in srgb, var(--ufm-text) 7%, transparent); }
+.search-facet-opt.active { background: var(--ufm-selection); font-weight: 600; }
+.search-facet-hint { font-size: 0.75rem; color: var(--ufm-text-muted); padding: 0.25rem 0.5rem; max-width: 11rem; }
+.search-facet-done { align-self: flex-end; font-weight: 600; }
 .search-filter-field { display: inline-flex; gap: .45rem; align-items: center; color: var(--ufm-text-muted); font-size: .85rem; }
 .search-date { height: var(--ufm-control-h, 2rem); border-radius: 9px; border: 1px solid var(--ufm-border); background: var(--ufm-surface); color: var(--ufm-text); padding: 0 .5rem; font: inherit; }
 /* Smart folder editor. */
@@ -2962,6 +3038,16 @@ select option { background-color: var(--ufm-surface); color: var(--ufm-text); }
 .music-title { font-weight: 650; font-size: 1.05rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .music-sub { color: var(--ufm-text-muted); font-size: 0.85rem; }
 .music-mode, .music-close { height: 2rem; padding: 0 0.8rem; border-radius: 999px; border: 1px solid var(--ufm-border); background: transparent; color: var(--ufm-text); cursor: pointer; }
+.music-detach { height: 2rem; width: 2rem; padding: 0; border-radius: 999px; border: 1px solid var(--ufm-border); background: transparent; color: var(--ufm-text); cursor: pointer; font-size: 0.95rem; }
+/* Detached state (UI round item 5): transport + queue are inert
+   while the mini window owns playback. */
+.music-card.detached .music-bar, .music-card.detached .music-tracks { opacity: 0.45; pointer-events: none; }
+.ql-audio-detach { align-self: flex-start; padding: 0.3rem 0.8rem; border-radius: 999px; border: 1px solid var(--ufm-border); background: transparent; color: var(--ufm-text); cursor: pointer; font: inherit; font-size: 0.8125rem; }
+.ql-audio-detach:hover { background: color-mix(in srgb, var(--ufm-text) 8%, transparent); }
+/* The audio detach (mini) window body. */
+.mini-audio { display: flex; flex-direction: column; gap: 0.6rem; padding: 1rem 1.1rem; height: 100vh; box-sizing: border-box; justify-content: center; background: #101014; color: #f5f5f7; }
+.mini-audio-title { font-weight: 600; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mini-audio-bar { display: flex; align-items: center; gap: 0.6rem; }
 .music-tracks { overflow-y: auto; border: 1px solid var(--ufm-border); border-radius: var(--ufm-radius); }
 .music-row { display: flex; align-items: center; gap: 0.7rem; padding: 0.42rem 0.7rem; cursor: pointer; }
 .music-row:nth-child(even) { background: color-mix(in srgb, var(--ufm-text) 4%, transparent); }

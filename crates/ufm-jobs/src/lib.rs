@@ -92,6 +92,13 @@ pub struct Job {
     /// steps complete. `serde(default)` keeps inc-1 snapshots loadable.
     #[serde(default)]
     pub outcomes: Vec<JobOutcome>,
+    /// UI round (packed transfer): the executor streamed this job's
+    /// small-file mass through the tar pipe instead of per-file
+    /// copies. Set by the executor when the packed pass engages;
+    /// surfaced on the job card as a small "Packed transfer" label.
+    /// `serde(default)` keeps older snapshots loadable.
+    #[serde(default)]
+    pub packed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +143,7 @@ impl Job {
             state: JobState::Queued,
             preview,
             outcomes: Vec::new(),
+            packed: false,
         }
     }
 
@@ -448,6 +456,19 @@ mod tests {
         jv.as_object_mut().unwrap().remove("outcomes");
         let jback: Job = serde_json::from_value(jv).unwrap();
         assert!(jback.outcomes.is_empty());
+    }
+
+    #[test]
+    fn job_packed_defaults_false_and_deserializes_without_field() {
+        // UI round (packed transfer): same upgrade-safety contract as
+        // outcomes — a snapshot written before the field existed
+        // loads with packed = false.
+        let job = sample_job();
+        assert!(!job.packed);
+        let mut jv = serde_json::to_value(&job).unwrap();
+        jv.as_object_mut().unwrap().remove("packed");
+        let jback: Job = serde_json::from_value(jv).unwrap();
+        assert!(!jback.packed);
     }
 
     #[test]

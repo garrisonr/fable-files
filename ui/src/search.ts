@@ -46,7 +46,27 @@ const TYPE_FILTERS: Array<{ id: string | null; label: string }> = [
   { id: "video", label: "Videos" },
   { id: "audio", label: "Audio" },
   { id: "document", label: "Documents" },
+  // UI round (Dickles: "I'm old"): email is a first-class type —
+  // .eml / .msg / .mbox, classified by the backend type_extensions.
+  { id: "email", label: "Email" },
   { id: "archive", label: "Archives" },
+];
+
+/** Size facet (UI round item 3c): applied client-side to search
+ * hits — the backend search contract has no size parameter, and a
+ * hit's size_bytes is right there. Folders always pass: a folder's
+ * size is its contents, not itself. */
+interface SizeFacet {
+  id: string;
+  label: string;
+  min: number | null;
+  max: number | null;
+}
+const SIZE_FACETS: SizeFacet[] = [
+  { id: "small", label: "Under 1 MB", min: null, max: 1_000_000 },
+  { id: "medium", label: "1 – 100 MB", min: 1_000_000, max: 100_000_000 },
+  { id: "large", label: "100 MB – 1 GB", min: 100_000_000, max: 1_000_000_000 },
+  { id: "huge", label: "Over 1 GB", min: 1_000_000_000, max: null },
 ];
 
 export class SearchView {
@@ -56,6 +76,10 @@ export class SearchView {
   private resultsEl: HTMLElement;
   private chipsEl: HTMLElement;
   private typeFilter: string | null = null;
+  /** Facet popover (UI round item 3c): button + panel + size facet. */
+  private facetBtn!: HTMLButtonElement;
+  private facetEl!: HTMLDivElement;
+  private sizeFacet: SizeFacet | null = null;
   /** Scope: "all" | "folder" | a location id. Plus modified-date range. */
   private scopeChoice = "all";
   private afterDate = "";
@@ -124,10 +148,7 @@ export class SearchView {
       chip.textContent = f.label;
       chip.dataset.filter = f.id ?? "";
       chip.addEventListener("click", () => {
-        this.typeFilter = f.id;
-        this.chipsEl.querySelectorAll(".search-chip").forEach((c) =>
-          c.classList.toggle("active", c === chip)
-        );
+        this.setTypeFilter(f.id);
         // Re-run under the new filter; type-only browsing (empty query)
         // is a valid search on its own.
         this.lastQuery = "\u0000force";
@@ -167,6 +188,7 @@ export class SearchView {
     this.afterInput.className = "search-date";
     this.afterInput.addEventListener("change", () => {
       this.afterDate = this.afterInput.value;
+      this.refreshFacetBtn();
       this.lastQuery = "\u0000force";
       void this.run();
     });
@@ -179,12 +201,30 @@ export class SearchView {
     this.beforeInput.className = "search-date";
     this.beforeInput.addEventListener("change", () => {
       this.beforeDate = this.beforeInput.value;
+      this.refreshFacetBtn();
       this.lastQuery = "\u0000force";
       void this.run();
     });
     beforeWrap.appendChild(this.beforeInput);
     this.filtersEl.append(scopeWrap, afterWrap, beforeWrap);
     this.el.appendChild(this.filtersEl);
+
+    // Facet popover (UI round item 3c): kind / date / size facets in
+    // one surface, Zorin-style. The kind facet mirrors the chips
+    // above (one source of truth: setTypeFilter); the date presets
+    // drive the same range the two date fields edit; size filters
+    // the returned hits client-side. The button carries the active
+    // facet count so a filtered search never looks unfiltered.
+    this.facetBtn = document.createElement("button");
+    this.facetBtn.className = "search-chip search-facets-btn";
+    this.facetBtn.textContent = "Filters";
+    this.facetBtn.title = "Filter by kind, date and size";
+    this.facetBtn.addEventListener("click", () => this.toggleFacets());
+    this.chipsEl.appendChild(this.facetBtn);
+    this.facetEl = document.createElement("div");
+    this.facetEl.className = "search-facets";
+    this.facetEl.hidden = true;
+    this.el.appendChild(this.facetEl);
 
     // Indexing banner (inc-2 item 13): a sibling of the results
     // wrap — the render methods wipe resultsEl, the banner must
@@ -254,12 +294,166 @@ export class SearchView {
   async runExternal(query: string, typeFilter: string | null): Promise<void> {
     this.externalRun = true;
     this.input.value = query;
-    this.typeFilter = typeFilter;
-    this.chipsEl.querySelectorAll<HTMLElement>(".search-chip").forEach((c) =>
-      c.classList.toggle("active", (c.dataset.filter ?? "") === (typeFilter ?? "")),
-    );
+    this.setTypeFilter(typeFilter);
     this.lastQuery = "\u0000force";
     await this.run();
+  }
+
+  /** Kind facet: one source of truth for the chips row and the
+   * facet popover, so the two surfaces can never disagree. Only
+   * chips that carry a data-filter participate (the Save / Filters
+   * chips keep their own states). */
+  private setTypeFilter(id: string | null): void {
+    this.typeFilter = id;
+    this.chipsEl.querySelectorAll<HTMLElement>(".search-chip").forEach((c) => {
+      if (c.dataset.filter === undefined) return;
+      c.classList.toggle("active", c.dataset.filter === (id ?? ""));
+    });
+    this.refreshFacetBtn();
+  }
+
+  /** The Filters button label carries the active facet count. */
+  private refreshFacetBtn(): void {
+    if (!this.facetBtn) return;
+    let n = 0;
+    if (this.typeFilter) n++;
+    if (this.afterDate || this.beforeDate) n++;
+    if (this.sizeFacet) n++;
+    this.facetBtn.textContent = n > 0 ? `Filters · ${n}` : "Filters";
+    this.facetBtn.classList.toggle("active", n > 0);
+  }
+
+  private toggleFacets(): void {
+    if (this.facetEl.hidden) {
+      this.buildFacets();
+      this.facetEl.hidden = false;
+    } else {
+      this.facetEl.hidden = true;
+    }
+  }
+
+  private buildFacets(): void {
+    const el = this.facetEl;
+    el.innerHTML = "";
+    const group = (title: string): HTMLDivElement => {
+      const g = document.createElement("div");
+      g.className = "search-facet-group";
+      const t = document.createElement("div");
+      t.className = "search-facet-title";
+      t.textContent = title;
+      g.appendChild(t);
+      el.appendChild(g);
+      return g;
+    };
+    const opt = (
+      g: HTMLDivElement,
+      label: string,
+      active: boolean,
+      fn: () => void,
+    ): void => {
+      const b = document.createElement("button");
+      b.className = "search-facet-opt" + (active ? " active" : "");
+      b.textContent = label;
+      b.addEventListener("click", fn);
+      g.appendChild(b);
+    };
+    const kind = group("Kind");
+    for (const f of TYPE_FILTERS) {
+      opt(kind, f.label, this.typeFilter === f.id, () => {
+        this.setTypeFilter(f.id);
+        this.lastQuery = "\u0000force";
+        void this.run();
+        this.buildFacets();
+      });
+    }
+    const dates = group("Modified");
+    for (const p of this.datePresets()) {
+      opt(
+        dates,
+        p.label,
+        this.afterDate === p.after && this.beforeDate === p.before,
+        () => {
+          this.applyDatePreset(p.after, p.before);
+          this.buildFacets();
+        },
+      );
+    }
+    const hint = document.createElement("div");
+    hint.className = "search-facet-hint";
+    hint.textContent = "Custom range: the date fields above.";
+    dates.appendChild(hint);
+    const sizes = group("Size");
+    opt(sizes, "Any size", this.sizeFacet === null, () => {
+      this.sizeFacet = null;
+      this.refreshFacetBtn();
+      this.rerenderLast();
+      this.buildFacets();
+    });
+    for (const s of SIZE_FACETS) {
+      opt(sizes, s.label, this.sizeFacet?.id === s.id, () => {
+        this.sizeFacet = s;
+        this.refreshFacetBtn();
+        this.rerenderLast();
+        this.buildFacets();
+      });
+    }
+    const done = document.createElement("button");
+    done.className = "search-facet-opt search-facet-done";
+    done.textContent = "Done";
+    done.addEventListener("click", () => {
+      this.facetEl.hidden = true;
+    });
+    el.appendChild(done);
+  }
+
+  private datePresets(): Array<{ label: string; after: string; before: string }> {
+    const p2 = (n: number) => String(n).padStart(2, "0");
+    const fmt = (d: Date): string =>
+      `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+    const today = new Date();
+    const daysAgo = (n: number): string => {
+      const d = new Date(today);
+      d.setDate(d.getDate() - n);
+      return fmt(d);
+    };
+    return [
+      { label: "Any time", after: "", before: "" },
+      { label: "Today", after: fmt(today), before: "" },
+      { label: "Last 7 days", after: daysAgo(6), before: "" },
+      { label: "Last 30 days", after: daysAgo(29), before: "" },
+      { label: "This year", after: `${today.getFullYear()}-01-01`, before: "" },
+    ];
+  }
+
+  /** A date preset drives the SAME range state the date fields
+   * edit (and the same backend modified-after/before arguments). */
+  private applyDatePreset(after: string, before: string): void {
+    this.afterDate = after;
+    this.beforeDate = before;
+    this.afterInput.value = after;
+    this.beforeInput.value = before;
+    this.refreshFacetBtn();
+    this.lastQuery = "\u0000force";
+    void this.run();
+  }
+
+  private sizeMatches(item: Item): boolean {
+    if (!this.sizeFacet) return true;
+    if (item.kind === "folder") return true;
+    const s = item.size_bytes;
+    if (s === null || s === undefined) return false;
+    if (this.sizeFacet.min !== null && s < this.sizeFacet.min) return false;
+    if (this.sizeFacet.max !== null && s >= this.sizeFacet.max) return false;
+    return true;
+  }
+
+  /** Re-render the last typed-search results under the current
+   * size facet — no new backend round-trip. lastResults always
+   * holds the RAW hits; the facet filters at render time. */
+  private rerenderLast(): void {
+    if (this.lastResults) {
+      this.renderResults(this.lastResults.q, this.lastResults.hits);
+    }
   }
 
   get field(): HTMLElement {
@@ -384,10 +578,9 @@ export class SearchView {
     window.clearTimeout(this.timer);
     this.input.value = "";
     this.lastQuery = "";
-    this.typeFilter = null;
-    this.chipsEl.querySelectorAll(".search-chip").forEach((c) =>
-      c.classList.toggle("active", (c as HTMLElement).dataset.filter === ""),
-    );
+    this.setTypeFilter(null);
+    this.sizeFacet = null;
+    this.refreshFacetBtn();
     this.scopeChoice = "all";
     this.scopeBtn.textContent = "Everywhere \u25be";
     this.afterDate = "";
@@ -664,9 +857,15 @@ export class SearchView {
     this.resultsEl.appendChild(p);
   }
 
-  private renderResults(q: string, hits: SearchHit[]): void {
+  private renderResults(q: string, rawHits: SearchHit[]): void {
+    // lastResults keeps the RAW hits — the size facet filters at
+    // render time, so changing it re-renders without a new search.
+    this.lastResults = { q, hits: rawHits };
+    const rawCount = rawHits.length;
+    const hits = this.sizeFacet
+      ? rawHits.filter((h) => this.sizeMatches(h.item))
+      : rawHits;
     this.hits = hits;
-    this.lastResults = { q, hits };
     this.selected.clear();
     this.anchor = -1;
     this.resultsEl.innerHTML = "";
@@ -688,6 +887,12 @@ export class SearchView {
             : `${hits.length} ${typeLabel ?? "files"}${hits.length === 50 ? " (first 50)" : ""}.`,
       ),
     );
+    if (rawCount !== hits.length) {
+      const note = document.createElement("p");
+      note.className = "search-hint";
+      note.textContent = `Size filter on — ${hits.length} of ${rawCount} results shown.`;
+      this.resultsEl.appendChild(note);
+    }
     if (hits.length > 0) {
       const hint = document.createElement("p");
       hint.className = "search-hint";

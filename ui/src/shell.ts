@@ -9,6 +9,7 @@ import {
   formatBytes,
   type Item,
   type JobOutcome,
+  type JobStart,
   type LocationSummary,
   type ThemeInfo,
 } from "./api";
@@ -64,7 +65,8 @@ import {
   type Tab,
   type ViewMode,
 } from "./tabs";
-import { DEFAULT_THEME, ThemeManager, type MenuThemeItem } from "./themes";
+import { DEFAULT_THEME, DISTRO_ENGINES, ThemeManager, type MenuThemeItem } from "./themes";
+import { PreferencesDialog } from "./preferences";
 
 /** Parent directory of an absolute path: dirname("/a/b") === "/a",
  * dirname("/foo.mp3") === "/", dirname("/") === "/". Never returns ""
@@ -125,6 +127,9 @@ export class Shell {
   private columnsView: ColumnsView;
   private galleryView: GalleryView;
   private aboutDialog = new AboutDialog();
+  private preferencesDialog = new PreferencesDialog();
+  /** The Ctrl+? shortcuts overlay element while it is open. */
+  private shortcutsEl: HTMLElement | null = null;
   private palette = new CommandPalette();
   private menuBtn!: HTMLButtonElement;
   /** Undoable file operations (trash / drag-move), newest last. */
@@ -583,6 +588,17 @@ export class Shell {
           void api.setUiPrefs({ ...this.uiPrefs }).catch(() => undefined);
         }
         this.applyCollapsePrefs();
+        // Text size + grid icon size (UI round): durable prefs,
+        // hydrated with the rest.
+        const fs = this.uiPrefs["ff-font-scale"];
+        if (typeof fs === "number" && fs >= 0.7 && fs <= 2.0) {
+          this.setFontScale(fs);
+        }
+        const isz = this.uiPrefs["ff-icon-size"];
+        if (typeof isz === "number") {
+          this.iconSize = Math.min(96, Math.max(32, Math.round(isz)));
+        }
+        this.applyIconSize();
       }
     } catch {
       // prefs are a nicety — the localStorage fast path already ran
@@ -829,6 +845,13 @@ export class Shell {
     this.viewport = document.createElement("div");
     this.viewport.className = "viewport";
     main.append(this.tabBar, this.viewport, this.termPanel.el);
+    // Jobs dock (UI round, Dickles' screenshot): the panel's real
+    // home is the bottom of the main column, directly above the
+    // status bar — in-flow chrome, never a floating overlay, so it
+    // cannot cover the status/indexing readouts at any window size.
+    // (appendChild relocates it from the shell root, where the
+    // constructor parked it with the dialogs.)
+    main.append(this.jobsPanel.el);
 
     workarea.append(sidebar, main);
     this.el.append(workarea);
@@ -1273,6 +1296,20 @@ export class Shell {
     this.jobsPanel.trackJob(jobId, label);
   }
 
+  /** Unwrap a start_* result (UI round double-submit guard): a
+   * fresh job yields its id; a submission the backend folded into
+   * an identical active job yields null — the caller abandons its
+   * own tracking (the original door's continuation still owns the
+   * finish line), the user is told plainly, and the panel focuses
+   * the one job that is actually running. `noun` is the operation
+   * word for the toast: copy / move / delete / trash. */
+  private acceptJobStart(start: JobStart, noun: string): string | null {
+    if (!start.alreadyRunning) return start.jobId;
+    Toast.info(`That ${noun} is already running`);
+    this.jobsPanel.focusJob(start.jobId);
+    return null;
+  }
+
   /** Outcomes of a finished job; [] when unavailable (unknown job /
    * backend error) — undo simply offers less in that case. */
   private async jobOutcomes(jobId: string): Promise<JobOutcome[]> {
@@ -1306,7 +1343,9 @@ export class Shell {
    * completion). */
   private async deleteItem(item: Item): Promise<void> {
     try {
-      const jobId = await api.startDelete([item.id], true);
+      const start = await api.startDelete([item.id], true);
+      const jobId = this.acceptJobStart(start, "trash");
+      if (!jobId) return;
       this.quickLook.close();
       this.trackTransfer(jobId, `Trash ${item.name}`, async (error) => {
         if (error) {
@@ -1333,10 +1372,12 @@ export class Shell {
   private async trashItems(items: Item[]): Promise<void> {
     if (items.length === 0) return;
     try {
-      const jobId = await api.startDelete(
+      const start = await api.startDelete(
         items.map((i) => i.id),
         true,
       );
+      const jobId = this.acceptJobStart(start, "trash");
+      if (!jobId) return;
       this.quickLook.close();
       const nameByPath = new Map(
         items.map(
@@ -1446,9 +1487,11 @@ export class Shell {
       // owns the same-folder cut no-op and the copy-into-same-folder
       // suffix idiom now.
       const paths = clip.paths;
-      const jobId = clip.cut
+      const start = clip.cut
         ? await api.startMoveFromPaths(paths, destDir)
         : await api.startCopyFromPaths(paths, destDir);
+      const jobId = this.acceptJobStart(start, clip.cut ? "move" : "copy");
+      if (!jobId) return;
       this.trackTransfer(
         jobId,
         clip.cut ? "Move" : "Copy",
@@ -1502,7 +1545,9 @@ export class Shell {
     for (const [parent, paths] of byParent) {
       const count = paths.length;
       try {
-        const jobId = await api.startCopyFromPaths(paths, parent);
+        const start = await api.startCopyFromPaths(paths, parent);
+        const jobId = this.acceptJobStart(start, "copy");
+        if (!jobId) continue;
         this.trackTransfer(jobId, "Duplicate", async (error) => {
           if (error) Toast.error(`Duplicate failed: ${errText(error)}`);
           else {
@@ -1547,10 +1592,12 @@ export class Shell {
     if (!dest) return;
     try {
       if (mode === "move") {
-        const jobId = await api.startMove(
+        const start = await api.startMove(
           items.map((i) => i.id),
           dest,
         );
+        const jobId = this.acceptJobStart(start, "move");
+        if (!jobId) return;
         const nameByPath = new Map(
           items.map(
             (i) => [i.provider_key ?? "", i.name] as [string, string],
@@ -1592,7 +1639,9 @@ export class Shell {
           .map((i) => i.provider_key)
           .filter((p): p is string => !!p);
         if (paths.length === 0) return;
-        const jobId = await api.startCopyFromPaths(paths, dest);
+        const start = await api.startCopyFromPaths(paths, dest);
+        const jobId = this.acceptJobStart(start, "copy");
+        if (!jobId) return;
         this.trackTransfer(jobId, "Copy", async (error) => {
           if (error) Toast.error(`Could not copy items: ${errText(error)}`);
           else {
@@ -1898,6 +1947,55 @@ export class Shell {
     this.romsList.hidden = roms;
     if (this.romsChevEl) {
       this.romsChevEl.style.transform = roms ? "rotate(-90deg)" : "";
+    }
+  }
+
+  /** Sidebar storage-gauge cache (UI round item 7): statvfs
+   * numbers by path, 60 s TTL — buildSidebar runs on ~18 paths and
+   * get_disk_info shells out to findmnt, so never pay it per
+   * rebuild. */
+  private diskGaugeCache = new Map<
+    string,
+    { at: number; total: number; free: number; mount: string }
+  >();
+
+  /** Paint one sidebar location's storage gauge: a slim used bar
+   * under the name. COLOR LAW (Dickles): alarm red is reserved for
+   * the BOOT drive running low — a nearly-full media drive is a
+   * victory, never red. */
+  private async paintLocGauge(
+    path: string,
+    gauge: HTMLElement,
+    fill: HTMLElement,
+  ): Promise<void> {
+    try {
+      let hit = this.diskGaugeCache.get(path);
+      if (!hit || Date.now() - hit.at > 60_000) {
+        const info = await api.getDiskInfo(path);
+        if (info.total_bytes <= 0) {
+          gauge.remove();
+          return;
+        }
+        hit = {
+          at: Date.now(),
+          total: info.total_bytes,
+          free: info.free_bytes,
+          mount: info.mount_point,
+        };
+        this.diskGaugeCache.set(path, hit);
+      }
+      if (!gauge.isConnected) return;
+      const usedPct = Math.max(
+        0,
+        Math.min(100, (1 - hit.free / hit.total) * 100),
+      );
+      fill.style.width = `${usedPct}%`;
+      const bootLow = hit.mount === "/" && hit.free / hit.total < 0.1;
+      gauge.classList.toggle("alarm", bootLow);
+      gauge.title = `${formatBytes(hit.total - hit.free)} used · ${formatBytes(hit.free)} free`;
+    } catch {
+      // No gauge beats a wrong one.
+      gauge.remove();
     }
   }
 
@@ -2438,7 +2536,9 @@ export class Shell {
       if (copy) {
         // Ctrl+drop = copy (fix block item 2): the destination parent
         // is the folder's own item id, which is what start_copy wants.
-        const jobId = await api.startCopy([dragged.id], target.dirId);
+        const start = await api.startCopy([dragged.id], target.dirId);
+        const jobId = this.acceptJobStart(start, "copy");
+        if (!jobId) return;
         this.trackTransfer(jobId, `Copy ${dragged.name}`, async (error) => {
           if (error) {
             Toast.error(`Could not copy “${dragged.name}”: ${errText(error)}`);
@@ -2450,7 +2550,9 @@ export class Shell {
         });
         return;
       }
-      const jobId = await api.startMove([dragged.id], dest);
+      const start = await api.startMove([dragged.id], dest);
+      const jobId = this.acceptJobStart(start, "move");
+      if (!jobId) return;
       this.trackTransfer(jobId, `Move ${dragged.name}`, async (error) => {
         if (error) {
           Toast.error(`Could not move “${dragged.name}”: ${errText(error)}`);
@@ -2587,7 +2689,9 @@ export class Shell {
           const copyWanted = e.ctrlKey;
           try {
             if (name === "Trash") {
-              const jobId = await api.startDelete([dragged.id], true);
+              const start = await api.startDelete([dragged.id], true);
+              const jobId = this.acceptJobStart(start, "trash");
+              if (!jobId) return;
               this.trackTransfer(
                 jobId,
                 `Trash ${dragged.name}`,
@@ -2619,7 +2723,9 @@ export class Shell {
               if (dragged.provider_key && dirname(dragged.provider_key) === dest) {
                 return; // already in this folder
               }
-              const jobId = await api.startCopy([dragged.id], target.dirId);
+              const start = await api.startCopy([dragged.id], target.dirId);
+              const jobId = this.acceptJobStart(start, "copy");
+              if (!jobId) return;
               this.trackTransfer(
                 jobId,
                 `Copy ${dragged.name}`,
@@ -2640,7 +2746,9 @@ export class Shell {
               if (dragged.provider_key && dirname(dragged.provider_key) === dest) {
                 return; // already in this folder
               }
-              const jobId = await api.startMove([dragged.id], dest);
+              const start = await api.startMove([dragged.id], dest);
+              const jobId = this.acceptJobStart(start, "move");
+              if (!jobId) return;
               this.trackTransfer(
                 jobId,
                 `Move ${dragged.name}`,
@@ -2791,13 +2899,28 @@ export class Shell {
     }
     for (const loc of this.locations) {
       const b = document.createElement("button");
-      b.className = "side-item";
+      b.className = "side-item side-loc";
       const name = document.createElement("span");
       name.textContent = loc.display_name;
+      // Name + storage gauge stack (UI round item 7): a slim
+      // gas-tank bar under the name for locations backed by a real
+      // path — used/free at a glance, Disk Properties data path.
+      const main = document.createElement("span");
+      main.className = "side-loc-main";
+      main.append(name);
+      if (loc.path) {
+        const gauge = document.createElement("span");
+        gauge.className = "side-gauge";
+        const fill = document.createElement("i");
+        fill.className = "side-gauge-fill";
+        gauge.appendChild(fill);
+        main.appendChild(gauge);
+        void this.paintLocGauge(loc.path, gauge, fill);
+      }
       const prov = document.createElement("span");
       prov.className = "side-provider";
       prov.textContent = loc.provider;
-      b.append(name, prov);
+      b.append(main, prov);
       // Removable volumes get an inline eject (Round 7.2), the way
       // Nautilus renders it — the right-click Unmount stays as well.
       if (loc.provider === "volume" && loc.removable && loc.path) {
@@ -3109,7 +3232,9 @@ export class Shell {
     );
   }
 
-  /** Adjust UI font scale (0.7 to 2.0). Persists for the session. */
+  /** Adjust UI font scale (0.7 to 2.0). UI round: hosted by the
+   * Preferences screen now, so it persists in the durable sidecar
+   * like the other preferences (was session-only before). */
   private setFontScale(scale: number): void {
     this.fontScale = Math.min(2.0, Math.max(0.7, Math.round(scale * 10) / 10));
     document.documentElement.style.setProperty("--ufm-font-scale", String(this.fontScale));
@@ -3118,6 +3243,40 @@ export class Shell {
     // view. (The old approach scaled only #app + two selectors, which
     // is why file labels ignored Ctrl +/-.)
     document.documentElement.style.fontSize = `${16 * this.fontScale}px`;
+    this.uiPrefs["ff-font-scale"] = this.fontScale;
+    void api.setUiPrefs({ ...this.uiPrefs }).catch(() => undefined);
+  }
+
+  /** Grid icon size in px (UI round item 3a, the Zorin/Nautilus
+   * zoom stepper): one preference drives the grid's icon, photo
+   * thumbnail and cell pitch through CSS vars. */
+  private iconSize = 48;
+  private static readonly ICON_STEPS = [32, 40, 48, 56, 64, 80, 96];
+
+  private applyIconSize(): void {
+    const px = this.iconSize;
+    const root = document.documentElement.style;
+    root.setProperty("--fv-icon", `${px}px`);
+    root.setProperty("--fv-thumb", `${px + 8}px`);
+    root.setProperty("--fv-cell", `${px + 56}px`);
+  }
+
+  private setIconSize(px: number): void {
+    this.iconSize = Math.min(96, Math.max(32, Math.round(px)));
+    this.applyIconSize();
+    this.uiPrefs["ff-icon-size"] = this.iconSize;
+    void api.setUiPrefs({ ...this.uiPrefs }).catch(() => undefined);
+  }
+
+  private stepIconSize(dir: 1 | -1): void {
+    const steps = Shell.ICON_STEPS;
+    const cur = steps.reduce(
+      (best, s) => (Math.abs(s - this.iconSize) < Math.abs(best - this.iconSize) ? s : best),
+      steps[0],
+    );
+    const next =
+      steps[Math.min(steps.length - 1, Math.max(0, steps.indexOf(cur) + dir))];
+    this.setIconSize(next);
   }
 
   // ------------------------------------------------------------ palette
@@ -3267,6 +3426,138 @@ export class Shell {
     void this.indexTracker.reindexAll(this.locations.map((l) => l.id));
   }
 
+  /** Preferences (UI round item 1): the settings surface. Every
+   * control writes through to the stores the rest of the app
+   * already reads — the ui-prefs sidecar, the theme manager, the
+   * ROM store — so there is one source of truth per setting. */
+  private openPreferences(): void {
+    this.preferencesDialog.open({
+      backendThemes: () => this.themeManager.list,
+      activeTheme: () => this.themeManager.active,
+      resolvedEngine: () => {
+        const id = this.themeManager.resolved;
+        const e = id ? DISTRO_ENGINES.find((x) => x.id === id) : undefined;
+        return e ? { name: e.name, preview: e.preview } : null;
+      },
+      applyTheme: (id) => this.themeManager.apply(id),
+      fontScale: () => this.fontScale,
+      setFontScale: (v) => this.setFontScale(v),
+      iconSize: () => this.iconSize,
+      stepIconSize: (dir) => this.stepIconSize(dir),
+      romsOn: () => romsEnabled(),
+      setRomsOn: (on) => {
+        setRomsEnabled(on);
+        void this.buildSidebar();
+      },
+      sectionCollapsed: (key) => this.prefCollapsed(key),
+      setSectionCollapsed: (key, collapsed) => {
+        this.setCollapsedPref(key, collapsed);
+        this.applyCollapsePrefs();
+      },
+      showShortcuts: () => this.showShortcuts(),
+    });
+  }
+
+  /** Keyboard shortcuts overlay (UI round item 3b, Ctrl+?): the
+   * app's REAL bindings, read off onGlobalKey and the player key
+   * handlers. If a binding changes there, change it here in the
+   * same commit — an invented shortcut in this list is a lie. */
+  private showShortcuts(): void {
+    this.closeShortcuts();
+    const overlay = document.createElement("div");
+    overlay.className = "props-overlay";
+    overlay.addEventListener("mousedown", (e) => {
+      if (e.target === overlay) this.closeShortcuts();
+    });
+    const card = document.createElement("div");
+    card.className = "shortcuts-card";
+    card.setAttribute("role", "dialog");
+    card.setAttribute("aria-label", "Keyboard shortcuts");
+    const head = document.createElement("div");
+    head.className = "prefs-head";
+    const title = document.createElement("h2");
+    title.className = "prefs-title";
+    title.textContent = "Keyboard Shortcuts";
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "icon-btn prefs-close";
+    closeBtn.textContent = "✕";
+    closeBtn.title = "Close";
+    closeBtn.addEventListener("click", () => this.closeShortcuts());
+    head.append(title, closeBtn);
+    card.appendChild(head);
+    const groups: Array<[string, Array<[string, string]>]> = [
+      [
+        "Files",
+        [
+          ["Ctrl X / Ctrl C", "Cut / copy the selection"],
+          ["Ctrl V", "Paste into the current folder"],
+          ["Ctrl A", "Select all"],
+          ["Delete / Backspace", "Move the selection to Trash"],
+          ["Ctrl Z", "Undo the last trash or move"],
+          ["F2", "Rename"],
+          ["Ctrl E", "Make the selected file executable"],
+        ],
+      ],
+      [
+        "Navigation & windows",
+        [
+          ["Ctrl T", "New tab"],
+          ["Ctrl W", "Close tab"],
+          ["Alt ↑", "Up one folder"],
+          ["Space", "Quick Look preview"],
+          ["Esc", "Close menu / Quick Look / this list"],
+          ["Ctrl K", "Command palette"],
+          ["Ctrl `", "Terminal"],
+          ["Ctrl ?", "This list"],
+        ],
+      ],
+      [
+        "View",
+        [
+          ["Ctrl + / Ctrl −", "Text larger / smaller"],
+          ["Ctrl 0", "Reset text size"],
+        ],
+      ],
+      [
+        "Players",
+        [
+          ["Space / K", "Play / pause (video)"],
+          ["← / →", "Seek 5 seconds (video & music)"],
+          ["F", "Fullscreen (video)"],
+          ["M", "Mute (video)"],
+        ],
+      ],
+    ];
+    for (const [name, rows] of groups) {
+      const h = document.createElement("h3");
+      h.className = "prefs-section";
+      h.textContent = name;
+      card.appendChild(h);
+      for (const [key, label] of rows) {
+        const row = document.createElement("div");
+        row.className = "shortcuts-row";
+        const k = document.createElement("kbd");
+        k.className = "shortcuts-key";
+        k.textContent = key;
+        const lab = document.createElement("span");
+        lab.textContent = label;
+        row.append(k, lab);
+        card.appendChild(row);
+      }
+    }
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    this.shortcutsEl = overlay;
+    closeBtn.focus();
+  }
+
+  private closeShortcuts(): void {
+    if (this.shortcutsEl) {
+      this.shortcutsEl.remove();
+      this.shortcutsEl = null;
+    }
+  }
+
   private openMainMenu(): void {
     const tab = this.activeTab;
     const mode = tab?.view ?? "grid";
@@ -3296,6 +3587,8 @@ export class Shell {
       { separator: true, label: "", action: () => {} },
       { label: "Larger text", shortcut: "Ctrl +", action: () => this.setFontScale(this.fontScale + 0.1) },
       { label: "Smaller text", shortcut: "Ctrl \u2212", action: () => this.setFontScale(this.fontScale - 0.1) },
+      { label: "Larger icons", action: () => this.stepIconSize(1) },
+      { label: "Smaller icons", action: () => this.stepIconSize(-1) },
       { separator: true, label: "", action: () => {} },
       { label: "About Fable Files", action: () => this.aboutDialog.open() },
       { label: "App Deleter\u2026", action: () => void this.appDeleter.open(() => this.refreshActiveDir()) },
@@ -3323,6 +3616,7 @@ export class Shell {
           }),
       },
       { label: "Mount Cloud Drive\u2026", action: () => void this.cloudMount.open() },
+      { label: "Preferences\u2026", action: () => this.openPreferences() },
       { label: "Re-index Library", action: () => this.reindexLibrary() },
       {
         label: "Report a Bug\u2026",
@@ -3862,6 +4156,13 @@ export class Shell {
     const inField =
       e.target instanceof HTMLInputElement ||
       e.target instanceof HTMLTextAreaElement;
+    if ((e.ctrlKey || e.metaKey) && e.key === "?") {
+      // Ctrl+? — the shortcuts cheat sheet (UI round item 3b).
+      e.preventDefault();
+      if (this.shortcutsEl) this.closeShortcuts();
+      else this.showShortcuts();
+      return;
+    }
     if ((e.ctrlKey || e.metaKey) && e.key.toLocaleLowerCase() === "k") {
       e.preventDefault();
       if (this.palette.isOpen) this.palette.close();
@@ -3975,7 +4276,8 @@ export class Shell {
         this.togglePreview();
       }
     } else if (e.key === "Escape") {
-      if (!this.menuLayer.hidden) this.closeMenu();
+      if (this.shortcutsEl) this.closeShortcuts();
+      else if (!this.menuLayer.hidden) this.closeMenu();
       else if (this.quickLook.isOpen) this.quickLook.close();
     } else if (e.altKey && e.key === "ArrowUp") {
       if (this.activeTab) {

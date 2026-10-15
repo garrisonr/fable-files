@@ -6,7 +6,14 @@
 // is an instant playlist). Drag-reorder + .m3u persistence and the
 // dot-matrix spectrum are the next increments.
 
-import { api, mediaSrc, type Item } from "./api";
+import {
+  api,
+  mediaSrc,
+  onPlayerClosed,
+  onPlayerReturn,
+  onPlayerState,
+  type Item,
+} from "./api";
 import { audioTags, folderArtUrl } from "./audiometa";
 import { Toast } from "./toast";
 
@@ -63,6 +70,14 @@ export class MusicPlayer {
   /** Id of the item whose src was loaded most recently; a
    * loadedmetadata event for any other item is stale (Round 7). */
   private loadingItemId: string | null = null;
+  /** UI round item 5 (detach): the path playing in the detach
+   * window + its latest streamed state. The queue stays loaded
+   * here while detached; the local element stays silent. */
+  private detachedPath: string | null = null;
+  private detachedState: { t: number; playing: boolean } | null = null;
+  /** A resume position to apply on the next loadedmetadata. */
+  private pendingResume: { t: number; playing: boolean } | null = null;
+  private detachBtn: HTMLButtonElement | null = null;
   private playBtn!: HTMLButtonElement;
   private seek!: HTMLInputElement;
   private timeLabel!: HTMLSpanElement;
@@ -83,10 +98,28 @@ export class MusicPlayer {
         this.durations.set(cur.id, this.audio.duration);
         this.fillDuration(this.index);
       }
+      // Detach return: land at the position the mini window
+      // reached, with its play state.
+      const pr = this.pendingResume;
+      if (pr) {
+        this.pendingResume = null;
+        const d = this.audio.duration;
+        if (Number.isFinite(d) && d > 0 && pr.t > 0) {
+          try {
+            this.audio.currentTime = Math.min(pr.t, Math.max(0, d - 0.25));
+          } catch {
+            // not seekable yet — starts at the top instead
+          }
+        }
+        if (!pr.playing) this.audio.pause();
+        this.syncPlayGlyph();
+      }
       this.syncProgress();
     });
     this.audio.addEventListener("ended", () => this.step(1, true));
     this.audio.addEventListener("error", () => {
+      // While detached the local element is intentionally src-less.
+      if (this.detachedPath) return;
       const cur = this.queue[this.index];
       if (cur && (extOf(cur.name) === "dsf" || extOf(cur.name) === "dff")) {
         Toast.error("This DSD file could not be played directly — the decode fallback arrives with the next backend pass.");
@@ -98,6 +131,92 @@ export class MusicPlayer {
       const v = parseFloat(localStorage.getItem("ff-music-vol") ?? "");
       if (Number.isFinite(v)) this.audio.volume = Math.min(1, Math.max(0, v));
     } catch { /* default volume */ }
+    // Detach handoff listeners (UI round item 5): the mini window
+    // streams its state here; its return/close brings playback home.
+    void onPlayerState((s) => {
+      if (s.path === this.detachedPath) {
+        this.detachedState = { t: s.t, playing: s.playing };
+      }
+    }).catch(() => undefined);
+    void onPlayerReturn((s) => {
+      if (s.path !== this.detachedPath) return;
+      this.detachedState = { t: s.t, playing: s.playing };
+      if (s.ended) {
+        // The mini window played the track out and closed itself:
+        // the queue advances HERE (or stops at the end of it).
+        // player-closed follows, finds detachedPath already null,
+        // and does nothing more.
+        this.detachedPath = null;
+        this.paintAttached();
+        if (!this.overlay) return;
+        const next = this.index + 1;
+        if (next < this.queue.length) {
+          void this.resumeAt(next, 0, true);
+        }
+      }
+    }).catch(() => undefined);
+    void onPlayerClosed((path) => {
+      if (path !== this.detachedPath) return;
+      this.detachedPath = null;
+      this.paintAttached();
+      if (!this.overlay) return; // the player itself was closed too
+      const st = this.detachedState;
+      this.detachedState = null;
+      void this.resumeAt(this.index, st?.t ?? 0, st?.playing ?? false);
+    }).catch(() => undefined);
+  }
+
+  /** Detach the current track into the always-on-top mini window
+   * (UI round item 5): playback continues there from this exact
+   * position; the local element goes silent. */
+  private detach(): void {
+    const item = this.queue[this.index];
+    if (!item?.provider_key || this.detachedPath) return;
+    const path = item.provider_key;
+    const t = this.audio.currentTime || 0;
+    const playing = !this.audio.paused && !this.audio.ended;
+    this.detachedState = { t, playing };
+    void api
+      .openPlayerWindow(path, item.name, {
+        kind: "audio",
+        start: t,
+        autoplay: playing,
+      })
+      .then(() => {
+        this.detachedPath = path;
+        this.audio.pause();
+        this.loadingItemId = null;
+        this.audio.removeAttribute("src");
+        this.audio.load();
+        this.paintDetached();
+      })
+      .catch(() => undefined);
+  }
+
+  /** Load queue index i and land at position t with the given play
+   * state — the trip home from the detach window. */
+  private async resumeAt(i: number, t: number, playing: boolean): Promise<void> {
+    if (i < 0 || i >= this.queue.length) return;
+    // Pending even when t is 0: playIndex autoplays, and a paused
+    // return must re-pause once metadata lands.
+    this.pendingResume = { t, playing };
+    await this.playIndex(i);
+    if (!playing && t <= 0) this.audio.pause();
+    this.syncPlayGlyph();
+  }
+
+  private paintDetached(): void {
+    if (!this.overlay) return;
+    this.overlay.querySelector(".music-card")?.classList.add("detached");
+    if (this.subEl) {
+      this.subEl.textContent =
+        "Playing in the detached window — the ⤺ button there brings it back here";
+    }
+  }
+
+  private paintAttached(): void {
+    if (!this.overlay) return;
+    this.overlay.querySelector(".music-card")?.classList.remove("detached");
   }
 
   open(items: Item[]): void {
@@ -181,6 +300,11 @@ export class MusicPlayer {
   }
 
   close(): void {
+    // A detach window outlives the panel: it keeps playing on its
+    // own, but its state stream no longer maps to this queue.
+    this.detachedPath = null;
+    this.detachedState = null;
+    this.pendingResume = null;
     this.audio.pause();
     this.loadingItemId = null;
     this.audio.removeAttribute("src");
@@ -211,6 +335,7 @@ export class MusicPlayer {
             <div class="music-sub"></div>
           </div>
           <button class="music-mode" title="Toggle Album / Playlist view">${compact ? "Playlist" : "Album"}</button>
+          <button class="music-detach" title="Detach into a mini window">⧉</button>
           <button class="music-close" title="Close (Esc)">✕</button>
         </div>
         <div class="music-tracks"></div>
@@ -277,6 +402,8 @@ export class MusicPlayer {
     this.tracksEl = q<HTMLDivElement>(".music-tracks");
     this.renderRows();
 
+    this.detachBtn = q<HTMLButtonElement>(".music-detach");
+    this.detachBtn.addEventListener("click", () => this.detach());
     q<HTMLButtonElement>(".music-close").addEventListener("click", () => this.close());
     overlay.addEventListener("pointerdown", (e) => {
       if (e.target === overlay) this.close();
@@ -305,6 +432,9 @@ export class MusicPlayer {
   }
 
   private async playIndex(i: number): Promise<void> {
+    // While a track is detached, the mini window owns playback —
+    // row clicks and transport keys must not start a second stream.
+    if (this.detachedPath) return;
     if (i < 0 || i >= this.queue.length) return;
     this.index = i;
     const item = this.queue[i];
@@ -345,6 +475,7 @@ export class MusicPlayer {
   }
 
   private toggle(): void {
+    if (this.detachedPath) return; // playback lives in the mini window
     if (this.audio.paused) void this.audio.play().then(() => this.syncPlayGlyph());
     else {
       this.audio.pause();

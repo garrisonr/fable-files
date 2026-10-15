@@ -45,8 +45,10 @@ impl Catalog {
     /// Open (or create) the catalog. WAL mode + foreign keys, always.
     pub fn open(path: &std::path::Path) -> Result<Self> {
         let conn = Connection::open(path).map_err(|e| UfmError::Database(e.to_string()))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| UfmError::Database(e.to_string()))?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        )
+        .map_err(|e| UfmError::Database(e.to_string()))?;
         let catalog = Self { conn };
         catalog.migrate()?;
         Ok(catalog)
@@ -195,17 +197,35 @@ impl Catalog {
         // Re-walks mint fresh ItemIds; reuse the stored id for the same
         // (location_id, provider_key) so labels/collections survive a
         // refresh and the FTS row stays put.
-        let stable_id: String = match item.provider_key.as_deref() {
+        let existing: Option<(String, i64, String)> = match item.provider_key.as_deref() {
             Some(pk) => self
                 .conn
                 .query_row(
-                    "SELECT id FROM items WHERE location_id = ?1 AND provider_key = ?2",
+                    "SELECT id, rowid, name FROM items WHERE location_id = ?1 AND provider_key = ?2",
                     params![item.location.to_string(), pk],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
-                .unwrap_or_else(|_| item.id.to_string()),
-            None => item.id.to_string(),
+                .ok(),
+            None => None,
         };
+        let stable_id: String = existing
+            .as_ref()
+            .map(|(id, _, _)| id.clone())
+            .unwrap_or_else(|| item.id.to_string());
+        // items_fts is external-content: the REPLACE below deletes the
+        // items row and re-inserts it under a NEW rowid, which would
+        // orphan the old FTS entry (ghost hits, and worse, a recycled
+        // rowid can join the ghost to an unrelated item). Retire the
+        // old entry with the FTS 'delete' command first, exactly as
+        // delete_unseen does.
+        if let Some((_, old_rowid, old_name)) = &existing {
+            self.conn
+                .execute(
+                    "INSERT INTO items_fts (items_fts, rowid, name) VALUES ('delete', ?1, ?2)",
+                    params![old_rowid, old_name],
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+        }
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO items
@@ -1096,6 +1116,24 @@ mod tests {
     }
 
     #[test]
+    fn reinsert_same_path_leaves_single_fts_hit() {
+        // Re-walks re-insert the same (location, provider_key) under
+        // a fresh ItemId; the items REPLACE churns the rowid, and
+        // without retiring the old external-content FTS entry the
+        // search ghosts a duplicate hit (found by the P0-2 gate).
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        cat.insert_item(&named_item(loc, "ghostcheck.txt", ItemKind::File))
+            .unwrap();
+        cat.insert_item(&named_item(loc, "ghostcheck.txt", ItemKind::File))
+            .unwrap();
+        let hits = cat.search_fts("ghostcheck*", 10).unwrap();
+        assert_eq!(hits.len(), 1, "no ghost FTS hits after re-insert");
+        assert_eq!(hits[0].0.name, "ghostcheck.txt");
+    }
+
+    #[test]
     fn search_fts_roundtrip() {
         let cat = Catalog::open_in_memory().unwrap();
         let loc = LocationId::new();
@@ -1192,6 +1230,11 @@ impl ufm_jobs::JournalSink for CatalogJournalSink {
     fn record(&self, entry: &ufm_jobs::JournalEntry) -> Result<()> {
         let conn =
             Connection::open(&self.path).map_err(|e| UfmError::Database(e.to_string()))?;
+        // P0: without a busy timeout, a journal insert that races a
+        // checkpoint write fails instantly with SQLITE_BUSY and the
+        // journal silently loses rows (the live journal was EMPTY
+        // after a night of exactly that). Wait for the lock instead.
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
         insert_journal_entry(&conn, entry)
     }
 }

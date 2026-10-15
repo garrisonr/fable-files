@@ -11,3 +11,9 @@ ufm-catalog = { path = "../ufm-catalog" }
 serde.workspace = true
 serde_json.workspace = true
 walkdir.workspace = true
+
+[dev-dependencies]
+# The subvolume gate fixture counts catalog item ROWS by provider
+# key (the shape of the live superdog evidence), which no public
+# catalog query exposes — read the test's own scratch db directly.
+rusqlite.workspace = true

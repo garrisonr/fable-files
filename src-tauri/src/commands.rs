@@ -85,6 +85,11 @@ struct MountCandidate {
     device: String,
     mountpoint: String,
     label: Option<String>,
+    /// GPT partition label — the device's own name when it has one.
+    partlabel: Option<String>,
+    /// Ancestor disk's model string (inherited down the tree, the
+    /// way rm/tran are) — the human name of last resort before ids.
+    model: Option<String>,
     removable: bool,
 }
 
@@ -93,6 +98,7 @@ fn collect_mounts(
     inherited_rm: bool,
     inherited_usb: bool,
     under_loop: bool,
+    inherited_model: Option<String>,
     out: &mut Vec<MountCandidate>,
 ) {
     let ty = node.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -101,6 +107,12 @@ fn collect_mounts(
         .and_then(|v| v.as_bool())
         .unwrap_or(inherited_rm);
     let usb = node.get("tran").and_then(|v| v.as_str()) == Some("usb") || inherited_usb;
+    let model = node
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or(inherited_model);
     let loopish = under_loop || ty == "loop" || ty == "rom";
     let fstype = node.get("fstype").and_then(|v| v.as_str()).unwrap_or("");
     if !loopish && fstype != "squashfs" {
@@ -118,6 +130,12 @@ fn collect_mounts(
                         .and_then(|v| v.as_str())
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty()),
+                    partlabel: node
+                        .get("partlabel")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                    model: model.clone(),
                     removable: rm || usb,
                 });
             }
@@ -125,7 +143,7 @@ fn collect_mounts(
     }
     if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
         for child in children {
-            collect_mounts(child, rm, usb, loopish, out);
+            collect_mounts(child, rm, usb, loopish, model.clone(), out);
         }
     }
 }
@@ -135,7 +153,7 @@ fn enumerate_mounted_volumes() -> Vec<MountedVolume> {
         .args([
             "-J",
             "-o",
-            "NAME,TYPE,RM,TRAN,MOUNTPOINTS,LABEL,FSTYPE",
+            "NAME,TYPE,RM,TRAN,MOUNTPOINTS,LABEL,PARTLABEL,MODEL,FSTYPE",
         ])
         .output()
     {
@@ -149,7 +167,7 @@ fn enumerate_mounted_volumes() -> Vec<MountedVolume> {
     let mut candidates = Vec::new();
     if let Some(list) = parsed.get("blockdevices").and_then(|v| v.as_array()) {
         for d in list {
-            collect_mounts(d, false, false, false, &mut candidates);
+            collect_mounts(d, false, false, false, None, &mut candidates);
         }
     }
     // Drop system / pseudo mounts: the sidebar is for browsable volumes.
@@ -181,12 +199,27 @@ fn enumerate_mounted_volumes() -> Vec<MountedVolume> {
     let mut volumes: Vec<MountedVolume> = by_device
         .into_values()
         .map(|c| {
-            let name = c.label.clone().unwrap_or_else(|| {
-                std::path::Path::new(&c.mountpoint)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| c.mountpoint.clone())
-            });
+            // Display-name chain (UI round, Dickles' ruling): the
+            // volume LABEL first, then the device / partition name,
+            // then the disk's model, and only as a last resort a
+            // SHORTENED id — a raw 36-char UUID in the sidebar (his
+            // LUKS superdog) names nothing a human recognizes.
+            let name = c
+                .label
+                .clone()
+                .or(c.partlabel.clone())
+                .or(c.model.clone())
+                .unwrap_or_else(|| {
+                    let base = std::path::Path::new(&c.mountpoint)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| c.mountpoint.clone());
+                    if base.chars().count() > 12 {
+                        format!("{}…", base.chars().take(8).collect::<String>())
+                    } else {
+                        base
+                    }
+                });
             MountedVolume {
                 name,
                 path: c.mountpoint,
@@ -689,6 +722,7 @@ fn emit_job_progress(
             "steps_total": job.steps.len(),
             "bytes_done": bytes_done,
             "bytes_total": job.preview.bytes_to_move,
+            "packed": job.packed,
             "current": current,
             "done": matches!(
                 job.state,
@@ -1569,20 +1603,87 @@ fn build_outcome(step: &ufm_jobs::Step, note: Option<&str>) -> ufm_jobs::JobOutc
     }
 }
 
-/// Record one step transition everywhere it must land: the in-memory
-/// snapshot, the durable journal, and the jobs-table snapshot.
+/// P0 (2026-10-14, "pause/cancel are dead"): how often the executor
+/// persists the whole-job blob. The blob is a CHECKPOINT, not a
+/// journal — the append-only journal rows are the per-event record,
+/// and startup recovery replays them over the checkpoint. The old
+/// design rewrote the blob on EVERY transition: for Dickles' 291k-
+/// file copy the blob is 616 MB, so each file paid two 616 MB
+/// serializations + writes, the journal's own inserts lost the
+/// write-lock race (the live journal table was EMPTY), and pause /
+/// cancel clicks paid the same 616 MB clone+write under the catalog
+/// lock — the buttons weren't broken, the bookkeeping was the job.
+/// The blob now lands on: this many transitions, this many seconds,
+/// any outcome-step completion (undo records are load-bearing), and
+/// every job-level transition (transition_job always writes).
+struct SnapshotGate {
+    since_write: u32,
+    last: std::time::Instant,
+}
+
+impl SnapshotGate {
+    fn new() -> Self {
+        Self {
+            since_write: 0,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn should_write(&mut self, force: bool) -> bool {
+        self.since_write += 1;
+        let due = force
+            || self.since_write >= 1000
+            || self.last.elapsed() >= std::time::Duration::from_secs(10);
+        if due {
+            self.since_write = 0;
+            self.last = std::time::Instant::now();
+        }
+        due
+    }
+}
+
+/// What a step transition changed, as counts — the emit path works
+/// from these plus a short lock, never from a cloned job (P0: one
+/// clone of a 465k-step job is ~600 MB of allocation).
+struct StepFx {
+    bytes_done: u64,
+}
+
+/// Emit `job-progress` from the handle's live state under a short
+/// lock — no job clone, no blob write (P0).
+fn emit_from_handle(
+    app: &tauri::AppHandle,
+    handle: &JobHandle,
+    bytes_done: u64,
+    current: Option<&str>,
+    error: Option<&str>,
+) {
+    let j = handle.job.lock().unwrap();
+    emit_job_progress(app, &j, bytes_done, current, error);
+}
+
+/// Bytes attributable to finished steps, computed under the lock.
+fn locked_bytes_done(handle: &JobHandle) -> u64 {
+    let j = handle.job.lock().unwrap();
+    job_bytes_done(&j)
+}
+
+/// Record one step transition everywhere it must land: the
+/// in-memory state, the durable journal (append-only, per event),
+/// and — gated by `gate` — the jobs-table checkpoint blob.
 /// Inc-2: when an outcome step (§2.2) finishes, its `JobOutcome` is
-/// appended under the same lock, before the upsert, so the outcome is
-/// durable in the same snapshot write as the transition itself.
+/// appended under the same lock; an outcome completion also forces
+/// a checkpoint, so the outcome is durable with the transition.
 fn transition_step(
     handle: &JobHandle,
     catalog: &ufm_catalog::Catalog,
     journal: &mut ufm_jobs::JobJournal,
+    gate: &mut SnapshotGate,
     step_id: &str,
     to: ufm_jobs::StepState,
     note: Option<String>,
-) -> ufm_jobs::Job {
-    let (snap, from) = {
+) -> StepFx {
+    let (fx, job_id, from, checkpoint) = {
         let mut j = handle.job.lock().unwrap();
         let from = j
             .steps
@@ -1592,12 +1693,14 @@ fn transition_step(
         if let Some(s) = j.steps.get_mut(step_id) {
             s.state = to;
         }
+        let mut outcome_completed = false;
         if matches!(
             to,
             ufm_jobs::StepState::Done | ufm_jobs::StepState::Skipped
         ) {
             let outcome = j.steps.get(step_id).and_then(|s| {
                 if s.outcome && !j.outcomes.iter().any(|o| o.step_id == step_id) {
+                    outcome_completed = true;
                     Some(build_outcome(s, note.as_deref()))
                 } else {
                     None
@@ -1607,11 +1710,21 @@ fn transition_step(
                 j.outcomes.push(o);
             }
         }
-        (j.clone(), from)
+        let fx = StepFx {
+            bytes_done: job_bytes_done(&j),
+        };
+        let checkpoint = if gate.should_write(outcome_completed) {
+            Some(j.clone())
+        } else {
+            None
+        };
+        (fx, j.id, from, checkpoint)
     };
-    journal.record_with_note(snap.id, step_id, from, to, note);
-    let _ = catalog.upsert_job(&snap);
-    snap
+    journal.record_with_note(job_id, step_id, from, to, note);
+    if let Some(snap) = checkpoint {
+        let _ = catalog.upsert_job(&snap);
+    }
+    fx
 }
 
 /// Set the job-level state and persist the snapshot.
@@ -1764,7 +1877,6 @@ fn execute_step(
     op: &ufm_jobs::StepOp,
     handle: &JobHandle,
     app: &tauri::AppHandle,
-    job_snapshot: &ufm_jobs::Job,
     bytes_done: &mut u64,
 ) -> StepOutcome {
     use std::io::{Read, Write};
@@ -1827,9 +1939,9 @@ fn execute_step(
                         *bytes_done += n as u64;
                         if last_emit.elapsed() >= std::time::Duration::from_millis(150)
                         {
-                            emit_job_progress(
+                            emit_from_handle(
                                 app,
-                                job_snapshot,
+                                handle,
                                 *bytes_done,
                                 Some(&format!("copy {}", src_path.display())),
                                 None,
@@ -1899,6 +2011,481 @@ fn execute_step(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Packed transfer (UI round — "migrate library magic", Dickles
+// 2026-10-14, after watching Zorin Files copy 291,699 files at
+// 21.8 MB/s): when a job's Copy steps form a many-small-files tree
+// headed to a DIFFERENT device, per-file copying pays a metadata +
+// open/close round trip per file on both filesystems; streaming the
+// files back-to-back as a ustar (STORE — media does not compress
+// and the N150's CPU is precious) pipe pays it once. The engine
+// picks the mode itself at job start — no settings, no mode
+// picker; the only UI trace is a small "Packed transfer" label on
+// the job card (job.packed).
+//
+// Resume law (his standing order): a step is journaled Done only
+// after its file is fully extracted at the destination and its
+// extracted length verified. A kill mid-stream leaves extracted
+// files in place; on resume their steps are Done and the rest
+// stream again or fall to the per-file loop — the union of both
+// sides is always complete. For moves the planner's Delete steps
+// run in the main loop AFTER the copies, so a source is deleted
+// only once its copy step is Done: a crash can duplicate, never
+// lose.
+//
+// Fallback law: any packed-path failure stops the pass; every
+// not-yet-committed step simply runs through the ordinary
+// per-file loop. A job never dies because the fast path failed.
+// ---------------------------------------------------------------------------
+
+/// Packing engages when the eligible cross-device set has at least
+/// this many files and their mean size is at most
+/// PACKED_MAX_MEAN_BYTES. Starting hypotheses from the ruling;
+/// confirmed by the on-box bench in the round report — encoded here
+/// so the bench result is what ships, not vibes.
+const PACKED_MIN_FILES: u64 = 500;
+const PACKED_MAX_MEAN_BYTES: u64 = 1024 * 1024;
+/// Files above this stay per-file even inside a packed job — the
+/// stream is for the small-file mass; a giant streams fine alone.
+const PACKED_MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+/// In-flight cap between packer and unpacker: eight 256 KiB blocks
+/// (the 2026-10-14 OOM lesson — the pipe stays a pipe, never a
+/// buffer that grows with the tree).
+const PACKED_BLOCK: usize = 256 * 1024;
+
+/// One Copy step resolved for streaming.
+struct PackedFile {
+    step_id: String,
+    src: PathBuf,
+    dst: PathBuf,
+    size: u64,
+}
+
+/// Nearest existing ancestor (device checks need a real path; the
+/// destination tree's deeper parents are Mkdir steps that may not
+/// have run yet when the pass is chosen).
+fn existing_ancestor(p: &Path) -> PathBuf {
+    let mut cur = p.to_path_buf();
+    while !cur.exists() {
+        if !cur.pop() {
+            break;
+        }
+    }
+    cur
+}
+
+/// The pure shape test, unit-tested separately (device identity is
+/// un-fakeable in a unit test).
+fn packed_shape(count: u64, total_bytes: u64) -> bool {
+    count >= PACKED_MIN_FILES && total_bytes / count.max(1) <= PACKED_MAX_MEAN_BYTES
+}
+
+/// Choose the packed set for a job, or None when per-file is right.
+/// Eligible Copy steps: Pending, no VerifyCopy dependency
+/// (verify-then-skip keeps its own semantics), both paths present,
+/// size at most PACKED_MAX_FILE_BYTES, and the source on a
+/// different device than the destination parent. The SET must then
+/// clear the count and mean-size thresholds.
+fn packed_candidates(job: &ufm_jobs::Job) -> Option<Vec<PackedFile>> {
+    let mut out: Vec<PackedFile> = Vec::new();
+    for step in job.steps.values() {
+        if !matches!(step.state, ufm_jobs::StepState::Pending) {
+            continue;
+        }
+        let ufm_jobs::StepOp::Copy {
+            src,
+            dst_parent,
+            new_name,
+        } = &step.op
+        else {
+            continue;
+        };
+        let verify_gated = step.depends_on.iter().any(|d| {
+            matches!(
+                job.steps.get(d),
+                Some(s) if matches!(s.op, ufm_jobs::StepOp::VerifyCopy { .. })
+            )
+        });
+        if verify_gated {
+            continue;
+        }
+        let (Some(src_key), Some(dst_key)) =
+            (src.provider_key.as_ref(), dst_parent.provider_key.as_ref())
+        else {
+            continue;
+        };
+        let size = src.size_bytes.unwrap_or(0);
+        if size > PACKED_MAX_FILE_BYTES {
+            continue;
+        }
+        let src_path = Path::new(src_key);
+        if same_device(src_path, &existing_ancestor(Path::new(dst_key))) {
+            continue;
+        }
+        out.push(PackedFile {
+            step_id: step.id.clone(),
+            src: src_path.to_path_buf(),
+            dst: Path::new(dst_key).join(new_name),
+            size,
+        });
+    }
+    let count = out.len() as u64;
+    let total: u64 = out.iter().map(|f| f.size).sum();
+    if !packed_shape(count, total) {
+        return None;
+    }
+    // Deterministic stream order (steps live in a HashMap).
+    out.sort_by(|a, b| a.step_id.cmp(&b.step_id));
+    Some(out)
+}
+
+/// Write one ustar header for `name` — the step id: short, ASCII,
+/// unique; the unpacker maps it back to the step's destination.
+fn ustar_header(name: &str, size: u64, mode: u32) -> [u8; 512] {
+    let mut h = [0u8; 512];
+    let put_name = |h: &mut [u8; 512]| {
+        let bytes = name.as_bytes();
+        let n = bytes.len().min(100);
+        h[..n].copy_from_slice(&bytes[..n]);
+    };
+    put_name(&mut h);
+    let put_octal = |h: &mut [u8; 512], off: usize, width: usize, v: u64| {
+        let s = format!("{:0width$o}", v, width = width - 1);
+        h[off..off + width - 1].copy_from_slice(s.as_bytes());
+        h[off + width - 1] = 0;
+    };
+    put_octal(&mut h, 100, 8, mode as u64);
+    put_octal(&mut h, 108, 8, 0); // uid — not carried
+    put_octal(&mut h, 116, 8, 0); // gid — not carried
+    put_octal(&mut h, 124, 12, size);
+    put_octal(&mut h, 136, 12, 0); // mtime — not carried; extraction is content-true
+    h[156] = b'0'; // regular file
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    // Checksum over the block with the field treated as spaces.
+    let sum: u64 = h
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| if (148..156).contains(&i) { b' ' as u64 } else { b as u64 })
+        .sum();
+    let chk = format!("{:06o}", sum);
+    h[148..154].copy_from_slice(chk.as_bytes());
+    h[154] = 0;
+    h[155] = b' ';
+    h
+}
+
+/// Parse one ustar header block. None = the end-of-archive zero
+/// block (or a corrupt read — the pass then stops and the per-file
+/// fallback takes the rest).
+fn ustar_parse(block: &[u8; 512]) -> Option<(String, u64, u32)> {
+    if block.iter().all(|&b| b == 0) {
+        return None;
+    }
+    if &block[257..262] != b"ustar" {
+        return None;
+    }
+    let field = |off: usize, len: usize| -> String {
+        let raw = &block[off..off + len];
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(len);
+        String::from_utf8_lossy(&raw[..end]).into_owned()
+    };
+    let octal = |off: usize, len: usize| -> u64 {
+        let mut v: u64 = 0;
+        for &b in &block[off..off + len] {
+            match b {
+                b'0'..=b'7' => v = v * 8 + (b - b'0') as u64,
+                b' ' if v == 0 => {} // leading space padding
+                _ => break,
+            }
+        }
+        v
+    };
+    let name = field(0, 100);
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, octal(124, 12), octal(100, 8) as u32))
+}
+
+/// The unpacker's view of the pipe: a byte stream reassembled from
+/// bounded blocks.
+struct BlockReader {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    cur: Vec<u8>,
+    pos: usize,
+}
+
+impl BlockReader {
+    /// Fill `buf` completely; false on end of stream / broken pipe.
+    fn read_exact(&mut self, buf: &mut [u8]) -> bool {
+        let mut filled = 0;
+        while filled < buf.len() {
+            if self.pos >= self.cur.len() {
+                match self.rx.recv() {
+                    Ok(block) => {
+                        self.cur = block;
+                        self.pos = 0;
+                    }
+                    Err(_) => return false,
+                }
+                if self.cur.is_empty() {
+                    continue;
+                }
+            }
+            let n = (buf.len() - filled).min(self.cur.len() - self.pos);
+            buf[filled..filled + n]
+                .copy_from_slice(&self.cur[self.pos..self.pos + n]);
+            self.pos += n;
+            filled += n;
+        }
+        true
+    }
+
+    /// Stream exactly `n` bytes into `w`; None on a short stream.
+    fn copy_n<W: std::io::Write>(&mut self, w: &mut W, mut n: u64) -> Option<u64> {
+        let mut done = 0u64;
+        while n > 0 {
+            if self.pos >= self.cur.len() {
+                match self.rx.recv() {
+                    Ok(block) => {
+                        self.cur = block;
+                        self.pos = 0;
+                    }
+                    Err(_) => return None,
+                }
+                if self.cur.is_empty() {
+                    continue;
+                }
+            }
+            let take = n.min((self.cur.len() - self.pos) as u64) as usize;
+            if w.write_all(&self.cur[self.pos..self.pos + take]).is_err() {
+                return None;
+            }
+            self.pos += take;
+            n -= take as u64;
+            done += take as u64;
+        }
+        Some(done)
+    }
+
+    /// Discard `n` bytes (padding, or an unplaceable entry's body).
+    fn skip_n(&mut self, mut n: u64) -> bool {
+        while n > 0 {
+            if self.pos >= self.cur.len() {
+                match self.rx.recv() {
+                    Ok(block) => {
+                        self.cur = block;
+                        self.pos = 0;
+                    }
+                    Err(_) => return false,
+                }
+                if self.cur.is_empty() {
+                    continue;
+                }
+            }
+            let take = n.min((self.cur.len() - self.pos) as u64) as usize;
+            self.pos += take;
+            n -= take as u64;
+        }
+        true
+    }
+}
+
+/// The unpacker thread: consumes the ustar stream, extracts each
+/// entry to the destination its step id maps to, and reports every
+/// fully-extracted (length-verified) file back for journaling. Any
+/// failure removes the in-flight partial file and ends the thread —
+/// the caller treats unreported steps as not done (fallback law).
+fn unpack_stream(
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    dests: std::sync::Arc<std::collections::HashMap<String, PathBuf>>,
+    done_tx: std::sync::mpsc::SyncSender<String>,
+) {
+    use std::io::Write as _;
+    let mut reader = BlockReader {
+        rx,
+        cur: Vec::new(),
+        pos: 0,
+    };
+    let mut header = [0u8; 512];
+    loop {
+        if !reader.read_exact(&mut header) {
+            return;
+        }
+        let Some((name, size, mode)) = ustar_parse(&header) else {
+            return; // end-of-archive zero block, or corrupt header
+        };
+        let pad = (512 - size % 512) % 512;
+        let Some(dst) = dests.get(&name) else {
+            // Unknown entry — cannot place it; skip its body to stay
+            // in frame and keep going.
+            if !reader.skip_n(size + pad) {
+                return;
+            }
+            continue;
+        };
+        let ok = (|| -> bool {
+            if let Some(parent) = dst.parent() {
+                if std::fs::create_dir_all(parent).is_err() {
+                    return false;
+                }
+            }
+            let mut out = match std::fs::File::create(dst) {
+                Ok(f) => f,
+                Err(_) => return false,
+            };
+            if reader.copy_n(&mut out, size) != Some(size) {
+                return false;
+            }
+            if !reader.skip_n(pad) {
+                return false;
+            }
+            let _ = out.flush();
+            if mode != 0 {
+                let _ = std::fs::set_permissions(
+                    dst,
+                    std::os::unix::fs::PermissionsExt::from_mode(mode),
+                );
+            }
+            true
+        })();
+        if !ok {
+            let _ = std::fs::remove_file(dst);
+            return;
+        }
+        if done_tx.send(name).is_err() {
+            return;
+        }
+    }
+}
+
+/// Run the packed pass over `files`: spawn the unpacker, stream the
+/// files to it as ustar, and journal each reported extraction via
+/// `transition_step` — the same commit the per-file loop uses, so
+/// resume semantics are identical in both modes. Returns the number
+/// of files committed; the rest stay Pending for the ordinary loop
+/// (fallback law). Pause/cancel land between files.
+fn run_packed_pass(
+    app: &tauri::AppHandle,
+    handle: &JobHandle,
+    catalog: &ufm_catalog::Catalog,
+    journal: &mut ufm_jobs::JobJournal,
+    gate: &mut SnapshotGate,
+    files: &[PackedFile],
+    bytes_done: &mut u64,
+) -> usize {
+    use std::io::Read;
+    let dests: std::sync::Arc<std::collections::HashMap<String, PathBuf>> =
+        std::sync::Arc::new(
+            files
+                .iter()
+                .map(|f| (f.step_id.clone(), f.dst.clone()))
+                .collect(),
+        );
+    let (block_tx, block_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<String>(64);
+    let unpacker = {
+        let dests = dests.clone();
+        std::thread::spawn(move || unpack_stream(block_rx, dests, done_tx))
+    };
+    let mut committed = 0usize;
+    let mut last_emit = std::time::Instant::now();
+    // Journal every extraction the unpacker has reported so far.
+    let mut drain = |journal: &mut ufm_jobs::JobJournal,
+                     gate: &mut SnapshotGate,
+                     bytes_done: &mut u64,
+                     committed: &mut usize,
+                     last_emit: &mut std::time::Instant,
+                     force_emit: bool| {
+        while let Ok(step_id) = done_rx.try_recv() {
+            let fx = transition_step(
+                handle,
+                catalog,
+                journal,
+                gate,
+                &step_id,
+                ufm_jobs::StepState::Done,
+                Some("packed".into()),
+            );
+            *bytes_done = fx.bytes_done;
+            *committed += 1;
+            if force_emit
+                || last_emit.elapsed() >= std::time::Duration::from_millis(150)
+            {
+                emit_from_handle(app, handle, *bytes_done, Some("packed transfer"), None);
+                *last_emit = std::time::Instant::now();
+            }
+        }
+    };
+    let mut send = |bytes: Vec<u8>| block_tx.send(bytes).is_ok();
+    'stream: for f in files {
+        if flag(&handle.cancel) {
+            break 'stream;
+        }
+        if flag(&handle.pause) && !wait_while_paused(handle) {
+            break 'stream; // cancelled while paused
+        }
+        // Stream the file's CURRENT length — a tree can grow between
+        // planning and execution; the packed copy is content-true,
+        // the planner's totals stay the progress denominator.
+        let meta = match std::fs::metadata(&f.src) {
+            Ok(m) => m,
+            Err(_) => break 'stream, // vanished source — the per-file fallback owns its error
+        };
+        let size = meta.len();
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            meta.permissions().mode() & 0o7777
+        };
+        let mut input = match std::fs::File::open(&f.src) {
+            Ok(x) => x,
+            Err(_) => break 'stream,
+        };
+        if !send(ustar_header(&f.step_id, size, mode).to_vec()) {
+            break 'stream;
+        }
+        let mut remaining = size;
+        let mut buf = vec![0u8; PACKED_BLOCK];
+        let mut short = false;
+        while remaining > 0 {
+            let want = (remaining as usize).min(PACKED_BLOCK);
+            match input.read(&mut buf[..want]) {
+                Ok(0) => {
+                    short = true;
+                    break;
+                } // shrank mid-stream — stop the pass, stay honest
+                Ok(n) => {
+                    if !send(buf[..n].to_vec()) {
+                        short = true;
+                        break;
+                    }
+                    remaining -= n as u64;
+                }
+                Err(_) => {
+                    short = true;
+                    break;
+                }
+            }
+        }
+        if short {
+            break 'stream;
+        }
+        let pad = (512 - size % 512) % 512;
+        if pad > 0 && !send(vec![0u8; pad as usize]) {
+            break 'stream;
+        }
+        drain(journal, gate, bytes_done, &mut committed, &mut last_emit, false);
+    }
+    drop(send);
+    let _ = block_tx.send(vec![0u8; 1024]); // end-of-archive marker
+    drop(block_tx);
+    // Final sweep: everything the unpacker reported before exiting.
+    let _ = unpacker.join();
+    drain(journal, gate, bytes_done, &mut committed, &mut last_emit, true);
+    committed
+}
+
 /// The executor: one blocking task per running job. Replays the durable
 /// journal over the snapshot first (crash leftovers normalize Running ->
 /// Pending), then runs every unfinished step in DAG order.
@@ -1933,6 +2520,9 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
         let mut j = handle.job.lock().unwrap();
         replay.replay_into(&mut j);
     }
+    // P0: the blob is checkpointed through this gate, never per
+    // transition (see SnapshotGate).
+    let mut gate = SnapshotGate::new();
     let mut bytes_done = job_bytes_done(&handle.snapshot());
     let snap = transition_job(&handle, &catalog, ufm_jobs::JobState::Running);
     emit_job_progress(&app, &snap, bytes_done, None, None);
@@ -1948,6 +2538,31 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
             return;
         }
     };
+
+    // Packed transfer (UI round): if this job's cross-device Copy
+    // mass qualifies, stream it first. The loop below then simply
+    // finds those steps Done and runs the rest — Mkdir steps,
+    // Delete companions (a move's source dies only after its copy
+    // committed), verify-gated and oversized copies.
+    if let Some(files) = packed_candidates(&handle.snapshot()) {
+        let snap = {
+            let mut j = handle.job.lock().unwrap();
+            j.packed = true;
+            j.clone()
+        };
+        let _ = catalog.upsert_job(&snap);
+        let snap = handle.snapshot();
+        emit_job_progress(&app, &snap, bytes_done, Some("packed transfer"), None);
+        run_packed_pass(
+            &app,
+            &handle,
+            &catalog,
+            &mut journal,
+            &mut gate,
+            &files,
+            &mut bytes_done,
+        );
+    }
 
     for step_id in &order {
         let step = {
@@ -1980,59 +2595,64 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
                 })
             };
             if verify_skipped {
-                let snap = transition_step(
+                let fx = transition_step(
                     &handle,
                     &catalog,
                     &mut journal,
+                    &mut gate,
                     step_id,
                     ufm_jobs::StepState::Skipped,
                     None,
                 );
-                bytes_done = job_bytes_done(&snap);
-                emit_job_progress(&app, &snap, bytes_done, None, None);
+                bytes_done = fx.bytes_done;
+                emit_from_handle(&app, &handle, bytes_done, None, None);
                 continue;
             }
         }
-        let snap = transition_step(
+        transition_step(
             &handle,
             &catalog,
             &mut journal,
+            &mut gate,
             step_id,
             ufm_jobs::StepState::Running,
             None,
         );
-        emit_job_progress(&app, &snap, bytes_done, Some(&step.label), None);
-        let outcome = execute_step(&step.op, &handle, &app, &snap, &mut bytes_done);
+        emit_from_handle(&app, &handle, bytes_done, Some(&step.label), None);
+        let outcome = execute_step(&step.op, &handle, &app, &mut bytes_done);
         match outcome {
             StepOutcome::Done(note) => {
-                let snap = transition_step(
+                let fx = transition_step(
                     &handle,
                     &catalog,
                     &mut journal,
+                    &mut gate,
                     step_id,
                     ufm_jobs::StepState::Done,
                     note,
                 );
-                bytes_done = job_bytes_done(&snap);
-                emit_job_progress(&app, &snap, bytes_done, None, None);
+                bytes_done = fx.bytes_done;
+                emit_from_handle(&app, &handle, bytes_done, None, None);
             }
             StepOutcome::Skipped => {
-                let snap = transition_step(
+                let fx = transition_step(
                     &handle,
                     &catalog,
                     &mut journal,
+                    &mut gate,
                     step_id,
                     ufm_jobs::StepState::Skipped,
                     None,
                 );
-                bytes_done = job_bytes_done(&snap);
-                emit_job_progress(&app, &snap, bytes_done, None, None);
+                bytes_done = fx.bytes_done;
+                emit_from_handle(&app, &handle, bytes_done, None, None);
             }
             StepOutcome::Failed(msg) => {
                 transition_step(
                     &handle,
                     &catalog,
                     &mut journal,
+                    &mut gate,
                     step_id,
                     ufm_jobs::StepState::Failed,
                     Some(msg.clone()),
@@ -2053,6 +2673,7 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
                     &handle,
                     &catalog,
                     &mut journal,
+                    &mut gate,
                     step_id,
                     ufm_jobs::StepState::Pending,
                     Some("cancelled mid-step; partial output removed".into()),
@@ -2104,24 +2725,123 @@ fn job_handle(state: &AppState, job: JobId) -> Cmd<JobHandle> {
         .ok_or_else(|| CommandError::from(UfmError::NotFound("unknown job".into())))
 }
 
+/// What a `start_*` command hands back (UI round): the job id, plus
+/// whether the submission was folded into an identical job that is
+/// already active — the double-submit guard below. Serialized
+/// camelCase like the request structs (seam-pinned in the tests).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobStart {
+    pub job_id: String,
+    pub already_running: bool,
+}
+
+/// Identity of a submission: what makes two `start_*` calls the SAME
+/// operation. Derived from the job's outcome steps (one per top-level
+/// source): op kind + sorted source paths + destination. A decomposed
+/// cross-device move plans Copy outcome steps plus Delete steps for
+/// the originals — the Delete steps are what mark it as a move rather
+/// than a copy. Jobs with no outcome sources (planner edge cases)
+/// get a unique signature so the guard never fires on them.
+fn job_signature(job: &ufm_jobs::Job) -> String {
+    let key = |item: &Item| {
+        item.provider_key
+            .clone()
+            .unwrap_or_else(|| item.name.clone())
+    };
+    let has_delete_step = job
+        .steps
+        .values()
+        .any(|s| matches!(s.op, ufm_jobs::StepOp::Delete { .. }));
+    let mut op = "job";
+    let mut srcs: Vec<String> = Vec::new();
+    let mut dst = String::new();
+    for step in job.steps.values() {
+        if !step.outcome {
+            continue;
+        }
+        match &step.op {
+            ufm_jobs::StepOp::Copy { src, dst_parent, .. } => {
+                op = if has_delete_step { "move" } else { "copy" };
+                srcs.push(key(src));
+                dst = key(dst_parent);
+            }
+            ufm_jobs::StepOp::Move { src, dst_parent, .. } => {
+                op = "move";
+                srcs.push(key(src));
+                dst = key(dst_parent);
+            }
+            ufm_jobs::StepOp::Delete { target, use_trash } => {
+                op = if *use_trash { "trash" } else { "delete" };
+                srcs.push(key(target));
+            }
+            ufm_jobs::StepOp::VerifyCopy { src, dst: dst_item } => {
+                if op == "job" {
+                    op = "copy";
+                }
+                srcs.push(key(src));
+                if dst.is_empty() {
+                    dst = key(dst_item);
+                }
+            }
+            ufm_jobs::StepOp::Mkdir { .. } => {}
+        }
+    }
+    if srcs.is_empty() {
+        return format!("unique:{}", job.id);
+    }
+    srcs.sort();
+    srcs.dedup();
+    format!("{op}|{}|{dst}", srcs.join("\u{1f}"))
+}
+
 /// The shared tail of every `start_*` command (inc-2 §2.1):
 /// journal-first upsert → register the handle → spawn the executor.
 /// The snapshot is durable before any step runs, so even a crash
 /// mid-operation leaves a resumable record.
+///
+/// UI round — double-submit guard (Dickles' live incident,
+/// 2026-10-14: a double-pressed copy shortcut spawned TWO identical
+/// jobs that crawled, both writing the same destination tree). An
+/// identical submission while a job is Queued/Running/Paused folds
+/// into the existing job: no twin is planned into the registry, the
+/// existing job's progress is re-emitted so the panel surfaces it,
+/// and the caller learns it was a duplicate so it can say so.
 fn start_job(
     app: tauri::AppHandle,
     state: &AppState,
     job: ufm_jobs::Job,
-) -> Cmd<JobId> {
+) -> Cmd<JobStart> {
+    let sig = job_signature(&job);
+    let mut jobs = state.jobs.lock().unwrap();
+    for (id, handle) in jobs.iter() {
+        let snap = handle.snapshot();
+        if matches!(
+            snap.state,
+            ufm_jobs::JobState::Queued
+                | ufm_jobs::JobState::Running
+                | ufm_jobs::JobState::Paused
+        ) && job_signature(&snap) == sig
+        {
+            let existing_id = *id;
+            let bytes = job_bytes_done(&snap);
+            drop(jobs);
+            emit_job_progress(&app, &snap, bytes, None, None);
+            return Ok(JobStart {
+                job_id: existing_id.to_string(),
+                already_running: true,
+            });
+        }
+    }
     let id = job.id;
     state.catalog.lock().unwrap().upsert_job(&job)?;
-    state
-        .jobs
-        .lock()
-        .unwrap()
-        .insert(id, JobHandle::new(job, false));
+    jobs.insert(id, JobHandle::new(job, false));
+    drop(jobs);
     spawn_executor(app, state, id);
-    Ok(id)
+    Ok(JobStart {
+        job_id: id.to_string(),
+        already_running: false,
+    })
 }
 
 /// Resolve id-based sources to paths through the live-browse caches
@@ -2167,7 +2887,7 @@ pub async fn start_copy(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     req: CopyRequest,
-) -> Cmd<JobId> {
+) -> Cmd<JobStart> {
     let job = build_copy_job(&state, &req)?;
     start_job(app, &state, job)
 }
@@ -2217,7 +2937,7 @@ pub async fn start_move(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     req: MoveRequest,
-) -> Cmd<JobId> {
+) -> Cmd<JobStart> {
     let (srcs, location) = resolve_source_paths(&state, &req.sources)?;
     let job = plan_move_job(&srcs, Path::new(&req.dst_dir), location)?;
     start_job(app, &state, job)
@@ -2228,7 +2948,7 @@ pub async fn start_move_from_paths(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     req: MovePathsRequest,
-) -> Cmd<JobId> {
+) -> Cmd<JobStart> {
     let srcs: Vec<PathBuf> = req.sources.iter().map(PathBuf::from).collect();
     let location = location_for_path(&state, Path::new(&req.dst_dir));
     let job = plan_move_job(&srcs, Path::new(&req.dst_dir), location)?;
@@ -2240,7 +2960,7 @@ pub async fn start_copy_from_paths(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     req: CopyPathsRequest,
-) -> Cmd<JobId> {
+) -> Cmd<JobStart> {
     let srcs: Vec<PathBuf> = req.sources.iter().map(PathBuf::from).collect();
     let location = location_for_path(&state, Path::new(&req.dst_dir));
     let job = plan_copy_job_paths(&srcs, Path::new(&req.dst_dir), location)?;
@@ -2252,7 +2972,7 @@ pub async fn start_delete(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     req: DeleteRequest,
-) -> Cmd<JobId> {
+) -> Cmd<JobStart> {
     let (srcs, location) = resolve_source_paths(&state, &req.sources)?;
     let job = plan_delete_job(&srcs, req.use_trash, location)?;
     start_job(app, &state, job)
@@ -2263,7 +2983,7 @@ pub async fn start_delete_from_paths(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     req: DeletePathsRequest,
-) -> Cmd<JobId> {
+) -> Cmd<JobStart> {
     let srcs: Vec<PathBuf> = req.paths.iter().map(PathBuf::from).collect();
     let location = srcs
         .first()
@@ -2283,6 +3003,8 @@ pub struct JobSummary {
     pub steps_total: usize,
     pub bytes_done: u64,
     pub bytes_total: u64,
+    /// UI round (packed transfer): the card's "Packed transfer" label.
+    pub packed: bool,
 }
 
 #[tauri::command]
@@ -2311,6 +3033,7 @@ pub async fn list_jobs(state: State<'_, AppState>) -> Cmd<Vec<JobSummary>> {
             steps_total: j.steps.len(),
             bytes_done: job_bytes_done(j),
             bytes_total: j.preview.bytes_to_move,
+            packed: j.packed,
         })
         .collect())
 }
@@ -2333,10 +3056,17 @@ pub async fn pause_job(
     job: JobId,
 ) -> Cmd<()> {
     let handle = job_handle(&state, job)?;
+    // P0: pause is a flag + a state + an emit — all O(1)-ish, no job
+    // clone, no blob write. The executor polls the flag (Copy checks
+    // it every 1 MiB chunk and between steps), so the effect lands
+    // within a second at ANY DAG size. Durability: the executor's
+    // snapshot gate checkpoints within seconds while it runs, and
+    // if the app dies first, startup recovery replays the journal
+    // over the checkpoint and normalizes Running -> Paused anyway.
     handle
         .pause
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let snap = {
+    {
         let mut j = handle.job.lock().unwrap();
         if matches!(
             j.state,
@@ -2344,10 +3074,9 @@ pub async fn pause_job(
         ) {
             j.state = ufm_jobs::JobState::Paused;
         }
-        j.clone()
-    };
-    state.catalog.lock().unwrap().upsert_job(&snap)?;
-    emit_job_progress(&app, &snap, job_bytes_done(&snap), None, None);
+    }
+    let bytes = locked_bytes_done(&handle);
+    emit_from_handle(&app, &handle, bytes, None, None);
     Ok(())
 }
 
@@ -2379,6 +3108,24 @@ pub async fn resume_job(
     Ok(())
 }
 
+/// One unconditional checkpoint write of the handle's job blob.
+fn checkpoint_handle(handle: &JobHandle, catalog: &ufm_catalog::Catalog) {
+    let snap = handle.snapshot();
+    let _ = catalog.upsert_job(&snap);
+}
+
+/// Settle a job to Cancelled without an executor (P0): a recovered
+/// or never-started job has nobody to consume the cancel flag, so
+/// the command settles it directly — terminal state in memory plus
+/// one checkpoint write.
+fn settle_cancelled(handle: &JobHandle, catalog: &ufm_catalog::Catalog) {
+    {
+        let mut j = handle.job.lock().unwrap();
+        j.state = ufm_jobs::JobState::Cancelled;
+    }
+    checkpoint_handle(handle, catalog);
+}
+
 #[tauri::command]
 pub async fn cancel_job(
     app: tauri::AppHandle,
@@ -2393,15 +3140,22 @@ pub async fn cancel_job(
         .pause
         .store(false, std::sync::atomic::Ordering::SeqCst);
     if !flag(&handle.live) {
-        // No executor to finalize it (e.g. a recovered job): cancel
-        // in place.
-        let snap = {
+        // No executor to finalize it (e.g. a recovered job): settle
+        // in place — emit first so the card clears immediately.
+        {
             let mut j = handle.job.lock().unwrap();
             j.state = ufm_jobs::JobState::Cancelled;
-            j.clone()
-        };
-        state.catalog.lock().unwrap().upsert_job(&snap)?;
-        emit_job_progress(&app, &snap, job_bytes_done(&snap), None, None);
+        }
+        let bytes = locked_bytes_done(&handle);
+        emit_from_handle(&app, &handle, bytes, None, None);
+        checkpoint_handle(&handle, &state.catalog.lock().unwrap());
+    } else {
+        // Live executor: the flag lands at the next chunk/step
+        // boundary (P0: boundaries arrive constantly now) and the
+        // executor finalizes + emits the terminal state. Emit once
+        // now so the click visibly registers.
+        let bytes = locked_bytes_done(&handle);
+        emit_from_handle(&app, &handle, bytes, None, None);
     }
     Ok(())
 }
@@ -2425,6 +3179,9 @@ fn type_extensions(filter: &str) -> Option<&'static [&'static str]> {
         "audio" => Some(&["mp3", "flac", "ogg", "oga", "wav", "m4a", "m4b", "opus", "aac"][..]),
         "document" => Some(&["pdf", "doc", "docx", "odt", "epub", "txt", "md", "rtf", "csv", "tsv"][..]),
         "archive" => Some(&["zip", "7z", "rar", "tar", "gz", "bz2", "xz", "tgz"][..]),
+        // UI round (Dickles: "I'm old"): mail files are a first-class
+        // search type — .eml messages, Outlook .msg, .mbox archives.
+        "email" => Some(&["eml", "msg", "mbox"][..]),
         _ => None,
     }
 }
@@ -4601,24 +5358,47 @@ fn query_encode(v: &str) -> String {
     out
 }
 
-/// Pop the video player out into its own window.
+/// Pop the player out into its own window. UI round: this is now the
+/// DETACH window — always-on-top mini player (Dickles: "same rule
+/// about detaching" for video AND audio), sized like a mini, and it
+/// receives the live playback state (`start` seconds + `autoplay`)
+/// so playback continues from the exact position instead of
+/// restarting. The window hands state back through `player-state` /
+/// `player-return` events (see ui/src/main.ts + quicklook.ts).
 #[tauri::command]
-pub async fn open_player_window(app: tauri::AppHandle, path: String, name: String) -> Cmd<()> {
+pub async fn open_player_window(
+    app: tauri::AppHandle,
+    path: String,
+    name: String,
+    kind: Option<String>,
+    start: Option<f64>,
+    autoplay: Option<bool>,
+) -> Cmd<()> {
     use tauri::{Emitter, Manager};
     let label = player_label(&path);
     if let Some(w) = app.get_webview_window(&label) {
         let _ = w.set_focus();
         return Ok(());
     }
+    let audio = kind.as_deref() == Some("audio");
     let url = format!(
-        "index.html?mode=player&path={}&name={}",
+        "index.html?mode=player&path={}&name={}&kind={}&start={}&autoplay={}",
         query_encode(&path),
-        query_encode(&name)
+        query_encode(&name),
+        if audio { "audio" } else { "video" },
+        start.unwrap_or(0.0).max(0.0),
+        if autoplay.unwrap_or(false) { "1" } else { "0" },
     );
+    let (w, h, min_w, min_h) = if audio {
+        (460.0, 208.0, 340.0, 170.0)
+    } else {
+        (560.0, 340.0, 320.0, 200.0)
+    };
     let window = tauri::WebviewWindowBuilder::new(&app, &label, tauri::WebviewUrl::App(url.into()))
         .title(format!("{name} — Fable Files"))
-        .inner_size(920.0, 580.0)
-        .min_inner_size(420.0, 300.0)
+        .inner_size(w, h)
+        .min_inner_size(min_w, min_h)
+        .always_on_top(true)
         .build()
         .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
     let app2 = app.clone();
@@ -9303,6 +10083,416 @@ mod tests {
             "sources": [id], "dst_dir": "/tmp/dest"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn job_start_serializes_camel_case() {
+        // UI round: the start_* commands return JobStart; the
+        // frontend reads jobId / alreadyRunning (api.ts JobStart).
+        // A lost rename here hands the shell an undefined job id and
+        // silently breaks every transfer door.
+        let v = serde_json::to_value(super::JobStart {
+            job_id: "abc".into(),
+            already_running: true,
+        })
+        .expect("JobStart serializes");
+        assert_eq!(v["jobId"], "abc");
+        assert_eq!(v["alreadyRunning"], true);
+    }
+
+    #[test]
+    fn email_type_extensions_cover_mail_files() {
+        // UI round (Dickles: "I'm old"): Email is a search type.
+        let exts = super::type_extensions("email").expect("email type exists");
+        for e in ["eml", "msg", "mbox"] {
+            assert!(exts.contains(&e), "email type must cover .{e}");
+        }
+    }
+
+    #[test]
+    fn job_signature_dedupes_identical_submissions() {
+        // UI round double-submit guard: identical submissions must
+        // share a signature (independent of the job's own id), and
+        // anything that makes them a different operation — op kind,
+        // sources, destination — must change it. A decomposed
+        // cross-device move (Copy outcome steps + Delete steps for
+        // the originals) must sign the same as a plain move.
+        use ufm_jobs::{Job, JobPreview, Step, StepOp, StepState};
+        let item = |path: &str| {
+            super::job_item(
+                ufm_core::ItemId(uuid::Uuid::nil()),
+                ufm_core::LocationId(uuid::Uuid::nil()),
+                std::path::Path::new(path),
+                ufm_vfs::ItemKind::Folder,
+                Some(10),
+            )
+        };
+        // NOTE: step ids must be unique per job — add_step keys the
+        // steps map by id, so a shared id silently eats steps (the
+        // first version of this test did exactly that and its
+        // decomposed move degenerated to a lone Delete).
+        let step = |id: &str, op: StepOp, outcome: bool| Step {
+            id: id.into(),
+            label: "step".into(),
+            op,
+            depends_on: Vec::new(),
+            state: StepState::Pending,
+            compensation: None,
+            outcome,
+            outcome_path: None,
+        };
+        let copy_op = || StepOp::Copy {
+            src: item("/superdog/richard"),
+            dst_parent: item("/media/Desk SSD"),
+            new_name: "richard".into(),
+        };
+        let mut copy1 = Job::new("Copy richard", JobPreview::default());
+        copy1.add_step(step("s1", copy_op(), true));
+        let mut copy2 = Job::new("Copy richard", JobPreview::default());
+        copy2.add_step(step("s1", copy_op(), true));
+        assert_eq!(super::job_signature(&copy1), super::job_signature(&copy2));
+
+        let mut decomposed_move = Job::new("Move richard", JobPreview::default());
+        decomposed_move.add_step(step("s1", copy_op(), true));
+        decomposed_move.add_step(step(
+            "s2",
+            StepOp::Delete {
+                target: item("/superdog/richard"),
+                use_trash: false,
+            },
+            false,
+        ));
+        let mut plain_move = Job::new("Move richard", JobPreview::default());
+        plain_move.add_step(step(
+            "s1",
+            StepOp::Move {
+                src: item("/superdog/richard"),
+                dst_parent: item("/media/Desk SSD"),
+                new_name: "richard".into(),
+            },
+            true,
+        ));
+        assert_eq!(
+            super::job_signature(&decomposed_move),
+            super::job_signature(&plain_move)
+        );
+        assert_ne!(
+            super::job_signature(&copy1),
+            super::job_signature(&plain_move)
+        );
+
+        // Destination changes the operation.
+        let mut copy_elsewhere = Job::new("Copy richard", JobPreview::default());
+        copy_elsewhere.add_step(step(
+            "s1",
+            StepOp::Copy {
+                src: item("/superdog/richard"),
+                dst_parent: item("/media/Other"),
+                new_name: "richard".into(),
+            },
+            true,
+        ));
+        assert_ne!(
+            super::job_signature(&copy1),
+            super::job_signature(&copy_elsewhere)
+        );
+
+        // Trash and permanent delete are different operations.
+        let mut trash = Job::new("Trash", JobPreview::default());
+        trash.add_step(step(
+            "s1",
+            StepOp::Delete {
+                target: item("/superdog/richard"),
+                use_trash: true,
+            },
+            true,
+        ));
+        let mut perm = Job::new("Delete", JobPreview::default());
+        perm.add_step(step(
+            "s1",
+            StepOp::Delete {
+                target: item("/superdog/richard"),
+                use_trash: false,
+            },
+            true,
+        ));
+        assert_ne!(super::job_signature(&trash), super::job_signature(&perm));
+        let mut trash2 = Job::new("Trash", JobPreview::default());
+        trash2.add_step(step(
+            "s1",
+            StepOp::Delete {
+                target: item("/superdog/richard"),
+                use_trash: true,
+            },
+            true,
+        ));
+        assert_eq!(super::job_signature(&trash), super::job_signature(&trash2));
+    }
+
+    #[test]
+    fn packed_shape_thresholds() {
+        // UI round (packed transfer): the shape gate — count AND
+        // mean size must both favor packing.
+        assert!(!super::packed_shape(499, 499 * 1024)); // too few files
+        assert!(!super::packed_shape(500, 500 * 2 * 1024 * 1024)); // mean 2 MiB
+        assert!(super::packed_shape(500, 500 * 512 * 1024)); // mean 512 KiB
+        assert!(super::packed_shape(20_000, 20_000 * 24 * 1024)); // his ROM tree shape
+        assert!(super::packed_shape(500, 0)); // empty files are all overhead
+    }
+
+    #[test]
+    fn ustar_header_roundtrip() {
+        // UI round (packed transfer): the stream format is real
+        // ustar — headers the packer writes must parse back exactly,
+        // and the zero block must read as end-of-archive.
+        for size in [0u64, 1, 511, 512, 513, 123_456, 512 * 1024 * 1024] {
+            let h = super::ustar_header("s0042", size, 0o644);
+            let (name, parsed_size, mode) =
+                super::ustar_parse(&h).expect("header must parse");
+            assert_eq!(name, "s0042");
+            assert_eq!(parsed_size, size);
+            assert_eq!(mode, 0o644);
+            // Magic + checksum sanity (a real tar reader checks both).
+            assert_eq!(&h[257..262], b"ustar");
+            let stored = std::str::from_utf8(&h[148..154]).unwrap();
+            let want: u64 = h
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| {
+                    if (148..156).contains(&i) {
+                        b' ' as u64
+                    } else {
+                        b as u64
+                    }
+                })
+                .sum();
+            assert_eq!(u64::from_str_radix(stored, 8).unwrap(), want);
+        }
+        assert!(super::ustar_parse(&[0u8; 512]).is_none());
+    }
+
+    #[test]
+    fn packed_stream_extracts_and_reports_only_completed() {
+        // UI round (packed transfer): the unpacker extracts a real
+        // stream (fed in awkward 100-byte blocks to stress the
+        // reassembly), reports exactly the files it finished, and a
+        // truncated tail is NOT reported — its step stays Pending
+        // for the per-file fallback, and no partial file survives.
+        let root = std::env::temp_dir().join(format!(
+            "ff-packed-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dest_dir = root.join("deep/nested");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let mk = |name: &str, body: &[u8]| {
+            let mut s = super::ustar_header(name, body.len() as u64, 0o644).to_vec();
+            s.extend_from_slice(body);
+            let pad = (512 - body.len() % 512) % 512;
+            s.extend(std::iter::repeat(0u8).take(pad));
+            s
+        };
+        let mut stream = Vec::new();
+        stream.extend(mk("s0001", b"hello"));
+        stream.extend(mk("s0002", &[7u8; 1500]));
+        // Truncated third entry: header promises 100 bytes, 40 arrive.
+        stream.extend(super::ustar_header("s0003", 100, 0o644).to_vec());
+        stream.extend([1u8; 40]);
+        let dests: std::sync::Arc<
+            std::collections::HashMap<String, std::path::PathBuf>,
+        > = std::sync::Arc::new(
+            [
+                ("s0001".to_string(), dest_dir.join("a.txt")),
+                ("s0002".to_string(), dest_dir.join("b.bin")),
+                ("s0003".to_string(), dest_dir.join("c.bin")),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<String>(16);
+        let t = std::thread::spawn(move || super::unpack_stream(rx, dests, done_tx));
+        for chunk in stream.chunks(100) {
+            if tx.send(chunk.to_vec()).is_err() {
+                break;
+            }
+        }
+        drop(tx);
+        t.join().unwrap();
+        let reported: Vec<String> = done_rx.try_iter().collect();
+        assert_eq!(reported, vec!["s0001".to_string(), "s0002".to_string()]);
+        assert_eq!(
+            std::fs::read(dest_dir.join("a.txt")).unwrap(),
+            b"hello".to_vec()
+        );
+        assert_eq!(std::fs::read(dest_dir.join("b.bin")).unwrap().len(), 1500);
+        assert!(!dest_dir.join("c.bin").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scale_transition_gate_keeps_blob_writes_rare() {
+        // P0 scale test: a 50,000-step job (Dickles' live DAG is
+        // ~465k steps / a 616 MB blob) driven through 3,000
+        // transitions. The gate must keep blob checkpoints rare:
+        // every transition still journals (append-only), DB growth
+        // stays in single-digit multiples of ONE blob, and the run
+        // takes seconds. The old design — clone + serialize + write
+        // the whole blob per transition — fails all three by orders
+        // of magnitude.
+        use ufm_jobs::{Job, JobPreview, Step, StepOp, StepState};
+        let dir = std::env::temp_dir()
+            .join(format!("ff-scale-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("catalog.db");
+        let catalog = ufm_catalog::Catalog::open(&db).unwrap();
+        let item = |path: &str, size: u64| {
+            super::job_item(
+                ufm_core::ItemId(uuid::Uuid::nil()),
+                ufm_core::LocationId(uuid::Uuid::nil()),
+                std::path::Path::new(path),
+                ufm_vfs::ItemKind::File,
+                Some(size),
+            )
+        };
+        let dst = item("/dst", 0);
+        let mut job = Job::new("scale", JobPreview::default());
+        for i in 0..50_000 {
+            job.add_step(Step {
+                id: format!("s{i:05}"),
+                label: format!("copy f{i}"),
+                op: StepOp::Copy {
+                    src: item(&format!("/src/f{i}"), 10),
+                    dst_parent: dst.clone(),
+                    new_name: format!("f{i}"),
+                },
+                depends_on: Vec::new(),
+                state: StepState::Pending,
+                compensation: None,
+                outcome: false,
+                outcome_path: None,
+            });
+        }
+        let job_id = job.id;
+        catalog.upsert_job(&job).unwrap();
+        let handle = super::JobHandle::new(job, false);
+        let mut journal = ufm_jobs::JobJournal::with_sink(std::sync::Arc::new(
+            ufm_catalog::CatalogJournalSink::new(db.clone()),
+        ));
+        let mut gate = super::SnapshotGate::new();
+        let db_size = |db: &std::path::Path| -> u64 {
+            let main = std::fs::metadata(db).map(|m| m.len()).unwrap_or(0);
+            let wal = std::fs::metadata(db.with_extension("db-wal"))
+                .map(|m| m.len())
+                .unwrap_or(0);
+            main + wal
+        };
+        let baseline = db_size(&db);
+        let t0 = std::time::Instant::now();
+        let mut fx_bytes = 0;
+        for i in 0..3_000 {
+            let fx = super::transition_step(
+                &handle,
+                &catalog,
+                &mut journal,
+                &mut gate,
+                &format!("s{i:05}"),
+                StepState::Done,
+                None,
+            );
+            fx_bytes = fx.bytes_done;
+        }
+        let elapsed = t0.elapsed();
+        assert_eq!(fx_bytes, 30_000);
+        assert_eq!(journal.entries().len(), 3_000);
+        let entries = catalog.journal_entries(&job_id).unwrap();
+        assert_eq!(entries.len(), 3_000);
+        let grew = db_size(&db) - baseline;
+        assert!(
+            grew < baseline * 6,
+            "db grew {grew} bytes on a {baseline}-byte baseline — blob writes are not gated"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "3,000 transitions took {elapsed:?} — per-transition cost is not ~O(1)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zombie_cancel_settles_without_executor() {
+        // P0: a job whose executor died (the OOM, the session kill)
+        // must settle to Cancelled through the command's own path —
+        // no executor will ever consume its cancel flag.
+        use ufm_jobs::{Job, JobPreview, Step, StepOp, StepState};
+        let dir = std::env::temp_dir()
+            .join(format!("ff-zombie-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("catalog.db");
+        let catalog = ufm_catalog::Catalog::open(&db).unwrap();
+        let item = |path: &str| {
+            super::job_item(
+                ufm_core::ItemId(uuid::Uuid::nil()),
+                ufm_core::LocationId(uuid::Uuid::nil()),
+                std::path::Path::new(path),
+                ufm_vfs::ItemKind::File,
+                Some(10),
+            )
+        };
+        let mut job = Job::new("zombie", JobPreview::default());
+        job.state = ufm_jobs::JobState::Running; // as a crash leaves it
+        job.add_step(Step {
+            id: "s0001".into(),
+            label: "copy".into(),
+            op: StepOp::Copy {
+                src: item("/src/a"),
+                dst_parent: item("/dst"),
+                new_name: "a".into(),
+            },
+            depends_on: Vec::new(),
+            state: StepState::Pending,
+            compensation: None,
+            outcome: false,
+            outcome_path: None,
+        });
+        let job_id = job.id;
+        catalog.upsert_job(&job).unwrap();
+        // live = false: JobHandle::new never starts an executor.
+        let handle = super::JobHandle::new(job, false);
+        super::settle_cancelled(&handle, &catalog);
+        assert_eq!(handle.snapshot().state, ufm_jobs::JobState::Cancelled);
+        let loaded = catalog.load_job(&job_id).unwrap().unwrap();
+        assert_eq!(loaded.state, ufm_jobs::JobState::Cancelled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pause_flag_blocks_until_cancel_releases() {
+        // P0: the executor's pause poll must hold while the flag is
+        // set and release ~immediately when cancel lands — the
+        // sub-second contract, at the mechanism level.
+        use ufm_jobs::{Job, JobPreview};
+        let handle = std::sync::Arc::new(super::JobHandle::new(
+            Job::new("pause", JobPreview::default()),
+            true, // paused
+        ));
+        let h2 = handle.clone();
+        let waiter = std::thread::spawn(move || super::wait_while_paused(&h2));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!waiter.is_finished(), "pause flag must hold the waiter");
+        handle
+            .cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let t0 = std::time::Instant::now();
+        let released = waiter.join().unwrap();
+        assert!(!released, "cancel must make wait_while_paused return false");
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "cancel release took {:?} — not sub-second",
+            t0.elapsed()
+        );
     }
 
     #[test]

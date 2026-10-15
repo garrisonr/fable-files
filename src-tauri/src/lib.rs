@@ -160,6 +160,18 @@ impl AppState {
         if let Ok(unfinished) = state.catalog.lock().unwrap().unfinished_jobs() {
             let mut recovered = Vec::new();
             for mut job in unfinished {
+                // P0: the blob is a checkpoint that may lag the
+                // journal — replay the journal over it so recovered
+                // step states (and the panel's counts) are the truth,
+                // not the last checkpoint's.
+                if let Ok(entries) =
+                    state.catalog.lock().unwrap().journal_entries(&job.id)
+                {
+                    if !entries.is_empty() {
+                        ufm_jobs::JobJournal::from_entries(entries)
+                            .replay_into(&mut job);
+                    }
+                }
                 if job.state == ufm_jobs::JobState::Running {
                     job.state = ufm_jobs::JobState::Paused;
                     let cat = state.catalog.lock().unwrap();
