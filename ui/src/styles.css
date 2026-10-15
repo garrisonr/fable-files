@@ -337,6 +337,96 @@ th[data-sort]:focus-visible {
   font-weight: 600;
 }
 
+/* ROM organization (2026-10-15): grouping switch + collapsible
+   division headers inside the Roms Collection section. */
+.rom-group-switch {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  margin: 0.125rem 0.25rem 0.375rem;
+  border-radius: calc(var(--ufm-radius-md) / 2);
+  background: color-mix(in srgb, var(--ufm-text) 7%, transparent);
+}
+
+.rom-group-opt {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--ufm-text-muted);
+  font: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  flex: 1 1 0;
+  padding: 0.25rem 0.5rem;
+  border-radius: calc(var(--ufm-radius-md) / 2 - 2px);
+  cursor: pointer;
+}
+
+.rom-group-opt[aria-pressed="true"] {
+  background: var(--ufm-surface);
+  color: var(--ufm-text);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.18);
+}
+
+.rom-div-head {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--ufm-text-muted);
+  font: inherit;
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: baseline;
+  gap: 0.375rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.3125rem 0.5rem;
+  border-radius: calc(var(--ufm-radius-md) / 2);
+  cursor: pointer;
+}
+
+.rom-div-head:hover {
+  background: color-mix(in srgb, var(--ufm-text) 7%, transparent);
+}
+
+.rom-div-title {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rom-div-count {
+  font-weight: 600;
+  letter-spacing: 0;
+  opacity: 0.75;
+}
+
+.rom-div-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-left: 0.875rem;
+}
+
+.rom-hw-item {
+  color: var(--ufm-text-muted);
+}
+
+.rom-hw-meta {
+  margin: 0 0 0.375rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--ufm-text-muted);
+}
+
+.rom-hw-note {
+  margin: 0 0 0.5rem;
+}
+
 .side-provider {
   margin-left: auto;
   font-size: 0.6875rem;

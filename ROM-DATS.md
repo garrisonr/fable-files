@@ -1,6 +1,6 @@
 # Fable Files ROM dataset — DAT manifest
 
-Compiled by datc from DAT files redistributed by the libretro-database project (repository license: Creative Commons Attribution-ShareAlike 4.0). The dataset carries only factual reference data — game names, file sizes and hashes (CRC32/MD5/SHA1) — published by the No-Intro, Redump and MAME projects for exactly this purpose (collection scanning). No ROM content is included, ever.
+Compiled by datc from DAT files redistributed by the libretro-database project (repository license: Creative Commons Attribution-ShareAlike 4.0). The dataset carries only factual reference data — game names, file sizes and hashes (CRC32/MD5/SHA1) — published by the No-Intro, Redump, MAME and TOSEC projects for exactly this purpose (collection scanning). No ROM content is included, ever.
 
 | Fable system | key | DAT file | source | games | rom rows |
 |---|---|---|---|---|---|
@@ -23,6 +23,7 @@ Compiled by datc from DAT files redistributed by the libretro-database project (
 | Genesis | genesis | Sega - Mega Drive - Genesis.dat | No-Intro (via libretro-database) | 2656 | 2656 |
 | Intellivision | intellivision | Mattel - Intellivision.dat | No-Intro (via libretro-database) | 246 | 246 |
 | Atari Jaguar | jaguar | Atari - Jaguar.dat | No-Intro (via libretro-database) | 460 | 460 |
+| Atari Jaguar | jaguar | Atari - Jaguar CD.dat | Redump (via libretro-database) | 27 | 27 |
 | Master System | mastersystem | Sega - Master System - Mark III.dat | No-Intro (via libretro-database) | 1057 | 1057 |
 | MSX | msx | Microsoft - MSX.dat | No-Intro (via libretro-database) | 899 | 899 |
 | MSX | msx | Microsoft - MSX2.dat | No-Intro (via libretro-database) | 195 | 195 |
@@ -52,16 +53,33 @@ Compiled by datc from DAT files redistributed by the libretro-database project (
 | Xbox | xbox | Microsoft - Xbox.dat | Redump (via libretro-database) | 2559 | 2559 |
 | Xbox 360 | xbox360 | Microsoft - Xbox 360.dat | Redump (via libretro-database) | 3959 | 3959 |
 | ZX Spectrum | zxspectrum | Sinclair - ZX Spectrum.dat | No-Intro combined (libretro-database) | 3855 | 3855 |
+| Odyssey2 | odyssey2 | Magnavox - Odyssey2.dat | No-Intro (via libretro-database) | 131 | 131 |
+| Odyssey2 | odyssey2 | Philips - Videopac+.dat | No-Intro (via libretro-database) | 32 | 32 |
+| Channel F | channelf | Fairchild - Channel F.dat | No-Intro (via libretro-database) | 34 | 34 |
+| Studio II | studio2 | RCA - Studio II.dat | No-Intro (via libretro-database) | 18 | 18 |
+| Arcadia 2001 | arcadia2001 | Emerson - Arcadia 2001.dat | No-Intro (via libretro-database) | 48 | 48 |
+| Super Cassette Vision | scv | Epoch - Super Cassette Vision.dat | No-Intro (via libretro-database) | 33 | 33 |
+| PV-1000 | pv1000 | Casio - PV-1000.dat | No-Intro (via libretro-database) | 13 | 13 |
+| Super A'can | superacan | Funtech - Super Acan.dat | No-Intro (via libretro-database) | 12 | 12 |
+| SG-1000 | sg1000 | Sega - SG-1000.dat | No-Intro (via libretro-database) | 211 | 211 |
+| VIC-20 | vic20 | Commodore - VIC-20.dat | No-Intro (via libretro-database) | 236 | 236 |
+| Game.com | gamecom | Tiger - Game.com.dat | No-Intro (via libretro-database) | 23 | 23 |
+| PS Vita | psvita | Sony - PlayStation Vita.dat | No-Intro (via libretro-database) | 240 | 240 |
+| CD-i | cdi | Philips - CD-i.dat | Redump (via libretro-database) | 2843 | 2843 |
+| PC-FX | pcfx | NEC - PC-FX.dat | Redump (via libretro-database) | 92 | 92 |
+| Neo Geo CD | neogeocd | SNK - Neo Geo CD.dat | Redump (via libretro-database) | 145 | 145 |
+| Amiga CD32 | amigacd32 | Commodore - CD32.dat | Redump (via libretro-database) | 204 | 204 |
+| GX4000 | gx4000 | Amstrad - GX4000.dat | TOSEC (via libretro-database) | 67 | 67 |
 | Arcade (MAME) sets | arcade | MAME 2016 XML (Arcade Only).xml | MAME listxml (via libretro-database) | 30999 | — |
 | Neo Geo sets | neogeo | (same XML, romof=neogeo family) | MAME listxml (via libretro-database) | 258 | — |
 
 ## Totals
 
-- file rows (deduped): 135499
+- file rows (deduped): 139309
 - rows in ambiguous (crc,size) groups (hashes kept): 4642
 - md5 side entries: 4642
 - sha1 side entries: 4642
-- unique names: 119438
-- name blob: 4713047 bytes
+- unique names: 122898
+- name blob: 4850727 bytes
 - sets: 31257 (set-rom entries: 259564)
-- **rom-dats.bin: 12703196 bytes**
+- **rom-dats.bin: 12947834 bytes**

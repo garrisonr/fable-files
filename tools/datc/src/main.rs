@@ -48,6 +48,7 @@ const NI: &str = "metadat/no-intro";
 const RD: &str = "metadat/redump";
 const MM: &str = "metadat/mame";
 const DT: &str = "dat";
+const TS: &str = "metadat/tosec";
 
 fn systems() -> Vec<SysDef> {
     vec![
@@ -95,6 +96,25 @@ fn systems() -> Vec<SysDef> {
         SysDef { key: "xbox", display: "Xbox", files: &[RD] },
         SysDef { key: "xbox360", display: "Xbox 360", files: &[RD] },
         SysDef { key: "zxspectrum", display: "ZX Spectrum", files: &[DT] },
+        // ROM organization pass (2026-10-15): systems Dickles owns whose
+        // DATs were in libretro-database all along but never compiled in.
+        // Appended so existing system indices never move.
+        SysDef { key: "odyssey2", display: "Odyssey2", files: &[NI] },
+        SysDef { key: "channelf", display: "Channel F", files: &[NI] },
+        SysDef { key: "studio2", display: "Studio II", files: &[NI] },
+        SysDef { key: "arcadia2001", display: "Arcadia 2001", files: &[NI] },
+        SysDef { key: "scv", display: "Super Cassette Vision", files: &[NI] },
+        SysDef { key: "pv1000", display: "PV-1000", files: &[NI] },
+        SysDef { key: "superacan", display: "Super A'can", files: &[NI] },
+        SysDef { key: "sg1000", display: "SG-1000", files: &[NI] },
+        SysDef { key: "vic20", display: "VIC-20", files: &[NI] },
+        SysDef { key: "gamecom", display: "Game.com", files: &[NI] },
+        SysDef { key: "psvita", display: "PS Vita", files: &[NI] },
+        SysDef { key: "cdi", display: "CD-i", files: &[RD] },
+        SysDef { key: "pcfx", display: "PC-FX", files: &[RD] },
+        SysDef { key: "neogeocd", display: "Neo Geo CD", files: &[RD] },
+        SysDef { key: "amigacd32", display: "Amiga CD32", files: &[RD] },
+        SysDef { key: "gx4000", display: "GX4000", files: &[TS] },
     ]
 }
 
@@ -105,6 +125,7 @@ fn dat_files(key: &str) -> Vec<(String, &'static str)> {
     let rd = |n: &str| (format!("{RD}/{n}"), "Redump (via libretro-database)");
     let mm = |n: &str| (format!("{MM}/{n}"), "MAME (via libretro-database)");
     let dt = |n: &str| (format!("{DT}/{n}"), "No-Intro combined (libretro-database)");
+    let ts = |n: &str| (format!("{TS}/{n}"), "TOSEC (via libretro-database)");
     match key {
         "3do" => vec![rd("The 3DO Company - 3DO.dat")],
         "amiga" => vec![ni("Commodore - Amiga.dat")],
@@ -124,7 +145,7 @@ fn dat_files(key: &str) -> Vec<(String, &'static str)> {
         "gamecube" => vec![rd("Nintendo - GameCube.dat")],
         "genesis" => vec![ni("Sega - Mega Drive - Genesis.dat")],
         "intellivision" => vec![ni("Mattel - Intellivision.dat")],
-        "jaguar" => vec![ni("Atari - Jaguar.dat")],
+        "jaguar" => vec![ni("Atari - Jaguar.dat"), rd("Atari - Jaguar CD.dat")],
         "mastersystem" => vec![ni("Sega - Master System - Mark III.dat")],
         "msx" => vec![ni("Microsoft - MSX.dat"), ni("Microsoft - MSX2.dat")],
         "neogeo" => vec![],
@@ -162,6 +183,27 @@ fn dat_files(key: &str) -> Vec<(String, &'static str)> {
         "xbox" => vec![rd("Microsoft - Xbox.dat")],
         "xbox360" => vec![rd("Microsoft - Xbox 360.dat")],
         "zxspectrum" => vec![dt("Sinclair - ZX Spectrum.dat")],
+        "odyssey2" => vec![
+            ni("Magnavox - Odyssey2.dat"),
+            ni("Philips - Videopac+.dat"),
+        ],
+        "channelf" => vec![ni("Fairchild - Channel F.dat")],
+        "studio2" => vec![ni("RCA - Studio II.dat")],
+        "arcadia2001" => vec![ni("Emerson - Arcadia 2001.dat")],
+        "scv" => vec![ni("Epoch - Super Cassette Vision.dat")],
+        "pv1000" => vec![ni("Casio - PV-1000.dat")],
+        "superacan" => vec![ni("Funtech - Super Acan.dat")],
+        "sg1000" => vec![ni("Sega - SG-1000.dat")],
+        "vic20" => vec![ni("Commodore - VIC-20.dat")],
+        "gamecom" => vec![ni("Tiger - Game.com.dat")],
+        // The Vita (PSN) DAT (17k loose .pkg entries) is deliberately
+        // NOT compiled in — see AUDIT.md; the base DAT is the library.
+        "psvita" => vec![ni("Sony - PlayStation Vita.dat")],
+        "cdi" => vec![rd("Philips - CD-i.dat")],
+        "pcfx" => vec![rd("NEC - PC-FX.dat")],
+        "neogeocd" => vec![rd("SNK - Neo Geo CD.dat")],
+        "amigacd32" => vec![rd("Commodore - CD32.dat")],
+        "gx4000" => vec![ts("Amstrad - GX4000.dat")],
         _ => vec![],
     }
 }
@@ -510,7 +552,7 @@ fn main() {
     manifest.push_str("Compiled by datc from DAT files redistributed by the libretro-database project ");
     manifest.push_str("(repository license: Creative Commons Attribution-ShareAlike 4.0). The dataset ");
     manifest.push_str("carries only factual reference data — game names, file sizes and hashes ");
-    manifest.push_str("(CRC32/MD5/SHA1) — published by the No-Intro, Redump and MAME projects for ");
+    manifest.push_str("(CRC32/MD5/SHA1) — published by the No-Intro, Redump, MAME and TOSEC projects for ");
     manifest.push_str("exactly this purpose (collection scanning). No ROM content is included, ever.\n\n");
     manifest.push_str("| Fable system | key | DAT file | source | games | rom rows |\n|---|---|---|---|---|---|\n");
 

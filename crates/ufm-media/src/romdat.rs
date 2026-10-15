@@ -359,16 +359,23 @@ pub fn systems_for_extension(ext: &str) -> &'static [&'static str] {
         "a78" => &["atari7800"],
         "adf" | "dms" | "lha" => &["amiga"],
         "atr" | "atx" | "xex" | "xfd" => &["atari8bit"],
-        "bin" => &["genesis", "segacd", "saturn", "psx", "tg16", "dreamcast"],
+        "bin" => &[
+            "genesis", "segacd", "saturn", "psx", "tg16", "dreamcast", "odyssey2", "channelf",
+            "studio2", "arcadia2001", "scv", "pv1000", "superacan", "gamecom", "cdi", "pcfx",
+            "neogeocd", "amigacd32",
+        ],
         "ccd" => &[],
         "chd" => &[],
         "cia" | "3ds" => &["n3ds"],
         "ciso" => &["gamecube"],
         "col" | "cv" => &["colecovision"],
-        "crt" => &["c64"],
+        "chf" => &["channelf"],
+        "cpr" => &["gx4000"],
+        "crt" => &["c64", "vic20"],
         "cso" => &["psp"],
         "cue" => &[],
-        "d64" | "prg" | "t64" => &["c64"],
+        "d64" | "t64" => &["c64"],
+        "prg" => &["c64", "vic20"],
         "dsk" => &["msx"],
         "fds" => &[],
         "fig" | "sfc" | "smc" | "swc" => &["snes"],
@@ -383,7 +390,7 @@ pub fn systems_for_extension(ext: &str) -> &'static [&'static str] {
         "int" => &["intellivision"],
         "iso" => &[
             "psx", "ps2", "saturn", "segacd", "dreamcast", "psp", "gamecube", "wii", "xbox",
-            "xbox360", "ps3",
+            "xbox360", "ps3", "cdi", "pcfx", "neogeocd", "amigacd32", "jaguar",
         ],
         "j64" | "jag" => &["jaguar"],
         "lnx" => &["lynx"],
@@ -401,10 +408,13 @@ pub fn systems_for_extension(ext: &str) -> &'static [&'static str] {
         "rpx" | "wua" | "wux" => &["wiiu"],
         "rvz" | "wbfs" | "wad" => &["wii"],
         "smd" => &["genesis"],
+        "sg" => &["sg1000"],
         "sms" => &["mastersystem"],
         "sna" | "szx" | "tzx" | "z80" => &["zxspectrum"],
-        "tap" => &["c64", "zxspectrum"],
+        "tap" => &["c64", "zxspectrum", "vic20"],
+        "tgc" => &["gamecom"],
         "vb" | "vboy" => &["virtualboy"],
+        "vpk" => &["psvita"],
         "vec" => &["vectrex"],
         "ws" | "wsc" => &["wonderswan"],
         "xbe" | "xiso" => &["xbox"],
@@ -416,13 +426,13 @@ pub fn systems_for_extension(ext: &str) -> &'static [&'static str] {
 /// (the union of `systems_for_extension` keys, plus "zip").
 pub fn candidate_extensions() -> Vec<&'static str> {
     vec![
-        "32x", "3ds", "a26", "a52", "a78", "adf", "atr", "atx", "bin", "cdi", "cia", "ciso",
-        "col", "crt", "cso", "cv", "d64", "dms", "dsk", "fig", "gb", "gba", "gbc", "gc",
+        "32x", "3ds", "a26", "a52", "a78", "adf", "atr", "atx", "bin", "cdi", "chf", "cia", "ciso",
+        "col", "cpr", "crt", "cso", "cv", "d64", "dms", "dsk", "fig", "gb", "gba", "gbc", "gc",
         "gcm", "gdi", "gen", "gg", "img", "int", "iso", "j64", "jag", "lha", "lnx", "md",
         "mdf", "mx1", "mx2", "n64", "nds", "neo", "nes", "ngc", "ngp", "pbp", "pce", "pkg",
-        "prg", "rom", "rpx", "sfc", "sgb", "smc", "smd", "sms", "sna", "swc", "szx", "t64",
-        "tap", "tzx", "unh", "v64", "vb", "vboy", "vec", "wad", "wbfs", "ws", "wsc", "wua",
-        "wux", "xbe", "xex", "xfd", "xiso", "z64", "z80", "zip",
+        "prg", "rom", "rpx", "sfc", "sg", "sgb", "smc", "smd", "sms", "sna", "swc", "szx", "t64",
+        "tap", "tgc", "tzx", "unh", "v64", "vb", "vboy", "vec", "vpk", "wad", "wbfs", "ws", "wsc",
+        "wua", "wux", "xbe", "xex", "xfd", "xiso", "z64", "z80", "zip",
     ]
 }
 
@@ -433,7 +443,9 @@ fn cartridge_systems() -> &'static [&'static str] {
         "atari2600", "atari5200", "atari7800", "atari8bit", "lynx", "colecovision", "c64",
         "gb", "gba", "gbc", "gamegear", "genesis", "intellivision", "jaguar", "mastersystem",
         "msx", "neogeopocket", "nes", "n64", "nds", "n3ds", "sega32x", "snes", "tg16",
-        "vectrex", "virtualboy", "wonderswan", "zxspectrum", "amiga",
+        "vectrex", "virtualboy", "wonderswan", "zxspectrum", "amiga", "odyssey2", "channelf",
+        "studio2", "arcadia2001", "scv", "pv1000", "superacan", "sg1000", "vic20", "gamecom",
+        "gx4000",
     ]
 }
 

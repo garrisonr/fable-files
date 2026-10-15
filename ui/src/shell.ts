@@ -30,7 +30,7 @@ import { FolderPicker, type PickerShortcut } from "./picker";
 import { RenameDialog } from "./rename";
 import { LabelManager, saveLabelRules } from "./labels";
 import { loadLabelDefs, migrateLabelAssignments, saveLabelDefs } from "./labels";
-import { loadRomSystems, saveRomSystems, romsEnabled, romScopeOf, romSystemKey, setRomsEnabled, type RomSystem } from "./roms";
+import { loadRomSystems, saveRomSystems, romsEnabled, romScopeOf, romSystemKey, setRomsEnabled, romDivisions, loadRomGrouping, saveRomGrouping, loadOpenDivisions, saveOpenDivisions, type RomSystem, type OwnedHardware } from "./roms";
 import { MusicPlayer } from "./music";
 import { isPlayableName, isVideoName } from "./video";
 import { OpenWithDialog } from "./openwith";
@@ -829,7 +829,7 @@ export class Shell {
     // Inc-2 item 11 fix: same as Labels above — prefCollapsed, not
     // a localStorage-only read, so every rebuild honors the durable
     // collapse state.
-    const romsCollapsed = this.prefCollapsed("ff-roms-collapsed");
+    const romsCollapsed = this.romsCollapsedPref();
     this.romsList.hidden = romsCollapsed;
     romsChev.style.transform = romsCollapsed ? "rotate(-90deg)" : "";
     romsHead.addEventListener("click", () => {
@@ -1959,14 +1959,23 @@ export class Shell {
   /** Effective collapse state for a sidebar section (Round 7.2): the
    * durable backend prefs win; localStorage is only the pre-paint
    * fast path the layout build reads before boot finishes. */
-  private prefCollapsed(key: string): boolean {
+  private prefCollapsed(key: string, dflt = false): boolean {
     const v = this.uiPrefs[key];
     if (typeof v === "boolean") return v;
     try {
-      return localStorage.getItem(key) === "1";
+      const raw = localStorage.getItem(key);
+      if (raw !== null) return raw === "1";
     } catch {
-      return false;
+      return dflt;
     }
+    return dflt;
+  }
+
+  /** The Roms Collection section COLLAPSES BY DEFAULT (Dickles,
+   * 2026-10-14: the full list is overwhelming). Only an explicitly
+   * saved state — his own toggle — overrides the default. */
+  private romsCollapsedPref(): boolean {
+    return this.prefCollapsed("ff-roms-collapsed", true);
   }
 
   /** Persist a sidebar collapse toggle to BOTH stores: localStorage
@@ -1990,7 +1999,7 @@ export class Shell {
     if (this.labelChevEl) {
       this.labelChevEl.style.transform = labels ? "rotate(-90deg)" : "";
     }
-    const roms = this.prefCollapsed("ff-roms-collapsed");
+    const roms = this.romsCollapsedPref();
     this.romsList.hidden = roms;
     if (this.romsChevEl) {
       this.romsChevEl.style.transform = roms ? "rotate(-90deg)" : "";
@@ -3496,7 +3505,8 @@ export class Shell {
         setRomsEnabled(on);
         void this.buildSidebar();
       },
-      sectionCollapsed: (key) => this.prefCollapsed(key),
+      sectionCollapsed: (key) =>
+        this.prefCollapsed(key, key === "ff-roms-collapsed"),
       setSectionCollapsed: (key, collapsed) => {
         this.setCollapsedPref(key, collapsed);
         this.applyCollapsePrefs();
@@ -3776,12 +3786,38 @@ export class Shell {
     // Fix block item 6: this render runs on EVERY sidebar rebuild and
     // used to force hidden = !on, stomping the user's collapse pref a
     // beat after every rebuild. The durable pref wins here too.
-    this.romsList.hidden = !on || this.prefCollapsed("ff-roms-collapsed");
+    this.romsList.hidden = !on || this.romsCollapsedPref();
     const chev = this.romsHead.querySelector(".side-chev");
     if (chev) chev.textContent = this.romsList.hidden ? "▸" : "▾";
     this.romsList.innerHTML = "";
     if (!on) return;
     const systems = loadRomSystems();
+    // Grouping switch (Dickles, 2026-10-14): systems live under
+    // collapsible division headers — By Manufacturer or By
+    // Generation. Divisions are collapsed unless he opened them;
+    // Arcade is its own division in both schemes.
+    const grouping = loadRomGrouping();
+    const switcher = document.createElement("div");
+    switcher.className = "rom-group-switch";
+    switcher.setAttribute("role", "group");
+    switcher.setAttribute("aria-label", "Group systems by");
+    for (const [mode, label] of [
+      ["maker", "Maker"],
+      ["generation", "Generation"],
+    ] as const) {
+      const opt = document.createElement("button");
+      opt.className = "rom-group-opt";
+      opt.textContent = label;
+      opt.setAttribute("aria-pressed", String(grouping === mode));
+      opt.addEventListener("click", () => {
+        if (loadRomGrouping() !== mode) {
+          saveRomGrouping(mode);
+          this.renderRomsSection();
+        }
+      });
+      switcher.appendChild(opt);
+    }
+    this.romsList.appendChild(switcher);
     if (systems.length === 0) {
       const p = document.createElement("p");
       p.className = "side-empty";
@@ -3789,55 +3825,135 @@ export class Shell {
       this.romsList.appendChild(p);
       return;
     }
-    for (const sys of systems) {
-      const b = document.createElement("button");
-      b.className = "side-item";
-      b.textContent = "\uD83C\uDFAE " + sys.name;
-      const key = romSystemKey(sys);
-      b.title = key
-        ? "Verified by the ROM lists (No-Intro / Redump / MAME) — only exact matches appear"
-        : "ROM files: " + sys.extensions.map((x) => "." + x).join(", ");
-      b.addEventListener("click", () => {
-        if (key) {
-          void this.searchView.runRomCollection(sys.name, key, romScopeOf(sys));
-        } else {
-          void this.searchView.runRule(
-            sys.name,
-            { extensions: sys.extensions },
-            romScopeOf(sys),
-          );
-        }
+    const open = loadOpenDivisions();
+    for (const div of romDivisions(systems, grouping)) {
+      const isOpen = open.has(div.title);
+      const head = document.createElement("button");
+      head.className = "rom-div-head";
+      head.setAttribute("aria-expanded", String(isOpen));
+      const dchev = document.createElement("span");
+      dchev.className = "side-chev";
+      dchev.textContent = isOpen ? "▾" : "▸";
+      const dtitle = document.createElement("span");
+      dtitle.className = "rom-div-title";
+      dtitle.textContent = div.title;
+      const dcount = document.createElement("span");
+      dcount.className = "rom-div-count";
+      dcount.textContent = String(div.systems.length + div.hardware.length);
+      head.append(dchev, dtitle, dcount);
+      head.addEventListener("click", () => {
+        const cur = loadOpenDivisions();
+        if (cur.has(div.title)) cur.delete(div.title);
+        else cur.add(div.title);
+        saveOpenDivisions(cur);
+        this.renderRomsSection();
       });
-      b.addEventListener("contextmenu", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this.ctxMenu.open(e.clientX, e.clientY, [
-          {
-            label: `Manage "${sys.name}"\u2026`,
-            action: () => this.openRomEditor(sys),
-          },
-          {
-            label: `Delete "${sys.name}"`,
-            danger: true,
-            action: () => {
-              void (async () => {
-                const ok = await confirmDialog(
-                  `Delete "${sys.name}"?`,
-                  "The system is removed from Roms Collection. Your ROM files are not touched.",
-                  "Delete",
-                  true,
-                );
-                if (!ok) return;
-                saveRomSystems(loadRomSystems().filter((s) => s.name !== sys.name));
-                void this.buildSidebar();
-                Toast.success(`Deleted system "${sys.name}".`);
-              })();
-            },
-          },
-        ]);
-      });
-      this.romsList.appendChild(b);
+      this.romsList.appendChild(head);
+      if (!isOpen) continue;
+      const box = document.createElement("div");
+      box.className = "rom-div-body";
+      for (const sys of div.systems) {
+        box.appendChild(this.romSystemButton(sys));
+      }
+      for (const hw of div.hardware) {
+        box.appendChild(this.romHardwareButton(hw));
+      }
+      this.romsList.appendChild(box);
     }
+  }
+
+  /** One system's sidebar row (click = run its collection; right
+   * click = manage/delete). Behavior unchanged from the flat list —
+   * only the grouping around it is new. */
+  private romSystemButton(sys: RomSystem): HTMLButtonElement {
+    const b = document.createElement("button");
+    b.className = "side-item";
+    b.textContent = "\uD83C\uDFAE " + sys.name;
+    const key = romSystemKey(sys);
+    b.title = key
+      ? "Verified by the ROM lists (No-Intro / Redump / MAME) — only exact matches appear"
+      : "ROM files: " + sys.extensions.map((x) => "." + x).join(", ");
+    b.addEventListener("click", () => {
+      if (key) {
+        void this.searchView.runRomCollection(sys.name, key, romScopeOf(sys));
+      } else {
+        void this.searchView.runRule(
+          sys.name,
+          { extensions: sys.extensions },
+          romScopeOf(sys),
+        );
+      }
+    });
+    b.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.ctxMenu.open(e.clientX, e.clientY, [
+        {
+          label: `Manage "${sys.name}"\u2026`,
+          action: () => this.openRomEditor(sys),
+        },
+        {
+          label: `Delete "${sys.name}"`,
+          danger: true,
+          action: () => {
+            void (async () => {
+              const ok = await confirmDialog(
+                `Delete "${sys.name}"?`,
+                "The system is removed from Roms Collection. Your ROM files are not touched.",
+                "Delete",
+                true,
+              );
+              if (!ok) return;
+              saveRomSystems(loadRomSystems().filter((s) => s.name !== sys.name));
+              void this.buildSidebar();
+              Toast.success(`Deleted system "${sys.name}".`);
+            })();
+          },
+        },
+      ]);
+    });
+    return b;
+  }
+
+  /** An owned-hardware row: a machine from Dickles' collection with
+   * no ROM library. Opens an honest detail card — never a file list,
+   * never a game count. */
+  private romHardwareButton(hw: OwnedHardware): HTMLButtonElement {
+    const b = document.createElement("button");
+    b.className = "side-item rom-hw-item";
+    b.textContent = "\uD83D\uDD79 " + hw.name;
+    b.title = `Owned hardware (${hw.year}) — no ROM library to identify`;
+    b.addEventListener("click", () => this.openOwnedHardware(hw));
+    return b;
+  }
+
+  private openOwnedHardware(hw: OwnedHardware): void {
+    const overlay = document.createElement("div");
+    overlay.className = "picker-overlay";
+    overlay.innerHTML = `
+      <div class="picker-card labels-card" role="dialog" aria-label="Owned hardware">
+        <h3 class="picker-title"></h3>
+        <p class="rom-hw-meta"></p>
+        <p class="rom-hw-note"></p>
+        <p class="smart-hint">Part of the collection — honored here, but this machine has no ROM library for Fable to identify, so there's no file list and no game count.</p>
+        <div class="picker-actions">
+          <button class="rom-hw-close primary">Close</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const title = overlay.querySelector(".picker-title");
+    if (title) title.textContent = hw.name;
+    const meta = overlay.querySelector(".rom-hw-meta");
+    if (meta) meta.textContent = `${hw.maker} · ${hw.year}`;
+    const note = overlay.querySelector(".rom-hw-note");
+    if (note) note.textContent = hw.note;
+    const close = () => overlay.remove();
+    overlay
+      .querySelector(".rom-hw-close")
+      ?.addEventListener("click", close);
+    overlay.addEventListener("pointerdown", (e) => {
+      if (e.target === overlay) close();
+    });
   }
 
   /** Add or edit a Roms Collection system. Built-in systems are

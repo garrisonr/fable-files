@@ -24,13 +24,17 @@ export interface RomSystem {
 export const ROM_SYSTEM_KEYS: Record<string, string> = {
   "3DO": "3do",
   "Amiga": "amiga",
+  "Amiga CD32": "amigacd32",
   "Arcade (MAME)": "arcade",
   "Arcade": "arcade",
+  "Arcadia 2001": "arcadia2001",
   "Atari 2600": "atari2600",
   "Atari 5200": "atari5200",
   "Atari 7800": "atari7800",
   "Atari 8-Bit": "atari8bit",
   "Atari Lynx": "lynx",
+  "CD-i": "cdi",
+  "Channel F": "channelf",
   "ColecoVision": "colecovision",
   "Commodore 64": "c64",
   "Dreamcast": "dreamcast",
@@ -39,35 +43,52 @@ export const ROM_SYSTEM_KEYS: Record<string, string> = {
   "Game Boy Color": "gbc",
   "Game Gear": "gamegear",
   "GameCube": "gamecube",
+  "Game.com": "gamecom",
   "Genesis": "genesis",
+  "GX4000": "gx4000",
   "Intellivision": "intellivision",
   "Jaguar": "jaguar",
   "Master System": "mastersystem",
   "MSX": "msx",
   "Neo Geo": "neogeo",
+  "Neo Geo CD": "neogeocd",
   "Neo Geo Pocket": "neogeopocket",
   "NES": "nes",
   "Nintendo 3DS": "n3ds",
   "Nintendo 64": "n64",
   "Nintendo DS": "nds",
+  "Odyssey²": "odyssey2",
+  "PC-FX": "pcfx",
   "PlayStation": "psx",
   "PlayStation 2": "ps2",
   "PlayStation 3": "ps3",
+  "PS Vita": "psvita",
   "PSP": "psp",
+  "PV-1000": "pv1000",
   "Saturn": "saturn",
   "Sega 32X": "sega32x",
   "Sega CD": "segacd",
+  "SG-1000": "sg1000",
   "SNES": "snes",
+  "Studio II": "studio2",
+  "Super A'can": "superacan",
+  "Super Cassette Vision": "scv",
   "TurboGrafx-16": "tg16",
   "Vectrex": "vectrex",
+  "VIC-20": "vic20",
   "Virtual Boy": "virtualboy",
   "Wii": "wii",
-  "Wii U": "wiiu",
   "WonderSwan": "wonderswan",
   "Xbox": "xbox",
   "Xbox 360": "xbox360",
   "ZX Spectrum": "zxspectrum",
 };
+// NOT mapped, deliberately: "Wii U". Its only DAT (the GameTDB-derived
+// list libretro-database carries) lists rom names with NO sizes or
+// hashes, so the compiled dataset holds zero Wii U rows and a mapped
+// collection could never match anything. Wii U keeps extension rules
+// (wua/wux/rpx) like Switch / PS4 / PS5; if a hashed DAT ever ships,
+// re-adding "Wii U": "wiiu" here restores list governance.
 
 /** The DAT dataset key for a system, or null when it is not a
  * list-governed built-in (custom systems, Switch, PS4, PS5). */
@@ -83,9 +104,252 @@ export function romScopeOf(sys: RomSystem): {
   return sys.scope ?? { mode: "all", drives: [] };
 }
 
+// ---------------------------------------------------------------------------
+// Organization (Dickles, 2026-10-14): the full systems list is grouped
+// under collapsible DIVISION headers — by manufacturer or by console
+// generation, switchable in the section. Arcade is its own division in
+// both schemes. Handhelds are first-class citizens of their maker /
+// generation divisions, never a ghetto of their own.
+// ---------------------------------------------------------------------------
+
+export interface RomSystemMeta {
+  maker: string;
+  /** Standard console generation (1–9). Computers are bucketed by
+   * launch era. null = unclassifiable (custom systems, Arcade). */
+  gen: number | null;
+}
+
+export const ROM_SYSTEM_META: Record<string, RomSystemMeta> = {
+  "3DO": { maker: "3DO", gen: 5 },
+  "Amiga": { maker: "Commodore", gen: 3 },
+  "Amiga CD32": { maker: "Commodore", gen: 5 },
+  "APF-MP1000": { maker: "APF", gen: 2 },
+  "Arcade": { maker: "Arcade", gen: null },
+  "Arcade (MAME)": { maker: "Arcade", gen: null },
+  "Arcadia 2001": { maker: "Emerson", gen: 2 },
+  "Atari 2600": { maker: "Atari", gen: 2 },
+  "Atari 5200": { maker: "Atari", gen: 2 },
+  "Atari 7800": { maker: "Atari", gen: 3 },
+  "Atari 8-Bit": { maker: "Atari", gen: 2 },
+  "Atari Lynx": { maker: "Atari", gen: 4 },
+  "Bally Astrocade": { maker: "Bally", gen: 2 },
+  "CD-i": { maker: "Philips", gen: 4 },
+  "Channel F": { maker: "Fairchild", gen: 2 },
+  "ColecoVision": { maker: "Coleco", gen: 2 },
+  "Commodore 64": { maker: "Commodore", gen: 2 },
+  "Dreamcast": { maker: "Sega", gen: 6 },
+  "FM Towns": { maker: "Fujitsu", gen: 4 },
+  "Game Boy": { maker: "Nintendo", gen: 4 },
+  "Game Boy Advance": { maker: "Nintendo", gen: 6 },
+  "Game Boy Color": { maker: "Nintendo", gen: 5 },
+  "Game Gear": { maker: "Sega", gen: 4 },
+  "Game.com": { maker: "Tiger", gen: 5 },
+  "GameCube": { maker: "Nintendo", gen: 6 },
+  "Genesis": { maker: "Sega", gen: 4 },
+  "GX4000": { maker: "Amstrad", gen: 3 },
+  "Intellivision": { maker: "Mattel", gen: 2 },
+  "Jaguar": { maker: "Atari", gen: 5 },
+  "Master System": { maker: "Sega", gen: 3 },
+  "MSX": { maker: "MSX", gen: 3 },
+  "Neo Geo": { maker: "SNK", gen: 4 },
+  "Neo Geo CD": { maker: "SNK", gen: 5 },
+  "Neo Geo Pocket": { maker: "SNK", gen: 5 },
+  "NES": { maker: "Nintendo", gen: 3 },
+  "Nintendo 3DS": { maker: "Nintendo", gen: 8 },
+  "Nintendo 64": { maker: "Nintendo", gen: 5 },
+  "Nintendo DS": { maker: "Nintendo", gen: 7 },
+  "Nintendo Switch": { maker: "Nintendo", gen: 8 },
+  "Odyssey²": { maker: "Magnavox", gen: 2 },
+  "PC-FX": { maker: "NEC", gen: 5 },
+  "PlayStation": { maker: "Sony", gen: 5 },
+  "PlayStation 2": { maker: "Sony", gen: 6 },
+  "PlayStation 3": { maker: "Sony", gen: 7 },
+  "PlayStation 4": { maker: "Sony", gen: 8 },
+  "PlayStation 5": { maker: "Sony", gen: 9 },
+  "Playdia": { maker: "Bandai", gen: 5 },
+  "PS Vita": { maker: "Sony", gen: 8 },
+  "PSP": { maker: "Sony", gen: 7 },
+  "PV-1000": { maker: "Casio", gen: 3 },
+  "Saturn": { maker: "Sega", gen: 5 },
+  "Sega 32X": { maker: "Sega", gen: 4 },
+  "Sega CD": { maker: "Sega", gen: 4 },
+  "SG-1000": { maker: "Sega", gen: 2 },
+  "SNES": { maker: "Nintendo", gen: 4 },
+  "Studio II": { maker: "RCA", gen: 2 },
+  "Super A'can": { maker: "Funtech", gen: 4 },
+  "Super Cassette Vision": { maker: "Epoch", gen: 2 },
+  "TurboGrafx-16": { maker: "NEC", gen: 4 },
+  "Vectrex": { maker: "GCE", gen: 2 },
+  "VIC-20": { maker: "Commodore", gen: 2 },
+  "Virtual Boy": { maker: "Nintendo", gen: 5 },
+  "Wii": { maker: "Nintendo", gen: 7 },
+  "Wii U": { maker: "Nintendo", gen: 8 },
+  "WonderSwan": { maker: "Bandai", gen: 5 },
+  "Xbox": { maker: "Microsoft", gen: 6 },
+  "Xbox 360": { maker: "Microsoft", gen: 7 },
+  "ZX Spectrum": { maker: "Sinclair", gen: 2 },
+};
+
+export function romSystemMeta(name: string): RomSystemMeta {
+  return ROM_SYSTEM_META[name] ?? { maker: "Other", gen: null };
+}
+
+/** Owned hardware with NO ROM library (Dickles' canon, 2026-10-14):
+ * honored collection entries — name, maker, year, an honest note.
+ * They never run a file search and never show a game count: the
+ * machines predate ROMs (analog/dedicated circuits), or their
+ * software isn't files at all (VHS tapes, DVDs, Android apps). */
+export interface OwnedHardware {
+  name: string;
+  maker: string;
+  year: number;
+  gen: number | null;
+  note: string;
+}
+
+const DEDICATED_NOTE =
+  "Dedicated console — its games are hardwired circuits, not ROMs, so there is no library to identify.";
+
+export const OWNED_HARDWARE: OwnedHardware[] = [
+  { name: "Magnavox Odyssey", maker: "Magnavox", year: 1972, gen: 1, note: "The first home video game console. Analog circuitry and plug-in game cards — no ROMs exist; the plastic screen overlays are the graphics." },
+  { name: "Sears Telegames Pong", maker: "Atari", year: 1975, gen: 1, note: DEDICATED_NOTE },
+  { name: "Odyssey 100", maker: "Magnavox", year: 1975, gen: 1, note: DEDICATED_NOTE },
+  { name: "Odyssey 200", maker: "Magnavox", year: 1975, gen: 1, note: DEDICATED_NOTE },
+  { name: "Odyssey 300", maker: "Magnavox", year: 1976, gen: 1, note: DEDICATED_NOTE },
+  { name: "Odyssey 400", maker: "Magnavox", year: 1976, gen: 1, note: DEDICATED_NOTE },
+  { name: "Odyssey 500", maker: "Magnavox", year: 1976, gen: 1, note: DEDICATED_NOTE },
+  { name: "Atari Super Pong C-140", maker: "Atari", year: 1976, gen: 1, note: DEDICATED_NOTE },
+  { name: "Odyssey 2000", maker: "Magnavox", year: 1977, gen: 1, note: DEDICATED_NOTE },
+  { name: "Odyssey 3000", maker: "Magnavox", year: 1977, gen: 1, note: DEDICATED_NOTE },
+  { name: "Odyssey 4000", maker: "Magnavox", year: 1977, gen: 1, note: DEDICATED_NOTE },
+  { name: "Atari Ultra Pong Doubles", maker: "Atari", year: 1977, gen: 1, note: DEDICATED_NOTE },
+  { name: "Atari Video Pinball", maker: "Atari", year: 1977, gen: 1, note: DEDICATED_NOTE },
+  { name: "Atari Touch Me", maker: "Atari", year: 1978, gen: 1, note: "Handheld electronic memory game — a circuit, not a computer. Nothing to load, nothing to collect." },
+  { name: "Action Max", maker: "Worlds of Wonder", year: 1987, gen: 3, note: "A light-gun system whose games are VHS tapes — the software is videotape, so there is no ROM library." },
+  { name: "Nuon", maker: "VM Labs", year: 2000, gen: 6, note: "A gaming platform built into DVD players. A handful of discs, no ROM ecosystem to identify." },
+  { name: "Game Wave", maker: "ZAPiT", year: 2005, gen: 7, note: "A DVD-based family game system — its games are DVDs, not ROM files." },
+  { name: "Ouya", maker: "Ouya", year: 2012, gen: 8, note: "An Android microconsole — its games are Android apps, not ROMs." },
+  { name: "Nvidia Shield", maker: "Nvidia", year: 2013, gen: 8, note: "An Android TV box — apps and streaming, no ROM library." },
+  { name: "MegaTouch Home", maker: "Merit", year: 2013, gen: 8, note: "The home edition of the bar-top touchscreen — self-contained games, no ROMs." },
+];
+
+export type RomGrouping = "maker" | "generation";
+
+export interface RomDivision {
+  title: string;
+  systems: RomSystem[];
+  hardware: OwnedHardware[];
+}
+
+function ordinal(n: number): string {
+  return n === 1 ? "1st" : n === 2 ? "2nd" : n === 3 ? "3rd" : `${n}th`;
+}
+
+function divisionTitle(
+  name: string,
+  meta: RomSystemMeta,
+  mode: RomGrouping,
+): string {
+  if (meta.maker === "Arcade") return "Arcade";
+  if (mode === "maker") return meta.maker;
+  return meta.gen !== null ? `${ordinal(meta.gen)} Generation` : "Other";
+}
+
+/** Group systems (+ owned-hardware entries) into divisions for the
+ * ROMs section. Arcade leads in both modes; maker divisions are
+ * alphabetical; generation divisions run 1st → 9th with "Other" last.
+ * Inside a division: systems first (alphabetical), then hardware. */
+export function romDivisions(
+  systems: RomSystem[],
+  mode: RomGrouping,
+): RomDivision[] {
+  const byTitle = new Map<string, RomDivision>();
+  const order = new Map<string, number>();
+  const keyOf = (title: string, meta: RomSystemMeta): number => {
+    if (title === "Arcade") return -1;
+    if (mode === "maker") return 0; // alphabetical via localeCompare below
+    if (meta.gen !== null) return meta.gen;
+    return 99; // "Other" last
+  };
+  const ensure = (title: string, meta: RomSystemMeta): RomDivision => {
+    let d = byTitle.get(title);
+    if (!d) {
+      d = { title, systems: [], hardware: [] };
+      byTitle.set(title, d);
+      order.set(title, keyOf(title, meta));
+    }
+    return d;
+  };
+  for (const sys of systems) {
+    const meta = romSystemMeta(sys.name);
+    ensure(divisionTitle(sys.name, meta, mode), meta).systems.push(sys);
+  }
+  for (const hw of OWNED_HARDWARE) {
+    const meta: RomSystemMeta = { maker: hw.maker, gen: hw.gen };
+    ensure(divisionTitle(hw.name, meta, mode), meta).hardware.push(hw);
+  }
+  const divs = [...byTitle.values()];
+  for (const d of divs) {
+    d.systems.sort((a, b) => a.name.localeCompare(b.name));
+    d.hardware.sort((a, b) => a.name.localeCompare(b.name));
+  }
+  divs.sort((a, b) => {
+    const ka = order.get(a.title) ?? 0;
+    const kb = order.get(b.title) ?? 0;
+    if (ka !== kb) return ka - kb;
+    return a.title.localeCompare(b.title);
+  });
+  return divs;
+}
+
+const GROUPING_KEY = "ff-rom-grouping";
+const DIV_OPEN_KEY = "ff-rom-div-open";
+
+export function loadRomGrouping(): RomGrouping {
+  try {
+    return localStorage.getItem(GROUPING_KEY) === "generation"
+      ? "generation"
+      : "maker";
+  } catch {
+    return "maker";
+  }
+}
+
+export function saveRomGrouping(mode: RomGrouping): void {
+  try {
+    localStorage.setItem(GROUPING_KEY, mode);
+  } catch {
+    // storage unavailable
+  }
+}
+
+/** Division collapse state: divisions are COLLAPSED unless their title
+ * is in the open set (Dickles: default collapsed, everywhere). */
+export function loadOpenDivisions(): Set<string> {
+  try {
+    const raw = localStorage.getItem(DIV_OPEN_KEY);
+    if (raw) {
+      const arr = JSON.parse(raw) as string[];
+      if (Array.isArray(arr)) return new Set(arr);
+    }
+  } catch {
+    // no stored state
+  }
+  return new Set();
+}
+
+export function saveOpenDivisions(open: Set<string>): void {
+  try {
+    localStorage.setItem(DIV_OPEN_KEY, JSON.stringify([...open]));
+  } catch {
+    // storage unavailable
+  }
+}
+
 const STORE_KEY = "ff-rom-systems";
 const SEED_FLAG = "ff-roms-v1";
 const SEED_FLAG_V2 = "ff-roms-v2";
+const SEED_FLAG_V3 = "ff-roms-v3";
 const ENABLED_KEY = "ff-roms-enabled";
 
 /** Round 7.1 additions (Dickles): modern consoles + arcade. Applied as a
@@ -104,6 +368,36 @@ export const ROM_SEED_V2: Array<{
   { name: "PlayStation 4", extensions: ["pkg"] },
   { name: "PlayStation 5", extensions: ["pkg"] },
   { name: "Arcade", extensions: ["zip", "7z", "chd"], aliases: ["Arcade (MAME)"] },
+];
+
+/** ROM organization pass (2026-10-15): systems restored from the
+ * canon audit — every owned, ROM-capable machine whose DAT sat unused
+ * in libretro-database (Odyssey², Channel F, Game.com, PS Vita, …),
+ * plus the owned systems no redistributable DAT covers (Bally
+ * Astrocade, APF-MP1000, FM Towns, Playdia), which keep extension
+ * rules like Switch/PS4/PS5. Fresh installs seed them directly;
+ * existing installs gain them via the one-time v3 additive merge. */
+export const ROM_NEW_SYSTEMS: Array<{ name: string; extensions: string[] }> = [
+  { name: "Amiga CD32", extensions: ["iso", "cue", "chd"] },
+  { name: "APF-MP1000", extensions: ["bin"] },
+  { name: "Arcadia 2001", extensions: ["bin"] },
+  { name: "Bally Astrocade", extensions: ["bin"] },
+  { name: "CD-i", extensions: ["iso", "cue", "chd", "bin"] },
+  { name: "Channel F", extensions: ["bin", "chf"] },
+  { name: "FM Towns", extensions: ["iso", "cue", "chd"] },
+  { name: "Game.com", extensions: ["tgc", "bin"] },
+  { name: "GX4000", extensions: ["cpr"] },
+  { name: "Neo Geo CD", extensions: ["iso", "cue", "chd"] },
+  { name: "Odyssey²", extensions: ["bin"] },
+  { name: "PC-FX", extensions: ["iso", "cue", "chd"] },
+  { name: "Playdia", extensions: ["iso", "cue", "chd"] },
+  { name: "PS Vita", extensions: ["vpk"] },
+  { name: "PV-1000", extensions: ["bin"] },
+  { name: "SG-1000", extensions: ["sg", "sc"] },
+  { name: "Studio II", extensions: ["bin", "st2"] },
+  { name: "Super A'can", extensions: ["bin"] },
+  { name: "Super Cassette Vision", extensions: ["bin"] },
+  { name: "VIC-20", extensions: ["prg", "crt", "tap", "d64"] },
 ];
 
 export const ROM_SEED: RomSystem[] = [
@@ -149,6 +443,10 @@ export const ROM_SEED: RomSystem[] = [
   { name: "WonderSwan", extensions: ["ws", "wsc"] },
   { name: "Xbox", extensions: ["xbe", "iso"] },
   { name: "ZX Spectrum", extensions: ["tzx", "tap", "z80", "sna"] },
+  ...ROM_NEW_SYSTEMS.map((s) => ({
+    name: s.name,
+    extensions: [...s.extensions],
+  })),
 ];
 
 export function loadRomSystems(): RomSystem[] {
@@ -200,6 +498,25 @@ export function loadRomSystems(): RomSystem[] {
       saveRomSystems(list);
     }
     try { localStorage.setItem(SEED_FLAG_V2, "1"); } catch { /* ignore */ }
+  }
+  // ROM organization pass: one-time additive merge of the restored
+  // systems. Runs exactly once per install; deletions made after this
+  // merge are never undone.
+  let mergedV3 = false;
+  try { mergedV3 = !!localStorage.getItem(SEED_FLAG_V3); } catch { mergedV3 = true; }
+  if (!mergedV3) {
+    let changed = false;
+    for (const d of ROM_NEW_SYSTEMS) {
+      if (!list.some((s) => s.name === d.name)) {
+        list.push({ name: d.name, extensions: [...d.extensions] });
+        changed = true;
+      }
+    }
+    if (changed) {
+      list.sort((a, b) => a.name.localeCompare(b.name));
+      saveRomSystems(list);
+    }
+    try { localStorage.setItem(SEED_FLAG_V3, "1"); } catch { /* ignore */ }
   }
   return list;
 }
