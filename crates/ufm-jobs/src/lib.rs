@@ -61,6 +61,32 @@ pub enum StepOp {
     Mkdir { parent: Item, name: String },
     /// Verify-then-skip: checks size/hash at the destination before copying.
     VerifyCopy { src: Item, dst: Item },
+    /// ROM media enrichment: fetch one media file for one identified
+    /// ROM from the source cascade and file it in the canonical media
+    /// tree. The step is deliberately self-contained data: no URLs
+    /// (the cascade resolves them at execution time), no destination
+    /// path (recomputed from the media settings at execution time),
+    /// and NEVER any credential: secrets are read from the OS keyring
+    /// by the executor, never written into a job snapshot.
+    FetchMedia {
+        /// Catalog item id of the ROM (string form of ItemId).
+        item_id: String,
+        /// Fable dataset system key (e.g. "nes", "lynx").
+        system: String,
+        /// DAT display name (e.g. "Contra (USA)").
+        dat_name: String,
+        /// ROM filename stem: the storage name in the media tree.
+        rom_stem: String,
+        /// boxart | screenshot | titleshot | trailer
+        media_type: String,
+        /// Identification hashes from the DAT pass (hex), when known.
+        crc: Option<String>,
+        md5: Option<String>,
+        sha1: Option<String>,
+        /// The ROM file size in bytes, when known (ScreenScraper asks
+        /// for it alongside the hashes).
+        size: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +330,43 @@ impl Default for JobJournal {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fetch_media_step_round_trips() {
+        let step = Step {
+            id: "s1".into(),
+            label: "NES - Contra (USA) - box art".into(),
+            op: StepOp::FetchMedia {
+                item_id: "item-1".into(),
+                system: "nes".into(),
+                dat_name: "Contra (USA)".into(),
+                rom_stem: "Contra (USA)".into(),
+                media_type: "boxart".into(),
+                crc: Some("1234abcd".into()),
+                md5: None,
+                sha1: Some("00112233445566778899aabbccddeeff00112233".into()),
+                size: Some(24592),
+            },
+            depends_on: vec![],
+            state: StepState::Pending,
+            compensation: None,
+            outcome: false,
+            outcome_path: None,
+        };
+        let json = serde_json::to_string(&step).unwrap();
+        let back: Step = serde_json::from_str(&json).unwrap();
+        match back.op {
+            StepOp::FetchMedia { ref system, ref media_type, .. } => {
+                assert_eq!(system, "nes");
+                assert_eq!(media_type, "boxart");
+            }
+            _ => panic!("wrong variant after round trip"),
+        }
+        // Older snapshots (no FetchMedia anywhere) still load: the
+        // enum is serde-tagged, so a Copy step JSON is unaffected.
+        let old = r#"{"id":"s0","label":"c","op":{"op":"mkdir","parent":{"id":"00000000-0000-0000-0000-000000000000","location":"00000000-0000-0000-0000-000000000000","name":"x","kind":"folder","size_bytes":null,"modified":null,"provider_key":null,"labels":[],"starred":false},"name":"y"},"depends_on":[],"state":"pending","compensation":null}"#;
+        assert!(serde_json::from_str::<Step>(old).is_ok());
+    }
+
     use super::*;
     use std::sync::Mutex;
     use ufm_core::{ItemId, LocationId};

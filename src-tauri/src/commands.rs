@@ -1651,7 +1651,7 @@ struct StepFx {
 
 /// Emit `job-progress` from the handle's live state under a short
 /// lock — no job clone, no blob write (P0).
-fn emit_from_handle(
+pub(crate) fn emit_from_handle(
     app: &tauri::AppHandle,
     handle: &JobHandle,
     bytes_done: u64,
@@ -2006,6 +2006,59 @@ fn execute_step(
                 }
             } else {
                 exec_permanent_delete(target_path)
+            }
+        }
+        ufm_jobs::StepOp::FetchMedia {
+            item_id,
+            system,
+            dat_name,
+            rom_stem,
+            media_type,
+            crc,
+            md5,
+            sha1,
+            size,
+        } => {
+            // ROM media enrichment: the step spec is data only — the
+            // cascade, the destination, and the credentials are all
+            // resolved inside rommedia at execution time (settings
+            // may have changed since the job was planned; secrets
+            // never live in job snapshots).
+            let spec = crate::rommedia::FetchSpec {
+                item_id: item_id.clone(),
+                system: system.clone(),
+                dat_name: dat_name.clone(),
+                rom_stem: rom_stem.clone(),
+                media_type: media_type.clone(),
+                crc: crc.clone(),
+                md5: md5.clone(),
+                sha1: sha1.clone(),
+                size: *size,
+            };
+            let catalog_path = app.state::<AppState>().catalog_path.clone();
+            let base = catalog_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default();
+            let progress = |text: &str| {
+                emit_from_handle(app, handle, *bytes_done, Some(text), None);
+            };
+            match crate::rommedia::run_fetch(
+                &spec,
+                &base,
+                &catalog_path,
+                &|| flag(&handle.cancel),
+                &|| wait_while_paused(handle),
+                &progress,
+            ) {
+                crate::rommedia::FetchVerdict::Done => StepOutcome::Done(None),
+                crate::rommedia::FetchVerdict::Skipped => StepOutcome::Skipped,
+                crate::rommedia::FetchVerdict::Failed(msg) => {
+                    StepOutcome::Failed(msg)
+                }
+                crate::rommedia::FetchVerdict::Cancelled => {
+                    StepOutcome::Cancelled
+                }
             }
         }
     }
@@ -2785,6 +2838,7 @@ fn job_signature(job: &ufm_jobs::Job) -> String {
                 }
             }
             ufm_jobs::StepOp::Mkdir { .. } => {}
+            ufm_jobs::StepOp::FetchMedia { .. } => {}
         }
     }
     if srcs.is_empty() {
@@ -10049,6 +10103,200 @@ pub async fn create_torrent(
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("torrent task failed: {e}"))))?
     .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+
+// ---------------------------------------------------------------------------
+// ROM media enrichment (rommedia.rs): settings + secrets + validation,
+// the journaled download job, the missing-media report, ambiguity
+// confirmation, and the art lookup for art-forward collections.
+// ---------------------------------------------------------------------------
+
+fn rom_media_base(state: &AppState) -> std::path::PathBuf {
+    state
+        .catalog_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default()
+}
+
+#[tauri::command]
+pub fn get_rom_media_settings(
+    state: State<'_, AppState>,
+) -> Cmd<crate::rommedia::SettingsView> {
+    Ok(crate::rommedia::settings_view(&rom_media_base(&state)))
+}
+
+#[tauri::command]
+pub fn set_rom_media_settings(
+    state: State<'_, AppState>,
+    settings: crate::rommedia::RomMediaSettings,
+) -> Cmd<()> {
+    crate::rommedia::save_settings(&rom_media_base(&state), &settings)
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+#[tauri::command]
+pub fn set_rom_media_secret(
+    kind: String,
+    value: Option<String>,
+) -> Cmd<String> {
+    if !crate::rommedia::SECRET_KINDS.contains(&kind.as_str()) {
+        return Err(CommandError::from(UfmError::InvalidInput(format!(
+            "unknown secret kind {kind}"
+        ))));
+    }
+    crate::rommedia::secret_set(&kind, value.as_deref())
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    Ok(match value.as_deref() {
+        Some(v) if !v.trim().is_empty() => "Saved to the system keyring.".into(),
+        _ => "Removed from the system keyring.".into(),
+    })
+}
+
+#[tauri::command]
+pub async fn validate_rom_media_source(
+    state: State<'_, AppState>,
+    kind: String,
+) -> Cmd<crate::rommedia::ValidateResult> {
+    let base = rom_media_base(&state);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::rommedia::validate_source(&base, &kind)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("validation task failed: {e}")))
+    })?;
+    Ok(result)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomMediaRetry {
+    pub item_id: String,
+    pub media_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomMediaDownloadRequest {
+    /// Dataset system keys; None = every system with identified ROMs.
+    #[serde(default)]
+    pub systems: Option<Vec<String>>,
+    /// Display label for a single-system job title.
+    #[serde(default)]
+    pub system_label: Option<String>,
+    /// Explicit (item, type) retries from the media report.
+    #[serde(default)]
+    pub retry: Vec<RomMediaRetry>,
+}
+
+#[tauri::command]
+pub async fn start_rom_media_download(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    req: RomMediaDownloadRequest,
+) -> Cmd<JobStart> {
+    let base = rom_media_base(&state);
+    let catalog_path = state.catalog_path.clone();
+    let retry: Vec<(String, String)> = req
+        .retry
+        .iter()
+        .map(|r| (r.item_id.clone(), r.media_type.clone()))
+        .collect();
+    let systems = req.systems.clone();
+    let label = req.system_label.clone();
+    let job = tauri::async_runtime::spawn_blocking(move || {
+        let settings = crate::rommedia::load_settings(&base);
+        let catalog = ufm_catalog::Catalog::open(&catalog_path)
+            .map_err(|e| format!("catalog open failed: {e}"))?;
+        crate::rommedia::plan_download(
+            &catalog,
+            &settings,
+            systems,
+            &retry,
+            label.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("planning task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    start_job(app, &state, job)
+}
+
+#[tauri::command]
+pub async fn rom_media_report(
+    state: State<'_, AppState>,
+    system: Option<String>,
+) -> Cmd<crate::rommedia::ReportData> {
+    let base = rom_media_base(&state);
+    let catalog_path = state.catalog_path.clone();
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let settings = crate::rommedia::load_settings(&base);
+        let catalog = ufm_catalog::Catalog::open(&catalog_path)
+            .map_err(|e| format!("catalog open failed: {e}"))?;
+        Ok::<_, String>(crate::rommedia::build_report(
+            &catalog,
+            &settings,
+            system.as_deref(),
+        ))
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("report task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    Ok(report)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomMediaConfirmRequest {
+    pub item_id: String,
+    pub media_type: String,
+    pub source: String,
+    pub url: String,
+}
+
+#[tauri::command]
+pub async fn confirm_rom_media_match(
+    state: State<'_, AppState>,
+    req: RomMediaConfirmRequest,
+) -> Cmd<String> {
+    let base = rom_media_base(&state);
+    let catalog_path = state.catalog_path.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let catalog = ufm_catalog::Catalog::open(&catalog_path)
+            .map_err(|e| format!("catalog open failed: {e}"))?;
+        crate::rommedia::confirm_match(
+            &catalog,
+            &base,
+            &req.item_id,
+            &req.media_type,
+            &req.source,
+            &req.url,
+        )
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("confirm task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn rom_media_art(
+    state: State<'_, AppState>,
+    item_ids: Vec<String>,
+) -> Cmd<std::collections::HashMap<String, String>> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    catalog
+        .rom_media_art(&item_ids)
+        .map_err(CommandError::from)
 }
 
 #[cfg(test)]

@@ -32,6 +32,25 @@ pub struct Catalog {
 
 /// A stored media identity (see `Catalog::media_identity_for`).
 #[derive(Debug, Clone)]
+/// One cached ROM-media lookup result (ROM media enrichment): for
+/// one identified ROM and one media type, whether the cascade found
+/// a file, where it came from, and where it now lives. Negative
+/// results are cached too — re-runs only chase what is still missing
+/// (or what errored, which always replans).
+pub struct RomMediaRow {
+    pub item_id: String,
+    pub media_type: String,
+    /// found | missing | ambiguous | error
+    pub status: String,
+    /// libretro | screenscraper | thegamesdb | steamgriddb |
+    /// emumovies | manual | null
+    pub source: Option<String>,
+    pub local_path: Option<String>,
+    /// JSON: candidates for ambiguous rows, note for error rows.
+    pub detail_json: String,
+    pub checked_at: String,
+}
+
 pub struct MediaIdentityRow {
     pub item_id: String,
     pub media_kind: String,
@@ -167,6 +186,23 @@ impl Catalog {
                 .execute("ALTER TABLE items ADD COLUMN duration_secs REAL", [])
                 .map_err(|e| UfmError::Database(e.to_string()))?;
         }
+        // ROM media enrichment: cached per-(rom, media type) lookup
+        // results. Lives beside media_identities; cascade misses are
+        // data here, not absence of data.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS rom_media (
+                    item_id TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    source TEXT,
+                    local_path TEXT,
+                    detail_json TEXT NOT NULL DEFAULT '{}',
+                    checked_at TEXT NOT NULL,
+                    PRIMARY KEY (item_id, media_type)
+                );",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
         Ok(())
     }
 
@@ -990,10 +1026,197 @@ impl Catalog {
         }
         Ok(entries)
     }
+    /// One cached ROM-media result for (item, media type).
+    pub fn rom_media_for(
+        &self,
+        item_id: &str,
+        media_type: &str,
+    ) -> Result<Option<RomMediaRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT item_id, media_type, status, source, local_path,
+                        detail_json, checked_at
+                 FROM rom_media WHERE item_id = ?1 AND media_type = ?2",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![item_id, media_type], |row| {
+                Ok(RomMediaRow {
+                    item_id: row.get(0)?,
+                    media_type: row.get(1)?,
+                    status: row.get(2)?,
+                    source: row.get(3)?,
+                    local_path: row.get(4)?,
+                    detail_json: row.get(5)?,
+                    checked_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r.map_err(|e| UfmError::Database(e.to_string()))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record (or replace) one ROM-media lookup result.
+    pub fn upsert_rom_media(
+        &self,
+        item_id: &str,
+        media_type: &str,
+        status: &str,
+        source: Option<&str>,
+        local_path: Option<&str>,
+        detail_json: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO rom_media
+                 (item_id, media_type, status, source, local_path, detail_json, checked_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    item_id,
+                    media_type,
+                    status,
+                    source,
+                    local_path,
+                    detail_json,
+                    ufm_core::now_utc().to_rfc3339()
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Every cached ROM-media row for ROMs identified on `platform`
+    /// (the missing-media report's raw material), with DAT titles.
+    /// Returns (row, DAT title, item provider key).
+    pub fn rom_media_for_system(
+        &self,
+        platform: &str,
+    ) -> Result<Vec<(RomMediaRow, String, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT rm.item_id, rm.media_type, rm.status, rm.source,
+                        rm.local_path, rm.detail_json, rm.checked_at,
+                        mi.title, i.provider_key
+                 FROM rom_media AS rm
+                 JOIN media_identities AS mi ON mi.item_id = rm.item_id
+                 JOIN items AS i ON i.id = rm.item_id
+                 WHERE mi.media_kind = 'rom' AND mi.platform = ?1
+                 ORDER BY mi.title COLLATE NOCASE, rm.media_type",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![platform], |row| {
+                Ok((
+                    RomMediaRow {
+                        item_id: row.get(0)?,
+                        media_type: row.get(1)?,
+                        status: row.get(2)?,
+                        source: row.get(3)?,
+                        local_path: row.get(4)?,
+                        detail_json: row.get(5)?,
+                        checked_at: row.get(6)?,
+                    },
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (row, title, pk) = r.map_err(|e| UfmError::Database(e.to_string()))?;
+            out.push((row, title.unwrap_or_default(), pk));
+        }
+        Ok(out)
+    }
+
+    /// Box-art paths for a set of items (art-forward collections):
+    /// item id -> canonical local path, only for rows the cascade (or
+    /// the user, by hand) actually landed.
+    pub fn rom_media_art(
+        &self,
+        item_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut out = std::collections::HashMap::new();
+        if item_ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders: Vec<String> =
+            item_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+        let sql = format!(
+            "SELECT item_id, local_path FROM rom_media
+             WHERE media_type = 'boxart' AND status = 'found'
+               AND local_path IS NOT NULL AND item_id IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let values: Vec<rusqlite::types::Value> =
+            item_ids.iter().map(|s| rusqlite::types::Value::Text(s.clone())).collect();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        for r in rows {
+            let (id, path) = r.map_err(|e| UfmError::Database(e.to_string()))?;
+            out.insert(id, path);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rom_media_cache_round_trip() {
+        let cat = Catalog::open_in_memory().unwrap();
+        // No row yet.
+        assert!(cat.rom_media_for("item-1", "boxart").unwrap().is_none());
+        cat.upsert_rom_media(
+            "item-1",
+            "boxart",
+            "found",
+            Some("libretro"),
+            Some("/media/nes/covers/X.png"),
+            "{}",
+        )
+        .unwrap();
+        cat.upsert_rom_media(
+            "item-1", "trailer", "missing", None, None, "{}",
+        )
+        .unwrap();
+        let row = cat.rom_media_for("item-1", "boxart").unwrap().unwrap();
+        assert_eq!(row.status, "found");
+        assert_eq!(row.source.as_deref(), Some("libretro"));
+        assert_eq!(
+            row.local_path.as_deref(),
+            Some("/media/nes/covers/X.png")
+        );
+        // Replace works (a later rung wins).
+        cat.upsert_rom_media(
+            "item-1",
+            "boxart",
+            "found",
+            Some("screenscraper"),
+            Some("/media/nes/covers/X.jpg"),
+            "{}",
+        )
+        .unwrap();
+        let row = cat.rom_media_for("item-1", "boxart").unwrap().unwrap();
+        assert_eq!(row.source.as_deref(), Some("screenscraper"));
+        // Art map only carries found box art.
+        let art = cat.rom_media_art(&["item-1".to_string()]).unwrap();
+        assert_eq!(art.get("item-1").map(|s| s.as_str()), Some("/media/nes/covers/X.jpg"));
+        let art = cat.rom_media_art(&["item-1".to_string(), "nope".to_string()]).unwrap();
+        assert_eq!(art.len(), 1);
+    }
+
     use super::*;
     use ufm_core::{ItemId, LocationId};
     use ufm_vfs::{Item, ItemKind};

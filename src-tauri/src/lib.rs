@@ -7,6 +7,7 @@
 //! from the running app) and then managed for the command layer.
 
 pub mod commands;
+pub mod rommedia;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -473,6 +474,14 @@ pub fn run() {
             commands::apply_label_rules,
             commands::identify_roms,
             commands::rom_collection_items,
+            commands::get_rom_media_settings,
+            commands::set_rom_media_settings,
+            commands::set_rom_media_secret,
+            commands::validate_rom_media_source,
+            commands::start_rom_media_download,
+            commands::rom_media_report,
+            commands::confirm_rom_media_match,
+            commands::rom_media_art,
             commands::media_url_for_path,
             commands::add_path_location,
             commands::remove_path_location,

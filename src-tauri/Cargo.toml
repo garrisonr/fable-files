@@ -34,6 +34,8 @@ ufm-emu = { path = "../crates/ufm-emu" }
 ufm-torrent = { path = "../crates/ufm-torrent" }
 tracing.workspace = true
 base64 = "0.22"
+ureq = "2"
+keyring = "3"
 sha1 = "0.10"
 crc32fast = "1"
 filetime = "0.2"

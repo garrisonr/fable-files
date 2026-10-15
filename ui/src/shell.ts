@@ -3488,6 +3488,8 @@ export class Shell {
    * ROM store — so there is one source of truth per setting. */
   private openPreferences(): void {
     this.preferencesDialog.open({
+      pickFolder: async (_initial: string | null) =>
+        this.picker.pick("Choose a folder", [], null),
       backendThemes: () => this.themeManager.list,
       activeTheme: () => this.themeManager.active,
       resolvedEngine: () => {

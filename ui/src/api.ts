@@ -434,6 +434,24 @@ export const api = {
   identifyRoms: () => invoke<RomIdentifyStats>("identify_roms"),
   romCollectionItems: (system: string, scope: RomScope) =>
     invoke<RomHit[]>("rom_collection_items", { system, scope }),
+  // ROM media enrichment: settings + keyring secrets (presence only
+  // ever comes back), validation, the download job, the report.
+  getRomMediaSettings: () =>
+    invoke<RomMediaSettingsView>("get_rom_media_settings"),
+  setRomMediaSettings: (settings: RomMediaSettings) =>
+    invoke<void>("set_rom_media_settings", { settings }),
+  setRomMediaSecret: (kind: string, value: string | null) =>
+    invoke<string>("set_rom_media_secret", { kind, value }),
+  validateRomMediaSource: (kind: string) =>
+    invoke<RomMediaValidate>("validate_rom_media_source", { kind }),
+  startRomMediaDownload: (req: RomMediaDownloadRequest) =>
+    invoke<JobStart>("start_rom_media_download", { req }),
+  romMediaReport: (system: string | null) =>
+    invoke<RomMediaReportData>("rom_media_report", { system }),
+  confirmRomMediaMatch: (req: RomMediaConfirmRequest) =>
+    invoke<string>("confirm_rom_media_match", { req }),
+  romMediaArt: (itemIds: string[]) =>
+    invoke<Record<string, string>>("rom_media_art", { itemIds }),
   pauseJob: (job: string) => invoke<void>("pause_job", { job }),
   resumeJob: (job: string) => invoke<void>("resume_job", { job }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),
@@ -640,6 +658,80 @@ export interface RomIdentifyProgress {
 export interface RomScope {
   mode: "all" | "boot" | "drives";
   drives: string[];
+}
+
+/** ROM media enrichment (mirrors rommedia.rs). */
+export interface RomMediaTypeSettings {
+  enabled: boolean;
+  dirOverride: string | null;
+}
+
+export interface RomMediaSettings {
+  mediaRoot: string;
+  retroarchDir: string | null;
+  boxart: RomMediaTypeSettings;
+  screenshots: RomMediaTypeSettings;
+  titles: RomMediaTypeSettings;
+  trailers: RomMediaTypeSettings;
+  trailerTier: string;
+  screenscraperUser: string | null;
+  emumoviesUser: string | null;
+}
+
+export interface RomMediaSettingsView {
+  settings: RomMediaSettings;
+  secretPresent: Record<string, boolean>;
+  keyringOk: boolean;
+  ssDevReady: boolean;
+}
+
+export interface RomMediaValidate {
+  ok: boolean;
+  message: string;
+}
+
+export interface RomMediaDownloadRequest {
+  systems?: string[] | null;
+  systemLabel?: string | null;
+  retry?: Array<{ itemId: string; mediaType: string }>;
+}
+
+export interface RomMediaConfirmRequest {
+  itemId: string;
+  mediaType: string;
+  source: string;
+  url: string;
+}
+
+export interface RomMediaCandidate {
+  source: string;
+  title: string;
+  url: string;
+}
+
+export interface RomMediaMissingRow {
+  itemId: string;
+  title: string;
+  mediaType: string;
+  status: string;
+  reason: string;
+  candidates: RomMediaCandidate[];
+}
+
+export interface RomMediaSystemReport {
+  system: string;
+  display: string;
+  totalGames: number;
+  coverage: Array<{ mediaType: string; have: number; total: number }>;
+  missing: RomMediaMissingRow[];
+  truncatedMissing: number;
+  diyFolder: string;
+  diyPattern: string;
+}
+
+export interface RomMediaReportData {
+  systems: RomMediaSystemReport[];
+  generatedAt: string;
 }
 
 /** One ROM collection member: the catalog item plus its DAT name. */

@@ -3185,3 +3185,43 @@ select option { background-color: var(--ufm-surface); color: var(--ufm-text); }
 .music-row.dragging { opacity: .45; }
 .music-row.drop-before { box-shadow: inset 0 2px 0 var(--ufm-accent); }
 .music-row.drop-after { box-shadow: inset 0 -2px 0 var(--ufm-accent); }
+
+/* --- ROM media enrichment (Game Media settings + report + art) --- */
+.rm-body { margin-bottom: 0.5rem; }
+.rm-block { margin: 0.25rem 0 0.75rem; }
+.rm-pathrow { display: flex; align-items: center; gap: 0.625rem; flex-wrap: wrap; }
+.rm-path-value { font-family: var(--ufm-font-mono); font-size: 0.75rem; color: var(--ufm-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 22rem; }
+.rm-source { border: 1px solid var(--ufm-border); border-radius: 12px; padding: 0.75rem 0.875rem; margin: 0.5rem 0; background: color-mix(in srgb, var(--ufm-text) 3%, transparent); }
+.rm-source-name { font-size: 0.875rem; font-weight: 700; margin: 0 0 0.25rem; }
+.rm-status { font-size: 0.8125rem; font-weight: 600; color: var(--ufm-accent); margin: 0.125rem 0 0.375rem; }
+.rm-verdict { font-size: 0.8125rem; margin: 0.5rem 0 0; padding: 0.5rem 0.625rem; border-radius: 8px; background: color-mix(in srgb, var(--ufm-accent) 10%, transparent); }
+.rm-cred-row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; margin-top: 0.375rem; }
+.rm-input { font: inherit; font-size: 0.8125rem; padding: 0.4375rem 0.625rem; border-radius: 8px; border: 1px solid var(--ufm-border); background: var(--ufm-content-canvas); color: var(--ufm-text); min-width: 11rem; }
+.rm-input-wide { min-width: 16rem; flex: 1; }
+.rm-select { font: inherit; font-size: 0.8125rem; padding: 0.375rem 0.5rem; border-radius: 8px; border: 1px solid var(--ufm-border); background: var(--ufm-content-canvas); color: var(--ufm-text); }
+.rm-tier-row, .rm-override-row { display: flex; align-items: center; gap: 0.625rem; flex-wrap: wrap; margin: 0.375rem 0; }
+.rm-advanced { margin-top: 0.625rem; font-size: 0.8125rem; }
+.rm-advanced summary { cursor: pointer; color: var(--ufm-text-muted); font-weight: 600; }
+.rm-freebox { border: 1px dashed var(--ufm-border); border-radius: 12px; padding: 0.625rem 0.875rem; margin: 0.75rem 0; }
+.rm-freebox-title { font-weight: 700; font-size: 0.875rem; margin: 0 0 0.25rem; }
+.rm-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.75rem 0 0.25rem; }
+.rm-warn { color: var(--ufm-danger, #c0392b); font-weight: 600; }
+.rm-collection-bar { display: flex; gap: 0.5rem; margin: 0.5rem 0 0.75rem; }
+.search-hit:has(> .hit-art) { grid-template-columns: auto 1fr auto; grid-template-areas: "art name meta" "art path meta"; }
+.hit-art { grid-area: art; height: 3.5rem; max-width: 6rem; object-fit: contain; border-radius: 6px; align-self: center; }
+.hit-art-glyph { width: 2.75rem; display: flex; align-items: center; justify-content: center; font-size: 1.25rem; opacity: 0.35; background: color-mix(in srgb, var(--ufm-text) 5%, transparent); }
+.rm-report-dialog { width: min(52rem, calc(100vw - 3rem)); }
+.rm-report-body { max-height: calc(100vh - 12rem); overflow-y: auto; }
+.rm-report-system { margin-bottom: 1.25rem; }
+.rm-coverage { font-size: 0.8125rem; font-weight: 600; color: var(--ufm-text-muted); margin: 0.25rem 0 0.5rem; }
+.rm-report-row { display: flex; gap: 0.75rem; align-items: flex-start; justify-content: space-between; padding: 0.5rem 0.625rem; border: 1px solid var(--ufm-border); border-radius: 10px; margin: 0.375rem 0; }
+.rm-report-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.rm-report-name { font-weight: 600; font-size: 0.875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rm-report-reason { font-size: 0.8125rem; color: var(--ufm-text-muted); }
+.rm-candidates { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.rm-candidate { appearance: none; border: 1px solid var(--ufm-border); background: var(--ufm-content-canvas); color: var(--ufm-text); border-radius: 10px; padding: 0.375rem; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 0.375rem; max-width: 9rem; font: inherit; }
+.rm-candidate:hover { border-color: var(--ufm-accent); }
+.rm-candidate-img { height: 5.5rem; max-width: 8rem; object-fit: contain; border-radius: 6px; }
+.rm-candidate-label { font-size: 0.6875rem; color: var(--ufm-text-muted); text-align: center; }
+.rm-diy { border: 1px dashed var(--ufm-border); border-radius: 10px; padding: 0.5rem 0.75rem; margin-top: 0.625rem; }
+.rm-diy-title { font-weight: 700; font-size: 0.8125rem; margin: 0; }

@@ -7,6 +7,7 @@
  */
 import {
   api,
+  fileSrc,
   formatBytes,
   onRomIdentifyProgress,
   type Item,
@@ -16,6 +17,7 @@ import {
 import { ContextMenu } from "./contextmenu";
 import { errText } from "./toast";
 import { isPlayableName } from "./video";
+import { openRomMediaReport, startMediaDownload } from "./rommedia";
 
 export interface SearchHooks {
   onNavigateToItem(item: Item): void;
@@ -828,6 +830,7 @@ export class SearchView {
     if (cached?.items) {
       this.displayNames = cached.displayNames;
       this.renderItems(name, cached.items);
+      this.mountRomMediaBar(name, systemKey);
       this.restoreScroll(key);
       return;
     }
@@ -859,6 +862,7 @@ export class SearchView {
         scrollTop: 0,
       });
       this.renderItems(name, items);
+      this.mountRomMediaBar(name, systemKey);
       if (items.length === 0) {
         const note = document.createElement("p");
         note.className = "search-hint";
@@ -917,6 +921,62 @@ export class SearchView {
       modifiedAfter: this.afterDate || null,
       modifiedBefore: this.beforeDate || null,
     };
+  }
+
+  /** ROM media enrichment, in the collection view: a "get media"
+   * bar under the results, and box art leading every row that has
+   * it (art-forward collections) with a quiet glyph where none has
+   * landed yet. The art pass is async and re-checks the view key so
+   * a stale answer never paints into a different view. */
+  private mountRomMediaBar(name: string, systemKey: string): void {
+    const bar = document.createElement("div");
+    bar.className = "rm-collection-bar";
+    const get = document.createElement("button");
+    get.className = "pill-btn primary";
+    get.textContent = "Get missing media";
+    get.addEventListener("click", () => {
+      void startMediaDownload(systemKey, name);
+    });
+    const rep = document.createElement("button");
+    rep.className = "pill-btn";
+    rep.textContent = "Media report…";
+    rep.addEventListener("click", () => openRomMediaReport(systemKey));
+    bar.append(get, rep);
+    this.resultsEl.appendChild(bar);
+    const key = this.currentViewKey;
+    const ids = this.hits.map((h) => h.item.id);
+    if (ids.length === 0) return;
+    void (async () => {
+      let art: Record<string, string>;
+      try {
+        art = await api.romMediaArt(ids);
+      } catch {
+        return; // art is decoration; its absence stays silent
+      }
+      if (this.currentViewKey !== key || !this.active) return;
+      const rows =
+        this.resultsEl.querySelectorAll<HTMLElement>(".search-hit");
+      rows.forEach((rowEl) => {
+        const idx = Number(rowEl.dataset.index);
+        const hit = this.hits[idx];
+        if (!hit) return;
+        const path = art[hit.item.id];
+        if (path) {
+          const img = document.createElement("img");
+          img.className = "hit-art";
+          img.src = fileSrc(path);
+          img.alt = "";
+          img.loading = "lazy";
+          rowEl.prepend(img);
+          rowEl.classList.add("has-art");
+        } else {
+          const glyph = document.createElement("span");
+          glyph.className = "hit-art hit-art-glyph";
+          glyph.textContent = "\u{1F3AE}";
+          rowEl.prepend(glyph);
+        }
+      });
+    })();
   }
 
   private renderStatus(text: string): void {

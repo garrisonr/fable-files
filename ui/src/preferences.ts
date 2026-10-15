@@ -12,6 +12,7 @@
  */
 import type { ThemeInfo } from "./api";
 import { DISTRO_ENGINES } from "./themes";
+import { RomMediaSection } from "./rommedia";
 
 export interface PreferencesHooks {
   /** Backend (built-in) themes from list_themes. */
@@ -29,6 +30,8 @@ export interface PreferencesHooks {
   stepIconSize(dir: 1 | -1): void;
   romsOn(): boolean;
   setRomsOn(on: boolean): void;
+  /** Folder chooser for the Game Media section (the shell's picker). */
+  pickFolder(initial: string | null): Promise<string | null>;
   sectionCollapsed(key: string): boolean;
   setSectionCollapsed(key: string, collapsed: boolean): void;
   showShortcuts(): void;
@@ -123,6 +126,12 @@ export class PreferencesDialog {
     scopeNote.textContent =
       "ROM collection scope — which drives a system draws from — is set per system in the Roms system editor (sidebar ▸ Roms).";
     dialog.appendChild(scopeNote);
+
+    // Game Media (ROM media enrichment): its own section, mounted
+    // async — it reads its settings + keyring state from the backend.
+    const mediaHost = document.createElement("div");
+    dialog.appendChild(mediaHost);
+    void new RomMediaSection().mount(mediaHost, hooks);
 
     const foot = document.createElement("div");
     foot.className = "prefs-foot";
