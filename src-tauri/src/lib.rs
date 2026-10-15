@@ -7,6 +7,7 @@
 //! from the running app) and then managed for the command layer.
 
 pub mod commands;
+pub mod deps;
 pub mod library;
 pub mod network;
 pub mod mcp_server;
@@ -604,6 +605,7 @@ pub fn run() {
             commands::musiccomplete_get_settings,
             commands::musiccomplete_save_settings,
             commands::musiccomplete_get_status,
+            commands::musiccomplete_install_fpcalc,
             commands::musiccomplete_set_acoustid_key,
             commands::musiccomplete_scan,
             commands::musiccomplete_apply,
@@ -667,6 +669,8 @@ pub fn run() {
             commands::rclone_unmount,
             commands::cast_register_file,
             commands::cast_scan,
+            commands::cast_backends,
+            commands::cast_setup,
             commands::cast_play,
             commands::cast_stop,
             commands::list_installed_apps,

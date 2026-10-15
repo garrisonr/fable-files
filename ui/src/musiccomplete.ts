@@ -20,6 +20,7 @@ import {
   type MuLyricsView,
   type MuRun,
   type MuSchedule,
+  type MuScanView,
   type MuSettings,
   type MuStatus,
   type MuTrackProposal,
@@ -108,6 +109,7 @@ export class MusicCompleteDialog {
   private footEl!: HTMLDivElement;
   private titleEl!: HTMLElement;
   private root = "/";
+  private lastPaths: string[] = [];
   private rows: RowState[] = [];
   private onDone: (() => void) | null = null;
   private lyricsDialog = new LyricsDialog();
@@ -176,9 +178,10 @@ export class MusicCompleteDialog {
     );
     this.footEl.innerHTML = "";
     this.root = root;
+    this.lastPaths = paths;
     try {
       const view = await api.muScan({ root, paths });
-      this.renderScan(view.rows, view.truncated, view.fingerprintingReady);
+      this.renderScan(view);
     } catch (err) {
       this.bodyEl.innerHTML = "";
       this.bodyEl.appendChild(
@@ -192,20 +195,75 @@ export class MusicCompleteDialog {
     this.el.hidden = true;
   }
 
-  private renderScan(
-    rows: MuTrackProposal[],
-    truncated: boolean,
-    fingerprintingReady: boolean,
-  ): void {
+  /** The AcoustID note in the completion dialog. When fpcalc is
+   * the missing piece, the note carries the fix itself: an Install
+   * button that runs the OS install right here and then re-scans,
+   * so identification continues in this same sitting (the
+   * dependency law — a status line is only ever the receipt after
+   * a declined install, and the retry stays attached). When only
+   * the key is missing, the note points at Preferences, because
+   * the key is the user's own secret to paste there. */
+  private renderFingerprintNote(body: HTMLElement, view: MuScanView): void {
+    if (view.fpcalcAvailable) {
+      body.appendChild(
+        el(
+          "p",
+          "mrx-note",
+          "Fingerprint matching (AcoustID) is off — fpcalc is installed, but it also needs your own free AcoustID key (paste it in Preferences → Music Completion). Tag and filename matching are unaffected.",
+        ),
+      );
+      return;
+    }
+    const note = el("p", "mrx-note");
+    note.append(
+      "Fingerprint matching (AcoustID) is off — it needs the free fpcalc tool" +
+        (view.acoustidKeySaved
+          ? "."
+          : " plus your own AcoustID key (Preferences → Music Completion).") +
+        " Fable can set fpcalc up right now: ",
+    );
+    const btn = el("button", "pill-btn", "Install fpcalc");
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      btn.textContent = "Installing fpcalc — approve the system prompt…";
+      try {
+        await api.muInstallFpcalc();
+        Toast.success(
+          "fpcalc installed — re-scanning so fingerprinting can join in.",
+        );
+        await this.start(this.root, this.lastPaths);
+      } catch (err) {
+        Toast.error(`fpcalc setup didn't finish: ${errText(err)}`);
+        btn.disabled = false;
+        btn.textContent = "Try installing fpcalc again";
+      }
+    });
+    note.appendChild(btn);
+    note.append(" Tag and filename matching are unaffected either way.");
+    body.appendChild(note);
+  }
+
+  private renderScan(view: MuScanView): void {
+    const rows = view.rows;
+    const truncated = view.truncated;
     const body = this.bodyEl;
     body.innerHTML = "";
     this.rows = [];
     const work = rows.filter((r) => r.needsWork).length;
+    // Complete and unmatched are different stories — a finished
+    // library and a pile MusicBrainz doesn't know shouldn't share
+    // one lumped number (Dickles, 2026-10-15).
+    const complete = rows.filter(
+      (r) => !r.needsWork && r.state !== "unmatched",
+    ).length;
+    const unmatched = rows.filter(
+      (r) => !r.needsWork && r.state === "unmatched",
+    ).length;
     body.appendChild(
       el(
         "p",
         "mrx-summary",
-        `${rows.length} track(s) read · ${work} could be completed · ${rows.length - work} already complete or unmatched`,
+        `${rows.length} track(s) read · ${work} could be completed · ${complete} already complete · ${unmatched} unmatched`,
       ),
     );
     body.appendChild(
@@ -215,14 +273,8 @@ export class MusicCompleteDialog {
         "MusicBrainz proposes; you dispose. Empty tags get filled. A tag that already says something different is NEVER changed unless you tick that exact line — and everything you apply lands as one journaled run you can undo in Preferences → Music Completion.",
       ),
     );
-    if (!fingerprintingReady) {
-      body.appendChild(
-        el(
-          "p",
-          "mrx-note",
-          "Fingerprint matching (AcoustID) is off — it needs the free fpcalc tool plus your own AcoustID key (Preferences → Music Completion). Tag and filename matching are unaffected.",
-        ),
-      );
+    if (!view.fingerprintingReady) {
+      this.renderFingerprintNote(body, view);
     }
     if (truncated) {
       body.appendChild(
@@ -748,9 +800,27 @@ export class MusicCompleteSection {
         el(
           "p",
           "prefs-note",
-          "The fpcalc fingerprint tool isn't installed on this computer, so sound-based matching is off. That's fine — tags and filenames identify most libraries. fpcalc ships in the “libchromaprint-tools” package on Ubuntu/Zorin; install it and this section lights up.",
+          "The fpcalc fingerprint tool isn't installed on this computer yet, so sound-based matching is off. That's fine — tags and filenames identify most libraries. Fable can set fpcalc up for you: one click, the system asks for the admin password once, and this section lights up.",
         ),
       );
+      const installRow = el("div", "prefs-form-row");
+      const installBtn = el("button", "pill-btn", "Install fpcalc");
+      installBtn.addEventListener("click", async () => {
+        installBtn.disabled = true;
+        installBtn.textContent = "Installing fpcalc — approve the system prompt…";
+        try {
+          await api.muInstallFpcalc();
+          this.status = await api.getMuStatus();
+          Toast.success("fpcalc installed — fingerprinting is ready once your key is saved.");
+          this.render(host);
+        } catch (err) {
+          Toast.error(`fpcalc setup didn't finish: ${errText(err)}`);
+          installBtn.disabled = false;
+          installBtn.textContent = "Install fpcalc";
+        }
+      });
+      installRow.appendChild(installBtn);
+      box.appendChild(installRow);
     } else if (!st.acoustidKeySaved) {
       box.appendChild(
         el(
@@ -768,7 +838,9 @@ export class MusicCompleteSection {
         ),
       );
     }
-    if (st.fpcalcAvailable) {
+    {
+      // The key row is always here — pasting the key before or
+      // after the fpcalc install are both fine.
       const row = el("div", "prefs-form-row");
       const input = document.createElement("input");
       input.type = "password";

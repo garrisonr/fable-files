@@ -23,10 +23,13 @@
 //! - FREE PATH FIRST-CLASS. MusicBrainz + Cover Art Archive +
 //!   LRCLIB need no key and no account. Fingerprinting (AcoustID)
 //!   is the only keyed extra, and only when the `fpcalc` tool is
-//!   installed AND the user saved their own free AcoustID key;
-//!   otherwise the status line says fingerprinting is off and
-//!   tag/filename matching carries on — reduced mode is a note,
-//!   never an error.
+//!   installed AND the user saved their own free AcoustID key.
+//!   When fpcalc is missing, the surfaces that want it offer to
+//!   install it on the spot (crate::deps — the dependency law:
+//!   no dead-end status lines, and "off" is only ever the receipt
+//!   after a declined install) and carry on with tag/filename
+//!   matching meanwhile. In unattended runs fingerprinting is
+//!   simply not used; no prompt ever fires at 3 AM.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -211,9 +214,18 @@ pub struct MuStatus {
     pub acoustid_key_saved: bool,
     /// Fingerprinting needs the chromaprint `fpcalc` tool.
     pub fpcalc_available: bool,
-    /// True only when BOTH the tool and a key exist — the honest
-    /// reduced-mode line in Preferences reads these fields.
+    /// True only when BOTH the tool and a key exist. When the tool
+    /// is missing, Preferences and the completion dialog offer the
+    /// install in context (crate::deps) — these fields say WHICH
+    /// piece is missing so each surface can offer the right fix.
     pub fingerprinting_ready: bool,
+}
+
+/// Install fpcalc through the OS package machinery (the
+/// dependency law: the app sets up what it needs, via the system
+/// prompt, and the caller re-reads status and carries on).
+pub fn install_fpcalc() -> Result<(), String> {
+    crate::deps::ensure_tool("fpcalc", "fpcalc")
 }
 
 pub fn status() -> MuStatus {
@@ -262,6 +274,27 @@ pub struct FileTagsView {
     pub lyrics_synced: Option<String>,
 }
 
+/// Is this embedded picture real cover art? Presence requires
+/// CONTENT: some writers leave an EMPTY picture block behind (or
+/// one holding a few meaningless bytes), and "a block exists"
+/// used to read as "art already in the file" — blocking a fetch
+/// the track actually needed. Real art has valid image magic and
+/// a sane size: nothing under 100 bytes is an album cover (the
+/// tiniest genuine JPEGs run ~150 bytes, and a 1×1 placeholder
+/// GIF/PNG is smaller still). Shared by the checker and the embed
+/// path so "yours wins" means the same thing in both.
+pub fn picture_has_content(data: &[u8]) -> bool {
+    if data.len() < 100 {
+        return false;
+    }
+    data.starts_with(&[0xFF, 0xD8, 0xFF]) // JPEG
+        || data.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) // PNG
+        || data.starts_with(b"GIF8") // GIF
+        || (data.len() > 12 && &data[0..4] == b"RIFF" && &data[8..12] == b"WEBP") // WebP
+        || data.starts_with(b"BM") // BMP
+        || (data.len() > 12 && &data[4..8] == b"ftyp") // ISO-BMFF (AVIF/HEIC covers)
+}
+
 /// Read everything completion needs from one audio file.
 pub fn read_file_tags(path: &Path) -> Result<FileTagsView, String> {
     use lofty::prelude::*;
@@ -296,11 +329,16 @@ pub fn read_file_tags(path: &Path) -> Result<FileTagsView, String> {
                 }
             }
         }
-        view.has_art = !tag.pictures().is_empty();
+        view.has_art = tag.pictures().iter().any(|p| picture_has_content(p.data()));
         if let Some(lyr) = tag.get_string(&lofty::tag::ItemKey::Lyrics) {
-            if lrc::looks_synced(lyr) {
+            // Presence requires CONTENT (Dickles' false-positive
+            // report, 2026-10-15): an empty lyrics field, a bare
+            // LRC header, or timestamps with nothing sung after
+            // them are not "lyrics already saved", and must not
+            // block a fetch or mark a track complete.
+            if lrc::looks_synced(lyr) && lrc::has_synced_content(lyr) {
                 view.lyrics_synced = Some(lyr.to_string());
-            } else if !lyr.trim().is_empty() {
+            } else if lrc::has_plain_content(lyr) {
                 view.lyrics_plain = Some(lyr.to_string());
             }
         }
@@ -378,16 +416,23 @@ pub fn write_embedded_lyrics(
     Ok(prior)
 }
 
-/// Embed cover art — ONLY when the file has none (existing art
-/// always wins). Returns true when art was embedded.
+/// Embed cover art — ONLY when the file has no real art (existing
+/// art always wins; the checker's content standard, so an empty
+/// placeholder block doesn't count as "has art" here either —
+/// those are removed to make room, which is a repair, and the
+/// journal's undo still removes the art the run embedded).
+/// Returns true when art was embedded.
 pub fn embed_art(path: &Path, bytes: &[u8]) -> Result<bool, String> {
     use lofty::prelude::*;
     let mut file = open_for_write(path)?;
     let tag = file
         .primary_tag_mut()
         .ok_or_else(|| "the file has no writable tag".to_string())?;
-    if !tag.pictures().is_empty() {
+    if tag.pictures().iter().any(|p| picture_has_content(p.data())) {
         return Ok(false);
+    }
+    while !tag.pictures().is_empty() {
+        tag.remove_picture(0);
     }
     let mime = if bytes.starts_with(&[0xFF, 0xD8]) {
         Some(lofty::picture::MimeType::Jpeg)
@@ -843,9 +888,11 @@ pub fn sidecar_path(audio: &Path) -> PathBuf {
 }
 
 fn sidecar_text(audio: &Path) -> Option<String> {
+    // Same content standard as embedded lyrics: whitespace, a
+    // bare LRC header, or bare timestamps are not "lyrics saved".
     std::fs::read_to_string(sidecar_path(audio))
         .ok()
-        .filter(|s| !s.trim().is_empty())
+        .filter(|s| lrc::has_plain_content(s) || lrc::has_synced_content(s))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -890,6 +937,10 @@ pub struct ScanView {
     pub rows: Vec<TrackProposal>,
     pub truncated: bool,
     pub fingerprinting_ready: bool,
+    /// Which fingerprinting piece is missing, so the dialog can
+    /// offer the right fix in context (install fpcalc / save key).
+    pub fpcalc_available: bool,
+    pub acoustid_key_saved: bool,
 }
 
 struct Proposers {
@@ -897,17 +948,20 @@ struct Proposers {
     lrclib: LrclibClient,
     acoustid_key: Option<String>,
     fingerprinting_ready: bool,
+    fpcalc_available: bool,
 }
 
 impl Proposers {
     fn new() -> Self {
         let key = acoustid_key_get();
-        let ready = fpcalc_path().is_some() && key.is_some();
+        let fpcalc = fpcalc_path().is_some();
+        let ready = fpcalc && key.is_some();
         Self {
             mb: MbClient::new(),
             lrclib: LrclibClient::new(),
             acoustid_key: key,
             fingerprinting_ready: ready,
+            fpcalc_available: fpcalc,
         }
     }
 
@@ -961,7 +1015,8 @@ impl Proposers {
             }
         }
         // Last door: fingerprint. Only when it's actually ready —
-        // absence is a reduced mode, not a failure.
+        // when it isn't, the dialog has already offered the fpcalc
+        // install in context; unattended runs just skip this door.
         let weak = best
             .as_ref()
             .map(|b| b.score < musicid::PROBABLE_MIN)
@@ -1144,6 +1199,8 @@ pub fn propose_paths(
         rows,
         truncated,
         fingerprinting_ready: proposers.fingerprinting_ready,
+        fpcalc_available: proposers.fpcalc_available,
+        acoustid_key_saved: proposers.acoustid_key.is_some(),
     })
 }
 

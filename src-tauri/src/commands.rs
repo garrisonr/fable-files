@@ -2692,10 +2692,10 @@ fn execute_step(
 
 /// File Auditor: run one ffmpeg conversion to completion,
 /// honoring the job's cancel flag. Returns (before, after) byte
-/// counts. A missing ffmpeg is a plain-language failure, never a
-/// dependency error dialog (NO DEPENDENCY ERRORS law — the Auditor
-/// only proposes conversions ffmpeg's presence makes plausible,
-/// and this stays graceful if that changes).
+/// counts. A missing ffmpeg is SET UP on the spot via crate::deps
+/// (the user just approved this conversion — the system prompt
+/// belongs to that click) and the conversion then runs; only a
+/// declined/failed setup lands as a plain-language failure.
 fn exec_convert(
     src: &Path,
     dst: &Path,
@@ -2721,18 +2721,36 @@ fn exec_convert(
         other => return Err(format!("unknown conversion kind: {other}")),
     };
     let before = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-    let mut child = match std::process::Command::new("ffmpeg")
-        .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+    let spawn_ffmpeg = |args: &[&str]| {
+        std::process::Command::new("ffmpeg")
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    let mut child = match spawn_ffmpeg(&args) {
         Ok(c) => c,
         Err(_) => {
-            return Err(
-                "ffmpeg isn't available on this machine, so the conversion couldn't run. The original file was left untouched."
-                    .into(),
-            )
+            // Dependency law: a conversion the user just approved
+            // sets ffmpeg up on the spot (system prompt) and then
+            // runs — the plain failure below is only the receipt
+            // when that setup was declined or couldn't complete.
+            match crate::deps::ensure_tool("ffmpeg", "ffmpeg") {
+                Ok(()) => match spawn_ffmpeg(&args) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        return Err(
+                            "ffmpeg still couldn't start after setup, so the conversion didn't run. The original file was left untouched."
+                                .into(),
+                        )
+                    }
+                },
+                Err(why) => {
+                    return Err(format!(
+                        "{why} The conversion didn't run, and the original file was left untouched."
+                    ))
+                }
+            }
         }
     };
     loop {
@@ -7120,6 +7138,7 @@ pub async fn create_pdf(state: State<'_, AppState>, items: Vec<ItemId>) -> Cmd<S
         return Err(CommandError::from(UfmError::NotFound("unknown items".into())));
     }
     tauri::async_runtime::spawn_blocking(move || {
+        crate::deps::ensure_tool("magick", "magick")?;
         let parent = paths[0].parent().ok_or("no parent")?.to_path_buf();
         let stem = if paths.len() == 1 {
             paths[0]
@@ -7209,6 +7228,7 @@ pub async fn list_archive(state: State<'_, AppState>, item: ItemId) -> Cmd<Vec<A
         .cloned()
         .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
     tauri::async_runtime::spawn_blocking(move || {
+        crate::deps::ensure_tool("bsdtar", "bsdtar")?;
         let out = std::process::Command::new("bsdtar")
             .arg("-tf")
             .arg(&path)
@@ -7313,6 +7333,7 @@ pub async fn extract_archive(
             }
         };
         std::fs::create_dir_all(&dest).map_err(|e| format!("mkdir: {e}"))?;
+        crate::deps::ensure_tool("bsdtar", "bsdtar")?;
         let out = std::process::Command::new("bsdtar")
             .arg("-xf")
             .arg(&path)
@@ -7343,6 +7364,7 @@ pub async fn extract_archive_entry(archive_path: String, entry_path: String) -> 
         std::fs::create_dir_all(&dest).map_err(|e| format!("mkdir: {e}"))?;
         let target = dest.join(&entry_path);
         if !target.exists() {
+            crate::deps::ensure_tool("bsdtar", "bsdtar")?;
             let out = std::process::Command::new("bsdtar")
                 .arg("-xf")
                 .arg(&archive_path)
@@ -8317,6 +8339,10 @@ pub async fn transcode(
                 }),
             );
         };
+        if let Err(why) = crate::deps::ensure_tool("ffmpeg", "ffmpeg") {
+            emit(0.0, true, None, Some(why));
+            return;
+        }
         let mut child = match std::process::Command::new("ffmpeg")
             .arg("-y")
             .arg("-i")
@@ -8420,6 +8446,7 @@ pub async fn read_metadata(state: State<'_, AppState>, item: ItemId) -> Cmd<Vec<
         .cloned()
         .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
     tauri::async_runtime::spawn_blocking(move || {
+        crate::deps::ensure_tool("exiftool", "exiftool")?;
         let out = std::process::Command::new(exiftool_bin())
             .arg("-json")
             .arg("-G1")
@@ -8518,6 +8545,7 @@ pub async fn edit_metadata(
         .cloned()
         .ok_or_else(|| CommandError::from(UfmError::NotFound(format!("unknown item {item}"))))?;
     tauri::async_runtime::spawn_blocking(move || {
+        crate::deps::ensure_tool("exiftool", "exiftool")?;
         let mut cmd = std::process::Command::new(exiftool_bin());
         cmd.arg("-overwrite_original");
         let mut any = false;
@@ -8612,6 +8640,7 @@ pub async fn wash_metadata(
         } else {
             src.clone()
         };
+        crate::deps::ensure_tool("exiftool", "exiftool")?;
         let before = count_metadata_tags(&target);
         let out = std::process::Command::new(exiftool_bin())
             .arg("-all=")
@@ -8891,6 +8920,7 @@ pub async fn build_iso(
         if paths.is_empty() {
             return Err("the project is empty".to_string());
         }
+        crate::deps::ensure_tool("xorriso", "xorriso")?;
         let mut cmd = std::process::Command::new("xorriso");
         cmd.arg("-as").arg("mkisofs")
             .arg("-o").arg(&dest_iso)
@@ -8947,6 +8977,7 @@ pub async fn verify_iso(iso_path: String, sources: Vec<String>) -> Cmd<VerifyRes
         let cleanup = |tmp: &std::path::Path| {
             let _ = std::fs::remove_dir_all(tmp);
         };
+        crate::deps::ensure_tool("bsdtar", "bsdtar")?;
         let out = std::process::Command::new("bsdtar")
             .arg("-xf")
             .arg(&iso_path)
@@ -9126,6 +9157,7 @@ pub async fn burn_disc(iso_path: String) -> Cmd<String> {
             }
         }
         let drive = drive.ok_or("no CD/DVD/Blu-ray drive found")?;
+        crate::deps::ensure_tool("growisofs", "growisofs")?;
         let out = std::process::Command::new("growisofs")
             .arg("-dvd-compat")
             .arg(format!("-Z{d}={iso}", d = drive, iso = iso_path))
@@ -9673,6 +9705,10 @@ pub async fn find_duplicates(root: String, min_size: u64) -> Cmd<Vec<DupGroup>> 
 // ---------------------------------------------------------------------------
 
 fn rclone_ok(args: &[&str]) -> std::result::Result<String, String> {
+    // Dependency law: every rclone door funnels through here, so
+    // a missing rclone is set up once, in context, and the call
+    // the user asked for then runs.
+    crate::deps::ensure_tool("rclone", "rclone")?;
     let out = std::process::Command::new("rclone")
         .args(args)
         .output()
@@ -10300,6 +10336,91 @@ pub async fn cast_scan() -> Cmd<Vec<CastDevice>> {
     })
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("scan task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+fn soco_python_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    format!("{home}/.local/share/pipx/venvs/soco/bin/python")
+}
+
+fn cast_tool_found(bin: &str) -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::Path::new(&format!("{home}/.local/bin/{bin}")).exists()
+        || crate::deps::tool_present(bin)
+}
+
+/// Which cast backends are NOT set up on this computer yet
+/// ("catt" = Chromecast, "atvremote" = AirPlay, "soco" = Sonos)?
+/// The cast dialog offers one-click setup when this is non-empty
+/// — without it, a scan on a fresh machine found nothing and
+/// blamed the network, which was a silent dependency dead-end.
+#[tauri::command]
+pub async fn cast_backends() -> Cmd<Vec<String>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut missing: Vec<String> = Vec::new();
+        if !cast_tool_found("catt") {
+            missing.push("catt".to_string());
+        }
+        if !cast_tool_found("atvremote") {
+            missing.push("atvremote".to_string());
+        }
+        if !std::path::Path::new(&soco_python_path()).exists() {
+            missing.push("soco".to_string());
+        }
+        Ok::<Vec<String>, String>(missing)
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("cast task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Set up the missing cast backends: pipx itself installs
+/// through the OS package machinery when absent (crate::deps);
+/// the backends are user-level pipx installs (catt, pyatv, soco —
+/// no admin password). Returns whatever is still missing.
+#[tauri::command]
+pub async fn cast_setup() -> Cmd<Vec<String>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::deps::ensure_tool("pipx", "pipx")?;
+        for (backend, package) in [
+            ("catt", "catt"),
+            ("atvremote", "pyatv"),
+            ("soco", "soco"),
+        ] {
+            let present = if backend == "soco" {
+                std::path::Path::new(&soco_python_path()).exists()
+            } else {
+                cast_tool_found(backend)
+            };
+            if present {
+                continue;
+            }
+            let out = std::process::Command::new("pipx")
+                .args(["install", package])
+                .output()
+                .map_err(|e| format!("pipx: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "Setting up the {backend} helper didn't finish: {}. Nothing else is affected — you can try again from the same button.",
+                    crate::deps::output_tail(&out)
+                ));
+            }
+        }
+        let mut missing: Vec<String> = Vec::new();
+        if !cast_tool_found("catt") {
+            missing.push("catt".to_string());
+        }
+        if !cast_tool_found("atvremote") {
+            missing.push("atvremote".to_string());
+        }
+        if !std::path::Path::new(&soco_python_path()).exists() {
+            missing.push("soco".to_string());
+        }
+        Ok::<Vec<String>, String>(missing)
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("cast setup task failed: {e}"))))?
     .map_err(|e| CommandError::from(UfmError::Internal(e)))
 }
 
@@ -11031,6 +11152,7 @@ pub async fn partition_resize_info(device: String) -> Cmd<ResizeInfo> {
             }
         }
         let (part, disk_path) = found.ok_or("unknown partition")?;
+        crate::deps::ensure_tool("parted", "parted")?;
         // parted machine-readable free-space scan
         let out = std::process::Command::new("parted")
             .args(["-m", &disk_path, "unit", "B", "print", "free"])
@@ -11240,6 +11362,7 @@ fn template_dir() -> std::result::Result<std::path::PathBuf, String> {
 /// Ensure a blank office template of `kind` exists in the cache,
 /// generated with LibreOffice from an empty seed file.
 fn office_template(kind: &str) -> std::result::Result<std::path::PathBuf, String> {
+    crate::deps::ensure_tool("soffice", "soffice")?;
     let dir = template_dir()?;
     let ext = kind;
     let template = dir.join(format!("blank.{ext}"));
@@ -11362,6 +11485,7 @@ pub struct Printer {
 #[tauri::command]
 pub async fn list_printers() -> Cmd<Vec<Printer>> {
     tauri::async_runtime::spawn_blocking(move || {
+        crate::deps::ensure_tool("lpstat", "cups")?;
         let default_name = std::process::Command::new("lpstat")
             .arg("-d")
             .output()
@@ -11437,9 +11561,11 @@ pub async fn print_item(
         let office = [
             "doc", "docx", "odt", "rtf", "xls", "xlsx", "ods", "ppt", "pptx", "odp",
         ];
+        crate::deps::ensure_tool("lpstat", "cups")?;
         let printable_path;
         let _temp_dir;
         if office.contains(&ext.as_str()) {
+            crate::deps::ensure_tool("soffice", "soffice")?;
             let td = std::env::temp_dir().join(format!("fable-print-{}", ItemId::new()));
             std::fs::create_dir_all(&td).map_err(|e| e.to_string())?;
             let out = std::process::Command::new("soffice")
@@ -11500,19 +11626,14 @@ pub async fn mktorrent_status() -> Cmd<bool> {
     Ok(ufm_torrent::mktorrent_available())
 }
 
-/// Install mktorrent via pacman (polkit prompt).
+/// Install mktorrent through the OS package machinery (the
+/// dialog's one-click offer; per-family packages via crate::deps
+/// — this used to hardcode pacman, which silently broke the
+/// offer on every apt/dnf/zypper machine).
 #[tauri::command]
 pub async fn install_mktorrent() -> Cmd<()> {
     tauri::async_runtime::spawn_blocking(move || {
-        let out = std::process::Command::new("pkexec")
-            .args(["pacman", "-S", "--noconfirm", "--needed", "mktorrent"])
-            .output()
-            .map_err(|e| format!("pkexec: {e}"))?;
-        if out.status.success() {
-            Ok::<(), String>(())
-        } else {
-            Err("install failed (or the password prompt was cancelled)".to_string())
-        }
+        crate::deps::ensure_tool("mktorrent", "mktorrent")
     })
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("install task failed: {e}"))))?
@@ -12639,6 +12760,20 @@ pub fn musiccomplete_save_settings(
 #[tauri::command]
 pub fn musiccomplete_get_status() -> Cmd<crate::musiccomplete::MuStatus> {
     Ok(crate::musiccomplete::status())
+}
+
+/// Install fpcalc for AcoustID fingerprinting (dependency law:
+/// offered in context by the completion dialog and Preferences;
+/// the polkit prompt is the system's, then the caller re-scans).
+#[tauri::command]
+pub async fn musiccomplete_install_fpcalc() -> Cmd<()> {
+    tauri::async_runtime::spawn_blocking(crate::musiccomplete::install_fpcalc)
+        .await
+        .map_err(|e| {
+            CommandError::from(UfmError::Internal(format!("install task failed: {e}")))
+        })?
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    Ok(())
 }
 
 #[tauri::command]

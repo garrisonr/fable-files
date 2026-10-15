@@ -141,6 +141,43 @@ pub fn line_at(lines: &[LrcLine], pos_ms: u64) -> Option<usize> {
     hit
 }
 
+/// Does this LRC carry any actual sung words? A field full of
+/// stamps with NOTHING after them (`[00:12.00]` alone on every
+/// line) parses — timestamps exist — but holds no lyrics, and
+/// completeness checks must not count it as "lyrics saved".
+/// Metadata lines don't count; stamped lines with text do.
+pub fn has_synced_content(text: &str) -> bool {
+    parse_lrc(text).iter().any(|l| !l.text.trim().is_empty())
+}
+
+/// Does this text hold any real lyric line, for the plain-text
+/// reading? Whitespace doesn't count, and neither does an LRC
+/// metadata header on its own (`[ti:…]`, `[ar:…]`, `[by:…]` —
+/// bookkeeping a ripper wrote, not words anyone sings). A line
+/// like `[Chorus]` is annotation around lyrics and counts; a
+/// timestamped line with words after the stamp counts too.
+pub fn has_plain_content(text: &str) -> bool {
+    text.lines().any(|raw| {
+        let l = raw.trim();
+        if l.is_empty() {
+            return false;
+        }
+        if l.starts_with('[') {
+            if let Some(close) = l.find(']') {
+                let inner = &l[1..close];
+                if inner.contains(':') {
+                    // A bracketed key:value group: a timestamp or a
+                    // metadata tag. It is content only when real
+                    // words follow a timestamp.
+                    let rest = l[close + 1..].trim();
+                    return !rest.is_empty() && parse_stamp(l).is_some();
+                }
+            }
+        }
+        true
+    })
+}
+
 /// Strip the stamps, leaving readable plain text (for surfaces
 /// that can't do sync, and for search).
 pub fn to_plain(text: &str) -> String {
@@ -212,5 +249,34 @@ mod tests {
         assert!(looks_synced(SAMPLE));
         assert!(!looks_synced("just some plain lyrics\nsecond line\n"));
         assert!(to_plain(SAMPLE).contains("When you were here before"));
+    }
+
+    #[test]
+    fn content_checks_reject_empty_shells() {
+        // Whitespace and empty strings are not lyrics.
+        assert!(!has_plain_content(""));
+        assert!(!has_plain_content("  \n \n\t\n"));
+        assert!(!has_synced_content(""));
+        // A metadata header alone is bookkeeping, not lyrics.
+        let header_only = "[ti:Some Song]\n[ar:Some Singer]\n[by:Ripper]\n";
+        assert!(!has_plain_content(header_only));
+        assert!(!has_synced_content(header_only));
+        // Timestamps with nothing sung after them are not lyrics.
+        let stamps_only = "[00:12.00]\n[00:17.50] \n[00:23.25]\n";
+        assert!(looks_synced(stamps_only));
+        assert!(!has_synced_content(stamps_only));
+        assert!(!has_plain_content(stamps_only));
+    }
+
+    #[test]
+    fn content_checks_accept_real_lyrics() {
+        // Header + real plain lines (the SpotiFLAC shape): counts.
+        let plain = "[ti:Song]\n[ar:Singer]\n[by:Ripper]\nWhen you were here before\nCouldn't look you in the eye\n";
+        assert!(has_plain_content(plain));
+        // Real synced lines count as synced.
+        assert!(has_synced_content(SAMPLE));
+        assert!(has_plain_content(SAMPLE));
+        // Plain text with an annotation bracket counts.
+        assert!(has_plain_content("[Chorus]\nsing it loud\n"));
     }
 }

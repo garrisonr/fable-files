@@ -89,21 +89,73 @@ export class CastDialog {
     scanning.textContent = "Scanning your network (Chromecast · AirPlay · Sonos)…";
     this.listEl.appendChild(scanning);
     try {
-      const devices = await api.castScan();
-      this.render(devices);
+      const [devices, missing] = await Promise.all([
+        api.castScan(),
+        api.castBackends().catch(() => [] as string[]),
+      ]);
+      this.render(devices, missing);
     } catch (err) {
       this.listEl.replaceChildren();
       this.statusEl.textContent = `Scan failed: ${errText(err)}`;
     }
   }
 
-  private render(devices: Device[]): void {
+  /** The dependency law at the cast door: the helper tools
+   * (catt / pyatv / soco) are small downloads Fable sets up
+   * itself. Without them whole device families are invisible to
+   * the scan, so "no devices found" must never blame the network
+   * for what is really an uninstalled helper. */
+  private setupRow(missing: string[]): HTMLDivElement {
+    const labels: Record<string, string> = {
+      catt: "Chromecast",
+      atvremote: "AirPlay",
+      soco: "Sonos",
+    };
+    const names = missing.map((m) => labels[m] ?? m).join(", ");
+    const box = document.createElement("div");
+    box.className = "cast-empty";
+    const text = document.createElement("div");
+    text.textContent =
+      `Casting to ${names} isn't set up on this computer yet — ` +
+      "Fable can install the free helper tools now (user-level, no admin password), then scan again.";
+    const btn = document.createElement("button");
+    btn.className = "pill-btn";
+    btn.textContent = "Set up casting";
+    btn.style.marginTop = "0.5rem";
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      btn.textContent = "Setting up casting…";
+      this.statusEl.textContent = "Downloading the cast helpers (catt · pyatv · soco)…";
+      try {
+        const still = await api.castSetup();
+        if (still.length === 0) {
+          Toast.success("Casting is set up — scanning again.");
+        } else {
+          Toast.error("Some cast helpers are still missing — the setup row stays so you can retry.");
+        }
+        await this.scan();
+      } catch (err) {
+        this.statusEl.textContent = `Setup didn't finish: ${errText(err)}`;
+        btn.disabled = false;
+        btn.textContent = "Set up casting";
+      }
+    });
+    box.append(text, btn);
+    return box;
+  }
+
+  private render(devices: Device[], missing: string[] = []): void {
     this.listEl.replaceChildren();
+    if (missing.length > 0) {
+      this.listEl.appendChild(this.setupRow(missing));
+    }
     if (devices.length === 0) {
       const empty = document.createElement("div");
       empty.className = "cast-empty";
       empty.textContent =
-        "No cast devices found. Devices must be on the same Wi-Fi/LAN and awake.";
+        missing.length > 0
+          ? "No cast devices found yet."
+          : "No cast devices found. Devices must be on the same Wi-Fi/LAN and awake.";
       this.listEl.appendChild(empty);
       return;
     }

@@ -734,6 +734,7 @@ export const api = {
   getMuStatus: () => invoke<MuStatus>("musiccomplete_get_status"),
   setMuAcoustidKey: (value: string | null) =>
     invoke<MuStatus>("musiccomplete_set_acoustid_key", { value }),
+  muInstallFpcalc: () => invoke<void>("musiccomplete_install_fpcalc"),
   muScan: (req: MuScanRequest) =>
     invoke<MuScanView>("musiccomplete_scan", { req }),
   muApply: (req: MuApplyRequest) =>
@@ -849,6 +850,8 @@ export const api = {
     invoke<void>("cast_play", { device, url }),
   castStop: (device: { name: string; kind: string; address: string }) =>
     invoke<void>("cast_stop", { device }),
+  castBackends: () => invoke<string[]>("cast_backends"),
+  castSetup: () => invoke<string[]>("cast_setup"),
   listInstalledApps: () =>
     invoke<Array<{ name: string; id: string; source: string; desktop_path: string }>>("list_installed_apps"),
   findAppLeftovers: (appId: string, appName: string) =>
@@ -1404,6 +1407,8 @@ export interface MuScanView {
   rows: MuTrackProposal[];
   truncated: boolean;
   fingerprintingReady: boolean;
+  fpcalcAvailable: boolean;
+  acoustidKeySaved: boolean;
 }
 
 export interface MuApplyField {

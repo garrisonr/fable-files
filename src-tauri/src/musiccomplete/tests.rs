@@ -139,6 +139,111 @@ fn tag_roundtrip_and_priors_flac_and_mp3() {
 }
 
 #[test]
+fn picture_content_standard() {
+    // Empty and garbage blocks are not cover art, at any size.
+    assert!(!picture_has_content(&[]));
+    assert!(!picture_has_content(&[7u8; 900]));
+    // A 1x1 placeholder GIF (43 bytes, valid magic) is not art.
+    let mut gif = b"GIF89a".to_vec();
+    gif.resize(43, 0);
+    assert!(!picture_has_content(&gif));
+    // Real magic at a sane size counts.
+    let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+    jpeg.resize(600, 1);
+    assert!(picture_has_content(&jpeg));
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.resize(600, 1);
+    assert!(picture_has_content(&png));
+}
+
+/// Regression (Dickles, 2026-10-15): empty embedded fields used
+/// to count as content — an empty picture block read as "cover
+/// art already in the file" and empty/header-only lyrics as
+/// "lyrics already saved". Presence now requires content.
+#[test]
+fn empty_fields_do_not_count_as_content() {
+    use lofty::prelude::*;
+    let dir = fixture_dir("emptyfields");
+    let Some(path) = make_audio(&dir, "song.flac", &[("title", "Creep")]) else {
+        eprintln!("ffmpeg unavailable — skipped");
+        return;
+    };
+    let push_picture = |path: &Path, data: Vec<u8>| {
+        let mut file = lofty::read_from_path(path).unwrap();
+        let tag = file.primary_tag_mut().unwrap();
+        tag.push_picture(lofty::picture::Picture::new_unchecked(
+            lofty::picture::PictureType::CoverFront,
+            Some(lofty::picture::MimeType::Jpeg),
+            None,
+            data,
+        ));
+        file.save_to_path(path, lofty::config::WriteOptions::default())
+            .unwrap();
+    };
+    let set_lyrics = |path: &Path, text: &str| {
+        let mut file = lofty::read_from_path(path).unwrap();
+        let tag = file.primary_tag_mut().unwrap();
+        tag.insert_text(lofty::tag::ItemKey::Lyrics, text.to_string());
+        file.save_to_path(path, lofty::config::WriteOptions::default())
+            .unwrap();
+    };
+
+    // An empty picture block: not art. Neither is a big garbage one.
+    push_picture(&path, Vec::new());
+    assert!(!read_file_tags(&path).unwrap().has_art, "empty picture block counted as art");
+    push_picture(&path, vec![7u8; 900]);
+    assert!(!read_file_tags(&path).unwrap().has_art, "garbage picture counted as art");
+
+    // Empty / whitespace / header-only / stamps-only lyrics: none
+    // of them are "lyrics already saved".
+    for shell in [
+        "",
+        "   \n  ",
+        "[ti:Creep]\n[ar:Radiohead]\n[by:Ripper]\n",
+        "[00:12.00]\n[00:17.50] \n",
+    ] {
+        set_lyrics(&path, shell);
+        let view = read_file_tags(&path).unwrap();
+        assert!(
+            view.lyrics_plain.is_none() && view.lyrics_synced.is_none(),
+            "shell lyrics counted as content: {shell:?}"
+        );
+    }
+    // Header + real plain lines (the SpotiFLAC shape) DO count.
+    set_lyrics(&path, "[ti:Creep]\n[ar:Radiohead]\nWhen you were here before\n");
+    let view = read_file_tags(&path).unwrap();
+    assert!(view.lyrics_plain.is_some(), "real plain lyrics not seen");
+    // Real synced lines count as synced.
+    set_lyrics(&path, "[00:12.00]When you were here before\n");
+    let view = read_file_tags(&path).unwrap();
+    assert!(view.lyrics_synced.is_some(), "real synced lyrics not seen");
+
+    // embed_art repairs a garbage-only file instead of deferring
+    // to the placeholder, and then the real art wins as usual.
+    let Some(jpeg) = tiny_jpeg(&dir) else {
+        eprintln!("ffmpeg could not make a JPEG — skipped");
+        return;
+    };
+    assert!(embed_art(&path, &jpeg).unwrap(), "embed deferred to garbage picture");
+    assert!(read_file_tags(&path).unwrap().has_art);
+    assert!(!embed_art(&path, &jpeg).unwrap(), "real art must win");
+}
+
+#[test]
+fn sidecar_shells_do_not_count_as_lyrics() {
+    let dir = fixture_dir("sidecarshell");
+    let audio = dir.join("track.flac");
+    std::fs::write(&audio, b"not audio - sidecar_text never reads it").unwrap();
+    let sc = sidecar_path(&audio);
+    std::fs::write(&sc, "[ti:Only A Header]\n[ar:Someone]\n").unwrap();
+    assert!(sidecar_text(&audio).is_none(), "header-only sidecar counted");
+    std::fs::write(&sc, "  \n").unwrap();
+    assert!(sidecar_text(&audio).is_none(), "blank sidecar counted");
+    std::fs::write(&sc, "real words someone saved\n").unwrap();
+    assert!(sidecar_text(&audio).is_some(), "real sidecar not seen");
+}
+
+#[test]
 fn artwork_embeds_only_when_absent_and_undoes() {
     let dir = fixture_dir("art");
     let Some(path) = make_audio(&dir, "song.flac", &[("title", "Creep")]) else {
