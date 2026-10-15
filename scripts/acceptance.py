@@ -46,6 +46,11 @@ PROBES = [
     ("ROM identification dataset", "crates/ufm-media/src/romdat.rs", "RomDataset"),
     ("Media Resolution (TMDB)", "src-tauri/src/mediares.rs", "tmdb"),
     ("ROM media cascade", "src-tauri/src/rommedia.rs", "screenscraper"),
+    ("Music Completion backend", "src-tauri/src/musiccomplete.rs", "MusicBrainz"),
+    ("MusicBrainz matching (pure)", "crates/ufm-media/src/musicid.rs", "score_candidate"),
+    ("LRC synced-lyrics parser", "crates/ufm-media/src/lrc.rs", "parse_lrc"),
+    ("Music run journal (undo)", "crates/ufm-catalog/src/lib.rs", "musiccomplete_runs"),
+    ("AcoustID fingerprint door", "src-tauri/src/musiccomplete.rs", "acoustid_lookup"),
 ]
 
 

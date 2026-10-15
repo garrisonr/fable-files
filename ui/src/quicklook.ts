@@ -25,6 +25,7 @@ import {
 import { onPlayerClosed, onPlayerReturn, onPlayerState } from "./api";
 import { VideoPlayer, isVideoName } from "./video";
 import { audioTags, folderArtUrl } from "./audiometa";
+import { parseLrcLines } from "./musiccomplete";
 import { fadeTo, reducedMotion, springTo } from "./motion";
 
 const FALLBACK_PANEL_WIDTH = 340;
@@ -73,6 +74,79 @@ export class QuickLook {
     }
     this.audioEl = null;
     this.audioPath = null;
+  }
+
+  /** Music Completion: the lyrics pane under the Quick Look audio
+   * player. Synced text (embedded USLT-with-stamps or a .lrc
+   * sidecar) gets line highlighting driven by the live audio
+   * element; plain text renders as-is. Async + guarded: if the
+   * card has moved on to another file, nothing is inserted. */
+  private async buildLyricsPane(
+    path: string,
+    card: HTMLElement,
+    before: HTMLElement,
+  ): Promise<void> {
+    let view;
+    try {
+      view = await api.muLyricsGet(path, false);
+    } catch {
+      return;
+    }
+    if (this.audioPath !== path) return;
+    const syncedText =
+      view.embeddedSynced ??
+      (view.sidecarText && /\[\d+:\d{1,2}[.,]\d+\]/.test(view.sidecarText)
+        ? view.sidecarText
+        : null);
+    const plainText = syncedText
+      ? null
+      : (view.embeddedPlain ?? view.sidecarText);
+    const pane = document.createElement("div");
+    pane.className = "ql-lyrics";
+    const head = document.createElement("div");
+    head.className = "ql-lyrics-head";
+    head.textContent = syncedText ? "Lyrics — synced" : "Lyrics";
+    pane.appendChild(head);
+    if (syncedText) {
+      const lines = parseLrcLines(syncedText);
+      if (!lines.length) return;
+      const lineEls: HTMLElement[] = [];
+      for (const l of lines) {
+        const d = document.createElement("div");
+        d.className = "ql-lrc-line";
+        d.textContent = l.text;
+        pane.appendChild(d);
+        lineEls.push(d);
+      }
+      card.insertBefore(pane, before);
+      const audio = this.audioEl;
+      if (!audio) return;
+      let active = -1;
+      audio.addEventListener("timeupdate", () => {
+        if (this.audioEl !== audio) return;
+        const nowMs = audio.currentTime * 1000;
+        let idx = -1;
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].timeMs <= nowMs) idx = i;
+          else break;
+        }
+        if (idx === active) return;
+        if (active >= 0) lineEls[active]?.classList.remove("active");
+        active = idx;
+        if (idx >= 0) {
+          lineEls[idx]?.classList.add("active");
+          lineEls[idx]?.scrollIntoView({ block: "nearest" });
+        }
+      });
+    } else if (plainText) {
+      for (const raw of plainText.split("\n")) {
+        const d = document.createElement("div");
+        d.className = "ql-lrc-line plain";
+        d.textContent = raw;
+        pane.appendChild(d);
+      }
+      card.insertBefore(pane, before);
+    }
   }
 
   /** Live video player (fix block item 3): tracked like the audio
@@ -739,6 +813,11 @@ export class QuickLook {
             name.after(subEl);
           }
         });
+        // Synced lyrics (Music Completion): timed lyrics —
+        // embedded or in a .lrc sidecar — render under the player
+        // with the sung line lit; plain lyrics render unlit; no
+        // lyrics = no pane.
+        void this.buildLyricsPane(apath, card, dl);
         }
       }
       const imgExts = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff", "ico"];

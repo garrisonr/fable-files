@@ -12612,6 +12612,257 @@ pub async fn mediacomplete_confirm_pending(
 }
 
 // ---------------------------------------------------------------------------
+// Music Completion commands (Dickles, 2026-10-15): tag enrichment
+// proposals + journaled apply, the Lyrics Manager, schedules that
+// ride the mediacomplete agent, runs + undo + the morning
+// checklist. The music sibling of the block above.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn musiccomplete_get_settings(
+    state: State<'_, AppState>,
+) -> Cmd<crate::musiccomplete::MuSettings> {
+    Ok(crate::musiccomplete::load_settings(&mc_base(&state)))
+}
+
+#[tauri::command]
+pub fn musiccomplete_save_settings(
+    state: State<'_, AppState>,
+    settings: crate::musiccomplete::MuSettings,
+) -> Cmd<crate::musiccomplete::MuSettings> {
+    let base = mc_base(&state);
+    crate::musiccomplete::save_settings(&base, &settings)
+        .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(crate::musiccomplete::load_settings(&base))
+}
+
+#[tauri::command]
+pub fn musiccomplete_get_status() -> Cmd<crate::musiccomplete::MuStatus> {
+    Ok(crate::musiccomplete::status())
+}
+
+#[tauri::command]
+pub fn musiccomplete_set_acoustid_key(
+    value: Option<String>,
+) -> Cmd<crate::musiccomplete::MuStatus> {
+    crate::musiccomplete::acoustid_key_set(value.as_deref())
+        .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(crate::musiccomplete::status())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MuScanRequest {
+    pub root: String,
+    pub paths: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn musiccomplete_scan(
+    state: State<'_, AppState>,
+    req: MuScanRequest,
+) -> Cmd<crate::musiccomplete::ScanView> {
+    let base = mc_base(&state);
+    let view = tauri::async_runtime::spawn_blocking(move || {
+        let settings = crate::musiccomplete::load_settings(&base);
+        crate::musiccomplete::propose_paths(
+            std::path::Path::new(&req.root),
+            &req.paths,
+            &settings,
+        )
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("scan task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(view)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MuApplyRequest {
+    pub target: String,
+    pub items: Vec<crate::musiccomplete::ApplyItem>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MuRunView {
+    pub id: String,
+    pub schedule_name: String,
+    pub target: String,
+    pub started: String,
+    pub finished: Option<String>,
+    pub was_late: bool,
+    pub status: String,
+    pub summary: serde_json::Value,
+    pub pending: serde_json::Value,
+    pub can_undo: bool,
+}
+
+fn mu_run_view(row: &ufm_catalog::MusicCompleteRunRow) -> MuRunView {
+    MuRunView {
+        id: row.id.clone(),
+        schedule_name: row.schedule_name.clone(),
+        target: row.target.clone(),
+        started: row.started.clone(),
+        finished: row.finished.clone(),
+        was_late: row.was_late,
+        status: row.status.clone(),
+        summary: serde_json::from_str(&row.summary_json)
+            .unwrap_or(serde_json::json!({})),
+        pending: serde_json::from_str(&row.pending_json)
+            .unwrap_or(serde_json::json!([])),
+        can_undo: row.undone_at.is_none() && row.status != "running",
+    }
+}
+
+#[tauri::command]
+pub async fn musiccomplete_apply(
+    state: State<'_, AppState>,
+    req: MuApplyRequest,
+) -> Cmd<MuRunView> {
+    let base = mc_base(&state);
+    let row = tauri::async_runtime::spawn_blocking(move || {
+        let settings = crate::musiccomplete::load_settings(&base);
+        crate::musiccomplete::apply_review(&req.target, &req.items, &settings)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("apply task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(mu_run_view(&row))
+}
+
+#[tauri::command]
+pub async fn musiccomplete_lyrics_get(
+    path: String,
+    fetch: bool,
+) -> Cmd<crate::musiccomplete::LyricsView> {
+    let view = tauri::async_runtime::spawn_blocking(move || {
+        crate::musiccomplete::lyrics_view(std::path::Path::new(&path), fetch)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("lyrics task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(view)
+}
+
+#[tauri::command]
+pub async fn musiccomplete_lyrics_save(
+    state: State<'_, AppState>,
+    path: String,
+    text: Option<String>,
+) -> Cmd<String> {
+    let base = mc_base(&state);
+    let msg = tauri::async_runtime::spawn_blocking(move || {
+        let settings = crate::musiccomplete::load_settings(&base);
+        crate::musiccomplete::lyrics_save(
+            std::path::Path::new(&path),
+            text.as_deref(),
+            &settings,
+        )
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("lyrics save failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(msg)
+}
+
+#[tauri::command]
+pub fn musiccomplete_list_runs(
+    state: State<'_, AppState>,
+) -> Cmd<Vec<MuRunView>> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
+    let rows = catalog
+        .recent_musiccomplete_runs(20)
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
+    Ok(rows.iter().map(mu_run_view).collect())
+}
+
+#[tauri::command]
+pub async fn musiccomplete_run_now(
+    state: State<'_, AppState>,
+    schedule_id: String,
+) -> Cmd<MuRunView> {
+    let base = mc_base(&state);
+    let settings = crate::musiccomplete::load_settings(&base);
+    let Some(sched) = settings
+        .schedules
+        .iter()
+        .find(|s| s.id == schedule_id)
+        .cloned()
+    else {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "no such schedule".into(),
+        )));
+    };
+    let sched_id = sched.id.clone();
+    let row = tauri::async_runtime::spawn_blocking(move || {
+        crate::musiccomplete::run_scheduled(&sched, false)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("run task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    // Stamp the schedule's bookkeeping so the agent doesn't fire
+    // the same slot again tonight.
+    let mut settings = crate::musiccomplete::load_settings(&base);
+    if let Some(s) = settings.schedules.iter_mut().find(|s| s.id == sched_id) {
+        s.last_started = Some(
+            chrono::Local::now()
+                .naive_local()
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string(),
+        );
+        s.last_status = Some(row.status.clone());
+        let _ = crate::musiccomplete::save_settings(&base, &settings);
+    }
+    Ok(mu_run_view(&row))
+}
+
+#[tauri::command]
+pub async fn musiccomplete_undo_run(run_id: String) -> Cmd<String> {
+    let msg = tauri::async_runtime::spawn_blocking(move || {
+        crate::musiccomplete::undo_run(&run_id)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("undo task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(msg)
+}
+
+/// Confirm one pending item from a music run's morning checklist:
+/// the file is re-proposed fresh and completed on the spot (fills
+/// only — overwrites still need the review surface). Removes the
+/// entry from the run's pending list.
+#[tauri::command]
+pub async fn musiccomplete_confirm_pending(
+    run_id: String,
+    path: String,
+) -> Cmd<String> {
+    let msg = tauri::async_runtime::spawn_blocking(move || {
+        crate::musiccomplete::confirm_pending(&run_id, &path)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("confirm task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(msg)
+}
+
+// ---------------------------------------------------------------------------
 // File Auditor commands (Dickles, 2026-10-15): settings, runs, the
 // checklist (flags), resolutions (the confirm / ask-lane / dismissal
 // machinery), and the memory managers. Every fix lands as a

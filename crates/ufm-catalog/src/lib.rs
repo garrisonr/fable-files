@@ -160,6 +160,47 @@ fn map_mc_run(r: &rusqlite::Row) -> rusqlite::Result<MediaCompleteRunRow> {
     })
 }
 
+/// One Music Completion run (manual apply, lyrics save, or
+/// scheduled): the music sibling of MediaCompleteRunRow — same
+/// column shape, its own table. `actions_json` is the undo journal:
+/// every tag write with its PRIOR values, every lyric write with
+/// its prior text, every artwork embed, every sidecar created.
+/// `pending_json` is the morning checklist: probable/unknown
+/// matches a scheduled run refused to guess at.
+#[derive(Debug, Clone)]
+pub struct MusicCompleteRunRow {
+    pub id: String,
+    pub schedule_id: Option<String>,
+    pub schedule_name: String,
+    pub target: String,
+    pub started: String,
+    pub finished: Option<String>,
+    pub was_late: bool,
+    /// running | completed | completed_with_failures | failed | undone
+    pub status: String,
+    pub summary_json: String,
+    pub actions_json: String,
+    pub pending_json: String,
+    pub undone_at: Option<String>,
+}
+
+fn map_mu_run(r: &rusqlite::Row) -> rusqlite::Result<MusicCompleteRunRow> {
+    Ok(MusicCompleteRunRow {
+        id: r.get(0)?,
+        schedule_id: r.get(1)?,
+        schedule_name: r.get(2)?,
+        target: r.get(3)?,
+        started: r.get(4)?,
+        finished: r.get(5)?,
+        was_late: r.get::<_, i64>(6)? != 0,
+        status: r.get(7)?,
+        summary_json: r.get(8)?,
+        actions_json: r.get(9)?,
+        pending_json: r.get(10)?,
+        undone_at: r.get(11)?,
+    })
+}
+
 /// One File Auditor run (manual or scheduled): the summary's durable
 /// home. `summary_json` carries the counts per family, how much was
 /// scanned, whether the walk truncated, and honest notes (e.g. a
@@ -546,6 +587,30 @@ impl Catalog {
                     undone_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_mc_runs_started ON mediacomplete_runs (started DESC);",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Music Completion: one row per enrichment run (manual
+        // apply, lyrics save, or scheduled) — the run journal whose
+        // actions_json is what Undo reads (prior tag values ride
+        // along). Mirrors mediacomplete_runs minus the subtitle
+        // quota column (LRCLIB/MusicBrainz have no quota to report).
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS musiccomplete_runs (
+                    id TEXT PRIMARY KEY,
+                    schedule_id TEXT,
+                    schedule_name TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    started TEXT NOT NULL,
+                    finished TEXT,
+                    was_late INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    summary_json TEXT NOT NULL DEFAULT '{}',
+                    actions_json TEXT NOT NULL DEFAULT '[]',
+                    pending_json TEXT NOT NULL DEFAULT '[]',
+                    undone_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_mu_runs_started ON musiccomplete_runs (started DESC);",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
         // File Auditor: runs (the summary's durable home, mirroring
@@ -2193,6 +2258,92 @@ impl Catalog {
             .execute(
                 "DELETE FROM mediacomplete_runs
                  WHERE id NOT IN (SELECT id FROM mediacomplete_runs ORDER BY started DESC LIMIT ?1)",
+                params![keep as i64],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(n as u64)
+    }
+
+    // -----------------------------------------------------------------
+    // Music Completion runs — the enrichment pipeline's journal.
+    // -----------------------------------------------------------------
+
+    /// Insert (or replace) a music completion run row. The runner
+    /// writes the row at start (status "running") and again at
+    /// finish with the full journal, so a crash mid-run still
+    /// leaves evidence.
+    pub fn upsert_musiccomplete_run(&self, row: &MusicCompleteRunRow) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO musiccomplete_runs (id, schedule_id, schedule_name, target, started, finished, was_late, status, summary_json, actions_json, pending_json, undone_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(id) DO UPDATE SET finished=excluded.finished, status=excluded.status, summary_json=excluded.summary_json, actions_json=excluded.actions_json, pending_json=excluded.pending_json, undone_at=excluded.undone_at",
+                params![
+                    row.id,
+                    row.schedule_id,
+                    row.schedule_name,
+                    row.target,
+                    row.started,
+                    row.finished,
+                    row.was_late as i64,
+                    row.status,
+                    row.summary_json,
+                    row.actions_json,
+                    row.pending_json,
+                    row.undone_at
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn musiccomplete_run(&self, id: &str) -> Result<Option<MusicCompleteRunRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, schedule_id, schedule_name, target, started, finished, was_late, status, summary_json, actions_json, pending_json, undone_at
+                 FROM musiccomplete_runs WHERE id = ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![id], map_mu_run)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        for row in rows {
+            return Ok(Some(row.map_err(|e| UfmError::Database(e.to_string()))?));
+        }
+        Ok(None)
+    }
+
+    /// The newest `limit` runs, newest first — the read path behind
+    /// the Preferences run history + morning checklist.
+    pub fn recent_musiccomplete_runs(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<MusicCompleteRunRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, schedule_id, schedule_name, target, started, finished, was_late, status, summary_json, actions_json, pending_json, undone_at
+                 FROM musiccomplete_runs ORDER BY started DESC LIMIT ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit as i64], map_mu_run)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// Retention: keep only the newest `keep` runs.
+    pub fn prune_musiccomplete_runs(&self, keep: u64) -> Result<u64> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM musiccomplete_runs
+                 WHERE id NOT IN (SELECT id FROM musiccomplete_runs ORDER BY started DESC LIMIT ?1)",
                 params![keep as i64],
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
@@ -4433,6 +4584,53 @@ mod phase2_tests {
         };
         cat.set_view_profile(&loc, &p2).unwrap();
         assert_eq!(cat.view_profile(&loc).unwrap().unwrap().view_mode, "grid");
+    }
+
+    #[test]
+    fn musiccomplete_runs_roundtrip() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let run = MusicCompleteRunRow {
+            id: "mu-1".into(),
+            schedule_id: None,
+            schedule_name: "Manual completion".into(),
+            target: "/music".into(),
+            started: "2026-10-15T03:00:00".into(),
+            finished: None,
+            was_late: false,
+            status: "running".into(),
+            summary_json: "{}".into(),
+            actions_json: "[]".into(),
+            pending_json: "[]".into(),
+            undone_at: None,
+        };
+        cat.upsert_musiccomplete_run(&run).unwrap();
+        let mut done = run.clone();
+        done.status = "completed".into();
+        done.finished = Some("2026-10-15T03:04:00".into());
+        done.actions_json =
+            "[{\"kind\":\"tags\",\"path\":\"/music/a.flac\",\"prior\":{\"album\":null}}]".into();
+        done.pending_json = "[{\"path\":\"/music/b.mp3\"}]".into();
+        cat.upsert_musiccomplete_run(&done).unwrap();
+        let got = cat.musiccomplete_run("mu-1").unwrap().unwrap();
+        assert_eq!(got.status, "completed");
+        assert!(got.actions_json.contains("\"prior\""));
+        assert_eq!(cat.recent_musiccomplete_runs(10).unwrap().len(), 1);
+        // Undo stamp persists through the upsert.
+        let mut undone = got.clone();
+        undone.status = "undone".into();
+        undone.undone_at = Some("2026-10-15T09:00:00".into());
+        cat.upsert_musiccomplete_run(&undone).unwrap();
+        assert_eq!(
+            cat.musiccomplete_run("mu-1").unwrap().unwrap().undone_at.as_deref(),
+            Some("2026-10-15T09:00:00")
+        );
+        // Retention prunes the older run.
+        let mut run2 = run.clone();
+        run2.id = "mu-2".into();
+        run2.started = "2026-10-16T03:00:00".into();
+        cat.upsert_musiccomplete_run(&run2).unwrap();
+        assert_eq!(cat.prune_musiccomplete_runs(1).unwrap(), 1);
+        assert!(cat.musiccomplete_run("mu-1").unwrap().is_none());
     }
 
     #[test]

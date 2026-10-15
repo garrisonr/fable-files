@@ -25,6 +25,7 @@ export interface FileViewHooks {
   onDelete(item: Item): void; // move to trash
   onTrash?(items: Item[]): void; // move a whole selection to trash
   onMediaRename?(items: Item[]): void; // Plex/Kodi/Emby rename
+  onMusicComplete?(items: Item[]): void; // Music Completion (tags/art/lyrics)
   onPlayMusic?(items: Item[]): void; // music player
   onRenameInline?(item: Item, newName: string): void;
   onProperties(item: Item): void;
@@ -302,6 +303,27 @@ export async function showItemMenu(
     items.push({
       label: "Resolve Media in this Folder...",
       action: () => hooks.onMediaRename!(targets),
+    });
+  if (
+    hooks.onMusicComplete &&
+    targets.length >= 1 &&
+    targets.every((t) => t.kind !== "folder" && isAudioName(t.name))
+  )
+    items.push({
+      label:
+        targets.length === 1
+          ? "Complete Music Tags & Lyrics..."
+          : `Complete ${targets.length} Tracks' Tags & Lyrics...`,
+      action: () => hooks.onMusicComplete!(targets),
+    });
+  if (
+    hooks.onMusicComplete &&
+    targets.length === 1 &&
+    targets[0].kind === "folder"
+  )
+    items.push({
+      label: "Complete Music in this Folder...",
+      action: () => hooks.onMusicComplete!(targets),
     });
   if (hooks.onCompress)
     items.push({

@@ -724,6 +724,31 @@ export const api = {
       path,
       choice,
     }),
+  // Music Completion: MusicBrainz tag enrichment + cover art +
+  // LRCLIB lyrics, journaled runs, and schedules that ride the
+  // same background agent as Media Completion.
+  getMuSettings: () =>
+    invoke<MuSettings>("musiccomplete_get_settings"),
+  saveMuSettings: (settings: MuSettings) =>
+    invoke<MuSettings>("musiccomplete_save_settings", { settings }),
+  getMuStatus: () => invoke<MuStatus>("musiccomplete_get_status"),
+  setMuAcoustidKey: (value: string | null) =>
+    invoke<MuStatus>("musiccomplete_set_acoustid_key", { value }),
+  muScan: (req: MuScanRequest) =>
+    invoke<MuScanView>("musiccomplete_scan", { req }),
+  muApply: (req: MuApplyRequest) =>
+    invoke<MuRun>("musiccomplete_apply", { req }),
+  muLyricsGet: (path: string, fetch: boolean) =>
+    invoke<MuLyricsView>("musiccomplete_lyrics_get", { path, fetch }),
+  muLyricsSave: (path: string, text: string | null) =>
+    invoke<string>("musiccomplete_lyrics_save", { path, text }),
+  muRunNow: (scheduleId: string) =>
+    invoke<MuRun>("musiccomplete_run_now", { scheduleId }),
+  muListRuns: () => invoke<MuRun[]>("musiccomplete_list_runs"),
+  muUndoRun: (runId: string) =>
+    invoke<string>("musiccomplete_undo_run", { runId }),
+  muConfirmPending: (runId: string, path: string) =>
+    invoke<string>("musiccomplete_confirm_pending", { runId, path }),
   // File Auditor: settings + schedules, runs (summaries), flags
   // (the checklist), resolutions, and the memory managers
   // (dismissals / standing rules / taught words).
@@ -1268,6 +1293,187 @@ export interface McRun {
   summary: McRunSummary;
   pending: McPendingItem[];
   quota: OpensubsQuota | null;
+  canUndo: boolean;
+}
+
+// ---------------------------------------------------------------------
+// Music Completion types (mirror musiccomplete.rs / musicid.rs)
+// ---------------------------------------------------------------------
+
+export interface MuSchedule {
+  id: string;
+  name: string;
+  target: string;
+  steps: { tags: boolean; lyrics: boolean; artwork: boolean };
+  time: string;
+  weekdays: boolean[];
+  idleMinutes: number;
+  requireOnAc: boolean;
+  enabled: boolean;
+  lastStarted: string | null;
+  lastStatus: string | null;
+}
+
+export interface MuSettings {
+  /** "embedded" | "sidecar" | "both" */
+  lyricsTarget: string;
+  fetchLyrics: boolean;
+  fetchArtwork: boolean;
+  schedules: MuSchedule[];
+}
+
+export interface MuStatus {
+  keyringOk: boolean;
+  acoustidKeySaved: boolean;
+  fpcalcAvailable: boolean;
+  fingerprintingReady: boolean;
+}
+
+export interface MuAudioTags {
+  title: string | null;
+  artist: string | null;
+  album: string | null;
+  albumArtist: string | null;
+  year: string | null;
+  track: string | null;
+  trackTotal: string | null;
+  disc: string | null;
+  discTotal: string | null;
+  genre: string | null;
+  composer: string | null;
+}
+
+export interface MuCandidateCore {
+  id: string;
+  title: string;
+  artist: string;
+  album: string | null;
+  albumArtist: string | null;
+  releaseId: string | null;
+  releaseGroupId: string | null;
+  year: number | null;
+  track: number | null;
+  trackTotal: number | null;
+  disc: number | null;
+  discTotal: number | null;
+  genre: string | null;
+  composer: string | null;
+  durationMs: number | null;
+  mbScore: number;
+}
+
+export interface MuCandidate {
+  candidate: MuCandidateCore;
+  score: number;
+  tier: string;
+  evidence: string[];
+}
+
+export interface MuTagChange {
+  field: string;
+  current: string | null;
+  proposed: string;
+  overwrite: boolean;
+}
+
+export interface MuTrackProposal {
+  path: string;
+  name: string;
+  current: MuAudioTags;
+  durationSecs: number | null;
+  state: string;
+  candidate: MuCandidate | null;
+  changes: MuTagChange[];
+  hasArt: boolean;
+  artAvailable: boolean;
+  hasLyrics: boolean;
+  lyricsAvailable: boolean;
+  fetchedPlain: string | null;
+  fetchedSynced: string | null;
+  needsWork: boolean;
+  note: string | null;
+}
+
+export interface MuScanRequest {
+  root: string;
+  paths: string[];
+}
+
+export interface MuScanView {
+  root: string;
+  rows: MuTrackProposal[];
+  truncated: boolean;
+  fingerprintingReady: boolean;
+}
+
+export interface MuApplyField {
+  field: string;
+  value: string | null;
+}
+
+export interface MuApplyItem {
+  path: string;
+  fields: MuApplyField[];
+  artReleaseId: string | null;
+  artReleaseGroupId: string | null;
+  lyricsPlain: string | null;
+  lyricsSynced: string | null;
+}
+
+export interface MuApplyRequest {
+  target: string;
+  items: MuApplyItem[];
+}
+
+export interface MuLyricsView {
+  path: string;
+  embeddedPlain: string | null;
+  embeddedSynced: string | null;
+  sidecarText: string | null;
+  sidecarPath: string;
+  fetchedPlain: string | null;
+  fetchedSynced: string | null;
+  fetchedInstrumental: boolean;
+  note: string | null;
+}
+
+export interface MuRunSummary {
+  filesCompleted?: number;
+  fieldsWritten?: number;
+  artworkEmbedded?: number;
+  lyricsSaved?: number;
+  pending?: number;
+  failures?: string[];
+  error?: string;
+}
+
+export interface MuPendingItem {
+  path: string;
+  name: string;
+  state: string;
+  score: number | null;
+  candidate: {
+    title: string;
+    artist: string;
+    album: string | null;
+    year: number | null;
+  } | null;
+  changes: MuTagChange[];
+  artAvailable: boolean;
+  lyricsAvailable: boolean;
+  note: string | null;
+}
+
+export interface MuRun {
+  id: string;
+  scheduleName: string;
+  target: string;
+  started: string;
+  finished: string | null;
+  wasLate: boolean;
+  status: string;
+  summary: MuRunSummary;
+  pending: MuPendingItem[];
   canUndo: boolean;
 }
 

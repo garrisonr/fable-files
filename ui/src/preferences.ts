@@ -16,6 +16,7 @@ import { RomMediaSection } from "./rommedia";
 import { ROM_ICON_SET_INFO, type RomIconSet } from "./roms";
 import { MediaResSection } from "./mediares";
 import { MediaCompleteSection } from "./mediacomplete";
+import { MusicCompleteSection } from "./musiccomplete";
 import { LibraryMemorySection } from "./library";
 import { PluginsSection } from "./plugins";
 import { TemplatesSection } from "./templates";
@@ -190,6 +191,13 @@ export class PreferencesDialog {
     const mcHost = document.createElement("div");
     dialog.appendChild(mcHost);
     void new MediaCompleteSection().mount(mcHost);
+
+    // Music Completion (tags + cover art + lyrics + its own
+    // schedules on the shared agent): the music sibling, mounted
+    // right under Media Completion.
+    const muHost = document.createElement("div");
+    dialog.appendChild(muHost);
+    void new MusicCompleteSection().mount(muHost);
 
     // Library Memory (Indexer v2): remembered drives + retention,
     // same pattern — backend-owned state, mounted async.

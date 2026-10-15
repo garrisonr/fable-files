@@ -48,6 +48,9 @@ filetime = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "ico"] }
 md5 = "0.7"
 open = "5"
+# Music Completion: audio tag read/write (mp3/flac/ogg/m4a — titles,
+# artists, lyrics, embedded pictures) for the enrichment pipeline.
+lofty = "0.22"
 # Network Locations: in-process GIO mounts (GVfs). 0.18.4 is already
 # in Cargo.lock via the Tauri GTK stack — this changes no versions.
 gio = "0.18"

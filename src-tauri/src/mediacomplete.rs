@@ -1052,6 +1052,9 @@ pub fn run_background_agent() -> i32 {
         // own tick converts schedules into this module's tested
         // state machine — one heartbeat for both).
         crate::auditor::agent_tick(&base);
+        // Music Completion: scheduled enrichment rides the same
+        // heartbeat the same way.
+        crate::musiccomplete::agent_tick(&base);
         std::thread::sleep(std::time::Duration::from_secs(30));
     }
 }

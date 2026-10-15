@@ -3564,3 +3564,23 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 .au-history { margin-top: 8px; }
 .au-history summary { cursor: pointer; font-size: 0.8125rem; color: var(--ufm-text-muted); }
 .au-dismiss-path { word-break: break-all; }
+
+/* ---- Music Completion (2026-10-15): review dialog + lyrics ---- */
+.mu-card { max-width: 760px; }
+.mu-row { text-align: left; }
+.mu-evidence { color: var(--ufm-text-muted); font-size: .8rem; margin: .15rem 0 .3rem; }
+.mu-art-preview { width: 96px; height: 96px; object-fit: cover; border-radius: 8px; margin: .35rem 0; }
+.mu-change { display: flex; align-items: baseline; gap: .5rem; padding: .14rem 0; font-size: .86rem; flex-wrap: wrap; }
+.mu-field { flex: 0 0 7.5rem; color: var(--ufm-text-muted); font-weight: 600; }
+.mu-from { color: var(--ufm-text-muted); }
+.mu-arrow { color: var(--ufm-text-muted); }
+.mu-to { font-weight: 600; }
+.mu-overwrite { display: inline-flex; align-items: center; gap: .3rem; color: var(--ufm-text-muted); font-size: .8rem; }
+.mu-lyrics-editor { width: 100%; box-sizing: border-box; font: inherit; font-size: .88rem; line-height: 1.45; padding: .6rem; border-radius: 8px; border: 1px solid var(--ufm-border, #8884); background: var(--ufm-surface, transparent); color: inherit; resize: vertical; }
+.mu-lrc-preview { margin-top: .5rem; max-height: 180px; overflow: auto; text-align: left; }
+.mu-lrc-line { padding: .08rem 0; font-size: .86rem; color: var(--ufm-text-muted); }
+.ql-lyrics { margin: 0 0 .85rem; max-height: 220px; overflow: auto; text-align: left; }
+.ql-lyrics-head { font-weight: 700; font-size: .82rem; color: var(--ufm-text-muted); margin-bottom: .3rem; }
+.ql-lrc-line { padding: .1rem .2rem; font-size: .9rem; color: var(--ufm-text-muted); border-radius: 4px; transition: color .2s ease, background .2s ease; }
+.ql-lrc-line.active { color: var(--ufm-text, inherit); font-weight: 700; background: var(--ufm-accent-soft, #8882); }
+.ql-lrc-line.plain { white-space: pre-wrap; }

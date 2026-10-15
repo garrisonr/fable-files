@@ -27,6 +27,7 @@ import { openConnectDialog } from "./network";
 import { showPluginRunDialog } from "./plugins";
 import { SearchView, fmtDay } from "./search";
 import { MediaResDialog } from "./mediares";
+import { MusicCompleteDialog } from "./musiccomplete";
 import { PropertiesDialog } from "./properties";
 import { AuditorPanel } from "./auditor";
 import { FolderPicker, type PickerShortcut } from "./picker";
@@ -165,6 +166,7 @@ export class Shell {
   private labelManager = new LabelManager();
   private searchOpenWith = new OpenWithDialog();
   private mediaRename = new MediaResDialog();
+  private musicComplete = new MusicCompleteDialog();
   private musicPlayer = new MusicPlayer();
   private labelList!: HTMLElement;
   private collectionList!: HTMLElement;
@@ -222,6 +224,10 @@ export class Shell {
         this.mediaRename.open(items, () => {
           this.refreshActiveDir();
           if (this.searchView.active) this.searchView.refresh();
+        }),
+      onMusicComplete: (items: Item[]) =>
+        void this.musicComplete.open(items, () => {
+          this.refreshActiveDir();
         }),
       onPlayMusic: (items: Item[]) => this.musicPlayer.open(items),
       onOpen: (item) => this.openItem(item),
@@ -2669,6 +2675,17 @@ export class Shell {
     this.dupDialog.open(path);
   }
 
+  /** Music Completion on the folder being browsed (hamburger →
+   * Organize). */
+  private async openMusicHere(): Promise<void> {
+    const path = (await this.currentDirPath()) || (await this.homePath());
+    if (!path) {
+      Toast.error("Open a folder first, then complete its music.");
+      return;
+    }
+    void this.musicComplete.openFolder(path, () => this.refreshActiveDir());
+  }
+
   /** Built-in terminal: opens in the folder being browsed. */
   private async toggleTerminal(): Promise<void> {
     let cwd = "";
@@ -4374,6 +4391,10 @@ export class Shell {
           {
             label: "Synchronize Folders\u2026",
             action: () => void this.openSyncHere(),
+          },
+          {
+            label: "Complete Music Tags & Lyrics\u2026",
+            action: () => void this.openMusicHere(),
           },
           {
             label: "Manage Labels\u2026",

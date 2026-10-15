@@ -13,6 +13,7 @@ pub mod mcp_server;
 pub mod auditor;
 pub mod mediacomplete;
 pub mod mediares;
+pub mod musiccomplete;
 pub mod opensubs;
 pub mod rommedia;
 pub mod plugins;
@@ -600,6 +601,18 @@ pub fn run() {
             commands::mediacomplete_list_runs,
             commands::mediacomplete_undo_run,
             commands::mediacomplete_confirm_pending,
+            commands::musiccomplete_get_settings,
+            commands::musiccomplete_save_settings,
+            commands::musiccomplete_get_status,
+            commands::musiccomplete_set_acoustid_key,
+            commands::musiccomplete_scan,
+            commands::musiccomplete_apply,
+            commands::musiccomplete_lyrics_get,
+            commands::musiccomplete_lyrics_save,
+            commands::musiccomplete_list_runs,
+            commands::musiccomplete_run_now,
+            commands::musiccomplete_undo_run,
+            commands::musiccomplete_confirm_pending,
             commands::auditor_get_settings,
             commands::auditor_save_settings,
             commands::auditor_run_now,
