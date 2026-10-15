@@ -11,6 +11,9 @@ pub mod library;
 pub mod mcp_server;
 pub mod mediares;
 pub mod rommedia;
+pub mod plugins;
+pub mod reader;
+pub mod templates;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -641,6 +644,19 @@ pub fn run() {
             commands::open_with_app,
             commands::set_default_app,
             mcp_server::mcp_audit_recent,
+            plugins::list_plugins,
+            plugins::set_plugin_enabled,
+            plugins::plugins_folder,
+            plugins::run_plugin_action,
+            plugins::confirm_plugin_proposal,
+            templates::list_folder_templates,
+            templates::create_folder_template,
+            templates::rename_folder_template,
+            templates::delete_folder_template,
+            templates::apply_folder_template,
+            reader::open_book,
+            reader::read_chapter,
+            reader::set_reading_progress,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Fable Files");

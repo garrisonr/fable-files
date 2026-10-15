@@ -57,6 +57,33 @@ export class OpenWithDialog {
     alwaysWrap.appendChild(alwaysCheck);
     alwaysWrap.appendChild(document.createTextNode(" Always use for this file type"));
 
+    // Phase 6: EPUBs can open in the built-in reader. It is not a
+    // system app, so the "Always use" checkbox doesn't apply to it.
+    if (item.name.toLowerCase().endsWith(".epub")) {
+      const b = document.createElement("button");
+      b.className = "ow-app";
+      const name = document.createElement("span");
+      name.className = "ow-app-name";
+      name.textContent = "Fable Reader";
+      b.appendChild(name);
+      const badge = document.createElement("span");
+      badge.className = "ow-badge";
+      badge.textContent = "Built-in";
+      b.appendChild(badge);
+      b.addEventListener("click", () => {
+        void (async () => {
+          const path =
+            item.provider_key ??
+            (await api.getItemPath(item.id).catch(() => null));
+          this.close();
+          if (!path) return;
+          const m = await import("./reader");
+          m.openReader(path);
+        })();
+      });
+      list.appendChild(b);
+    }
+
     for (const app of info.apps) {
       const b = document.createElement("button");
       b.className = "ow-app";

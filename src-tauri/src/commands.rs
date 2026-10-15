@@ -889,7 +889,7 @@ fn emit_job_progress(
     );
 }
 
-fn job_item(
+pub(crate) fn job_item(
     id: ItemId,
     location: LocationId,
     path: &Path,
@@ -2042,6 +2042,21 @@ fn execute_step(
                 Err(e) => StepOutcome::Failed(e.to_string()),
             }
         }
+        ufm_jobs::StepOp::WriteFile { parent, name, contents } => {
+            // Phase 6: the one plugin-originated mutation, always a
+            // confirmed proposal by the time it lands here. Never
+            // overwrites: an existing file fails the step loudly.
+            let base = parent.provider_key.as_deref().unwrap_or_default();
+            let path = Path::new(base).join(name);
+            if path.exists() {
+                StepOutcome::Failed(format!("{} already exists", path.display()))
+            } else {
+                match std::fs::write(&path, contents) {
+                    Ok(()) => StepOutcome::Done(None),
+                    Err(e) => StepOutcome::Failed(e.to_string()),
+                }
+            }
+        }
         ufm_jobs::StepOp::VerifyCopy { src, dst } => {
             // Verify-then-skip: an equal-length destination file counts
             // as already copied (size-level in this increment; hash
@@ -2992,6 +3007,7 @@ fn job_signature(job: &ufm_jobs::Job) -> String {
                 }
             }
             ufm_jobs::StepOp::Mkdir { .. } => {}
+            ufm_jobs::StepOp::WriteFile { .. } => {}
             ufm_jobs::StepOp::FetchMedia { .. } => {}
         }
     }
@@ -3015,7 +3031,7 @@ fn job_signature(job: &ufm_jobs::Job) -> String {
 /// into the existing job: no twin is planned into the registry, the
 /// existing job's progress is re-emitted so the panel surfaces it,
 /// and the caller learns it was a duplicate so it can say so.
-fn start_job(
+pub(crate) fn start_job(
     app: tauri::AppHandle,
     state: &AppState,
     job: ufm_jobs::Job,

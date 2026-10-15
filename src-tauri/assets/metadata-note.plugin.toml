@@ -1,0 +1,8 @@
+[plugin]
+name = "Metadata Note"
+author = "Fable Files"
+version = "1.0.0"
+description = "Example plugin: writes a small text note summarising an item's metadata, proposed for your confirmation."
+capabilities = ["action.context"]
+permissions = []
+entry = "main.wasm"

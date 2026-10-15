@@ -23,6 +23,7 @@ import { reducedMotion, animateFromLive, liveOpacity } from "./motion";
 import { QuickLook } from "./quicklook";
 import { ContextMenu } from "./contextmenu";
 import { Toast, confirmDialog, promptDialog, errText} from "./toast";
+import { showPluginRunDialog } from "./plugins";
 import { SearchView, fmtDay } from "./search";
 import { MediaResDialog } from "./mediares";
 import { PropertiesDialog } from "./properties";
@@ -399,6 +400,11 @@ export class Shell {
       onPrint: (item) => void this.printDialog.open(item),
       onCreateTorrent: (item) => void this.torrentDialog.open(item),
       onNewFolder: () => void this.createFolderHere(),
+      onListPlugins: () => this.pluginCache,
+      onRunPlugin: (item, key) => void this.runPluginFlow(item, key),
+      onListTemplates: () => this.templateCache,
+      onNewFolderFromTemplate: (templateId) =>
+        void this.newFolderFromTemplateFlow(templateId),
       onNewFile: (kind) => void this.createFileHere(kind),
       onPasteHere: () => void this.pasteIntoCurrentDir(),
       onTerminalHere: () => void this.toggleTerminal(),
@@ -630,6 +636,8 @@ export class Shell {
       this.locations = [];
     }
     await this.buildSidebar();
+    // Phase 6: warm the plugin/template menu caches.
+    void this.refreshPluginTemplateCaches();
     // Durable UI prefs (Round 7.2): hydrate sidebar collapse state
     // from the backend sidecar — WebKit localStorage alone lost it
     // across sessions. Adopt any localStorage-only values once so
@@ -2214,6 +2222,99 @@ export class Shell {
       ) ?? this.locations[0];
     if (!home) return "";
     return api.getItemPath(home.root_item).catch(() => "");
+  }
+
+  // ---- Phase 6: plugins + folder templates ----
+
+  /** Menu snapshots (sync by FileViewHooks design): runnable
+   *  plugins (valid + enabled + wired) and folder templates.
+   *  Refreshed at boot and after every run/apply. */
+  private pluginCache: { key: string; name: string }[] = [];
+  private templateCache: { id: string; name: string }[] = [];
+
+  private async refreshPluginTemplateCaches(): Promise<void> {
+    try {
+      const plugins = await api.listPlugins();
+      this.pluginCache = plugins
+        .filter((p) => p.valid && p.enabled && p.wired)
+        .map((p) => ({ key: p.key, name: p.name }));
+    } catch {
+      /* keep the last good snapshot */
+    }
+    try {
+      const templates = await api.listFolderTemplates();
+      this.templateCache = templates.map((t) => ({ id: t.id, name: t.name }));
+    } catch {
+      /* keep the last good snapshot */
+    }
+  }
+
+  /** Run a plugin on one item and show what it said / proposed.
+   *  A proposal becomes a job only when the user confirms it in
+   *  the result dialog — never from here. */
+  private async runPluginFlow(
+    item: import("./api").Item,
+    key: string,
+  ): Promise<void> {
+    const path =
+      item.provider_key ?? (await api.getItemPath(item.id).catch(() => null));
+    if (!path) {
+      Toast.error("That item has no local path to run a plugin on.");
+      return;
+    }
+    const known = this.pluginCache.find((p) => p.key === key);
+    try {
+      const run = await api.runPluginAction(key, path);
+      showPluginRunDialog(
+        run.proposals[0]?.pluginName ?? known?.name ?? "Plugin",
+        run,
+      );
+    } catch (err) {
+      Toast.error(`Plugin failed: ${errText(err)}`);
+    }
+    void this.refreshPluginTemplateCaches();
+  }
+
+  /** Background menu → New Folder from Template: name it, then the
+   *  backend plans it as a journaled job. */
+  private async newFolderFromTemplateFlow(templateId: string): Promise<void> {
+    const tab = this.activeTab;
+    if (!tab) return;
+    const dir = currentDir(tab);
+    if (
+      dir.dirId.startsWith("label:") ||
+      dir.dirId.startsWith("archive:") ||
+      dir.dirId.startsWith("collection:")
+    ) {
+      Toast.error("Can't create a folder here — this is a virtual view.");
+      return;
+    }
+    const parentPath = await api.getItemPath(dir.dirId).catch(() => "");
+    if (!parentPath) {
+      Toast.error("Couldn't find this folder on disk.");
+      return;
+    }
+    const template = this.templateCache.find((t) => t.id === templateId);
+    const name = await promptDialog(
+      "New Folder from Template",
+      "Folder name",
+      template?.name ?? "Untitled Folder",
+    );
+    if (!name) return;
+    try {
+      const start = await api.applyFolderTemplate(templateId, parentPath, name);
+      if (start.alreadyRunning) {
+        Toast.show("That job is already running.");
+      } else {
+        Toast.success(`Creating \u201c${name}\u201d from the template — watch it in Jobs.`);
+      }
+      // Template jobs are small; refresh shortly so the new folder
+      // appears without a manual reload.
+      setTimeout(() => this.refreshActiveDir(), 1500);
+    } catch (err) {
+      Toast.error(`Couldn't apply the template: ${errText(err)}`);
+    }
+    void this.refreshPluginTemplateCaches();
   }
 
   /** New Folder in the folder being browsed (background menu). */

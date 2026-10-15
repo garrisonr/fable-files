@@ -6,6 +6,8 @@
 //! every call; third-party plugins run sandboxed with declared permissions.
 //! A community directory/marketplace model follows in P1.
 
+pub mod runtime;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use ufm_core::{PluginId, Result, UfmError};

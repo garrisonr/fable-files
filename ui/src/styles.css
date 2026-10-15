@@ -3315,3 +3315,37 @@ select option { background-color: var(--ufm-surface); color: var(--ufm-text); }
 .rm-candidate-label { font-size: 0.6875rem; color: var(--ufm-text-muted); text-align: center; }
 .rm-diy { border: 1px dashed var(--ufm-border); border-radius: 10px; padding: 0.5rem 0.75rem; margin-top: 0.625rem; }
 .rm-diy-title { font-weight: 700; font-size: 0.8125rem; margin: 0; }
+
+/* ---- Phase 6: plugins + folder templates (Preferences) ---- */
+.p6-body { margin-bottom: 0.5rem; }
+.p6-row-head { display: flex; align-items: baseline; gap: 0.5rem; }
+.p6-version { font-size: 0.75rem; color: var(--ufm-text-muted); font-weight: 600; }
+.p6-log { font-family: var(--ufm-font-mono); font-size: 0.75rem; white-space: pre-wrap; word-break: break-word; max-height: 12rem; overflow-y: auto; margin: 0.5rem 0; color: var(--ufm-text); }
+.p6-run-card { width: min(38rem, calc(100vw - 3rem)); max-height: calc(100vh - 4rem); overflow-y: auto; }
+.ql-read-btn { margin-top: 0.625rem; }
+
+/* ---- Phase 6: the ebook reader ----
+   A reading surface: the app chrome quiets down to a title, a
+   chapter, and room to read. The page column caps its measure on
+   wide windows and goes full-bleed on narrow ones; the text is set
+   in the system serif, sized by the reader's own A−/A+ steppers. */
+.reader-overlay { position: fixed; inset: 0; background: rgb(0 0 0 / 0.32); backdrop-filter: blur(6px) saturate(140%); display: flex; align-items: stretch; justify-content: center; z-index: 1300; }
+.reader-shell { display: flex; flex-direction: column; width: min(52rem, 100vw); max-height: 100vh; background: var(--ufm-content-canvas); color: var(--ufm-text); box-shadow: 0 1.5rem 4rem rgb(0 0 0 / 0.35); }
+@media (min-width: 60rem) {
+  .reader-overlay { align-items: center; padding: 2rem 0; }
+  .reader-shell { max-height: calc(100vh - 4rem); border-radius: 18px; overflow: hidden; }
+}
+.reader-head { display: flex; align-items: flex-start; gap: 1rem; padding: 1rem 1.25rem 0.75rem; border-bottom: 1px solid var(--ufm-border); }
+.reader-titles { flex: 1 1 auto; min-width: 0; }
+.reader-title { font-size: 1.0625rem; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reader-author { font-size: 0.875rem; color: var(--ufm-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reader-tools { display: flex; gap: 0.375rem; flex: none; align-items: center; }
+.reader-tool { font-size: 0.8125rem; }
+.reader-body { flex: 1 1 auto; overflow-y: auto; }
+.reader-page { max-width: 38rem; margin: 0 auto; padding: 1.75rem 1.5rem 3rem; font-family: ui-serif, Georgia, "Times New Roman", serif; line-height: 1.62; }
+.reader-chapter-title { font-size: 1.35em; line-height: 1.3; margin: 0 0 1em; font-weight: 700; }
+.reader-para { margin: 0 0 0.9em; }
+.reader-note { color: var(--ufm-text-muted); font-family: var(--ufm-font-ui); font-size: 0.9375rem; line-height: 1.55; }
+.reader-foot { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1.25rem; border-top: 1px solid var(--ufm-border); }
+.reader-pos { font-size: 0.8125rem; color: var(--ufm-text-muted); white-space: nowrap; }
+.reader-select { flex: 1 1 auto; font: inherit; font-size: 0.8125rem; padding: 0.375rem 0.5rem; border-radius: 8px; border: 1px solid var(--ufm-border); background: var(--ufm-content-canvas); color: var(--ufm-text); min-width: 0; }

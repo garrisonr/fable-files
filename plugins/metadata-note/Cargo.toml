@@ -1,0 +1,17 @@
+[package]
+name = "fable-metadata-note"
+version = "1.0.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Fable Files example plugin: proposes a text note summarising an item's metadata."
+
+# Standalone crate — deliberately NOT part of the app workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1

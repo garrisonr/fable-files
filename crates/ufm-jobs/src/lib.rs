@@ -87,6 +87,18 @@ pub enum StepOp {
         /// for it alongside the hashes).
         size: Option<u64>,
     },
+    /// Phase 6: write a small text file into an existing folder — the
+    /// one mutation a WASM plugin may cause, and only as a confirmed
+    /// proposal (see ufm-plugins). The step is self-contained data:
+    /// the full contents ride in the job snapshot, capped by the
+    /// planner (64 KiB). The executor refuses to overwrite an existing
+    /// file. The job is journaled like every other job; the file it
+    /// creates is an ordinary file (trashable in-app).
+    WriteFile {
+        parent: Item,
+        name: String,
+        contents: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -410,6 +422,34 @@ mod tests {
         // enum is serde-tagged, so a Copy step JSON is unaffected.
         let old = r#"{"id":"s0","label":"c","op":{"op":"mkdir","parent":{"id":"00000000-0000-0000-0000-000000000000","location":"00000000-0000-0000-0000-000000000000","name":"x","kind":"folder","size_bytes":null,"modified":null,"provider_key":null,"labels":[],"starred":false},"name":"y"},"depends_on":[],"state":"pending","compensation":null}"#;
         assert!(serde_json::from_str::<Step>(old).is_ok());
+    }
+
+    #[test]
+    fn write_file_step_roundtrips() {
+        let step = Step {
+            id: "s0001".into(),
+            label: "write note".into(),
+            op: StepOp::WriteFile {
+                parent: item("dest", ItemKind::Folder),
+                name: "game.fable-note.txt".into(),
+                contents: "Title: game\n".into(),
+            },
+            depends_on: vec![],
+            state: StepState::Pending,
+            compensation: None,
+            outcome: false,
+            outcome_path: None,
+        };
+        let json = serde_json::to_string(&step).unwrap();
+        assert!(json.contains("\"op\":\"write_file\""), "tag: {json}");
+        let back: Step = serde_json::from_str(&json).unwrap();
+        match back.op {
+            StepOp::WriteFile { ref name, ref contents, .. } => {
+                assert_eq!(name, "game.fable-note.txt");
+                assert_eq!(contents, "Title: game\n");
+            }
+            _ => panic!("wrong variant after round trip"),
+        }
     }
 
     use super::*;

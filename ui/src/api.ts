@@ -192,6 +192,70 @@ export interface ItemVolumeBadge {
   last_seen?: string | null;
 }
 
+/** Phase 6 — one plugin folder, as Preferences lists it. Mirrors
+ *  plugins.rs PluginView (camelCase over the wire). */
+export interface PluginInfo {
+  key: string;
+  name: string;
+  author: string;
+  version: string;
+  description: string;
+  capabilities: string[];
+  permissions: string[];
+  enabled: boolean;
+  valid: boolean;
+  error: string | null;
+  /** v1 dispatches `action.context`; other capabilities are
+   *  declared and displayed, not wired. */
+  wired: boolean;
+}
+
+export interface PluginProposal {
+  pluginKey: string;
+  pluginName: string;
+  name: string;
+  contents: string;
+  targetDir: string;
+}
+
+export interface PluginRun {
+  logs: string[];
+  proposals: PluginProposal[];
+}
+
+/** Phase 6 — one folder template, as Preferences lists it. */
+export interface FolderTemplateInfo {
+  id: string;
+  name: string;
+  starter: boolean;
+  folders: number;
+  files: number;
+  bytes: number;
+}
+
+export interface CreateTemplateResult {
+  template: FolderTemplateInfo;
+  skippedLargeFiles: number;
+}
+
+/** Phase 6 — the reader's opening handshake for one book. */
+export interface BookOpen {
+  title: string | null;
+  author: string | null;
+  chapterCount: number;
+  drmProtected: boolean;
+  note: string | null;
+  startChapter: number;
+  fontScale: number;
+}
+
+export interface ChapterView {
+  index: number;
+  title: string | null;
+  text: string;
+  chapterCount: number;
+}
+
 /** Library Memory settings (Preferences): how long Fable remembers
  *  a disconnected drive's files. null = Forever. */
 export interface LibrarySettings {
@@ -737,6 +801,43 @@ export const api = {
   /** Purge a connected volume's rows + reset resume state so the
    *  next walk is a true full walk. Resolves with its mount point. */
   rebuildVolume: (fsUuid: string) => invoke<string>("rebuild_volume", { fsUuid }),
+  /** Phase 6 — WASM plugins (spec §§17–18). */
+  listPlugins: () => invoke<PluginInfo[]>("list_plugins"),
+  setPluginEnabled: (key: string, enabled: boolean) =>
+    invoke<void>("set_plugin_enabled", { key, enabled }),
+  pluginsFolder: () => invoke<string>("plugins_folder"),
+  runPluginAction: (key: string, path: string) =>
+    invoke<PluginRun>("run_plugin_action", { key, path }),
+  confirmPluginProposal: (
+    pluginKey: string,
+    pluginName: string,
+    targetDir: string,
+    name: string,
+    contents: string,
+  ) =>
+    invoke<JobStart>("confirm_plugin_proposal", {
+      pluginKey,
+      pluginName,
+      targetDir,
+      name,
+      contents,
+    }),
+  /** Phase 6 — folder templates (spec §22). */
+  listFolderTemplates: () => invoke<FolderTemplateInfo[]>("list_folder_templates"),
+  createFolderTemplate: (name: string, fromPath: string | null) =>
+    invoke<CreateTemplateResult>("create_folder_template", { name, fromPath }),
+  renameFolderTemplate: (id: string, name: string) =>
+    invoke<void>("rename_folder_template", { id, name }),
+  deleteFolderTemplate: (id: string) =>
+    invoke<void>("delete_folder_template", { id }),
+  applyFolderTemplate: (templateId: string, parentPath: string, name: string) =>
+    invoke<JobStart>("apply_folder_template", { templateId, parentPath, name }),
+  /** Phase 6 — ebook reader (spec §25, EPUB). */
+  openBook: (path: string) => invoke<BookOpen>("open_book", { path }),
+  readChapter: (path: string, index: number) =>
+    invoke<ChapterView>("read_chapter", { path, index }),
+  setReadingProgress: (path: string, chapter: number, fontScale?: number) =>
+    invoke<void>("set_reading_progress", { path, chapter, fontScale }),
   openItem: (item: string) => invoke<void>("open_item", { item }),
   setExecutable: (item: string, executable: boolean) => invoke<void>("set_executable", { item, executable }),
 };

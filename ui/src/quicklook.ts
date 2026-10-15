@@ -447,6 +447,26 @@ export class QuickLook {
       note.textContent = doc.note;
       card.appendChild(note);
     }
+    // Phase 6: an EPUB opens in the built-in reader from here —
+    // an explicit door; double-click still opens the OS default app.
+    if (item.name.toLowerCase().endsWith(".epub")) {
+      const readBtn = document.createElement("button");
+      readBtn.className = "ql-detach-btn ql-read-btn";
+      readBtn.textContent = "Read";
+      readBtn.title = "Open in the built-in reader";
+      readBtn.addEventListener("click", () => {
+        void (async () => {
+          const path =
+            item.provider_key ??
+            (await api.getItemPath(item.id).catch(() => null));
+          if (!path) return;
+          this.close();
+          const m = await import("./reader");
+          m.openReader(path);
+        })();
+      });
+      card.appendChild(readBtn);
+    }
     return true;
   }
 

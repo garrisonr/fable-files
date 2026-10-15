@@ -556,6 +556,176 @@ fn find_cover(
     None
 }
 
+// ---------------------------------------------------------------------------
+// The reader's engine (Phase 6): the whole book, chapter by chapter, in
+// spine order. Same failure philosophy as the preview — a note, never
+// an error — and the preview decoder above is deliberately untouched.
+// ---------------------------------------------------------------------------
+
+/// Cap on one chapter's extracted text (reader material, not a book's
+/// worth of runaway markup).
+const MAX_CHAPTER_CHARS: usize = 256_000;
+/// Cap on the whole book's extracted text.
+const MAX_BOOK_CHARS: usize = 4_000_000;
+/// Cap on spine documents walked (hostile-archive rail).
+const MAX_SPINE_DOCS: usize = 2_000;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct EpubChapter {
+    pub title: Option<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct EpubBook {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    /// Chapters in reading (spine) order. Empty when the book can't be
+    /// read at all (see `note`) or is DRM-locked.
+    pub chapters: Vec<EpubChapter>,
+    pub drm_protected: bool,
+    /// Plain-language reason the book is limited, when it is.
+    pub note: Option<String>,
+}
+
+/// A chapter's display title: the first visible heading, else the
+/// document `<title>`, else the first line of its text.
+fn chapter_title(xhtml: &str, text: &str) -> Option<String> {
+    for tag in ["h1", "h2", "title"] {
+        if let Some(t) = tag_text(xhtml, tag) {
+            let t = collapse_ws(&xhtml_to_text(&t));
+            if !t.is_empty() {
+                return Some(t.chars().take(120).collect());
+            }
+        }
+    }
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| l.chars().take(120).collect())
+}
+
+/// Decode a whole EPUB for the reader. Never fails hard: worst case
+/// is a book with no chapters and a plain-language note.
+pub fn decode_epub_book(data: &[u8]) -> EpubBook {
+    let mut out = EpubBook::default();
+    let Some(zip) = ZipArchive::open(data) else {
+        out.note = Some(
+            "This file isn't a readable EPUB (the book archive couldn't be opened).".into(),
+        );
+        return out;
+    };
+
+    // DRM: same rule as the preview — encryption.xml locking anything
+    // but fonts locks the content itself.
+    if let Some(enc) = zip.read_text("META-INF/encryption.xml") {
+        let locked_content = iter_tags(&enc, "CipherReference").iter().any(|t| {
+            let uri = attr(t, "URI").unwrap_or("");
+            let lower = uri.to_lowercase();
+            !(lower.ends_with(".ttf")
+                || lower.ends_with(".otf")
+                || lower.ends_with(".woff")
+                || lower.ends_with(".woff2"))
+        });
+        if locked_content {
+            out.drm_protected = true;
+            out.note = Some(
+                "This book is protected by DRM, so Fable can't open it in the reader. \
+                 It will still open in your usual reader app."
+                    .into(),
+            );
+        }
+    }
+
+    let opf_path = zip
+        .read_text("META-INF/container.xml")
+        .and_then(|c| {
+            iter_tags(&c, "rootfile")
+                .into_iter()
+                .find_map(|t| attr(t, "full-path").map(str::to_owned))
+        })
+        .unwrap_or_else(|| "OEBPS/content.opf".to_string());
+    let Some(opf) = zip.read_text(&opf_path) else {
+        if out.note.is_none() {
+            out.note = Some(
+                "This EPUB is missing its book index (the OPF file), so it can't be read."
+                    .into(),
+            );
+        }
+        return out;
+    };
+    let opf_dir = opf_path
+        .rsplit_once('/')
+        .map(|(d, _)| d.to_string())
+        .unwrap_or_default();
+
+    out.title = tag_text(&opf, "dc:title");
+    out.author = tag_text(&opf, "dc:creator");
+
+    if out.drm_protected {
+        return out;
+    }
+
+    let mut manifest: HashMap<String, ManifestItem> = HashMap::new();
+    for t in iter_tags(&opf, "item") {
+        if let (Some(id), Some(href)) = (attr(t, "id"), attr(t, "href")) {
+            manifest.insert(
+                id.to_string(),
+                ManifestItem {
+                    href: href.to_string(),
+                    media_type: attr(t, "media-type").unwrap_or("").to_string(),
+                    properties: attr(t, "properties").unwrap_or("").to_string(),
+                },
+            );
+        }
+    }
+    let spine_ids: Vec<String> = iter_tags(&opf, "itemref")
+        .into_iter()
+        .filter(|t| attr(t, "linear") != Some("no"))
+        .filter_map(|t| attr(t, "idref").map(str::to_owned))
+        .take(MAX_SPINE_DOCS)
+        .collect();
+
+    let mut total_chars = 0usize;
+    let mut truncated = false;
+    for id in &spine_ids {
+        let Some(item) = manifest.get(id) else {
+            continue;
+        };
+        if !item.media_type.contains("html") && !item.media_type.contains("xml") {
+            continue;
+        }
+        let path = resolve_href(&opf_dir, &item.href);
+        let Some(xhtml) = zip.read_text(&path) else {
+            continue;
+        };
+        let text = xhtml_to_text(&xhtml);
+        let text = text.trim();
+        let title = chapter_title(&xhtml, text);
+        let room = MAX_BOOK_CHARS.saturating_sub(total_chars);
+        let capped: String = text
+            .chars()
+            .take(MAX_CHAPTER_CHARS.min(room))
+            .collect();
+        if capped.chars().count() < text.chars().count() {
+            truncated = true;
+        }
+        total_chars += capped.chars().count();
+        out.chapters.push(EpubChapter {
+            title,
+            text: capped,
+        });
+    }
+    if out.chapters.is_empty() && out.note.is_none() {
+        out.note = Some("No readable chapters were found in this book.".into());
+    } else if truncated && out.note.is_none() {
+        out.note = Some(
+            "This book is very large, so the reader loaded only its first portion.".into(),
+        );
+    }
+    out
+}
+
 fn build_excerpt(
     zip: &ZipArchive,
     opf_dir: &str,
@@ -762,6 +932,50 @@ mod tests {
         assert!(p.note.as_deref().unwrap_or("").contains("DRM"));
         // Metadata is not encrypted in real DRM books either.
         assert_eq!(p.title.as_deref(), Some("The Fixture Book"));
+    }
+
+    #[test]
+    fn book_decodes_chapters_in_spine_order() {
+        let b = decode_epub_book(&book_fixture());
+        assert_eq!(b.title.as_deref(), Some("The Fixture Book"));
+        assert_eq!(b.author.as_deref(), Some("Jane Tester"));
+        assert!(!b.drm_protected);
+        assert_eq!(b.chapters.len(), 2, "chapters: {:?}", b.chapters);
+        // Spine order despite archive order (ch2 stored first).
+        assert_eq!(b.chapters[0].title.as_deref(), Some("Chapter One"));
+        assert!(b.chapters[0].text.contains("bright cold day & the clocks"));
+        assert!(!b.chapters[0].text.contains("HEAD TEXT"));
+        assert_eq!(b.chapters[1].title.as_deref(), Some("Chapter Two"));
+        assert!(b.chapters[1].text.contains("second chapter follows"));
+    }
+
+    #[test]
+    fn book_drm_withholds_chapters_but_keeps_metadata() {
+        let enc = r#"<?xml version="1.0"?>
+<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"
+  xmlns:enc="http://www.w3.org/2001/04/xmlenc#">
+  <enc:EncryptedData><enc:CipherData><enc:CipherReference URI="OEBPS/ch1.xhtml"/></enc:CipherData></enc:EncryptedData>
+</encryption>"#;
+        let entries = vec![
+            FixtureEntry { name: "mimetype", data: b"application/epub+zip".to_vec(), deflate: false },
+            FixtureEntry { name: "META-INF/container.xml", data: CONTAINER.into(), deflate: false },
+            FixtureEntry { name: "META-INF/encryption.xml", data: enc.into(), deflate: false },
+            FixtureEntry { name: "OEBPS/content.opf", data: OPF.into(), deflate: false },
+            FixtureEntry { name: "OEBPS/ch1.xhtml", data: CH1.into(), deflate: false },
+            FixtureEntry { name: "OEBPS/ch2.xhtml", data: CH2.into(), deflate: false },
+        ];
+        let b = decode_epub_book(&zip_fixture(&entries));
+        assert!(b.drm_protected);
+        assert!(b.chapters.is_empty());
+        assert_eq!(b.title.as_deref(), Some("The Fixture Book"));
+        assert!(b.note.as_deref().unwrap_or("").contains("DRM"));
+    }
+
+    #[test]
+    fn book_garbage_is_a_note_not_an_error() {
+        let b = decode_epub_book(b"this is not a zip at all");
+        assert!(b.chapters.is_empty());
+        assert!(b.note.is_some());
     }
 
     #[test]

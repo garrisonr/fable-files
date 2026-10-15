@@ -15,6 +15,8 @@ import { DISTRO_ENGINES } from "./themes";
 import { RomMediaSection } from "./rommedia";
 import { MediaResSection } from "./mediares";
 import { LibraryMemorySection } from "./library";
+import { PluginsSection } from "./plugins";
+import { TemplatesSection } from "./templates";
 
 export interface PreferencesHooks {
   /** Backend (built-in) themes from list_themes. */
@@ -149,6 +151,17 @@ export class PreferencesDialog {
     const libHost = document.createElement("div");
     dialog.appendChild(libHost);
     void new LibraryMemorySection().mount(libHost, hooks);
+
+    // Plugins (Phase 6): sandboxed WASM extensions — what's
+    // installed, what each declares, enabled or not.
+    const pluginsHost = document.createElement("div");
+    dialog.appendChild(pluginsHost);
+    void new PluginsSection().mount(pluginsHost);
+
+    // Folder Templates (Phase 6): the New Folder template set.
+    const templatesHost = document.createElement("div");
+    dialog.appendChild(templatesHost);
+    void new TemplatesSection().mount(templatesHost, hooks);
 
     const foot = document.createElement("div");
     foot.className = "prefs-foot";

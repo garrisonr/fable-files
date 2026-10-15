@@ -48,6 +48,13 @@ export interface FileViewHooks {
   onManageLabels?(): void;
   // Phase 2 — stars + collections + view-profile memory.
   onToggleStar?(items: Item[], on: boolean): void;
+  // Phase 6 — plugin context actions + folder templates.
+  /** Sync snapshot of runnable plugins (enabled + wired). */
+  onListPlugins?(): { key: string; name: string }[];
+  onRunPlugin?(item: Item, pluginKey: string): void;
+  /** Sync snapshot of folder templates for the background menu. */
+  onListTemplates?(): { id: string; name: string }[];
+  onNewFolderFromTemplate?(templateId: string): void;
   /** Sync snapshot of the user's collections for the item menu. */
   onListCollections?(): { id: string; name: string }[];
   onAddToCollection?(items: Item[], collectionId: string): void;
@@ -475,6 +482,21 @@ export async function showItemMenu(
       });
     }
   }
+  // Phase 6: plugin context actions. A plugin is invoked on ONE
+  // item — the host enforces that scope — so this cluster appears
+  // for single selections only.
+  if (hooks.onRunPlugin && hooks.onListPlugins && targets.length === 1) {
+    const plugins = hooks.onListPlugins();
+    if (plugins.length > 0) {
+      items.push(sep);
+      for (const p of plugins) {
+        items.push({
+          label: `Run \u201c${p.name}\u201d`,
+          action: () => hooks.onRunPlugin!(targets[0], p.key),
+        });
+      }
+    }
+  }
   if (hooks.onToggleLabel || hooks.onManageLabels) {
     items.push(sep);
     const defs = loadLabelDefs();
@@ -574,6 +596,24 @@ export class FileView {
         label: "New Folder",
         action: () => hooks.onNewFolder!(),
       });
+    }
+    if (hooks.onListTemplates && hooks.onNewFolderFromTemplate) {
+      const templates = hooks.onListTemplates();
+      if (templates.length > 0) {
+        items.push({
+          label: "New Folder from Template",
+          action: () => {
+            this.ctxMenu.open(
+              x,
+              y,
+              templates.map((t) => ({
+                label: t.name,
+                action: () => hooks.onNewFolderFromTemplate!(t.id),
+              })),
+            );
+          },
+        });
+      }
     }
     if (hooks.onNewFile) {
       const kinds: Array<[string, string]> = [
