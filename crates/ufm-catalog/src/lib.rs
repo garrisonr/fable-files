@@ -83,6 +83,44 @@ pub struct ViewProfileRow {
     pub show_extensions: bool,
 }
 
+/// One persisted MCP audit row (Phase 3): every tool call the MCP
+/// server authorizes lands here — allowed, denied, parked for human
+/// approval, or failed — with its argument JSON, whether it was a
+/// write, and how long it took. Append-only from the server's side;
+/// retention pruning is the only delete (see `prune_mcp_audit`).
+#[derive(Debug, Clone)]
+pub struct McpAuditRow {
+    pub seq: i64,
+    /// RFC 3339 timestamp of the call.
+    pub at: String,
+    /// The paired client's id (UUID string).
+    pub client: String,
+    /// Tool name (`ufm_mcp::McpTool::name`).
+    pub tool: String,
+    /// The call's arguments as JSON text (server-truncated).
+    pub args_json: String,
+    /// JSON outcome object: `{"outcome":"allowed"|"denied"|"needs_approval"|"failed","detail":...}`.
+    pub outcome: String,
+    /// True when the tool mutates user metadata or files (tag, and
+    /// the destructive trio) — denied/parked writes are flagged too.
+    pub is_write: bool,
+    pub duration_ms: i64,
+}
+
+/// One duplicate-candidate group for `dedupe_analyze` (Phase 3):
+/// files sharing an identical byte size. Candidates only — content
+/// is NOT hashed, so equal size never proves equal content.
+#[derive(Debug, Clone)]
+pub struct DuplicateGroup {
+    pub size_bytes: u64,
+    pub count: u64,
+    /// Bytes reclaimable IF all-but-one copies were identical:
+    /// size * (count - 1). An upper bound, not a promise.
+    pub wasted_bytes: u64,
+    /// Up to five member paths (provider keys) as samples.
+    pub sample_paths: Vec<String>,
+}
+
 impl Catalog {
     /// Open (or create) the catalog. WAL mode + foreign keys, always.
     pub fn open(path: &std::path::Path) -> Result<Self> {
@@ -291,6 +329,23 @@ impl Catalog {
                 )
                 .map_err(|e| UfmError::Database(e.to_string()))?;
         }
+        // Phase 3: the MCP audit chain (docs/MCP_API.md item 5 —
+        // append-only, queryable in the app). One row per tool call.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS mcp_audit (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    at TEXT NOT NULL,
+                    client TEXT NOT NULL,
+                    tool TEXT NOT NULL,
+                    args_json TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    is_write INTEGER NOT NULL DEFAULT 0,
+                    duration_ms INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_mcp_audit_seq ON mcp_audit (seq DESC);",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
         Ok(())
     }
 
@@ -494,6 +549,67 @@ impl Catalog {
             ));
         }
         Ok(out)
+    }
+
+    /// Fetch one item by id (Phase 3: MCP `read_item`/`get_metadata`
+    /// address items by the ids search handed out). Labels/starred are
+    /// NOT hydrated — the stores are path-keyed; callers hydrate via
+    /// `labels_for_path` / `is_starred_path` like `finish_search` does.
+    pub fn item_by_id(&self, id: &ItemId) -> Result<Option<ufm_vfs::Item>> {
+        self.item_by_query("SELECT id, location_id, name, kind, size_bytes, modified, provider_key
+                 FROM items WHERE id = ?1", &id.to_string())
+    }
+
+    /// Fetch one item by provider key (absolute path for local
+    /// providers) — the by-path twin of `item_by_id`, for MCP
+    /// `get_metadata` calls that name a path. If several locations
+    /// somehow hold the same key, the first row wins.
+    pub fn item_by_path(&self, provider_key: &str) -> Result<Option<ufm_vfs::Item>> {
+        self.item_by_query("SELECT id, location_id, name, kind, size_bytes, modified, provider_key
+                 FROM items WHERE provider_key = ?1 LIMIT 1", provider_key)
+    }
+
+    /// Shared row mapping for the single-item getters above.
+    fn item_by_query(&self, sql: &str, key: &str) -> Result<Option<ufm_vfs::Item>> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn
+            .query_row(sql, params![key], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<i64>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .optional()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let Some((id, location_id, name, kind_s, size_bytes, modified_s, provider_key)) = row
+        else {
+            return Ok(None);
+        };
+        let parse_id = |s: &str, what: &str| {
+            uuid::Uuid::parse_str(s)
+                .map_err(|e| UfmError::Database(format!("bad {what} id {s:?}: {e}")))
+        };
+        Ok(Some(ufm_vfs::Item {
+            id: ufm_core::ItemId(parse_id(&id, "item")?),
+            location: ufm_core::LocationId(parse_id(&location_id, "location")?),
+            name,
+            kind: parse_kind(&kind_s),
+            size_bytes: size_bytes.map(|s| s as u64),
+            modified: modified_s.and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+            }),
+            provider_key,
+            labels: Vec::new(),
+            starred: false,
+        }))
     }
 
     /// Browse items by file extension (advanced-search type filter with
@@ -1391,6 +1507,16 @@ impl Catalog {
         Ok(())
     }
 
+    /// Total catalogued items, all locations (Phase 3 fix:
+    /// `integrity_check` first shipped counting via the prefix
+    /// helper, whose SQL treats "/" as a literal two-character
+    /// prefix and so reported 0 on a full catalog).
+    pub fn item_count(&self) -> Result<u64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .map_err(|e| UfmError::Database(e.to_string()))
+    }
+
     pub fn location_count(&self) -> Result<u64> {
         self.conn
             .query_row("SELECT COUNT(*) FROM locations", [], |r| r.get(0))
@@ -1515,6 +1641,163 @@ impl Catalog {
         }
         Ok(entries)
     }
+    /// The most recent jobs of ANY state, newest first (Phase 3: MCP
+    /// `list_jobs`). The GUI lists its in-memory handles; a headless
+    /// reader's truthful source is this table — the executor
+    /// checkpoints every job here, and terminal snapshots keep their
+    /// tallies after hygiene slimming, so deserialized jobs report
+    /// honest step counts either way.
+    pub fn recent_jobs(&self, limit: u32) -> Result<Vec<ufm_jobs::Job>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT job_json FROM jobs ORDER BY created DESC LIMIT ?1")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| r.get::<_, String>(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            let json = row.map_err(|e| UfmError::Database(e.to_string()))?;
+            jobs.push(
+                serde_json::from_str(&json).map_err(|e| UfmError::Database(e.to_string()))?,
+            );
+        }
+        Ok(jobs)
+    }
+
+    // -----------------------------------------------------------------
+    // MCP audit chain (Phase 3) — see docs/MCP_API.md item 5.
+    // -----------------------------------------------------------------
+
+    /// Append one MCP tool-call record. Returns the row's seq.
+    /// `outcome` is the JSON outcome object (see `McpAuditRow`).
+    pub fn append_mcp_audit(
+        &self,
+        client: &str,
+        tool: &str,
+        args_json: &str,
+        outcome: &str,
+        is_write: bool,
+        duration_ms: i64,
+    ) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO mcp_audit (at, client, tool, args_json, outcome, is_write, duration_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    ufm_core::now_utc().to_rfc3339(),
+                    client,
+                    tool,
+                    args_json,
+                    outcome,
+                    is_write as i64,
+                    duration_ms
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The newest `limit` audit rows, newest first — the read path
+    /// behind `fable-files --mcp-audit` and the `mcp_audit_recent`
+    /// Tauri command.
+    pub fn recent_mcp_audit(&self, limit: u32) -> Result<Vec<McpAuditRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT seq, at, client, tool, args_json, outcome, is_write, duration_ms
+                 FROM mcp_audit ORDER BY seq DESC LIMIT ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(McpAuditRow {
+                    seq: r.get(0)?,
+                    at: r.get(1)?,
+                    client: r.get(2)?,
+                    tool: r.get(3)?,
+                    args_json: r.get(4)?,
+                    outcome: r.get(5)?,
+                    is_write: r.get::<_, i64>(6)? != 0,
+                    duration_ms: r.get(7)?,
+                })
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// Retention for the audit chain: keep only the newest `keep`
+    /// rows. Returns how many were pruned. This is the ONLY delete
+    /// the audit table ever sees — the chain is otherwise append-only.
+    pub fn prune_mcp_audit(&self, keep: u64) -> Result<u64> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM mcp_audit
+                 WHERE seq NOT IN (SELECT seq FROM mcp_audit ORDER BY seq DESC LIMIT ?1)",
+                params![keep as i64],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(n as u64)
+    }
+
+    /// Duplicate candidates for MCP `dedupe_analyze`: groups of files
+    /// (folders excluded, zero-byte excluded) sharing an identical
+    /// byte size, biggest potential waste first. Report-only data —
+    /// content is never hashed here, so a group is a *candidate* set,
+    /// never proof of duplication.
+    pub fn duplicate_candidates(&self, limit: u32) -> Result<Vec<DuplicateGroup>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT size_bytes, COUNT(*) AS n FROM items
+                 WHERE kind = 'file' AND size_bytes IS NOT NULL AND size_bytes > 0
+                 GROUP BY size_bytes HAVING n >= 2
+                 ORDER BY size_bytes * (n - 1) DESC LIMIT ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let groups = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut sizes: Vec<(i64, i64)> = Vec::new();
+        for g in groups {
+            sizes.push(g.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        let mut out = Vec::new();
+        for (size, n) in sizes {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT provider_key FROM items
+                     WHERE kind = 'file' AND size_bytes = ?1 AND provider_key IS NOT NULL
+                     LIMIT 5",
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![size], |r| r.get::<_, String>(0))
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let mut sample_paths = Vec::new();
+            for row in rows {
+                sample_paths.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+            }
+            let size = size as u64;
+            let n = n as u64;
+            out.push(DuplicateGroup {
+                size_bytes: size,
+                count: n,
+                wasted_bytes: size * (n - 1),
+                sample_paths,
+            });
+        }
+        Ok(out)
+    }
+
     /// One cached ROM-media result for (item, media type).
     pub fn rom_media_for(
         &self,
@@ -2291,6 +2574,122 @@ mod tests {
         // Limit is honored (3 rows match, only 1 returned).
         let hits = cat.search_fts("report* OR photos* OR draft*", 1).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn item_by_id_and_path_roundtrip() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let item = sample_item();
+        cat.insert_location(&sample_location(item.location)).unwrap();
+        cat.insert_item(&item).unwrap();
+        let got = cat.item_by_id(&item.id).unwrap().unwrap();
+        assert_eq!(got.id, item.id);
+        assert_eq!(got.name, "return-2026.pdf");
+        assert_eq!(got.provider_key.as_deref(), Some("test-key"));
+        assert!(cat.item_by_id(&ItemId::new()).unwrap().is_none());
+        let by_path = cat.item_by_path("test-key").unwrap().unwrap();
+        assert_eq!(by_path.id, item.id);
+        assert!(cat.item_by_path("/no/such/path").unwrap().is_none());
+        assert_eq!(cat.item_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn recent_jobs_returns_newest_first() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut older = ufm_jobs::Job::new("older job", ufm_jobs::JobPreview::default());
+        let mut newer = ufm_jobs::Job::new("newer job", ufm_jobs::JobPreview::default());
+        newer.created = older.created + chrono::Duration::seconds(5);
+        older.state = ufm_jobs::JobState::Completed;
+        newer.state = ufm_jobs::JobState::Running;
+        cat.upsert_job(&older).unwrap();
+        cat.upsert_job(&newer).unwrap();
+        let all = cat.recent_jobs(10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].title, "newer job");
+        assert_eq!(all[1].title, "older job");
+        // Any state is returned (not just unfinished), and limit caps.
+        let one = cat.recent_jobs(1).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].title, "newer job");
+    }
+
+    #[test]
+    fn mcp_audit_append_recent_and_prune() {
+        let cat = Catalog::open_in_memory().unwrap();
+        // Empty chain reads empty.
+        assert!(cat.recent_mcp_audit(10).unwrap().is_empty());
+        let s1 = cat
+            .append_mcp_audit(
+                "client-1",
+                "search",
+                "{\"query\":\"zelda\"}",
+                "{\"outcome\":\"allowed\"}",
+                false,
+                12,
+            )
+            .unwrap();
+        let s2 = cat
+            .append_mcp_audit(
+                "client-1",
+                "organize",
+                "{}",
+                "{\"outcome\":\"needs_approval\"}",
+                true,
+                1,
+            )
+            .unwrap();
+        assert!(s2 > s1);
+        let rows = cat.recent_mcp_audit(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest first.
+        assert_eq!(rows[0].tool, "organize");
+        assert!(rows[0].is_write);
+        assert_eq!(rows[1].tool, "search");
+        assert!(!rows[1].is_write);
+        assert_eq!(rows[1].duration_ms, 12);
+        // Retention: keep only the newest row.
+        assert_eq!(cat.prune_mcp_audit(1).unwrap(), 1);
+        let rows = cat.recent_mcp_audit(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool, "organize");
+        // Pruning an already-small chain is a no-op.
+        assert_eq!(cat.prune_mcp_audit(10).unwrap(), 0);
+    }
+
+    #[test]
+    fn duplicate_candidates_groups_by_size() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        for (name, size) in [
+            ("a.bin", 500u64),
+            ("b.bin", 500),
+            ("c.bin", 500),
+            ("d.bin", 900),
+            ("e.bin", 900),
+            ("solo.bin", 42),
+            ("empty.bin", 0),
+        ] {
+            let mut it = named_item(loc, name, ItemKind::File);
+            it.size_bytes = Some(size);
+            it.provider_key = Some(format!("/data/{name}"));
+            cat.insert_item(&it).unwrap();
+        }
+        // A folder with a shared size must NOT form a group.
+        let mut dir = named_item(loc, "folder", ItemKind::Folder);
+        dir.size_bytes = Some(500);
+        dir.provider_key = Some("/data/folder".into());
+        cat.insert_item(&dir).unwrap();
+
+        let groups = cat.duplicate_candidates(10).unwrap();
+        assert_eq!(groups.len(), 2);
+        // Biggest waste first: 500x(3-1)=1000 beats 900x(2-1)=900.
+        assert_eq!(groups[0].size_bytes, 500);
+        assert_eq!(groups[0].count, 3);
+        assert_eq!(groups[0].wasted_bytes, 1000);
+        assert_eq!(groups[0].sample_paths.len(), 3);
+        assert_eq!(groups[1].size_bytes, 900);
+        assert_eq!(groups[1].count, 2);
     }
 }
 

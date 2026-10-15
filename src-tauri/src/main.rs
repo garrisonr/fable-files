@@ -60,5 +60,19 @@ fn main() {
             std::process::exit(fable_files_lib::commands::run_sync_headless(id));
         }
     }
+    // Headless MCP "AI file clerk" (Phase 3): `fable-files mcp` serves
+    // MCP over stdio until the client hangs up; `fable-files
+    // --mcp-audit [n]` prints the newest audit rows. Neither starts
+    // Tauri — stdout belongs to the protocol / the listing.
+    if args.get(1).map(|a| a == "mcp").unwrap_or(false) {
+        std::process::exit(fable_files_lib::mcp_server::run_mcp_stdio());
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--mcp-audit") {
+        let limit = args
+            .get(pos + 1)
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(20);
+        std::process::exit(fable_files_lib::mcp_server::run_mcp_audit_cli(limit));
+    }
     fable_files_lib::run()
 }

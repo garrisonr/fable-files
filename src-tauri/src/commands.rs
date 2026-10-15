@@ -812,7 +812,7 @@ fn flag(b: &std::sync::atomic::AtomicBool) -> bool {
     b.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-fn job_state_name(state: ufm_jobs::JobState) -> &'static str {
+pub(crate) fn job_state_name(state: ufm_jobs::JobState) -> &'static str {
     match state {
         ufm_jobs::JobState::Queued => "queued",
         ufm_jobs::JobState::Running => "running",
@@ -829,7 +829,7 @@ fn job_state_name(state: ufm_jobs::JobState) -> &'static str {
 /// walked tree total on their src Item, permanent deletes carry
 /// per-file sizes, and a trash step's target carries the walked total,
 /// so move/delete progress bars advance instead of sitting at 0.
-fn job_bytes_done(job: &ufm_jobs::Job) -> u64 {
+pub(crate) fn job_bytes_done(job: &ufm_jobs::Job) -> u64 {
     job.steps
         .values()
         .filter(|s| {
@@ -3406,7 +3406,7 @@ pub struct SearchHit {
 }
 
 /// File-type categories for the advanced-search filter.
-fn type_extensions(filter: &str) -> Option<&'static [&'static str]> {
+pub(crate) fn type_extensions(filter: &str) -> Option<&'static [&'static str]> {
     match filter {
         "image" => Some(&["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "svg", "ico", "avif"][..]),
         "video" => Some(&["mp4", "mkv", "webm", "mov", "avi", "m4v", "mpg", "mpeg"][..]),
@@ -3520,7 +3520,7 @@ pub async fn search(
 /// Does an item satisfy the extracted metadata facets? Label facets
 /// are ANDed (the item must carry every label, case-insensitively);
 /// the starred facet compares against `path_stars`.
-fn metadata_match(
+pub(crate) fn metadata_match(
     catalog: &ufm_catalog::Catalog,
     item: &Item,
     labels: &[String],

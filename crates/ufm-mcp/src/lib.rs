@@ -31,6 +31,13 @@ pub enum McpTool {
     IntegrityCheck,
     RepairAssist,   // proposes repairs; applying needs approval
     RecoverMedia,   // lost-media recovery assistance
+    // Phase 3: catalog-browsing tools the stdio server adds on top of
+    // the original contract set — all read-only.
+    ListLocations,
+    ListVolumes,
+    ListCollections,
+    CollectionItems,
+    ListJobs,
 }
 
 impl McpTool {
@@ -52,7 +59,41 @@ impl McpTool {
             McpTool::IntegrityCheck => "integrity_check",
             McpTool::RepairAssist => "repair_assist",
             McpTool::RecoverMedia => "recover_media",
+            McpTool::ListLocations => "list_locations",
+            McpTool::ListVolumes => "list_volumes",
+            McpTool::ListCollections => "list_collections",
+            McpTool::CollectionItems => "collection_items",
+            McpTool::ListJobs => "list_jobs",
         }
+    }
+
+    /// Every tool the server can list, in contract order.
+    pub const ALL: [McpTool; 14] = [
+        McpTool::Search,
+        McpTool::ReadItem,
+        McpTool::GetMetadata,
+        McpTool::Tag,
+        McpTool::Organize,
+        McpTool::DedupeAnalyze,
+        McpTool::IntegrityCheck,
+        McpTool::RepairAssist,
+        McpTool::RecoverMedia,
+        McpTool::ListLocations,
+        McpTool::ListVolumes,
+        McpTool::ListCollections,
+        McpTool::CollectionItems,
+        McpTool::ListJobs,
+    ];
+
+    pub fn from_name(name: &str) -> Option<McpTool> {
+        McpTool::ALL.iter().copied().find(|t| t.name() == name)
+    }
+
+    /// True when a call mutates user metadata or files. `tag` is the
+    /// one non-destructive write; the destructive trio also writes.
+    /// The audit chain flags every write (attempted ones included).
+    pub fn is_write(self) -> bool {
+        self.destructive() || matches!(self, McpTool::Tag)
     }
 }
 
@@ -129,7 +170,11 @@ impl AuditLog {
             args_json: args.to_string(),
             outcome,
         });
-        // TODO(spec §26): persist to the catalog DB (mcp_audit table), fsync.
+        // Persistence (spec §26) lives one layer up: the stdio server
+        // (src-tauri/src/mcp_server.rs) writes every call — this log's
+        // outcomes included — through `Catalog::append_mcp_audit` into
+        // the catalog's `mcp_audit` table. This Vec stays the
+        // in-process mirror for the running server.
     }
 
     pub fn len(&self) -> usize {
@@ -243,5 +288,137 @@ pub enum Authorization {
 impl Default for McpServer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn paired_server(tools: Vec<McpTool>, approvals_required: bool) -> (McpServer, McpClientId) {
+        let mut server = McpServer::new();
+        let client = server.request_pairing();
+        server
+            .approve_pairing(
+                &client,
+                Grant {
+                    client,
+                    tools,
+                    location_scope: None,
+                    expires: now_utc() + chrono::Duration::days(1),
+                    approvals_required,
+                },
+            )
+            .unwrap();
+        (server, client)
+    }
+
+    #[test]
+    fn tool_names_roundtrip() {
+        for tool in McpTool::ALL {
+            assert_eq!(McpTool::from_name(tool.name()), Some(tool));
+        }
+        assert_eq!(McpTool::from_name("nuke_everything"), None);
+        assert!(McpTool::Tag.is_write());
+        assert!(McpTool::Organize.is_write());
+        assert!(!McpTool::Search.is_write());
+        assert!(!McpTool::ListJobs.is_write());
+    }
+
+    #[test]
+    fn unpaired_client_is_denied_and_audited() {
+        let mut server = McpServer::new();
+        let stranger = McpClientId::new();
+        match server.authorize(&stranger, McpTool::Search, None, "{}") {
+            Authorization::Denied(reason) => assert!(reason.contains("not paired")),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        assert_eq!(server.audit.len(), 1);
+    }
+
+    #[test]
+    fn granted_read_tool_is_allowed() {
+        let (mut server, client) = paired_server(vec![McpTool::Search], true);
+        assert!(matches!(
+            server.authorize(&client, McpTool::Search, None, "{}"),
+            Authorization::Allowed
+        ));
+        // A tool outside the grant is denied even for a paired client.
+        assert!(matches!(
+            server.authorize(&client, McpTool::Tag, None, "{}"),
+            Authorization::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn destructive_tool_parks_for_human_approval() {
+        let (mut server, client) =
+            paired_server(vec![McpTool::Organize], true);
+        assert!(matches!(
+            server.authorize(&client, McpTool::Organize, None, "{}"),
+            Authorization::NeedsHumanApproval
+        ));
+        // With approvals waived by the grant, the same call is allowed.
+        let (mut server, client) =
+            paired_server(vec![McpTool::Organize], false);
+        assert!(matches!(
+            server.authorize(&client, McpTool::Organize, None, "{}"),
+            Authorization::Allowed
+        ));
+    }
+
+    #[test]
+    fn expired_grant_denies() {
+        let mut server = McpServer::new();
+        let client = server.request_pairing();
+        server
+            .approve_pairing(
+                &client,
+                Grant {
+                    client,
+                    tools: vec![McpTool::Search],
+                    location_scope: None,
+                    expires: now_utc() - chrono::Duration::hours(1),
+                    approvals_required: false,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            server.authorize(&client, McpTool::Search, None, "{}"),
+            Authorization::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn location_scope_is_enforced() {
+        let mut server = McpServer::new();
+        let client = server.request_pairing();
+        let inside = LocationId::new();
+        let outside = LocationId::new();
+        server
+            .approve_pairing(
+                &client,
+                Grant {
+                    client,
+                    tools: vec![McpTool::ReadItem],
+                    location_scope: Some(vec![inside]),
+                    expires: now_utc() + chrono::Duration::days(1),
+                    approvals_required: false,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            server.authorize(&client, McpTool::ReadItem, Some(&inside), "{}"),
+            Authorization::Allowed
+        ));
+        assert!(matches!(
+            server.authorize(&client, McpTool::ReadItem, Some(&outside), "{}"),
+            Authorization::Denied(_)
+        ));
+        // A scoped grant never authorizes a location-less call.
+        assert!(matches!(
+            server.authorize(&client, McpTool::ReadItem, None, "{}"),
+            Authorization::Denied(_)
+        ));
     }
 }

@@ -8,6 +8,7 @@
 
 pub mod commands;
 pub mod library;
+pub mod mcp_server;
 pub mod rommedia;
 
 use serde::{Deserialize, Serialize};
@@ -630,6 +631,7 @@ pub fn run() {
             commands::open_with_apps,
             commands::open_with_app,
             commands::set_default_app,
+            mcp_server::mcp_audit_recent,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Fable Files");
