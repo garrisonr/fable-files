@@ -60,10 +60,20 @@ pub struct LocationSummary {
     /// open the top level.
     pub root_item: ItemId,
     /// Absolute root path when the backend knows it (Round 7.2: mounted
-    /// volumes carry it so the shell can eject by path).
+    /// volumes carry it so the shell can eject by path). None for a
+    /// network server that isn't connected right now.
     pub path: Option<String>,
     /// Removable media (USB / SD card) — the sidebar offers eject.
     pub removable: bool,
+    /// Network Locations: the normalized server URI for
+    /// provider="network" rows (never carries a password).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// False only for a bookmarked network server that isn't
+    /// currently connected. Unlike an unplugged volume (which leaves
+    /// the list), a server bookmark stays listed offline — Library
+    /// Memory semantics — with Connect as its action.
+    pub online: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -579,11 +589,348 @@ pub async fn list_locations(state: State<'_, AppState>) -> Cmd<Vec<LocationSumma
                 root_item,
                 path: Some(v.path.clone()),
                 removable: v.removable,
+                uri: None,
+                online: true,
             });
         }
     }
 
+    // Network Locations: merge server bookmarks against the live
+    // GIO mount list (fresh every call, like volumes from lsblk).
+    let live_net = tauri::async_runtime::spawn_blocking(crate::network::live_mounts)
+        .await
+        .unwrap_or_default();
+    merge_network_locations(&state, &live_net);
+
     Ok(state.locations.lock().unwrap().clone())
+}
+
+// ---------------------------------------------------------------------------
+// Network Locations — runtime locations like volumes (never written
+// to locations.json; bookmarks live in network-servers.json, passwords
+// only in the OS keyring). See network.rs and AUDIT.md.
+// ---------------------------------------------------------------------------
+
+pub(crate) fn network_location_id(uri: &str) -> LocationId {
+    LocationId(volume_uuid(&format!("network:{uri}")))
+}
+
+fn network_root_item(uri: &str) -> ItemId {
+    ItemId(volume_uuid(&format!("network-root:{uri}")))
+}
+
+fn register_browse_root(state: &AppState, id: LocationId, root_item: ItemId, root: &Path) {
+    state
+        .local_roots
+        .lock()
+        .unwrap()
+        .insert(id, root.to_path_buf());
+    state.root_items.lock().unwrap().insert(id, root_item);
+    state
+        .item_paths
+        .lock()
+        .unwrap()
+        .insert(root_item, root.to_path_buf());
+    state
+        .path_ids
+        .lock()
+        .unwrap()
+        .insert(root.to_path_buf(), root_item);
+}
+
+fn unregister_browse_root(state: &AppState, id: LocationId) {
+    state.local_roots.lock().unwrap().remove(&id);
+    if let Some(root_item) = state.root_items.lock().unwrap().remove(&id) {
+        if let Some(root) = state.item_paths.lock().unwrap().remove(&root_item) {
+            state.path_ids.lock().unwrap().remove(&root);
+        }
+    }
+}
+
+fn upsert_location_summary(state: &AppState, summary: LocationSummary) {
+    let mut locs = state.locations.lock().unwrap();
+    match locs.iter_mut().find(|l| l.id == summary.id) {
+        Some(existing) => *existing = summary,
+        None => locs.push(summary),
+    }
+}
+
+/// Merge server bookmarks into the locations list against the live
+/// GIO mounts: connected → registered for browsing + online; absent
+/// → still listed, offline (Library Memory). Records a catalog
+/// sighting for each connected server (the `volumes` mirror).
+fn merge_network_locations(state: &AppState, live: &[crate::network::LiveMount]) {
+    let bookmarks = crate::network::load_bookmarks(&state.data_base);
+    let bookmarked: std::collections::HashSet<LocationId> = bookmarks
+        .iter()
+        .map(|b| network_location_id(&b.uri))
+        .collect();
+    // Prune network rows whose bookmark is gone (forgotten elsewhere
+    // or the sidecar was edited) — volumes prune the same way.
+    let stale: Vec<LocationId> = state
+        .locations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.provider == "network" && !bookmarked.contains(&l.id))
+        .map(|l| l.id)
+        .collect();
+    for id in stale {
+        unregister_browse_root(state, id);
+        state.locations.lock().unwrap().retain(|l| l.id != id);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    for b in &bookmarks {
+        let id = network_location_id(&b.uri);
+        let root_item = network_root_item(&b.uri);
+        let parsed = crate::network::normalize_server_uri(&b.uri).ok();
+        let live_mount = parsed.as_ref().and_then(|p| {
+            live.iter()
+                .find(|m| crate::network::uri_matches(&m.root_uri, p))
+                // Browse root = the requested share under the mount,
+                // not the raw mount root (sftp home-root case).
+                .map(|m| crate::network::effective_mount(m, p))
+        });
+        match live_mount {
+            Some(m) => {
+                {
+                    let catalog = state.catalog.lock().unwrap();
+                    let _ = catalog.record_network_sighting(
+                        &b.uri,
+                        Some(&b.display_name),
+                        &m.fuse_path.to_string_lossy(),
+                        &now,
+                    );
+                }
+                register_browse_root(state, id, root_item, &m.fuse_path);
+                upsert_location_summary(
+                    state,
+                    LocationSummary {
+                        id,
+                        provider: "network".into(),
+                        display_name: b.display_name.clone(),
+                        root_item,
+                        path: Some(m.fuse_path.to_string_lossy().into_owned()),
+                        removable: false,
+                        uri: Some(b.uri.clone()),
+                        online: true,
+                    },
+                );
+            }
+            None => {
+                unregister_browse_root(state, id);
+                upsert_location_summary(
+                    state,
+                    LocationSummary {
+                        id,
+                        provider: "network".into(),
+                        display_name: b.display_name.clone(),
+                        root_item,
+                        path: None,
+                        removable: false,
+                        uri: Some(b.uri.clone()),
+                        online: false,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// The Network Locations sibling of `volume_badge_for_path`: resolve
+/// an item path to a server badge. A path under a live mount's FUSE
+/// prefix is online; a path under any remembered mount prefix is
+/// offline with the server's last_seen — the unplugged-drive
+/// semantics, for servers.
+pub(crate) fn network_badge_for_path(
+    records: &[ufm_catalog::NetworkLocationRecord],
+    live: &[crate::network::LiveMount],
+    path: &str,
+) -> Option<VolumeBadge> {
+    for m in live {
+        if path_under(path, &m.fuse_path.to_string_lossy()) {
+            if let Ok(parsed) = crate::network::normalize_server_uri(&m.root_uri) {
+                if let Some(rec) = records.iter().find(|r| r.uri == parsed.uri) {
+                    return Some(VolumeBadge {
+                        label: rec
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| parsed.host.clone()),
+                        offline: false,
+                        last_seen: Some(rec.last_seen.clone()),
+                    });
+                }
+            }
+            // A live GVfs mount with no bookmark (mounted by another
+            // app): still a server — badge it by its GIO name.
+            return Some(VolumeBadge {
+                label: m.name.clone(),
+                offline: false,
+                last_seen: None,
+            });
+        }
+    }
+    let mut best: Option<(&ufm_catalog::NetworkLocationRecord, usize)> = None;
+    for rec in records {
+        for sighting in &rec.mount_history {
+            if path_under(path, &sighting.path) {
+                let len = sighting.path.len();
+                if best.is_none_or(|(_, l)| len > l) {
+                    best = Some((rec, len));
+                }
+            }
+        }
+    }
+    best.map(|(rec, _)| VolumeBadge {
+        label: rec
+            .display_name
+            .clone()
+            .unwrap_or_else(|| rec.uri.clone()),
+        offline: true,
+        last_seen: Some(rec.last_seen.clone()),
+    })
+}
+
+/// Resolve a network location id back to its bookmark.
+fn bookmark_for_location(
+    state: &AppState,
+    location: LocationId,
+) -> Cmd<crate::network::ServerBookmark> {
+    crate::network::load_bookmarks(&state.data_base)
+        .into_iter()
+        .find(|b| network_location_id(&b.uri) == location)
+        .ok_or_else(|| {
+            CommandError::from(UfmError::NotFound(
+                "that server isn't in the saved servers list".into(),
+            ))
+        })
+}
+
+/// Connect to a server (smb/ftp/ftps/sftp/dav/davs/nfs/afp) via GIO.
+/// Mounts it, saves the bookmark, and returns the now-online
+/// Location. The password goes to the OS keyring ONLY when
+/// `remember_password` is set and the mount succeeded.
+#[tauri::command]
+pub async fn net_connect(
+    state: State<'_, AppState>,
+    uri: String,
+    username: Option<String>,
+    password: Option<String>,
+    domain: Option<String>,
+    anonymous: bool,
+    remember_password: bool,
+) -> Cmd<LocationSummary> {
+    let parsed = crate::network::normalize_server_uri(&uri)
+        .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    let effective_user = username
+        .filter(|u| !u.trim().is_empty())
+        .or_else(|| parsed.username.clone());
+    let explicit_password = password.filter(|p| !p.is_empty());
+    // A typed password wins; otherwise fall back to the keyring's
+    // saved one (that's what Remember means at reconnect time).
+    let effective_password =
+        explicit_password.clone().or_else(|| crate::network::saved_password(&parsed.uri));
+    let creds = crate::network::Credentials {
+        username: effective_user.clone(),
+        password: effective_password,
+        domain: domain.filter(|d| !d.trim().is_empty()),
+        anonymous,
+    };
+    let connect_uri = parsed.uri.clone();
+    let mount = tauri::async_runtime::spawn_blocking(move || {
+        crate::network::mount(&connect_uri, &creds)
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("connect task: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    // Mounted. Persist the bookmark (password to the keyring only if
+    // the user asked us to remember it).
+    let mut has_saved = crate::network::saved_password(&parsed.uri).is_some();
+    if remember_password {
+        if let Some(p) = &explicit_password {
+            crate::network::store_password(&parsed.uri, p)
+                .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+            has_saved = true;
+        }
+    }
+    let bookmark = crate::network::ServerBookmark {
+        uri: parsed.uri.clone(),
+        display_name: crate::network::display_name_for(&parsed),
+        username: effective_user,
+        has_saved_password: has_saved,
+    };
+    crate::network::upsert_bookmark(&state.data_base, bookmark)
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    // Sync state (registers the browse root, records the sighting).
+    let mut live = tauri::async_runtime::spawn_blocking(crate::network::live_mounts)
+        .await
+        .unwrap_or_default();
+    if !live.iter().any(|m| m.fuse_path == mount.fuse_path) {
+        live.push(mount);
+    }
+    merge_network_locations(&state, &live);
+    state
+        .locations
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|l| l.id == network_location_id(&parsed.uri))
+        .cloned()
+        .ok_or_else(|| {
+            CommandError::from(UfmError::Internal(
+                "connected, but the location didn't register".into(),
+            ))
+        })
+}
+
+/// Disconnect a server: GIO unmount. The bookmark stays — the
+/// location flips to its offline state, files still badged in
+/// search — until Forget Server removes it entirely.
+#[tauri::command]
+pub async fn net_disconnect(state: State<'_, AppState>, location: LocationId) -> Cmd<()> {
+    let bookmark = bookmark_for_location(&state, location)?;
+    let uri = bookmark.uri.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::network::unmount(&uri))
+        .await
+        .map_err(|e| CommandError::from(UfmError::Internal(format!("disconnect task: {e}"))))?
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    let live = tauri::async_runtime::spawn_blocking(crate::network::live_mounts)
+        .await
+        .unwrap_or_default();
+    merge_network_locations(&state, &live);
+    Ok(())
+}
+
+/// Forget a server entirely: unmount if connected, drop the
+/// bookmark, the saved password, and the catalog record (its indexed
+/// items are purged, like forgetting a drive).
+#[tauri::command]
+pub async fn net_forget(state: State<'_, AppState>, location: LocationId) -> Cmd<()> {
+    let bookmark = bookmark_for_location(&state, location)?;
+    let uri = bookmark.uri.clone();
+    // Best-effort unmount first — a vanished server must not block
+    // forgetting it.
+    let u = uri.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || crate::network::unmount(&u)).await;
+    crate::network::forget_password(&uri);
+    crate::network::remove_bookmark(&state.data_base, &uri)
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    {
+        let catalog = state.catalog.lock().unwrap();
+        if let Ok(Some(rec)) = catalog.network_location(&uri) {
+            let prefixes: Vec<String> =
+                rec.mount_history.iter().map(|m| m.path.clone()).collect();
+            if !prefixes.is_empty() {
+                let _ = catalog.purge_items_under_prefixes(&prefixes);
+            }
+            let _ = catalog.delete_network_location(&uri);
+        }
+    }
+    let live = tauri::async_runtime::spawn_blocking(crate::network::live_mounts)
+        .await
+        .unwrap_or_default();
+    merge_network_locations(&state, &live);
+    Ok(())
 }
 
 /// Durable UI preferences (Round 7.2): a small JSON sidecar in the app
@@ -3838,19 +4185,21 @@ fn finish_search(
     // Library Memory: resolve each hit's volume once per search
     // (one enumeration + one volumes read, not per hit).
     let mounted = current_filesystems();
-    let volumes = state
-        .catalog
-        .lock()
-        .unwrap()
-        .volumes()
-        .unwrap_or_default();
+    let (volumes, network_records) = {
+        let catalog = state.catalog.lock().unwrap();
+        (
+            catalog.volumes().unwrap_or_default(),
+            catalog.network_locations().unwrap_or_default(),
+        )
+    };
+    let live_net = crate::network::live_mounts();
     Ok(rows
         .into_iter()
         .map(|(item, rank)| {
-            let badge = item
-                .provider_key
-                .as_deref()
-                .and_then(|pk| volume_badge_for_path(&mounted, &volumes, pk));
+            let badge = item.provider_key.as_deref().and_then(|pk| {
+                volume_badge_for_path(&mounted, &volumes, pk)
+                    .or_else(|| network_badge_for_path(&network_records, &live_net, pk))
+            });
             SearchHit {
                 item,
                 rank,
@@ -4007,6 +4356,17 @@ pub async fn start_indexing(
             if let Some(uuid) = best.and_then(|v| v.uuid.clone()) {
                 let _ = catalog
                     .mark_volume_indexed(&uuid, &chrono::Utc::now().to_rfc3339());
+            }
+            // Network Locations: the same completion mark when the
+            // indexed root is a server's FUSE mount (its prefix is in
+            // the record's mount history by construction).
+            if let Ok(records) = catalog.network_locations() {
+                if let Some(rec) = records.iter().find(|r| {
+                    r.mount_history.iter().any(|h| path_under(&root_s, &h.path))
+                }) {
+                    let _ = catalog
+                        .mark_network_indexed(&rec.uri, &chrono::Utc::now().to_rfc3339());
+                }
             }
         }
         let payload = state.index_state.lock().unwrap().clone();
@@ -4504,11 +4864,18 @@ pub async fn open_item(state: State<'_, AppState>, item: ItemId) -> Cmd<()> {
     // plain-language answer, never a dead click or a raw OS error.
     if !path.exists() {
         let path_s = path.to_string_lossy().into_owned();
-        let (mounted, volumes) = {
+        let (mounted, volumes, network_records) = {
             let catalog = state.catalog.lock().unwrap();
-            (current_filesystems(), catalog.volumes().unwrap_or_default())
+            (
+                current_filesystems(),
+                catalog.volumes().unwrap_or_default(),
+                catalog.network_locations().unwrap_or_default(),
+            )
         };
-        if let Some(badge) = volume_badge_for_path(&mounted, &volumes, &path_s) {
+        let badge = volume_badge_for_path(&mounted, &volumes, &path_s).or_else(|| {
+            network_badge_for_path(&network_records, &crate::network::live_mounts(), &path_s)
+        });
+        if let Some(badge) = badge {
             if badge.offline {
                 let name = path
                     .file_name()
@@ -4520,7 +4887,7 @@ pub async fn open_item(state: State<'_, AppState>, item: ItemId) -> Cmd<()> {
                     .map(human_date)
                     .unwrap_or_else(|| "a while ago".to_string());
                 return Err(CommandError::from(UfmError::NotFound(format!(
-                    "“{name}” is on “{label}”, which isn't connected right now (last seen {seen}). Connect the drive and try again.",
+                    "“{name}” is on “{label}”, which isn't connected right now (last seen {seen}). Connect it and try again.",
                     label = badge.label
                 ))));
             }
@@ -7113,10 +7480,14 @@ pub struct ItemVolumeBadge {
 fn badges_for_items(catalog: &ufm_catalog::Catalog, items: &[Item]) -> Vec<ItemVolumeBadge> {
     let mounted = current_filesystems();
     let volumes = catalog.volumes().unwrap_or_default();
+    let network_records = catalog.network_locations().unwrap_or_default();
+    let live_net = crate::network::live_mounts();
     let mut out = Vec::new();
     for item in items {
         if let Some(pk) = item.provider_key.as_deref() {
-            if let Some(b) = volume_badge_for_path(&mounted, &volumes, pk) {
+            let badge = volume_badge_for_path(&mounted, &volumes, pk)
+                .or_else(|| network_badge_for_path(&network_records, &live_net, pk));
+            if let Some(b) = badge {
                 out.push(ItemVolumeBadge {
                     item_id: item.id.to_string(),
                     volume_label: b.label,
@@ -7684,6 +8055,8 @@ pub async fn add_path_location(
         root_item: root_item.id,
         path: Some(path),
         removable: false,
+        uri: None,
+        online: true,
     };
     state.locations.lock().unwrap().push(summary.clone());
     Ok(summary)
@@ -7702,72 +8075,6 @@ pub async fn remove_path_location(state: State<'_, AppState>, location: Location
         .retain(|l| l.id != location);
     Ok(())
 }
-
-/// Mount a network server with gio (sftp://, smb://, ftp://, dav://…)
-/// and return the gvfs mount path. Credentials are handled by gvfs's
-/// own prompts/agent — never by us.
-#[tauri::command]
-pub async fn mount_server(url: String) -> Cmd<String> {
-    let url = url.trim().to_string();
-    if !url.contains("://") {
-        return Err(CommandError::from(UfmError::InvalidInput(
-            "include the scheme, e.g. sftp://user@host/path".into(),
-        )));
-    }
-    tauri::async_runtime::spawn_blocking(move || {
-        let uid = std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_else(|_| "1000".into());
-        let gvfs = std::path::PathBuf::from(format!("/run/user/{uid}/gvfs"));
-        let before: std::collections::HashSet<String> = std::fs::read_dir(&gvfs)
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let out = std::process::Command::new("gio")
-            .arg("mount")
-            .arg(&url)
-            .output()
-            .map_err(|e| format!("gio: {e}"))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            return Err(if err.is_empty() {
-                "gio mount failed".to_string()
-            } else {
-                err
-            });
-        }
-        // Find the new gvfs entry (or any entry if it was already up).
-        for _ in 0..10 {
-            if let Ok(rd) = std::fs::read_dir(&gvfs) {
-                let names: Vec<String> = rd
-                    .flatten()
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .collect();
-                if let Some(new) = names.iter().find(|n| !before.contains(*n)) {
-                    return Ok::<String, String>(
-                        gvfs.join(new).to_string_lossy().to_string(),
-                    );
-                }
-                if names.len() == 1 && before.len() == 1 {
-                    return Ok::<String, String>(
-                        gvfs.join(&names[0]).to_string_lossy().to_string(),
-                    );
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(300));
-        }
-        Err("mounted, but the gvfs mount point was not found".to_string())
-    })
-    .await
-    .map_err(|e| CommandError::from(UfmError::Internal(format!("mount task failed: {e}"))))?
-    .map_err(|e| CommandError::from(UfmError::Internal(e)))
-}
-
 
 // ---------------------------------------------------------------------------
 // Built-in terminal (PTY)
@@ -11616,12 +11923,20 @@ pub fn mediares_set_key(value: Option<String>) -> Cmd<String> {
 }
 
 #[tauri::command]
-pub async fn mediares_validate_key() -> Cmd<crate::mediares::ValidateResult> {
-    let key = crate::mediares::tmdb_key_get().ok_or_else(|| {
-        CommandError::from(UfmError::InvalidInput(
-            "no TMDB key saved yet".into(),
-        ))
-    })?;
+pub async fn mediares_validate_key(
+    key: Option<String>,
+) -> Cmd<crate::mediares::ValidateResult> {
+    // UX rider (2026-10-15): a non-empty field value wins — paste →
+    // Check works without Save first. Empty field = check the saved
+    // key, as before.
+    let key = match key {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => crate::mediares::tmdb_key_get().ok_or_else(|| {
+            CommandError::from(UfmError::InvalidInput(
+                "no TMDB key saved yet".into(),
+            ))
+        })?,
+    };
     let result = tauri::async_runtime::spawn_blocking(move || {
         crate::mediares::TmdbClient::new(key).validate()
     })
@@ -12596,12 +12911,75 @@ fn auditor_fix_job(flag: &ufm_catalog::AuditorFlagRow) -> Cmd<ufm_jobs::Job> {
         }
         crate::auditor::FixPlan::None => {
             return Err(CommandError::from(UfmError::InvalidInput(
-                "this flag has no fix to apply — use “Move to Trash” or “It's OK”"
+                "this flag has no fix to apply — Skip it, once or forever"
                     .into(),
             )));
         }
     };
     Ok(job)
+}
+
+/// Fix All Similar: compose ONE journaled job covering every
+/// given flag's fix (steps renumbered into one sequence, each
+/// flag's internal step dependencies remapped). Flags whose fix
+/// can't be planned anymore (file gone, target name now taken)
+/// are skipped, not fatal — the caller reports how many landed.
+/// Returns the job and the flags actually included.
+fn auditor_fix_all_job(
+    flags: &[ufm_catalog::AuditorFlagRow],
+) -> Cmd<(ufm_jobs::Job, Vec<String>)> {
+    use ufm_jobs::{Job, JobPreview};
+    let mut combined: Option<Job> = None;
+    let mut included: Vec<String> = Vec::new();
+    let mut next = 0usize;
+    for flag in flags {
+        let Ok(mut single) = auditor_fix_job(flag) else {
+            continue;
+        };
+        let target = combined.get_or_insert_with(|| {
+            Job::new(
+                format!(
+                    "Fix {} similar items ({})",
+                    flags.len(),
+                    flag.class_key
+                ),
+                JobPreview::default(),
+            )
+        });
+        // Renumber this flag's steps into the combined sequence.
+        let mut steps: Vec<ufm_jobs::Step> = single.steps.drain().map(|(_, s)| s).collect();
+        steps.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut id_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for s in &steps {
+            next += 1;
+            id_map.insert(s.id.clone(), format!("s{next:04}"));
+        }
+        for mut s in steps {
+            s.id = id_map[&s.id].clone();
+            s.depends_on = s
+                .depends_on
+                .iter()
+                .map(|d| id_map.get(d).cloned().unwrap_or_else(|| d.clone()))
+                .collect();
+            target.add_step(s);
+        }
+        included.push(flag.id.clone());
+    }
+    match combined {
+        Some(mut job) if !included.is_empty() => {
+            job.title = format!(
+                "Fix {} similar item{} ({})",
+                included.len(),
+                if included.len() == 1 { "" } else { "s" },
+                flags[0].class_key
+            );
+            Ok((job, included))
+        }
+        _ => Err(CommandError::from(UfmError::InvalidInput(
+            "none of the matching files could be fixed anymore — they may have moved or been renamed".into(),
+        ))),
+    }
 }
 
 /// Trash job for proposal-less flags (copy chains, cold files…) —
@@ -12662,6 +13040,9 @@ pub async fn auditor_resolve(
     resolution: String,
     scope: Option<String>,
 ) -> Cmd<String> {
+    // `scope` is kept for call compatibility; the four-label
+    // answer grammar carries its scope in the resolution itself.
+    let _ = &scope;
     let catalog = auditor_catalog(&state)?;
     let flag = catalog
         .auditor_flag(&flag_id)
@@ -12688,56 +13069,104 @@ pub async fn auditor_resolve(
                 "moved to trash as a job".to_string()
             })
         }
-        "ok" => {
-            let scope = scope.as_deref().unwrap_or("one");
-            match scope {
-                "similar" | "never" => {
-                    // A typo verdict teaches the dictionary the
-                    // token itself — the strongest form of the rule.
-                    if flag.family == "typo" {
-                        if let Some(token) = flag.class_key.strip_prefix("typo:") {
-                            let _ = catalog.add_auditor_user_word(token, &now);
-                        }
-                    }
-                    let decision = if scope == "never" { "suppress" } else { "accept" };
-                    catalog
-                        .set_auditor_rule(&flag.class_key, decision, &now)
-                        .map_err(|e| {
-                            CommandError::from(UfmError::Internal(e.to_string()))
-                        })?;
-                    // Close every open flag of this class.
-                    let open = catalog
-                        .auditor_flags(Some("open"), 5000)
-                        .unwrap_or_default();
-                    for other in open.iter().filter(|f| f.class_key == flag.class_key) {
-                        let _ = catalog.set_auditor_flag_state(
-                            &other.id,
-                            "dismissed",
-                            &now,
-                        );
-                    }
-                    set_state(&catalog, "dismissed");
-                    Ok(if scope == "never" {
-                        "got it — files like this won't be flagged again".into()
-                    } else {
-                        "got it — this is fine, for all files like this".into()
-                    })
+        // The answer grammar (Dickles, 2026-10-15 — four exact
+        // labels on every question card): "Just this one" (the
+        // apply/trash_it arms), "Fix All Similar (Irreversible)",
+        // "Skip This One Once", "Skip This One Forever". The old
+        // scope-select answers ("This one / All similar / Never…")
+        // are retired.
+        "apply_all" => {
+            // ONE journaled job covering every current match of
+            // this class, plus the standing rule: this question
+            // never repeats — future matches arrive as FACTS with
+            // the fix proposed (run_audit promotes the lane), never
+            // silently fixed (the founding law).
+            let open = catalog
+                .auditor_flags(Some("open"), 5000)
+                .unwrap_or_default();
+            let matches: Vec<ufm_catalog::AuditorFlagRow> = open
+                .into_iter()
+                .filter(|f| f.class_key == flag.class_key)
+                .collect();
+            let (job, included) = auditor_fix_all_job(&matches)?;
+            let count = included.len();
+            start_job(app, &state, job).map(|_| {
+                for id in &included {
+                    let _ = catalog.set_auditor_flag_state(id, "confirmed", &now);
                 }
-                _ => {
-                    catalog
-                        .add_auditor_dismissal(&flag.path, &flag.family, &now)
-                        .map_err(|e| {
-                            CommandError::from(UfmError::Internal(e.to_string()))
-                        })?;
-                    set_state(&catalog, "dismissed");
-                    Ok("remembered — this one won't be flagged again".into())
-                }
-            }
+                let _ = catalog.set_auditor_rule(&flag.class_key, "fix", &now);
+                format!(
+                    "fix started for {count} file{} as one job — watch it in Transfers. Files like this will arrive as facts with the fix proposed from now on",
+                    if count == 1 { "" } else { "s" }
+                )
+            })
+        }
+        "skip_once" => {
+            // Dismissed for THIS run only: no dismissal memory, no
+            // rule. The next audit re-derives the flag from the
+            // file and it resurfaces (the run pipeline only
+            // carries state='open' flags, so a 'skipped' row is
+            // history, not a match).
+            set_state(&catalog, "skipped");
+            Ok("skipped for now — it will come back on the next audit".into())
+        }
+        "skip_forever" => {
+            catalog
+                .add_auditor_dismissal(&flag.path, &flag.family, &now)
+                .map_err(|e| {
+                    CommandError::from(UfmError::Internal(e.to_string()))
+                })?;
+            set_state(&catalog, "dismissed");
+            Ok("remembered — this one won't be flagged again".into())
         }
         other => Err(CommandError::from(UfmError::InvalidInput(format!(
             "unknown resolution: {other}"
         )))),
     }
+}
+
+/// Clear findings (Auditor item 13, Dickles 2026-10-15): empties
+/// the findings list ONLY. Dismissal memory and ask-lane rules
+/// survive — what he taught it stays taught; the full reset is a
+/// separate Preferences-level action. The clear is JOURNALED as a
+/// run-history row carrying the cleared count + timestamp, so the
+/// Auditor's own history shows it happened. The UI only calls
+/// this after its warning dialog is confirmed.
+#[tauri::command]
+pub fn auditor_clear_findings(state: State<'_, AppState>) -> Cmd<String> {
+    let catalog = auditor_catalog(&state)?;
+    let cleared = catalog
+        .clear_auditor_flags()
+        .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
+    let now = crate::auditor::stamp(crate::auditor::now_local());
+    let target = catalog
+        .recent_auditor_runs(1)
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .map(|r| r.target)
+        .unwrap_or_default();
+    let row = ufm_catalog::AuditorRunRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        schedule_id: None,
+        schedule_name: "Findings cleared".into(),
+        target,
+        started: now.clone(),
+        finished: Some(now),
+        was_late: false,
+        status: "cleared".into(),
+        summary_json: serde_json::json!({
+            "clearedFlags": cleared,
+            "notes": [format!(
+                "Cleared {cleared} finding(s). Nothing was renamed, moved, or deleted — skips and standing rules were kept."
+            )],
+        })
+        .to_string(),
+    };
+    let _ = catalog.upsert_auditor_run(&row);
+    Ok(format!(
+        "cleared {cleared} finding{} — your skips and rules are untouched",
+        if cleared == 1 { "" } else { "s" }
+    ))
 }
 
 #[derive(Serialize)]
@@ -12835,6 +13264,44 @@ pub fn auditor_add_user_word(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auditor_fix_all_composes_one_job_for_all_matches() {
+        // Fix All Similar (Dickles, 2026-10-15): every current
+        // match of a class lands in ONE journaled job.
+        let dir = std::env::temp_dir().join(format!(
+            "fable-fixall-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::write(dir.join("a/The Richrd Story.txt"), b"x").unwrap();
+        std::fs::write(dir.join("b/The Richrd Story.txt"), b"x").unwrap();
+        let mk = |sub: &str, id: &str| ufm_catalog::AuditorFlagRow {
+            id: id.into(),
+            run_id: "r".into(),
+            path: dir.join(sub).join("The Richrd Story.txt").to_string_lossy().into_owned(),
+            family: "typo".into(),
+            lane: "question".into(),
+            class_key: "typo:richrd".into(),
+            title: "t".into(),
+            detail: String::new(),
+            proposal_json: Some(
+                serde_json::json!({"kind": "rename", "to": "The Richard Story.txt"})
+                    .to_string(),
+            ),
+            state: "open".into(),
+            created: "t".into(),
+            updated: "t".into(),
+        };
+        let flags = vec![mk("a", "f1"), mk("b", "f2")];
+        let (job, included) = super::auditor_fix_all_job(&flags).expect("job composes");
+        assert_eq!(included.len(), 2);
+        assert_eq!(job.steps.len(), 2, "ONE job holding both renames");
+        assert!(job.title.contains('2'), "title counts the matches: {}", job.title);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn seam_job_requests_accept_frontend_camel_case() {
         // SEAM TEST (ROM-lists fix block item 1): the frontend sends

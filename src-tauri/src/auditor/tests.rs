@@ -497,6 +497,83 @@ fn run_audit_memory_supersede_and_rules() {
 }
 
 #[test]
+fn skip_once_resurfaces_next_run_skip_forever_never_does() {
+    // The answer grammar (Dickles, 2026-10-15): "Skip This One
+    // Once" dismisses for THIS run only — the flag returns on the
+    // next audit. "Skip This One Forever" is the dismissal memory
+    // and never returns.
+    let root = fixture("skipgrammar");
+    put(&root, "The Richrd Garrison Story.txt", b"x");
+    let cat = Catalog::open_in_memory().unwrap();
+    let settings = AuditorSettings::default();
+    let req = RunRequest {
+        target: root.to_string_lossy().into_owned(),
+        schedule_id: None,
+        schedule_name: "Manual audit".into(),
+        late: false,
+    };
+    run_audit(&cat, &req, &settings, &no_probe()).unwrap();
+    let open = cat.auditor_flags(Some("open"), 10).unwrap();
+    assert_eq!(open.len(), 1);
+    // SKIP ONCE — exactly what auditor_resolve does: state change
+    // only, no dismissal row, no rule.
+    cat.set_auditor_flag_state(&open[0].id, "skipped", "2026-10-15T00:00:00")
+        .unwrap();
+    assert_eq!(cat.auditor_open_flag_count().unwrap(), 0);
+    // Next run: it resurfaces as a fresh open flag.
+    run_audit(&cat, &req, &settings, &no_probe()).unwrap();
+    let open = cat.auditor_flags(Some("open"), 10).unwrap();
+    assert_eq!(open.len(), 1, "skip-once must resurface on the next run");
+    assert_eq!(open[0].family, "typo");
+    // SKIP FOREVER — dismissal memory lands.
+    cat.add_auditor_dismissal(&open[0].path, "typo", "2026-10-15T00:00:00")
+        .unwrap();
+    cat.set_auditor_flag_state(&open[0].id, "dismissed", "2026-10-15T00:00:00")
+        .unwrap();
+    run_audit(&cat, &req, &settings, &no_probe()).unwrap();
+    assert_eq!(
+        cat.auditor_open_flag_count().unwrap(),
+        0,
+        "skip-forever must never resurface"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn fix_rule_promotes_future_matches_to_facts() {
+    // "Fix All Similar (Irreversible)" records a "fix" standing
+    // rule: future matches of the class surface as FACTS with the
+    // fix proposed — never questions again, and never silently
+    // fixed (the file on disk is untouched by the rule itself).
+    let root = fixture("fixrule");
+    put(&root, "The Richrd Garrison Story.txt", b"x");
+    let cat = Catalog::open_in_memory().unwrap();
+    cat.set_auditor_rule("typo:richrd", "fix", "2026-10-15T00:00:00")
+        .unwrap();
+    let settings = AuditorSettings::default();
+    let req = RunRequest {
+        target: root.to_string_lossy().into_owned(),
+        schedule_id: None,
+        schedule_name: "Manual audit".into(),
+        late: false,
+    };
+    run_audit(&cat, &req, &settings, &no_probe()).unwrap();
+    let open = cat.auditor_flags(Some("open"), 10).unwrap();
+    assert_eq!(open.len(), 1, "a fix-ruled match still surfaces");
+    assert_eq!(open[0].lane, "certain", "as a FACT, not a question");
+    assert!(
+        open[0].proposal_json.as_deref().unwrap_or("").contains("rename"),
+        "with the fix proposed: {:?}",
+        open[0].proposal_json
+    );
+    assert!(
+        root.join("The Richrd Garrison Story.txt").exists(),
+        "the rule never silently renames"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn schedule_conversion_uses_the_tested_machine() {
     let sched = AuditSchedule {
         id: "s1".into(),
@@ -537,4 +614,69 @@ fn schedule_conversion_uses_the_tested_machine() {
         crate::mediacomplete::evaluate(&mc, before),
         crate::mediacomplete::Decision::Due { late: true }
     ));
+}
+
+#[test]
+fn typo_suggestion_carries_the_tokens_case() {
+    // Dickles, 2026-10-15: the question headline cited the
+    // dictionary's lowercase form ("breckenridge") while the
+    // detail and the rename proposal in the SAME card correctly
+    // showed "Breckenridge". The suggestion must carry the case
+    // pattern of the token it replaces — in the headline, the
+    // detail, AND the proposal; they render from one string.
+    let mut words = test_words();
+    words.insert("breckenridge".to_string());
+    let root = fixture("typocase");
+    put(&root, "The Breckenrdige Story.txt", b"x");
+    put(&root, "THE BRECKENRDIGE STORY.txt", b"x");
+    let (tree, _) = scan(&root);
+    let cands = detect_typos(&tree, &words);
+    assert_eq!(cands.len(), 2, "both case shapes flag: {cands:?}");
+    let cap = cands
+        .iter()
+        .find(|c| c.path.ends_with("The Breckenrdige Story.txt"))
+        .expect("capitalized fixture flags");
+    assert!(cap.title.contains("“Breckenridge”"), "headline: {}", cap.title);
+    assert!(cap.detail.contains("“Breckenridge”"), "detail: {}", cap.detail);
+    assert_eq!(
+        cap.proposal["to"],
+        serde_json::json!("The Breckenridge Story.txt"),
+        "proposal"
+    );
+    let upper = cands
+        .iter()
+        .find(|c| c.path.ends_with("THE BRECKENRDIGE STORY.txt"))
+        .expect("all-caps fixture flags");
+    assert!(upper.title.contains("“BRECKENRIDGE”"), "headline: {}", upper.title);
+    assert!(upper.detail.contains("“BRECKENRIDGE”"), "detail: {}", upper.detail);
+    assert_eq!(
+        upper.proposal["to"],
+        serde_json::json!("THE BRECKENRIDGE STORY.txt"),
+        "proposal"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn typo_ignores_release_vocabulary() {
+    // Dickles, 2026-10-15: the engine asked "Did you mean 'yes'?"
+    // about the [YTS.MX] tag — and proposed renaming it to [YES] —
+    // on every YTS file in the library. Release vocabulary is
+    // excluded by default (NEUTRAL_TOKENS). "yes" is planted in
+    // the dictionary so the pre-fix engine WOULD have asked; the
+    // fixed engine must not, while a real typo still flags.
+    let mut words = test_words();
+    words.insert("belinda".to_string());
+    words.insert("yes".to_string());
+    let root = fixture("typorelease");
+    put(&root, "Oh Belinda (1986) [1080p] [WEBRip] [YTS.MX].mkv", b"v");
+    for n in ["The Great Movie", "The American Story", "Family Holiday Photos"] {
+        put(&root, &format!("{n} (2020) [1080p] [WEBRip] [YTS.MX].mkv"), b"v");
+    }
+    put(&root, "The Richrd Story [YTS.MX].mkv", b"v");
+    let (tree, _) = scan(&root);
+    let cands = detect_typos(&tree, &words);
+    assert_eq!(cands.len(), 1, "only the real typo flags: {cands:?}");
+    assert!(cands[0].path.ends_with("The Richrd Story [YTS.MX].mkv"));
+    let _ = std::fs::remove_dir_all(&root);
 }

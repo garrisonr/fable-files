@@ -8,6 +8,7 @@
 
 pub mod commands;
 pub mod library;
+pub mod network;
 pub mod mcp_server;
 pub mod auditor;
 pub mod mediacomplete;
@@ -63,6 +64,9 @@ pub struct AppState {
     /// Kept so background tasks (search reads, the indexer) can open their
     /// own short-lived connections instead of borrowing the managed one.
     pub catalog_path: PathBuf,
+    /// The app data base dir (catalog.db's parent) — sidecars live
+    /// here (network-servers.json among them).
+    pub data_base: PathBuf,
     pub checkpoint_path: PathBuf,
     /// Durable UI prefs sidecar (Round 7.2): ui-prefs.json in the app
     /// data dir — sidebar collapse state and future shell preferences.
@@ -197,6 +201,7 @@ impl AppState {
         let state = Self {
             catalog: Mutex::new(catalog),
             catalog_path,
+            data_base: base.clone(),
             checkpoint_path,
             ui_prefs_path: base.join("ui-prefs.json"),
             previews: ufm_preview::registry_with_builtins(),
@@ -309,6 +314,8 @@ impl AppState {
                         root_item,
                         path: Some(loc.root.clone()),
                         removable: false,
+                        uri: None,
+                        online: true,
                     });
                     restored += 1;
                 }
@@ -375,6 +382,8 @@ impl AppState {
             root_item: root_item.id,
             path: Some(home.to_string_lossy().into_owned()),
             removable: false,
+            uri: None,
+            online: true,
         });
 
         let saved = vec![PersistedLocation {
@@ -598,6 +607,7 @@ pub fn run() {
             commands::auditor_list_flags,
             commands::auditor_open_count,
             commands::auditor_resolve,
+            commands::auditor_clear_findings,
             commands::auditor_list_dismissals,
             commands::auditor_delete_dismissal,
             commands::auditor_list_rules,
@@ -607,7 +617,9 @@ pub fn run() {
             commands::media_url_for_path,
             commands::add_path_location,
             commands::remove_path_location,
-            commands::mount_server,
+            commands::net_connect,
+            commands::net_disconnect,
+            commands::net_forget,
             commands::term_open,
             commands::term_write,
             commands::term_resize,

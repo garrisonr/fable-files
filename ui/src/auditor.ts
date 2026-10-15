@@ -5,9 +5,10 @@
  *
  * The two lanes are visible in the UI itself: CERTAIN findings are
  * labeled "Fact" and state what was verified; UNCERTAIN ones are
- * labeled "Question" and are ASKED, never asserted — with scoped
- * answers ("This one / All similar / Never for files like this")
- * that become standing rules. Nothing here changes a file without
+ * labeled "Question" and are ASKED, never asserted — with the
+ * four-label answer grammar ("Just this one / Fix All Similar
+ * (Irreversible) / Skip This One Once / Skip This One Forever").
+ * Nothing here changes a file without
  * a click, and every fix runs as a journaled job the Transfers
  * panel can undo. Dismissals are remembered forever and can be
  * reviewed and reset at the bottom of the page.
@@ -20,7 +21,8 @@ import {
   type AuditorSettings,
   type AuditorDismissal,
 } from "./api";
-import { Toast, errText } from "./toast";
+import { Toast, confirmDialog, errText } from "./toast";
+import { ContextMenu } from "./contextmenu";
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -98,6 +100,7 @@ export class AuditorPanel {
   private overlay: HTMLElement | null = null;
   private body: HTMLElement | null = null;
   private hooks: AuditorPanelHooks | null = null;
+  private ctxMenu = new ContextMenu();
   private settings: AuditorSettings | null = null;
   private runs: AuditorRun[] = [];
   private flags: AuditorFlag[] = [];
@@ -228,30 +231,7 @@ export class AuditorPanel {
       }
     });
     const go = el("button", "pill-btn primary", "Audit now");
-    go.addEventListener("click", async () => {
-      const target = this.target.trim();
-      if (!target) {
-        Toast.error("Choose a folder or drive to audit first.");
-        return;
-      }
-      localStorage.setItem("ff-auditor-target", target);
-      go.textContent = "Auditing… (large drives take a while)";
-      go.toggleAttribute("disabled", true);
-      try {
-        const run = await api.auditorRunNow(target, null);
-        const sm = run.summary;
-        Toast.success(
-          `Audit finished: ${sm.flagsOpen ?? 0} open finding(s) — ${sm.flagsNew ?? 0} new, ${sm.flagsCarried ?? 0} still open, ${sm.flagsSuperseded ?? 0} cleared up.`,
-          9000,
-        );
-        await this.reload();
-        this.hooks?.refreshBadge?.();
-      } catch (err) {
-        Toast.error(`Audit failed: ${errText(err)}`);
-        go.textContent = "Audit now";
-        go.toggleAttribute("disabled", false);
-      }
-    });
+    go.addEventListener("click", () => void this.runAuditNow(go));
     row.append(input, browse, go);
     block.appendChild(row);
     return block;
@@ -313,8 +293,71 @@ export class AuditorPanel {
   // The checklist
   // ---------------------------------------------------------------
 
+  private async runAuditNow(btn?: HTMLButtonElement): Promise<void> {
+    const target = this.target.trim();
+    if (!target) {
+      Toast.error("Choose a folder or drive to audit first.");
+      return;
+    }
+    localStorage.setItem("ff-auditor-target", target);
+    if (btn) {
+      btn.textContent = "Auditing… (large drives take a while)";
+      btn.toggleAttribute("disabled", true);
+    }
+    try {
+      const run = await api.auditorRunNow(target, null);
+      const sm = run.summary;
+      Toast.success(
+        `Audit finished: ${sm.flagsOpen ?? 0} open finding(s) — ${sm.flagsNew ?? 0} new, ${sm.flagsCarried ?? 0} still open, ${sm.flagsSuperseded ?? 0} cleared up.`,
+        9000,
+      );
+      await this.reload();
+      this.hooks?.refreshBadge?.();
+    } catch (err) {
+      Toast.error(`Audit failed: ${errText(err)}`);
+      if (btn) {
+        btn.textContent = "Audit now";
+        btn.toggleAttribute("disabled", false);
+      }
+    }
+  }
+
+  /** Clear findings (Auditor item 13): right-click the findings
+   * surface → warning FIRST → clear on confirm only. Findings
+   * only — skips and standing rules survive; the journal of the
+   * clear is a run-history row written by the command. */
+  private async clearFindings(): Promise<void> {
+    const ok = await confirmDialog(
+      "Clear findings?",
+      "This clears the current findings list. Nothing is renamed, moved, or deleted — only the list is emptied, and a fresh audit rebuilds it. What you taught the Auditor — your skips and standing rules — stays taught. The clear can't be undone.",
+      "Clear findings",
+      true,
+    );
+    if (!ok) return;
+    try {
+      const msg = await api.auditorClearFindings();
+      Toast.success(msg, 7000);
+      await this.reload();
+      this.hooks?.refreshBadge?.();
+    } catch (err) {
+      Toast.error(errText(err));
+    }
+  }
+
   private renderChecklist(): HTMLElement {
     const block = el("div", "mr-tmdb");
+    // Right-click the findings surface: Clear findings (item 13).
+    block.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.ctxMenu.open(e.clientX, e.clientY, [
+        {
+          label: "Clear findings",
+          danger: true,
+          action: () => void this.clearFindings(),
+        },
+      ]);
+    });
     const open = this.flags.filter((f) => f.state === "open");
     block.appendChild(
       el("h4", "mc-h", `Checklist — ${open.length} open`),
@@ -324,9 +367,12 @@ export class AuditorPanel {
         el(
           "p",
           "prefs-note",
-          "Nothing open. Either the library is clean, or everything found so far has been settled — settled items are listed under Memory, below.",
+          "Nothing open. Either the library is clean, or everything found so far has been settled — settled items are listed under Memory, below. Right-click here to clear the findings list and start fresh.",
         ),
       );
+      const runBtn = el("button", "pill-btn primary", "Run audit");
+      runBtn.addEventListener("click", () => void this.runAuditNow(runBtn));
+      block.appendChild(runBtn);
       return block;
     }
     for (const [fam, label] of FAMILY_ORDER) {
@@ -354,64 +400,74 @@ export class AuditorPanel {
     card.appendChild(el("div", "au-path", flag.path));
     if (flag.detail) card.appendChild(el("p", "au-detail", flag.detail));
 
-    const actions = el("div", "mr-keyrow au-actions");
+    // The answer grammar (Dickles, 2026-10-15 — four exact labels,
+    // complete action set on question cards): the proposal is the
+    // card's BODY text, and the buttons are "Just this one",
+    // "Fix All Similar (Irreversible)", "Skip This One Once",
+    // "Skip This One Forever". Fact cards keep their direct fix
+    // button and share the same two Skip wordings for dismissals.
+    // The old scope select + "This one / It's fine as-is" is gone.
     const p = flag.proposal;
+    let proposalText: string | null = null;
+    let applyResolution: string | null = null;
     if (p?.kind === "rename" && p.to) {
-      const b = el("button", "pill-btn primary", `Rename to “${p.to}”`);
-      b.addEventListener("click", () => void this.resolve(flag, "apply", null, b));
-      actions.appendChild(b);
+      proposalText = `Rename to “${p.to}”`;
+      applyResolution = "apply";
     } else if (p?.kind === "trash") {
-      const b = el("button", "pill-btn primary", "Move to Trash");
-      b.addEventListener("click", () => void this.resolve(flag, "apply", null, b));
-      actions.appendChild(b);
+      proposalText = "Move to Trash";
+      applyResolution = "apply";
     } else if (p?.kind === "convert") {
-      const label =
+      proposalText =
         p.convertKind === "flac"
           ? "Convert to FLAC (lossless)"
           : p.convertKind === "hevc"
             ? "Re-encode to H.265"
             : "Convert to PNG (lossless)";
-      const b = el("button", "pill-btn primary", label);
-      b.addEventListener("click", () => void this.resolve(flag, "apply", null, b));
-      actions.appendChild(b);
-      if (p.replace) {
-        actions.appendChild(
-          el("span", "mr-status", "the original goes to Trash after — restoring it is one Undo"),
-        );
-      }
+      applyResolution = "apply";
     } else if (
       p?.kind === "none" &&
       flag.family !== "editions" &&
       !flag.classKey.startsWith("pattern:gap")
     ) {
-      const b = el("button", "pill-btn", "Move to Trash");
-      b.addEventListener("click", () =>
-        void this.resolve(flag, "trash_it", null, b),
-      );
-      actions.appendChild(b);
+      proposalText = "Move to Trash";
+      applyResolution = "trash_it";
     }
 
-    // The dismissal / ask-lane answer: scope select + OK button.
-    const scope = document.createElement("select");
-    scope.className = "mr-in au-scope";
-    const opt = (v: string, t: string) => {
-      const o = document.createElement("option");
-      o.value = v;
-      o.textContent = t;
-      scope.appendChild(o);
+    if (flag.lane === "question" && proposalText) {
+      card.appendChild(el("p", "au-proposal", `Proposal: ${proposalText}`));
+      if (p?.kind === "convert" && p.replace) {
+        card.appendChild(
+          el("p", "prefs-note", "The original goes to Trash after — restoring it is one Undo."),
+        );
+      }
+    }
+
+    const actions = el("div", "mr-keyrow au-actions");
+    const mkBtn = (
+      label: string,
+      resolution: string,
+      primary = false,
+    ): HTMLButtonElement => {
+      const b = el("button", primary ? "pill-btn primary" : "pill-btn", label);
+      b.addEventListener("click", () => void this.resolve(flag, resolution, null, b));
+      return b;
     };
-    opt("one", "This one");
-    opt("similar", "All similar");
-    opt("never", "Never for files like this");
-    const ok = el(
-      "button",
-      "pill-btn",
-      flag.lane === "question" ? "It's fine as-is" : "No — this one is OK",
-    );
-    ok.addEventListener("click", () =>
-      void this.resolve(flag, "ok", scope.value, ok),
-    );
-    actions.append(scope, ok);
+    if (flag.lane === "question") {
+      if (applyResolution) {
+        actions.appendChild(mkBtn("Just this one", applyResolution, true));
+        actions.appendChild(mkBtn("Fix All Similar (Irreversible)", "apply_all"));
+      }
+    } else if (applyResolution && proposalText) {
+      // Fact card: the verified fix stays one direct click.
+      actions.appendChild(mkBtn(proposalText, applyResolution, true));
+      if (p?.kind === "convert" && p.replace) {
+        actions.appendChild(
+          el("span", "mr-status", "the original goes to Trash after — restoring it is one Undo"),
+        );
+      }
+    }
+    actions.appendChild(mkBtn("Skip This One Once", "skip_once"));
+    actions.appendChild(mkBtn("Skip This One Forever", "skip_forever"));
     card.appendChild(actions);
     return card;
   }
@@ -649,13 +705,13 @@ export class AuditorPanel {
       el(
         "p",
         "prefs-note",
-        "Every “this one is OK” and every scoped answer lives here, forever, until you remove it. Nothing on this list will ever be flagged again while its entry stands.",
+        "Every “Skip This One Forever” and every standing rule lives here, until you remove it. Skipped files won't be flagged again while their entry stands, and ruled classes follow their rule.",
       ),
     );
 
     block.appendChild(el("h5", "au-fam", `Standing rules (${this.rules.length})`));
     if (!this.rules.length) {
-      block.appendChild(el("p", "prefs-note", "No standing rules yet — answer a Question with “All similar” or “Never for files like this” to make one."));
+      block.appendChild(el("p", "prefs-note", "No standing rules yet — answer a Question with “Fix All Similar (Irreversible)” to make one."));
     }
     for (const rule of this.rules) {
       const row = el("div", "mr-keyrow");
@@ -663,7 +719,7 @@ export class AuditorPanel {
         el(
           "span",
           "mr-status",
-          `${describeClass(rule.classKey)} — ${rule.decision === "suppress" ? "never flag" : "this is fine"} (since ${rule.created.slice(0, 10)})`,
+          `${describeClass(rule.classKey)} — ${rule.decision === "suppress" ? "never flag" : rule.decision === "fix" ? "arrives as a fact with the fix proposed" : "this is fine"} (since ${rule.created.slice(0, 10)})`,
         ),
       );
       const del = el("button", "pill-btn", "Remove rule");
@@ -679,7 +735,7 @@ export class AuditorPanel {
       block.appendChild(row);
     }
 
-    block.appendChild(el("h5", "au-fam", `“This one is OK” (${this.dismissals.length})`));
+    block.appendChild(el("h5", "au-fam", `Skipped forever (${this.dismissals.length})`));
     if (!this.dismissals.length) {
       block.appendChild(el("p", "prefs-note", "No per-file dismissals yet."));
     }

@@ -113,10 +113,18 @@ export interface LocationSummary {
    *  Real UUID minted by the backend; never synthesize ids on the shell side. */
   root_item: string;
   /** Absolute root path when the backend knows it (Round 7.2: mounted
-   *  volumes carry it so the sidebar can eject by path). */
+   *  volumes carry it so the sidebar can eject by path). Null for a
+   *  network server that isn't connected right now. */
   path: string | null;
   /** Removable media (USB / SD) — the sidebar offers eject. */
   removable: boolean;
+  /** Network Locations: the normalized server URI (provider
+   *  "network" only; never carries a password). */
+  uri?: string;
+  /** False only for a bookmarked network server that isn't
+   *  currently connected — it stays listed (Library Memory) with
+   *  Connect as its action. */
+  online: boolean;
 }
 
 export type ItemKind = "file" | "folder" | string;
@@ -586,7 +594,28 @@ export const api = {
     invoke<LocationSummary>("add_path_location", { name, path }),
   removePathLocation: (location: string) =>
     invoke<void>("remove_path_location", { location }),
-  mountServer: (url: string) => invoke<string>("mount_server", { url }),
+  /** Network Locations: connect a server via GIO (smb/ftp/ftps/
+   *  sftp/dav/davs/nfs/afp). The password reaches the OS keyring
+   *  only when rememberPassword is set and the mount succeeds. */
+  netConnect: (args: {
+    uri: string;
+    username?: string;
+    password?: string;
+    domain?: string;
+    anonymous: boolean;
+    rememberPassword: boolean;
+  }) =>
+    invoke<LocationSummary>("net_connect", {
+      uri: args.uri,
+      username: args.username ?? null,
+      password: args.password ?? null,
+      domain: args.domain ?? null,
+      anonymous: args.anonymous,
+      rememberPassword: args.rememberPassword,
+    }),
+  netDisconnect: (location: string) =>
+    invoke<void>("net_disconnect", { location }),
+  netForget: (location: string) => invoke<void>("net_forget", { location }),
   transcode: (item: string, preset: string) =>
     invoke<string>("transcode", { item, preset }),
   cancelTranscode: (id: string) => invoke<void>("cancel_transcode", { id }),
@@ -652,8 +681,8 @@ export const api = {
     invoke<MediaresSettingsView>("mediares_get_settings"),
   setMediaresKey: (value: string | null) =>
     invoke<string>("mediares_set_key", { value }),
-  validateMediaresKey: () =>
-    invoke<MediaresValidate>("mediares_validate_key"),
+  validateMediaresKey: (key?: string | null) =>
+    invoke<MediaresValidate>("mediares_validate_key", { key: key ?? null }),
   mediaresScan: (req: MediaresScanRequest) =>
     invoke<MediaresScanResult>("mediares_scan", { req }),
   mediaresConfirm: (req: MediaresConfirmRequest) =>
@@ -714,6 +743,7 @@ export const api = {
     scope: string | null,
   ) =>
     invoke<string>("auditor_resolve", { flagId, resolution, scope }),
+  auditorClearFindings: () => invoke<string>("auditor_clear_findings"),
   auditorListDismissals: () =>
     invoke<AuditorDismissal[]>("auditor_list_dismissals"),
   auditorDeleteDismissal: (path: string, family: string) =>

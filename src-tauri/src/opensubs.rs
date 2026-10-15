@@ -53,9 +53,16 @@ pub fn secret_get(kind: &str) -> Option<String> {
 pub fn secret_set(kind: &str, value: Option<&str>) -> Result<(), String> {
     let e = entry(kind)?;
     match value {
-        Some(v) if !v.trim().is_empty() => e
-            .set_password(v.trim())
-            .map_err(|e| format!("could not save to the system keyring: {e}")),
+        Some(v) if !v.trim().is_empty() => {
+            e.set_password(v.trim())
+                .map_err(|e| format!("could not save to the system keyring: {e}"))?;
+            // Read back through a fresh Entry before claiming
+            // success (2026-10-15 mock-store incident).
+            crate::rommedia::verify_readback(
+                &format!("mediacomplete/{kind}"),
+                v.trim(),
+            )
+        }
         _ => match e.delete_credential() {
             Ok(()) => Ok(()),
             Err(keyring::Error::NoEntry) => Ok(()),

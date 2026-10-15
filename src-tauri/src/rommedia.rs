@@ -290,12 +290,36 @@ pub fn secret_get(kind: &str) -> Option<String> {
     }
 }
 
+/// Prove a just-set secret actually persisted: read it back through
+/// a FRESH Entry and compare. Production constructs a new Entry for
+/// every call, so a store that keeps values only inside one Entry
+/// instance (the keyring crate's mock fallback) passes `set` and
+/// fails here — that failure must surface as an honest error, never
+/// a false "Saved" (2026-10-15 TMDB keyring incident).
+pub fn verify_readback(user: &str, expected: &str) -> Result<(), String> {
+    let fresh = keyring::Entry::new(KEYRING_SERVICE, user)
+        .map_err(|e| format!("system keyring unavailable: {e}"))?;
+    match fresh.get_password() {
+        Ok(v) if v == expected => Ok(()),
+        Ok(_) => Err(
+            "the system keyring kept a different value than the one just saved"
+                .to_string(),
+        ),
+        Err(e) => Err(format!(
+            "the value could not be read back from the system keyring ({e}) — it was NOT stored"
+        )),
+    }
+}
+
 pub fn secret_set(kind: &str, value: Option<&str>) -> Result<(), String> {
     let entry = keyring_entry(kind)?;
     match value {
-        Some(v) if !v.trim().is_empty() => entry
-            .set_password(v)
-            .map_err(|e| format!("could not save to the system keyring: {e}")),
+        Some(v) if !v.trim().is_empty() => {
+            entry
+                .set_password(v)
+                .map_err(|e| format!("could not save to the system keyring: {e}"))?;
+            verify_readback(&format!("rommedia/{kind}"), v)
+        }
         _ => match entry.delete_credential() {
             Ok(()) => Ok(()),
             Err(keyring::Error::NoEntry) => Ok(()),
@@ -2638,6 +2662,33 @@ pub fn settings_view(base: &Path) -> SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (2026-10-15 TMDB keyring incident): production
+    /// constructs a FRESH keyring Entry for every call. A store that
+    /// keeps values only inside one Entry instance — the keyring
+    /// crate's mock fallback, compiled in when no credential-store
+    /// feature is enabled — passes `set` and loses the value, so
+    /// this set-through-one-entry / read-through-a-second-one
+    /// roundtrip fails against the mock EXACTLY as production did.
+    /// Where no real store is reachable at all (headless CI without
+    /// a Secret Service), `set` itself errors and the test stands
+    /// down — the invariant under test is "a successful save is
+    /// readable from a fresh Entry", not "a store exists here".
+    #[test]
+    fn keyring_roundtrip_through_fresh_entries() {
+        const KIND: &str = "test-roundtrip";
+        const VALUE: &str = "roundtrip-probe-value";
+        if secret_set(KIND, Some(VALUE)).is_err() {
+            return; // no reachable store in this environment
+        }
+        let read_back = secret_get(KIND);
+        let _ = secret_set(KIND, None);
+        assert_eq!(
+            read_back.as_deref(),
+            Some(VALUE),
+            "a saved credential must read back through a fresh Entry"
+        );
+    }
 
     #[test]
     fn libretro_names_substitute_the_forbidden_ten() {

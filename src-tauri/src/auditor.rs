@@ -599,12 +599,27 @@ fn is_audio(e: &EntryInfo) -> bool {
 // 1. TYPO HUNT — dictionary-first, gibberish left alone.
 // ---------------------------------------------------------------------------
 
-/// Tokens that are never scored: release/quality vocabulary that
-/// legitimately isn't in a general dictionary.
-const NEUTRAL_TOKENS: [&str; 24] = [
-    "bluray", "remux", "webrip", "hdtv", "x264", "x265", "h264", "h265", "hevc", "av1",
-    "aac", "dts", "ac3", "atmos", "uhd", "hdr", "sdr", "fps", "720p", "1080p", "2160p",
-    "480p", "imax", "3d",
+/// THE release-vocabulary exclusion list: tokens that are never
+/// typos, so the typo hunt never scores them. Release-world words
+/// legitimately aren't in a general dictionary — technical/source
+/// tags, streaming-service tags, and release-group/uploader brands.
+/// (Dickles, 2026-10-15: the engine asked "Did you mean 'yes'?" at
+/// the [YTS.MX] tag on every YTS file in his library — "YTS, we
+/// know what that means. Exclude it by default.") This is the ONE
+/// vocabulary source for the typo family; the junk family below
+/// recognizes the same uploader brands (yts, rarbg) by name
+/// signature — keep the two in step when adding a brand. Grow the
+/// list here, in one place, rather than teaching detectors ad hoc.
+const NEUTRAL_TOKENS: [&str; 50] = [
+    // technical / source / quality tags
+    "bluray", "remux", "webrip", "webdl", "bdrip", "brrip", "hdrip", "dvdrip",
+    "hdtv", "hdcam", "hdts", "x264", "x265", "h264", "h265", "hevc", "avc", "av1",
+    "xvid", "divx", "aac", "dts", "ddp", "truehd", "ac3", "atmos", "uhd", "hdr",
+    "sdr", "fps", "720p", "1080p", "2160p", "480p", "imax", "3d",
+    // streaming-service tags (scene abbreviations)
+    "amzn", "hulu", "dsnp", "atvp", "pcok", "pmtp", "hbo", "starz",
+    // release groups / uploader brands — never typos
+    "yts", "yify", "rarbg", "eztv", "galaxyrg", "tgx",
 ];
 
 /// Split a name stem into word tokens (ORIGINAL case): non-alpha
@@ -689,16 +704,24 @@ fn detect_typos(tree: &ScanTree, words: &HashSet<String>) -> Vec<Candidate> {
         if new_name == e.name {
             continue;
         }
+        // ONE rendering of the suggestion (Dickles, 2026-10-15):
+        // the suggested word carries the CASE PATTERN of the token
+        // it replaces — Capitalized → Capitalized, ALL-CAPS →
+        // ALL-CAPS, lowercase → lowercase — computed once here and
+        // used by the headline, the detail, and (via replace_token,
+        // which match-cases the same way) the rename proposal, so
+        // the three spots can never disagree again. The bug was the
+        // headline printing the raw lowercase dictionary form.
+        let shown = display_token(&e.stem(), miss);
+        let fix_cased = match_case(&shown, &fix);
         out.push(Candidate {
             path: e.path_str(),
             family: "typo",
             lane: "question",
             class_key: format!("typo:{miss}"),
-            title: format!("Did you mean “{fix}”?"),
+            title: format!("Did you mean “{fix_cased}”?"),
             detail: format!(
-                "“{}” looks like a misspelling of “{}” in an otherwise ordinary name.",
-                display_token(&e.stem(), miss),
-                match_case(&display_token(&e.stem(), miss), &fix)
+                "“{shown}” looks like a misspelling of “{fix_cased}” in an otherwise ordinary name."
             ),
             proposal: prop_rename(&new_name),
         });
@@ -1519,6 +1542,10 @@ fn detect_junk(tree: &ScanTree, by_parent: &HashMap<PathBuf, Vec<usize>>) -> Vec
             });
         };
         // --- signatures (certain) ---
+        // Uploader brands recognized here (yts, rarbg, …) are the
+        // same vocabulary as NEUTRAL_TOKENS above: the junk family
+        // matches them as name signatures, the typo family excludes
+        // them as known tokens. One vocabulary, two mechanisms.
         if IMAGE_EXTS.contains(&ext.as_str())
             && (lower.contains("yts.")
                 || lower.starts_with("yts")
@@ -2208,6 +2235,13 @@ pub fn run_audit(
             {
                 superseded += 1;
             }
+        } else if f.lane == "question"
+            && rules.get(&f.class_key).map(|d| d.as_str()) == Some("fix")
+        {
+            // Carried flag under a "fix" standing rule (Fix All
+            // Similar): it stops being a question — it is a fact
+            // with the fix proposed, from now on.
+            let _ = catalog.set_auditor_flag_lane(&f.id, "certain", &now);
         }
     }
 
@@ -2220,12 +2254,22 @@ pub fn run_audit(
             *per_family.entry(c.family).or_insert(0) += 1;
             continue;
         }
+        // A "fix" standing rule (recorded by Fix All Similar)
+        // promotes the match: it surfaces as a FACT with the fix
+        // proposed — never silently applied, never re-asked.
+        let lane = if c.lane == "question"
+            && rules.get(&c.class_key).map(|d| d.as_str()) == Some("fix")
+        {
+            "certain"
+        } else {
+            c.lane
+        };
         let flag = AuditorFlagRow {
             id: uuid::Uuid::new_v4().to_string(),
             run_id: row.id.clone(),
             path: c.path.clone(),
             family: c.family.to_string(),
-            lane: c.lane.to_string(),
+            lane: lane.to_string(),
             class_key: c.class_key.clone(),
             title: c.title.clone(),
             detail: c.detail.clone(),

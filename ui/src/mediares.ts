@@ -23,6 +23,7 @@ import {
   type MediaresScanRow,
 } from "./api";
 import { Toast, errText } from "./toast";
+import { wireGuideLinks } from "./guidelinks";
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -564,8 +565,9 @@ export class MediaResSection {
     block.appendChild(p1);
     const p2 = document.createElement("p");
     p2.innerHTML =
-      "To get a key: 1. Create a free account at <span class=\"mr-mono\">themoviedb.org</span>. 2. Open <span class=\"mr-mono\">Settings → API</span> and copy the <span class=\"mr-mono\">API Key (v3 auth)</span>. 3. Paste it here — it is stored in your system keyring, never in a settings file, and is only used when you run a resolution scan.";
+      "To get a key: 1. Create a free account at <a class=\"guide-link mr-mono\" href=\"https://www.themoviedb.org/signup\">themoviedb.org</a>. 2. Open <a class=\"guide-link mr-mono\" href=\"https://www.themoviedb.org/settings/api\">Settings → API</a> and copy the <span class=\"mr-mono\">API Key (v3 auth)</span>. 3. Paste it here — it is stored in your system keyring, never in a settings file, and is only used when you run a resolution scan.";
     block.appendChild(p2);
+    wireGuideLinks(block);
     const row = el("div", "mr-keyrow");
     const input = document.createElement("input");
     input.className = "mr-in mr-key";
@@ -598,9 +600,14 @@ export class MediaResSection {
     const check = el("button", "pill-btn", "Check key");
     check.addEventListener("click", async () => {
       status.textContent = "Checking…";
+      // A pasted-but-unsaved key is what's checked; an empty field
+      // checks the saved key.
+      const field = input.value.trim();
       try {
-        const r = await api.validateMediaresKey();
-        status.textContent = r.message;
+        const r = await api.validateMediaresKey(field || null);
+        status.textContent = field
+          ? `${r.message} (That checked the pasted key — choose Save key to keep it.)`
+          : r.message;
       } catch (err) {
         status.textContent = `Check failed: ${errText(err)}`;
       }

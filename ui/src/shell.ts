@@ -23,6 +23,7 @@ import { reducedMotion, animateFromLive, liveOpacity } from "./motion";
 import { QuickLook } from "./quicklook";
 import { ContextMenu } from "./contextmenu";
 import { Toast, confirmDialog, promptDialog, errText} from "./toast";
+import { openConnectDialog } from "./network";
 import { showPluginRunDialog } from "./plugins";
 import { SearchView, fmtDay } from "./search";
 import { MediaResDialog } from "./mediares";
@@ -32,7 +33,7 @@ import { FolderPicker, type PickerShortcut } from "./picker";
 import { RenameDialog } from "./rename";
 import { LabelManager, saveLabelRules } from "./labels";
 import { loadLabelDefs, migrateLabelAssignments, saveLabelDefs } from "./labels";
-import { loadRomSystems, saveRomSystems, romsEnabled, romScopeOf, romSystemKey, setRomsEnabled, romDivisions, loadRomGrouping, saveRomGrouping, loadOpenDivisions, saveOpenDivisions, type RomSystem, type OwnedHardware } from "./roms";
+import { loadRomSystems, saveRomSystems, romsEnabled, romScopeOf, romSystemKey, isRomPlaceholder, setRomsEnabled, romDivisions, loadRomGrouping, saveRomGrouping, loadOpenDivisions, saveOpenDivisions, type RomSystem, type OwnedHardware } from "./roms";
 import { MusicPlayer } from "./music";
 import { isPlayableName, isVideoName } from "./video";
 import { OpenWithDialog } from "./openwith";
@@ -708,7 +709,9 @@ export class Shell {
     // Library still covers them on demand.
     void this.indexTracker.boot(
       this.locations
-        .filter((l) => l.provider !== "volume")
+        // Offline network bookmarks aren't registered for browsing —
+        // indexing one would just be refused. They index on Connect.
+        .filter((l) => l.provider !== "volume" && l.online)
         .map((l) => l.id),
     );
   }
@@ -2462,43 +2465,86 @@ export class Shell {
     { at: number; total: number; free: number; mount: string }
   >();
 
+  /** Live sidebar gauge elements by path. buildSidebar replaces
+   * the sidebar DOM on every rebuild (and rebuilds fire from dozens
+   * of triggers — boot burst, navigation, job/index events), so a
+   * paint that resolves after a rebuild must land on the CURRENT
+   * elements for the path. Painting only the captured pair was the
+   * gray-bar bug (Dickles, 2026-10-15): orphaned paints left fresh
+   * rows at width 0 — gray at rest, blue only when a click opened a
+   * quiet window, gone again at the next rebuild burst. */
+  private gaugeEls = new Map<
+    string,
+    { gauge: HTMLElement; fill: HTMLElement }
+  >();
+
+  /** Apply a gauge reading to the live elements for `path`.
+   * COLOR LAW (Dickles): alarm red is reserved for the BOOT drive
+   * running low — a nearly-full media drive is a victory, never red. */
+  private paintGaugeNow(
+    path: string,
+    total: number,
+    free: number,
+    mount: string,
+  ): void {
+    const els = this.gaugeEls.get(path);
+    if (!els || !els.gauge.isConnected) return;
+    const usedPct = Math.max(0, Math.min(100, (1 - free / total) * 100));
+    els.fill.style.width = `${usedPct}%`;
+    const bootLow = mount === "/" && free / total < 0.1;
+    els.gauge.classList.toggle("alarm", bootLow);
+    els.gauge.title = `${formatBytes(total - free)} used · ${formatBytes(free)} free`;
+  }
+
+  /** Repaint every registered gauge from the cache, synchronously.
+   * Runs at the end of buildSidebar so the rows it just built are
+   * never left unpainted waiting on a fetch. */
+  private repaintGaugesFromCache(): void {
+    for (const [path, hit] of this.diskGaugeCache) {
+      this.paintGaugeNow(path, hit.total, hit.free, hit.mount);
+    }
+  }
+
   /** Paint one sidebar location's storage gauge: a slim used bar
-   * under the name. COLOR LAW (Dickles): alarm red is reserved for
-   * the BOOT drive running low — a nearly-full media drive is a
-   * victory, never red. */
+   * under the name. Registers the elements, paints instantly from a
+   * warm cache, otherwise fetches — and when the fetch resolves it
+   * paints whatever elements are live for the path THEN, not the
+   * possibly-detached pair captured here. */
   private async paintLocGauge(
     path: string,
     gauge: HTMLElement,
     fill: HTMLElement,
   ): Promise<void> {
+    this.gaugeEls.set(path, { gauge, fill });
+    const cached = this.diskGaugeCache.get(path);
+    if (cached && Date.now() - cached.at <= 60_000) {
+      this.paintGaugeNow(path, cached.total, cached.free, cached.mount);
+      return;
+    }
     try {
-      let hit = this.diskGaugeCache.get(path);
-      if (!hit || Date.now() - hit.at > 60_000) {
-        const info = await api.getDiskInfo(path);
-        if (info.total_bytes <= 0) {
-          gauge.remove();
-          return;
-        }
-        hit = {
-          at: Date.now(),
-          total: info.total_bytes,
-          free: info.free_bytes,
-          mount: info.mount_point,
-        };
-        this.diskGaugeCache.set(path, hit);
+      const info = await api.getDiskInfo(path);
+      if (info.total_bytes <= 0) {
+        // No gauge beats a wrong one — remove only the LIVE gauge;
+        // a stale captured element is already gone.
+        const els = this.gaugeEls.get(path);
+        if (els && els.gauge === gauge) els.gauge.remove();
+        return;
       }
-      if (!gauge.isConnected) return;
-      const usedPct = Math.max(
-        0,
-        Math.min(100, (1 - hit.free / hit.total) * 100),
-      );
-      fill.style.width = `${usedPct}%`;
-      const bootLow = hit.mount === "/" && hit.free / hit.total < 0.1;
-      gauge.classList.toggle("alarm", bootLow);
-      gauge.title = `${formatBytes(hit.total - hit.free)} used · ${formatBytes(hit.free)} free`;
+      const hit = {
+        at: Date.now(),
+        total: info.total_bytes,
+        free: info.free_bytes,
+        mount: info.mount_point,
+      };
+      this.diskGaugeCache.set(path, hit);
+      this.paintGaugeNow(path, hit.total, hit.free, hit.mount);
     } catch {
-      // No gauge beats a wrong one.
-      gauge.remove();
+      // A failed fetch keeps any cached paint; only a never-painted
+      // live gauge is removed (no gauge beats a wrong one).
+      if (!this.diskGaugeCache.has(path)) {
+        const els = this.gaugeEls.get(path);
+        if (els && els.gauge === gauge) els.gauge.remove();
+      }
     }
   }
 
@@ -2641,33 +2687,55 @@ export class Shell {
     await this.termPanel.toggle(cwd || "/");
   }
 
-  /** Connect to Server (Finder): gio-mounts sftp/smb/ftp/dav and adds
-   * the mount as a browsable location. */
-  private async connectToServer(): Promise<void> {
-    const url = await promptDialog(
-      "Connect to Server",
-      "sftp://user@server/share · smb://server/share · ftp://… · dav://…",
-    );
-    if (!url) return;
+  /** Connect to Server (Finder): the Network Locations dialog —
+   * GIO mounts the server (smb/sftp/ftp/ftps/dav/davs/nfs/afp), the
+   * bookmark lands in Locations, and we navigate into it. Prefill
+   * comes from an offline bookmark row's click. */
+  private connectToServer(prefill?: { uri?: string }): void {
+    openConnectDialog({ initialUri: prefill?.uri }, (summary) => {
+      void (async () => {
+        await this.refreshLocations();
+        this.navigateTo({
+          locationId: summary.id,
+          dirId: summary.root_item,
+          crumbs: [{ dirId: summary.root_item, name: summary.display_name }],
+        });
+      })();
+    });
+  }
+
+  /** Disconnect a server (Network Locations): the bookmark stays in
+   * Locations in its offline state — files still badged in search —
+   * until Forget Server removes it. */
+  private async disconnectServer(loc: LocationSummary): Promise<void> {
     try {
-      Toast.success("Mounting… (a sign-in prompt may appear)");
-      const mountPath = await api.mountServer(url);
-      const name = url
-        .replace(/^[a-z]+:\/\//, "")
-        .split("/")[0] || "Server";
-      const summary = await api.addPathLocation(name, mountPath);
-      this.locations = await api.listLocations().catch(() => this.locations);
-      void summary;
-      void this.buildSidebar();
-      this.navigateTo({
-        locationId: summary.id,
-        dirId: summary.root_item,
-        crumbs: [{ dirId: summary.root_item, name: summary.display_name }],
-      });
-      Toast.success(`Connected: ${summary.display_name}`);
+      await api.netDisconnect(loc.id);
+      Toast.success(
+        `Disconnected ${loc.display_name}. It stays in Locations — click it to reconnect.`,
+      );
     } catch (err) {
-      Toast.error(`Connect failed: ${errText(err)}`);
+      Toast.error(`Disconnect failed: ${errText(err)}`);
     }
+    await this.refreshLocations();
+  }
+
+  /** Forget a server entirely: disconnect + bookmark + saved
+   * password + indexed file list all go. Server files untouched. */
+  private async forgetServer(loc: LocationSummary): Promise<void> {
+    const ok = await confirmDialog(
+      `Forget ${loc.display_name}?`,
+      "Fable will disconnect it, remove it from Locations, forget its saved password, and drop its indexed file list. The files on the server aren't touched.",
+      "Forget Server",
+      true,
+    );
+    if (!ok) return;
+    try {
+      await api.netForget(loc.id);
+      Toast.success(`Forgot ${loc.display_name}.`);
+    } catch (err) {
+      Toast.error(`Forget failed: ${errText(err)}`);
+    }
+    await this.refreshLocations();
   }
 
   // ------------------------------------------------------------- breadcrumbs
@@ -3296,6 +3364,7 @@ export class Shell {
             this.ctxMenu.open(e.clientX, e.clientY, [
               {
                 label: "Empty Trash",
+                danger: true,
                 action: async () => {
                   const sum = await api.trashSummary().catch(() => null);
                   const ok = await confirmDialog(
@@ -3402,7 +3471,10 @@ export class Shell {
     }
     for (const loc of this.locations) {
       const b = document.createElement("button");
-      b.className = "side-item side-loc";
+      const isOfflineServer = loc.provider === "network" && !loc.online;
+      b.className = isOfflineServer
+        ? "side-item side-loc offline"
+        : "side-item side-loc";
       const name = document.createElement("span");
       name.textContent = loc.display_name;
       // Name + storage gauge stack (UI round item 7): a slim
@@ -3423,6 +3495,12 @@ export class Shell {
       const prov = document.createElement("span");
       prov.className = "side-provider";
       prov.textContent = loc.provider;
+      if (isOfflineServer) {
+        // Plain state, not jargon: the server is saved but not
+        // connected right now (Library Memory keeps it listed).
+        prov.className = "side-offline-tag";
+        prov.textContent = "not connected";
+      }
       b.append(main, prov);
       // Removable volumes get an inline eject (Round 7.2), the way
       // Nautilus renders it — the right-click Unmount stays as well.
@@ -3449,6 +3527,13 @@ export class Shell {
         b.appendChild(eject);
       }
       b.addEventListener("click", () => {
+        if (isOfflineServer) {
+          // Clicking a saved-but-offline server CONNECTS it (the
+          // dialog opens prefilled) — never a dead click on an
+          // unregistered root.
+          this.connectToServer({ uri: loc.uri ?? undefined });
+          return;
+        }
         this.navigateTo({
           locationId: loc.id,
           dirId: loc.root_item,
@@ -3458,6 +3543,34 @@ export class Shell {
       b.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         e.stopPropagation();
+        if (loc.provider === "network") {
+          const items: MenuItem[] = [];
+          if (loc.online) {
+            items.push({
+              label: "Open in New Tab",
+              action: () => {
+                const t = this.newTab(loc);
+                void this.loadDir(t);
+              },
+            });
+            items.push({
+              label: "Disconnect",
+              action: () => void this.disconnectServer(loc),
+            });
+          } else {
+            items.push({
+              label: "Connect…",
+              action: () => this.connectToServer({ uri: loc.uri ?? undefined }),
+            });
+          }
+          items.push({
+            label: "Forget Server…",
+            danger: true,
+            action: () => void this.forgetServer(loc),
+          });
+          this.ctxMenu.open(e.clientX, e.clientY, items);
+          return;
+        }
         void (async () => {
           const rootPath = await api
             .getItemPath(loc.root_item)
@@ -3505,6 +3618,7 @@ export class Shell {
       // engine like the favorites.
       b.addEventListener("dragover", (e) => {
         if (dragState.favName || !dragState.item) return;
+        if (isOfflineServer) return; // connect first, then drop
         e.preventDefault();
         if (e.dataTransfer) e.dataTransfer.dropEffect = e.ctrlKey ? "copy" : "move";
         b.classList.add("drop-hover");
@@ -3515,6 +3629,7 @@ export class Shell {
         b.classList.remove("drop-hover");
         const dragged = dragState.item;
         if (!dragged || dragState.favName) return;
+        if (isOfflineServer) return;
         void this.fileDraggedIntoFolder(
           dragged,
           { locationId: loc.id, dirId: loc.root_item, display: loc.path ?? loc.display_name },
@@ -3530,6 +3645,10 @@ export class Shell {
       p.textContent = "No locations yet.";
       this.sidebarList.appendChild(p);
     }
+    // Gauges: repaint the just-built rows from the warm cache NOW —
+    // a location bar must read blue at rest, not whenever a fetch
+    // happens to win a race against the next rebuild.
+    this.repaintGaugesFromCache();
     // Labels: click to browse everything carrying the label.
     this.labelList.innerHTML = "";
     for (const def of loadLabelDefs()) {
@@ -4021,7 +4140,10 @@ export class Shell {
   private reindexLibrary(): void {
     if (this.locations.length === 0) return;
     Toast.show("Re-indexing the library…", "info");
-    void this.indexTracker.reindexAll(this.locations.map((l) => l.id));
+    // Offline server bookmarks can't be walked — Connect indexes them.
+    void this.indexTracker.reindexAll(
+      this.locations.filter((l) => l.online).map((l) => l.id),
+    );
   }
 
   /** File Auditor: the sidebar badge carries the open-flag count
@@ -4209,68 +4331,80 @@ export class Shell {
         this.renderActiveView();
       },
     });
+    // The main menu (Dickles, 2026-10-15): named groups as flyout
+    // submenus — no "Other"/"Miscellaneous" junk drawer; every
+    // group name says what its items do. Every one of the old flat
+    // menu's 29 items has a named home below.
         this.ctxMenu.open(rect.left - 140, rect.bottom + 6, [
-      viewItem("Grid view", "grid"),
-      viewItem("List view", "list"),
-      viewItem("Columns view", "columns"),
-      viewItem("Gallery view", "gallery"),
-      { separator: true, label: "", action: () => {} },
-      sortItem("Name", "name"),
-      sortItem("Size", "size"),
-      sortItem("Date", "modified"),
-      { separator: true, label: "", action: () => {} },
-      { label: "Larger text", shortcut: "Ctrl +", action: () => this.setFontScale(this.fontScale + 0.1) },
-      { label: "Smaller text", shortcut: "Ctrl \u2212", action: () => this.setFontScale(this.fontScale - 0.1) },
-      { label: "Larger icons", action: () => this.stepIconSize(1) },
-      { label: "Smaller icons", action: () => this.stepIconSize(-1) },
-      { separator: true, label: "", action: () => {} },
-      { label: "About Fable Files", action: () => this.aboutDialog.open() },
-      { label: "App Deleter\u2026", action: () => void this.appDeleter.open(() => this.refreshActiveDir()) },
       {
-        label: "Auto-Label Rules\u2026",
-        action: () =>
-          this.labelManager.openRules(() => {
-            void this.buildSidebar();
-            this.refreshActiveDir();
-          }),
-      },
-      { label: "Burn Studio\u2026", action: () => this.burnStudio.open() },
-      { label: "Connect to Server\u2026", action: () => void this.connectToServer() },
-      { label: "Disk Utility\u2026", action: () => void this.diskDialog.open() },
-      {
-        label: "Duplicate Finder\u2026",
-        action: () => void this.openDupHere(),
+        label: "View",
+        action: () => {},
+        submenu: [
+          viewItem("Grid view", "grid"),
+          viewItem("List view", "list"),
+          viewItem("Columns view", "columns"),
+          viewItem("Gallery view", "gallery"),
+          { separator: true, label: "", action: () => {} },
+          sortItem("Name", "name"),
+          sortItem("Size", "size"),
+          sortItem("Date", "modified"),
+          { separator: true, label: "", action: () => {} },
+          { label: "Larger text", shortcut: "Ctrl +", action: () => this.setFontScale(this.fontScale + 0.1) },
+          { label: "Smaller text", shortcut: "Ctrl \u2212", action: () => this.setFontScale(this.fontScale - 0.1) },
+          { label: "Larger icons", action: () => this.stepIconSize(1) },
+          { label: "Smaller icons", action: () => this.stepIconSize(-1) },
+          { separator: true, label: "", action: () => {} },
+          { label: "Theme\u2026", action: () => this.themeManager.openMenu(this.menuBtn) },
+        ],
       },
       {
-        label: "Manage Labels\u2026",
-        action: () =>
-          this.labelManager.open(() => {
-            void this.buildSidebar();
-            this.refreshActiveDir();
-          }),
+        label: "Organize",
+        action: () => {},
+        submenu: [
+          {
+            label: "Duplicate Finder\u2026",
+            action: () => void this.openDupHere(),
+          },
+          {
+            label: "Synchronize Folders\u2026",
+            action: () => void this.openSyncHere(),
+          },
+          {
+            label: "Manage Labels\u2026",
+            action: () =>
+              this.labelManager.open(() => {
+                void this.buildSidebar();
+                this.refreshActiveDir();
+              }),
+          },
+          {
+            label: "Auto-Label Rules\u2026",
+            action: () =>
+              this.labelManager.openRules(() => {
+                void this.buildSidebar();
+                this.refreshActiveDir();
+              }),
+          },
+          { label: "Re-index Library", action: () => this.reindexLibrary() },
+        ],
       },
-      { label: "Mount Cloud Drive\u2026", action: () => void this.cloudMount.open() },
-      { label: "Preferences\u2026", action: () => this.openPreferences() },
-      { label: "Re-index Library", action: () => this.reindexLibrary() },
       {
-        label: "Report a Bug\u2026",
-        action: () =>
-          void api.openUrl(
-            "https://github.com/garrisonr/fable-files/issues/new?title=" +
-              encodeURIComponent("[Bug] ") +
-              "&labels=bug"
-          ),
+        label: "Connect",
+        action: () => {},
+        submenu: [
+          { label: "Connect to Server\u2026", action: () => void this.connectToServer() },
+          { label: "Mount Cloud Drive\u2026", action: () => void this.cloudMount.open() },
+        ],
       },
       {
-        label: "Request a Feature\u2026",
-        action: () =>
-          void api.openUrl(
-            "https://github.com/garrisonr/fable-files/issues/new?title=" +
-              encodeURIComponent("[Feature] ") +
-              "&labels=enhancement"
-          ),
+        label: "Storage",
+        action: () => {},
+        submenu: [
+          { label: "Disk Utility\u2026", action: () => void this.diskDialog.open() },
+          { label: "Burn Studio\u2026", action: () => this.burnStudio.open() },
+          { label: "App Deleter\u2026", action: () => void this.appDeleter.open(() => this.refreshActiveDir()) },
+        ],
       },
-      { label: "Restore Defaults\u2026", danger: true, action: () => void this.restoreDefaults() },
       {
         label: romsEnabled() ? "Roms Collection \u2713" : "Roms Collection",
         action: () => {
@@ -4280,12 +4414,34 @@ export class Shell {
           Toast.success(on ? "Roms Collection is on." : "Roms Collection is off. Your systems are kept.");
         },
       },
-      {
-        label: "Synchronize Folders\u2026",
-        action: () => void this.openSyncHere(),
-      },
       { label: "Terminal", shortcut: "Ctrl `", action: () => void this.toggleTerminal() },
-      { label: "Theme\u2026", action: () => this.themeManager.openMenu(this.menuBtn) },
+      { label: "Preferences\u2026", action: () => this.openPreferences() },
+      {
+        label: "Help & Feedback",
+        action: () => {},
+        submenu: [
+          {
+            label: "Report a Bug\u2026",
+            action: () =>
+              void api.openUrl(
+                "https://github.com/garrisonr/fable-files/issues/new?title=" +
+                  encodeURIComponent("[Bug] ") +
+                  "&labels=bug"
+              ),
+          },
+          {
+            label: "Request a Feature\u2026",
+            action: () =>
+              void api.openUrl(
+                "https://github.com/garrisonr/fable-files/issues/new?title=" +
+                  encodeURIComponent("[Feature] ") +
+                  "&labels=enhancement"
+              ),
+          },
+        ],
+      },
+      { label: "About Fable Files", action: () => this.aboutDialog.open() },
+      { label: "Restore Defaults\u2026", danger: true, action: () => void this.restoreDefaults() },
     ]);
   }
 
@@ -4447,11 +4603,15 @@ export class Shell {
     b.className = "side-item";
     b.textContent = "\uD83C\uDFAE " + sys.name;
     const key = romSystemKey(sys);
-    b.title = key
-      ? "Verified by the ROM lists (No-Intro / Redump / MAME) — only exact matches appear"
-      : "ROM files: " + sys.extensions.map((x) => "." + x).join(", ");
+    b.title = isRomPlaceholder(sys)
+      ? "A placeholder for what's coming — no emulator core or verified game list for this system yet"
+      : key
+        ? "Verified by the ROM lists (No-Intro / Redump / MAME) — only exact matches appear"
+        : "ROM files: " + sys.extensions.map((x) => "." + x).join(", ");
     b.addEventListener("click", () => {
-      if (key) {
+      if (isRomPlaceholder(sys)) {
+        void this.searchView.runRomPlaceholder(sys.name);
+      } else if (key) {
         void this.searchView.runRomCollection(sys.name, key, romScopeOf(sys));
       } else {
         void this.searchView.runRule(
@@ -4540,6 +4700,7 @@ export class Shell {
    * extension editor. */
   private openRomEditor(sys: RomSystem | null): void {
     const isDat = sys ? romSystemKey(sys) !== null : false;
+    const isPlaceholder = sys ? isRomPlaceholder(sys) : false;
     const overlay = document.createElement("div");
     overlay.className = "picker-overlay";
     overlay.innerHTML = `
@@ -4606,6 +4767,19 @@ export class Shell {
       q<HTMLDivElement>(".rom-ext-wrap").hidden = true;
       q<HTMLParagraphElement>(".rom-dat-note").hidden = false;
     }
+    if (isPlaceholder) {
+      // A placeholder gathers nothing and identifies nothing —
+      // extensions would be a false promise, so they're not
+      // editable; the name is likewise the registry identity.
+      q<HTMLInputElement>(".rom-name").disabled = true;
+      q<HTMLInputElement>(".rom-name").title =
+        "Placeholder systems keep their registry name.";
+      q<HTMLDivElement>(".rom-ext-wrap").hidden = true;
+      const note = q<HTMLParagraphElement>(".rom-dat-note");
+      note.textContent =
+        "This is a placeholder system: it holds a shelf for a machine whose emulator cores and verified game lists don't exist yet. It gathers no files and fetches no media — when the real support lands, the shelf wakes up on its own.";
+      note.hidden = false;
+    }
     renderDrives();
     q<HTMLButtonElement>(".rom-cancel").addEventListener("click", () => overlay.remove());
     overlay.addEventListener("pointerdown", (e) => {
@@ -4613,17 +4787,18 @@ export class Shell {
     });
     q<HTMLButtonElement>(".rom-save").addEventListener("click", () => {
       const name = q<HTMLInputElement>(".rom-name").value.trim();
-      const exts = isDat
-        ? [...(sys?.extensions ?? [])]
-        : q<HTMLInputElement>(".rom-exts")
-            .value.split(/[,\s]+/)
-            .map((s) => s.replace(/^\./, "").toLowerCase())
-            .filter(Boolean);
+      const exts =
+        isDat || isPlaceholder
+          ? [...(sys?.extensions ?? [])]
+          : q<HTMLInputElement>(".rom-exts")
+              .value.split(/[,\s]+/)
+              .map((s) => s.replace(/^\./, "").toLowerCase())
+              .filter(Boolean);
       if (!name) {
         Toast.error("Give the system a name.");
         return;
       }
-      if (!isDat && exts.length === 0) {
+      if (!isDat && !isPlaceholder && exts.length === 0) {
         Toast.error("Add at least one ROM extension.");
         return;
       }
@@ -4642,7 +4817,15 @@ export class Shell {
       const list = loadRomSystems();
       if (sys) {
         const idx = list.findIndex((s) => s.name === sys.name);
-        if (idx >= 0) list[idx] = { name, extensions: exts, scope };
+        if (idx >= 0)
+          list[idx] = {
+            name,
+            extensions: exts,
+            scope,
+            // The kind is identity, not an edit — saving the system
+            // never silently standardizes a placeholder.
+            ...(sys.kind ? { kind: sys.kind } : {}),
+          };
       } else {
         if (list.some((s) => s.name === name)) {
           Toast.error(`"${name}" is already in the collection.`);

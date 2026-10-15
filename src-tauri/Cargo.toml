@@ -35,13 +35,22 @@ ufm-torrent = { path = "../crates/ufm-torrent" }
 tracing.workspace = true
 base64 = "0.22"
 ureq = "2"
-keyring = "3"
+# The features ARE the store: with none, the keyring crate silently
+# falls back to its in-memory mock, which "provides no persistence" —
+# every credential Fable ever "saved" evaporated (2026-10-15 TMDB
+# incident; see docs + FINDINGS). sync-secret-service = the real
+# GNOME/KDE Secret Service over D-Bus for our sync call sites;
+# crypto-rust = pure-Rust session crypto (no system OpenSSL dep).
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 sha1 = "0.10"
 crc32fast = "1"
 filetime = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "ico"] }
 md5 = "0.7"
 open = "5"
+# Network Locations: in-process GIO mounts (GVfs). 0.18.4 is already
+# in Cargo.lock via the Tauri GTK stack — this changes no versions.
+gio = "0.18"
 portable-pty = "0.8"
 sha2 = "0.10"
 # File Auditor: decompresses the bundled SCOWL word list

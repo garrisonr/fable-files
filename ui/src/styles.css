@@ -438,7 +438,7 @@ th[data-sort]:focus-visible {
 .side-loc-main { display: flex; flex-direction: column; gap: 3px; flex: 1 1 auto; min-width: 0; }
 .side-loc-main > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .side-gauge { display: block; height: 4px; border-radius: 2px; background: color-mix(in srgb, var(--ufm-text) 14%, transparent); overflow: hidden; }
-.side-gauge-fill { display: block; height: 100%; width: 0%; border-radius: 2px; background: var(--ufm-accent); transition: width 300ms ease; }
+.side-gauge-fill { display: block; height: 100%; width: 0%; border-radius: 2px; background: var(--ufm-accent, #0a84ff); transition: width 300ms ease; }
 /* Alarm red ONLY for a low boot drive (Dickles' color law) — the
    class is set exclusively for mount_point "/" running low. */
 .side-gauge.alarm .side-gauge-fill { background: #d70015; }
@@ -1162,6 +1162,19 @@ body[data-layout="tv"] .cell-icon {
   opacity: 0.6;
 }
 
+/* Flyout submenus (main-menu groups): the arrow sits where a
+   shortcut would, and the parent row stays lit while its flyout
+   is open — even once the pointer moves into the flyout. */
+.ctx-sub-arrow {
+  margin-left: auto;
+  padding-left: 24px;
+  font-size: 11px;
+  opacity: 0.6;
+}
+.ctx-item[aria-expanded="true"] {
+  background: color-mix(in srgb, var(--ufm-accent) 22%, transparent);
+}
+
 /* Quick Look text preview */
 .ql-text-preview {
   margin-top: 12px;
@@ -1558,12 +1571,22 @@ body[data-layout="tv"] .cell-icon {
 }
 
 /* ------------------------------------------------------ context menu */
+/* Destructive menu items (Dickles' design, 2026-10-15): NORMAL at
+   rest — they blend in with every other item; the red text and the
+   murky 10% wash are gone. The warning lives in the interaction
+   state: hover / focus / keyboard selection paints a BRIGHT RED
+   box with WHITE text. The red is #e60000, not pure #ff0000: white
+   on #ff0000 is only 4.0:1 — under WCAG AA for 13px menu text —
+   while #e60000 still reads as bright red at 4.8:1. One law, every
+   menu, via the shared .ctx-danger class. */
 .ctx-item.ctx-danger {
-  color: #d70015;
+  color: var(--ufm-text);
 }
 
-.ctx-item.ctx-danger:hover:not(:disabled) {
-  background: color-mix(in srgb, #d70015 10%, transparent);
+.ctx-item.ctx-danger:hover:not(:disabled),
+.ctx-item.ctx-danger:focus-visible {
+  background: #e60000;
+  color: #fff;
 }
 
 /* --------------------------------------------------------- drag & drop */
@@ -2273,6 +2296,36 @@ body[data-layout="tv"] .cell-icon {
   font-size: 0.875rem;
 }
 
+/* Connect to Server dialog (Network Locations) + offline servers. */
+.net-card { width: min(26rem, calc(100vw - 3rem)); }
+.net-field { display: block; margin-bottom: 0.55rem; }
+.net-field > span { display: block; font-size: 0.75rem; font-weight: 600; color: var(--ufm-text-muted); margin-bottom: 0.25rem; }
+.net-field > span em { font-style: normal; font-weight: 400; }
+.net-help { min-height: 2.1em; }
+.net-check { display: flex; align-items: center; gap: 0.45rem; font-size: 0.8125rem; margin: 0.35rem 0; cursor: pointer; }
+.net-check input { accent-color: var(--ufm-accent, #0a84ff); }
+.net-error {
+  display: flex; align-items: flex-start; gap: 0.5rem;
+  margin-top: 0.6rem; padding: 0.55rem 0.65rem;
+  border-radius: 10px; font-size: 0.8125rem;
+  background: color-mix(in srgb, var(--ufm-danger, #d70015) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ufm-danger, #d70015) 40%, transparent);
+}
+.net-error[hidden] { display: none; }
+.net-error-text { flex: 1; overflow-wrap: anywhere; }
+.net-error-copy {
+  appearance: none; border: 1px solid var(--ufm-border); border-radius: 999px;
+  background: transparent; color: var(--ufm-text); font-size: 0.75rem;
+  padding: 0.15rem 0.6rem; cursor: pointer; flex: none;
+}
+/* A bookmarked server that isn't connected: dimmed, italic-free,
+   with a plain "not connected" tag — never a dead click. */
+.side-item.side-loc.offline { opacity: 0.55; }
+.side-item.side-loc .side-offline-tag {
+  margin-left: auto; font-size: 0.6875rem; color: var(--ufm-text-muted);
+  border: 1px solid var(--ufm-border); border-radius: 999px; padding: 0.05rem 0.45rem;
+}
+
 /* ——— context menu extras (labels / checks / separators) ——— */
 .ctx-sep { height: 1px; margin: 4px 8px; background: var(--ufm-border); }
 .ctx-dot {
@@ -2362,7 +2415,35 @@ tr.row[style*="--label-color"] {
   margin: 0.5rem 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .picker-empty { color: var(--ufm-text-muted); font-size: 0.875rem; padding: 0.5rem; }
+/* Picker rail sections (Favorites / Places / Smart Folders) + the
+   New Folder inline prompt. The rail scrolls — three sections of
+   places must never push the card off screen. */
+.picker-shortcuts { overflow-y: auto; padding-right: 2px; }
+.picker-rail-head {
+  font-size: 0.6875rem; font-weight: 700; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--ufm-text-muted);
+  padding: 0.55rem 0.5rem 0.2rem;
+}
+.picker-rail-head:first-child { padding-top: 0.1rem; }
+.picker-row-sub { display: block; font-size: 0.75rem; color: var(--ufm-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .picker-actions { display: flex; justify-content: flex-end; gap: 0.5rem; }
+.picker-newfolder { margin-right: auto; }
+.picker-newfolder, .picker-newcreate, .picker-newcancel {
+  appearance: none; border-radius: 999px; padding: 0.4rem 0.9rem;
+  font-size: 0.8125rem; font-weight: 600; cursor: pointer;
+  border: 1px solid var(--ufm-border);
+  background: color-mix(in srgb, var(--ufm-surface) 82%, var(--ufm-text) 6%);
+  color: var(--ufm-text);
+}
+.picker-newfolder:disabled { opacity: 0.45; cursor: default; }
+.picker-newcreate.primary { background: var(--ufm-accent, #0a84ff); color: var(--ufm-on-accent, #fff); border-color: transparent; }
+.picker-newrow { display: flex; gap: 0.5rem; align-items: center; margin: 0.25rem 0 0.6rem; }
+.picker-newrow[hidden] { display: none; }
+.picker-newname {
+  flex: 1; box-sizing: border-box; padding: 0.45rem 0.6rem;
+  border-radius: 10px; border: 1px solid var(--ufm-border);
+  background: var(--ufm-content-canvas); color: var(--ufm-text); font-size: 0.875rem;
+}
 .picker-cancel, .picker-choose {
   appearance: none; border-radius: 999px; padding: 0.4rem 0.9rem;
   font-size: 0.8125rem; font-weight: 600; cursor: pointer;
@@ -3054,6 +3135,7 @@ tr.row[style*="--label-color"] {
   font-size: var(--text-xs);
   color: var(--text-muted);
 }
+.rom-empty-help { margin-top: 0.25rem; }
 
 /* ---- 5.5: sidebar type unification (Dickles: every section wears
    the same type; label text aligns with the other sections) ---- */
@@ -3176,6 +3258,11 @@ select option { background-color: var(--ufm-surface); color: var(--ufm-text); }
 .mr-tmdb { margin-top: .8rem; border-top: 1px solid var(--ufm-border); padding-top: .6rem; }
 .mr-tmdb p { color: var(--ufm-text-muted); font-size: .82rem; line-height: 1.55; }
 .mr-mono { font-family: ui-monospace, monospace; color: var(--ufm-text); }
+/* Guidance links (guidelinks.ts): a website named in teaching copy
+   is a real, working link — accent-colored and underlined, in every
+   theme. */
+a.guide-link { color: var(--ufm-accent, #0a84ff); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+a.guide-link:hover { text-decoration-thickness: 2px; }
 .mr-keyrow { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
 .mr-key { flex: 1 1 14rem; width: auto; }
 .mr-status { color: var(--ufm-text-muted); font-size: .82rem; }
@@ -3407,6 +3494,7 @@ select option { background-color: var(--ufm-surface); color: var(--ufm-text); }
 .au-detail { margin: 6px 0 2px; font-size: 0.875rem; line-height: 1.45; }
 .au-actions { margin-top: 8px; align-items: center; }
 .au-scope { max-width: 13rem; }
+.au-proposal { font-weight: 600; margin: 0.35rem 0 0.15rem; }
 .au-history { margin-top: 8px; }
 .au-history summary { cursor: pointer; font-size: 0.8125rem; color: var(--ufm-text-muted); }
 .au-dismiss-path { word-break: break-all; }

@@ -57,9 +57,15 @@ pub fn tmdb_key_get() -> Option<String> {
 pub fn tmdb_key_set(value: Option<&str>) -> Result<(), String> {
     let entry = keyring_entry()?;
     match value {
-        Some(v) if !v.trim().is_empty() => entry
-            .set_password(v.trim())
-            .map_err(|e| format!("could not save to the system keyring: {e}")),
+        Some(v) if !v.trim().is_empty() => {
+            entry
+                .set_password(v.trim())
+                .map_err(|e| format!("could not save to the system keyring: {e}"))?;
+            // Never report "Saved" on faith: read it back through a
+            // fresh Entry first (the 2026-10-15 mock-store incident —
+            // saves returned Ok and evaporated).
+            crate::rommedia::verify_readback("mediares/tmdb", v.trim())
+        }
         _ => match entry.delete_credential() {
             Ok(()) => Ok(()),
             Err(keyring::Error::NoEntry) => Ok(()),

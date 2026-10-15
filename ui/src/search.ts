@@ -19,6 +19,8 @@ import { ContextMenu } from "./contextmenu";
 import { errText } from "./toast";
 import { isPlayableName } from "./video";
 import { openRomMediaReport, startMediaDownload } from "./rommedia";
+import { romArchiveLink } from "./roms";
+import { openGuideLink } from "./guidelinks";
 
 export interface SearchHooks {
   onNavigateToItem(item: Item): void;
@@ -136,6 +138,10 @@ export class SearchView {
   /** Last ROM collection shown (DAT-identified membership). */
   private lastRom: { name: string; systemKey: string; scope: RomScope } | null =
     null;
+  /** Placeholder system currently shown, if any (Xbox Series /
+   * Switch 2): no collection, no identification — just the shelf
+   * card. Tracked so a re-index doesn't flip the view away. */
+  private lastPlaceholder: string | null = null;
   /** Display-name overrides for the current rule/collection render:
    * item id → DAT name (ROM Lists: the DAT name headlines, the real
    * filename stays in the path line). */
@@ -687,7 +693,9 @@ export class SearchView {
   rerunAfterIndex(): void {
     this.viewCache.clear();
     if (!this.active) return;
-    if (this.lastRom) {
+    if (this.lastPlaceholder) {
+      void this.runRomPlaceholder(this.lastPlaceholder);
+    } else if (this.lastRom) {
       void this.runRomCollection(
         this.lastRom.name,
         this.lastRom.systemKey,
@@ -776,6 +784,7 @@ export class SearchView {
     this.titleHint = name;
     this.lastRule = { name, rule };
     this.lastRom = null;
+    this.lastPlaceholder = null;
     this.displayNames = null;
     this.hooks.onResults();
     // View cache (fix batch item 2): re-entering a smart folder
@@ -839,6 +848,30 @@ export class SearchView {
    * never an extension. Runs the identification pass first (cached
    * identifications make repeat opens instant), then renders the
    * collection with DAT names headlining each row. */
+  /** Placeholder system view (Dickles, 2026-10-15): the shelf
+   * exists, the system doesn't — yet. No gathering, no media bar,
+   * no identification promises; just the placeholder card. */
+  async runRomPlaceholder(name: string): Promise<void> {
+    this.active = true;
+    this.el.hidden = false;
+    this.titleHint = name;
+    this.lastRule = null;
+    this.lastRom = null;
+    this.lastPlaceholder = name;
+    this.displayNames = null;
+    this.hooks.onResults();
+    this.currentViewKey = `rom-placeholder|${name}`;
+    this.resultsEl.innerHTML = "";
+    this.resultsEl.appendChild(
+      this.resultsHeader(`“${name}” — a shelf in waiting`),
+    );
+    const p = document.createElement("p");
+    p.className = "search-hint";
+    p.textContent =
+      "A placeholder for what's coming. There's no emulator core or verified game list for this system yet — when they arrive, this shelf wakes up.";
+    this.resultsEl.appendChild(p);
+  }
+
   async runRomCollection(
     name: string,
     systemKey: string,
@@ -848,6 +881,7 @@ export class SearchView {
     this.el.hidden = false;
     this.titleHint = name;
     this.lastRule = null;
+    this.lastPlaceholder = null;
     this.lastRom = { name, systemKey, scope };
     this.displayNames = null;
     this.hooks.onResults();
@@ -895,11 +929,37 @@ export class SearchView {
       this.renderItems(name, items);
       this.mountRomMediaBar(name, systemKey);
       if (items.length === 0) {
+        // An empty shelf should POINT somewhere (Dickles,
+        // 2026-10-15): the honest membership line, then a real
+        // link to the system's Internet Archive shelf, then the
+        // standing legal routes in one breath. Warm and brief.
+        const help = document.createElement("div");
+        help.className = "rom-empty-help";
         const note = document.createElement("p");
         note.className = "search-hint";
         note.textContent =
           "No verified ROMs yet. Membership comes from the No-Intro / Redump / MAME lists — a file joins only when its contents match a known game exactly.";
-        this.resultsEl.appendChild(note);
+        help.appendChild(note);
+        const pointer = document.createElement("p");
+        pointer.className = "search-hint";
+        pointer.append("Looking to fill this shelf? ");
+        const shelf = romArchiveLink(systemKey);
+        const link = document.createElement("a");
+        link.className = "guide-link";
+        link.href = shelf.url;
+        link.textContent = shelf.perSystem
+          ? `The Internet Archive keeps a ${name} collection`
+          : "The Internet Archive's Software Library";
+        link.addEventListener("click", (e) => {
+          e.preventDefault();
+          openGuideLink(shelf.url);
+        });
+        pointer.appendChild(link);
+        pointer.append(
+          " — and the classic routes never close: dump cartridges you own, homebrew, and public-domain releases are all fair game.",
+        );
+        help.appendChild(pointer);
+        this.resultsEl.appendChild(help);
       }
     } catch (err) {
       this.renderStatus(

@@ -440,6 +440,24 @@ impl Catalog {
                 );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Network Locations: the volumes table's mirror for servers.
+        // Identity is the normalized server URI (scheme://[user@]host
+        // [:port]/path — never a password); the GVfs FUSE prefixes it
+        // has been mounted at are history, never identity. Items on a
+        // server that has gone away keep their catalog rows and badge
+        // from this table exactly like unplugged drives do.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS network_locations (
+                    uri TEXT PRIMARY KEY,
+                    display_name TEXT,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    last_indexed TEXT,
+                    mount_history_json TEXT NOT NULL DEFAULT '[]'
+                );",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
         // Phase 2 (collections / stars / view profiles made real):
         // stars are path-keyed exactly like labels (path_labels) — the
         // provider_key is the identity that survives re-indexing.
@@ -2354,6 +2372,34 @@ impl Catalog {
         Ok(())
     }
 
+    /// Move a flag between lanes (question -> fact) without touching
+    /// its state — the "fix" standing rule promotes future matches
+    /// of a class Dickles already answered with Fix All Similar.
+    pub fn set_auditor_flag_lane(&self, id: &str, lane: &str, updated: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE auditor_flags SET lane = ?2, updated = ?3 WHERE id = ?1",
+                params![id, lane, updated],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Clear findings (Auditor item 13, Dickles 2026-10-15):
+    /// delete EVERY flag row, whatever its state — the findings
+    /// list starts empty and a fresh audit rebuilds it. Dismissal
+    /// memory, standing rules, taught words and run history all
+    /// SURVIVE on purpose: this is list hygiene for test/retest,
+    /// never a factory reset (the full reset lives in Preferences).
+    /// Returns how many findings were cleared, for the journal.
+    pub fn clear_auditor_flags(&self) -> Result<u64> {
+        let n = self
+            .conn
+            .execute("DELETE FROM auditor_flags", [])
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(n as u64)
+    }
+
     /// Open flags whose path is `target` itself or lives under it —
     /// the supersede candidate set when a fresh run covers a target.
     pub fn open_auditor_flags_under(&self, target: &str) -> Result<Vec<AuditorFlagRow>> {
@@ -2764,6 +2810,22 @@ pub struct VolumeRecord {
     pub mount_history: Vec<MountSighting>,
 }
 
+/// A persistent per-server record (Network Locations' Library
+/// Memory). Identity is the normalized server URI; display names and
+/// FUSE mount prefixes are observations, exactly like VolumeRecord.
+#[derive(Debug, Clone)]
+pub struct NetworkLocationRecord {
+    pub uri: String,
+    pub display_name: Option<String>,
+    /// RFC 3339: first time this server was ever observed.
+    pub first_seen: String,
+    /// RFC 3339: most recent time this server was observed MOUNTED.
+    pub last_seen: String,
+    /// RFC 3339: most recent completed index of its mount.
+    pub last_indexed: Option<String>,
+    pub mount_history: Vec<MountSighting>,
+}
+
 /// Outcome of a terminal-job slimming pass (catalog hygiene).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SlimReport {
@@ -2836,6 +2898,147 @@ impl Catalog {
             .execute(
                 "UPDATE volumes SET last_indexed = ?2, last_seen = ?3 WHERE fs_uuid = ?1",
                 params![fs_uuid, at, at],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Record that the server `uri` is mounted at FUSE prefix
+    /// `mount_prefix` at `at` (RFC 3339). Creates the record on first
+    /// sight; refreshes display name/last_seen afterwards and merges
+    /// the prefix into the history (same prefix updates its last_seen,
+    /// a new prefix is appended — identity never changes with the
+    /// mount point, exactly like volumes).
+    pub fn record_network_sighting(
+        &self,
+        uri: &str,
+        display_name: Option<&str>,
+        mount_prefix: &str,
+        at: &str,
+    ) -> Result<()> {
+        let existing = self.network_location(uri)?;
+        match existing {
+            None => {
+                let history = vec![MountSighting {
+                    path: mount_prefix.to_string(),
+                    first_seen: at.to_string(),
+                    last_seen: at.to_string(),
+                }];
+                let history_json = serde_json::to_string(&history)
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                self.conn
+                    .execute(
+                        "INSERT INTO network_locations (uri, display_name, first_seen, last_seen, last_indexed, mount_history_json)
+                         VALUES (?1, ?2, ?3, ?3, NULL, ?4)",
+                        params![uri, display_name, at, history_json],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+            }
+            Some(mut rec) => {
+                if display_name.is_some() {
+                    rec.display_name = display_name.map(|s| s.to_string());
+                }
+                rec.last_seen = at.to_string();
+                match rec.mount_history.iter_mut().find(|m| m.path == mount_prefix) {
+                    Some(m) => m.last_seen = at.to_string(),
+                    None => rec.mount_history.push(MountSighting {
+                        path: mount_prefix.to_string(),
+                        first_seen: at.to_string(),
+                        last_seen: at.to_string(),
+                    }),
+                }
+                let history_json = serde_json::to_string(&rec.mount_history)
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                self.conn
+                    .execute(
+                        "UPDATE network_locations SET display_name = ?2, last_seen = ?3, mount_history_json = ?4
+                         WHERE uri = ?1",
+                        params![uri, rec.display_name, rec.last_seen, history_json],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark a server as indexed at `at` (a completed index run over
+    /// its mount). Also refreshes last_seen — it was mounted.
+    pub fn mark_network_indexed(&self, uri: &str, at: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE network_locations SET last_indexed = ?2, last_seen = ?3 WHERE uri = ?1",
+                params![uri, at, at],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn network_location(&self, uri: &str) -> Result<Option<NetworkLocationRecord>> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT uri, display_name, first_seen, last_seen, last_indexed, mount_history_json
+                 FROM network_locations WHERE uri = ?1",
+                params![uri],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        match row {
+            None => Ok(None),
+            Some((uri, display_name, first_seen, last_seen, last_indexed, history_json)) => {
+                let mount_history: Vec<MountSighting> =
+                    serde_json::from_str(&history_json).unwrap_or_default();
+                Ok(Some(NetworkLocationRecord {
+                    uri,
+                    display_name,
+                    first_seen,
+                    last_seen,
+                    last_indexed,
+                    mount_history,
+                }))
+            }
+        }
+    }
+
+    /// Every remembered server, most recently seen first.
+    pub fn network_locations(&self) -> Result<Vec<NetworkLocationRecord>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uri FROM network_locations ORDER BY last_seen DESC")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        drop(stmt);
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(v) = self.network_location(&id)? {
+                out.push(v);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Remove a server record (Forget Server; its items must already
+    /// be purged — see `purge_items_under_prefixes`).
+    pub fn delete_network_location(&self, uri: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM network_locations WHERE uri = ?1",
+                params![uri],
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
         Ok(())
@@ -3885,6 +4088,82 @@ mod library_memory_tests {
     }
 
     #[test]
+    fn network_sightings_merge_mount_history() {
+        let cat = Catalog::open_in_memory().unwrap();
+        cat.record_network_sighting(
+            "sftp://fabletest@127.0.0.1/share",
+            Some("127.0.0.1"),
+            "/run/user/1000/gvfs/sftp:host=127.0.0.1,user=fabletest",
+            "2026-10-01T10:00:00Z",
+        )
+        .unwrap();
+        // Same mount again: history stays one entry, last_seen moves.
+        cat.record_network_sighting(
+            "sftp://fabletest@127.0.0.1/share",
+            Some("127.0.0.1"),
+            "/run/user/1000/gvfs/sftp:host=127.0.0.1,user=fabletest",
+            "2026-10-05T10:00:00Z",
+        )
+        .unwrap();
+        // Same server re-mounted under a different FUSE prefix (the
+        // gvfs dir name changed): SAME server, history grows.
+        cat.record_network_sighting(
+            "sftp://fabletest@127.0.0.1/share",
+            None,
+            "/run/user/1000/gvfs/sftp:host=127.0.0.1",
+            "2026-10-09T10:00:00Z",
+        )
+        .unwrap();
+        let v = cat.network_location("sftp://fabletest@127.0.0.1/share")
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.display_name.as_deref(), Some("127.0.0.1"));
+        assert_eq!(v.first_seen, "2026-10-01T10:00:00Z");
+        assert_eq!(v.last_seen, "2026-10-09T10:00:00Z");
+        assert_eq!(v.mount_history.len(), 2);
+        assert_eq!(v.mount_history[0].last_seen, "2026-10-05T10:00:00Z");
+        cat.mark_network_indexed(
+            "sftp://fabletest@127.0.0.1/share",
+            "2026-10-09T11:00:00Z",
+        )
+        .unwrap();
+        let v = cat.network_location("sftp://fabletest@127.0.0.1/share")
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.last_indexed.as_deref(), Some("2026-10-09T11:00:00Z"));
+        assert_eq!(cat.network_locations().unwrap().len(), 1);
+        cat.delete_network_location("sftp://fabletest@127.0.0.1/share")
+            .unwrap();
+        assert!(cat
+            .network_location("sftp://fabletest@127.0.0.1/share")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn network_locations_order_by_last_seen_desc() {
+        let cat = Catalog::open_in_memory().unwrap();
+        cat.record_network_sighting(
+            "smb://nas.local/photos",
+            Some("nas"),
+            "/run/user/1000/gvfs/smb-share:server=nas.local,share=photos",
+            "2026-10-01T10:00:00Z",
+        )
+        .unwrap();
+        cat.record_network_sighting(
+            "dav://127.0.0.1:8971/dav",
+            Some("127.0.0.1"),
+            "/run/user/1000/gvfs/dav:host=127.0.0.1,port=8971,prefix=%2Fdav",
+            "2026-10-03T10:00:00Z",
+        )
+        .unwrap();
+        let all = cat.network_locations().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].uri, "dav://127.0.0.1:8971/dav");
+        assert_eq!(all[1].uri, "smb://nas.local/photos");
+    }
+
+    #[test]
     fn manifest_and_prefix_purge() {
         let cat = Catalog::open_in_memory().unwrap();
         let (id, location) = loc();
@@ -4246,5 +4525,46 @@ mod phase2_tests {
         assert_eq!(cat.auditor_hash("/x/a.bin", 10, "m1").unwrap().as_deref(), Some("abc123"));
         assert!(cat.auditor_hash("/x/a.bin", 11, "m1").unwrap().is_none());
         assert!(cat.auditor_hash("/x/a.bin", 10, "m2").unwrap().is_none());
+    }
+
+    #[test]
+    fn auditor_clear_findings_wipes_flags_keeps_memory() {
+        // Item 13: Clear findings empties the findings list ONLY —
+        // dismissal memory and standing rules provably survive.
+        let cat = Catalog::open_in_memory().unwrap();
+        let flag = |id: &str, state: &str| AuditorFlagRow {
+            id: id.into(),
+            run_id: "run-1".into(),
+            path: format!("/data/{id}.txt"),
+            family: "typo".into(),
+            lane: "question".into(),
+            class_key: "typo:richrd".into(),
+            title: "t".into(),
+            detail: "d".into(),
+            proposal_json: None,
+            state: state.into(),
+            created: "2026-10-15T03:01:00".into(),
+            updated: "2026-10-15T03:01:00".into(),
+        };
+        cat.insert_auditor_flag(&flag("f1", "open")).unwrap();
+        cat.insert_auditor_flag(&flag("f2", "open")).unwrap();
+        cat.insert_auditor_flag(&flag("f3", "dismissed")).unwrap();
+        cat.add_auditor_dismissal("/data/keep.txt", "typo", "2026-10-15T03:00:00").unwrap();
+        cat.set_auditor_rule("typo:richrd", "fix", "2026-10-15T03:00:00").unwrap();
+        cat.add_auditor_user_word("garrison", "2026-10-15T03:00:00").unwrap();
+        // The clear reports its count (the journal entry's number)
+        // and wipes every state of flag.
+        assert_eq!(cat.clear_auditor_flags().unwrap(), 3);
+        assert_eq!(cat.auditor_flags(None, 10).unwrap().len(), 0);
+        assert_eq!(cat.auditor_open_flag_count().unwrap(), 0);
+        // Memory survives intact.
+        assert!(cat.auditor_is_dismissed("/data/keep.txt", "typo").unwrap());
+        assert_eq!(
+            cat.auditor_rule("typo:richrd").unwrap().as_deref(),
+            Some("fix")
+        );
+        assert_eq!(cat.auditor_user_words().unwrap(), vec!["garrison".to_string()]);
+        // Clearing an already-empty list is a reported no-op.
+        assert_eq!(cat.clear_auditor_flags().unwrap(), 0);
     }
 }

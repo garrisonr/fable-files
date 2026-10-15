@@ -21,6 +21,7 @@ import {
   type RomMediaSystemReport,
 } from "./api";
 import { Toast, errText } from "./toast";
+import { guidanceNote } from "./guidelinks";
 
 export interface RomMediaHooks {
   pickFolder(initial: string | null): Promise<string | null>;
@@ -167,7 +168,7 @@ export class RomMediaSection {
         "thegamesdb",
         "TheGamesDB",
         view.secretPresent["thegamesdb"] ?? false,
-        "A second opinion for box art and screenshots. Keys are free but human-issued: ask on the TheGamesDB forums (Developers → API key requests) — it can take a little while — then paste the key here. It comes with a monthly request budget, and Fable shows it as it spends.",
+        "A second opinion for box art and screenshots. Keys are free but human-issued: ask on the [TheGamesDB forums](https://api.thegamesdb.net/key.php) (Developers → API key requests) — it can take a little while — then paste the key here. It comes with a monthly request budget, and Fable shows it as it spends.",
         "Paste API key",
       ),
     );
@@ -176,7 +177,7 @@ export class RomMediaSection {
         "steamgriddb",
         "SteamGridDB",
         view.secretPresent["steamgriddb"] ?? false,
-        "Extra-pretty poster art for games the other sources miss. Free account at steamgriddb.com → your profile → Preferences → API → create a key, then paste it here.",
+        "Extra-pretty poster art for games the other sources miss. Free account at [steamgriddb.com](https://www.steamgriddb.com) → your profile → Preferences → API → create a key, then paste it here.",
         "Paste API key",
       ),
     );
@@ -398,7 +399,7 @@ export class RomMediaSection {
           : "Not connected",
     );
     outer.appendChild(status);
-    outer.appendChild(el("p", "prefs-note", opts.teacher));
+    outer.appendChild(guidanceNote(opts.teacher));
     const { wrap, user, pass } = this.credentialFields(
       opts.userPlaceholder,
       "Password",
@@ -477,7 +478,7 @@ export class RomMediaSection {
       connectedUser: s.screenscraperUser,
       hasSecret: view.secretPresent["screenscraper"] ?? false,
       teacher:
-        "The deep well: 3D boxes, logos, manuals, video clips — and it finds games by their fingerprint (the same hashes Fable already computed), so the Japanese box lands on the Japanese game. A free account lifts you past the anonymous slow lane: one thread and busy-hour refusals become a roomy daily allowance. No account yet? It is free — screenscraper.fr → create an account → come back with the name and password. One honest wrinkle: ScreenScraper also asks each app to identify itself with developer credentials; Fable's own registration is in progress, and until it lands this source can only switch on with developer credentials of your own (free to request on their site) — pasted under Advanced. Nothing else on this page waits for that.",
+        "The deep well: 3D boxes, logos, manuals, video clips — and it finds games by their fingerprint (the same hashes Fable already computed), so the Japanese box lands on the Japanese game. A free account lifts you past the anonymous slow lane: one thread and busy-hour refusals become a roomy daily allowance. No account yet? It is free — [screenscraper.fr](https://www.screenscraper.fr/membreinscription.php) → create an account → come back with the name and password. One honest wrinkle: ScreenScraper also asks each app to identify itself with developer credentials; Fable's own registration is in progress, and until it lands this source can only switch on with developer credentials of your own (free to request on their site) — pasted under Advanced. Nothing else on this page waits for that.",
       userPlaceholder: "ScreenScraper user name",
       onConnectedUser: (u) => {
         s.screenscraperUser = u;
@@ -532,7 +533,7 @@ export class RomMediaSection {
       connectedUser: s.emumoviesUser,
       hasSecret: view.secretPresent["emumovies"] ?? false,
       teacher:
-        "The trailer library — the deepest collection of game videos in the hobby, in small, standard and HD sizes. You sign in with the name on your EmuMovies account. Free accounts browse the website; paid membership opens the file server Fable connects to, with full-quality video and no download limits — Connect will tell you honestly which door your account opens.",
+        "The trailer library — the deepest collection of game videos in the hobby, in small, standard and HD sizes. You sign in with the name on your EmuMovies account. Free accounts browse the website; [paid membership](https://emumovies.com/subscriptions/) opens the file server Fable connects to, with full-quality video and no download limits — Connect will tell you honestly which door your account opens.",
       userPlaceholder: "EmuMovies user name",
       onConnectedUser: (u) => {
         s.emumoviesUser = u;
@@ -551,7 +552,7 @@ export class RomMediaSection {
     outer.appendChild(el("h5", "rm-source-name", name));
     const status = this.statusLine(hasSecret ? "Key saved" : "Not connected");
     outer.appendChild(status);
-    outer.appendChild(el("p", "prefs-note", teacher));
+    outer.appendChild(guidanceNote(teacher));
     const row = el("div", "rm-cred-row");
     const input = document.createElement("input");
     input.type = "password";

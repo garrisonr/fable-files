@@ -21,6 +21,7 @@ import {
   type McStatus,
 } from "./api";
 import { Toast, errText } from "./toast";
+import { wireGuideLinks } from "./guidelinks";
 
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -180,8 +181,9 @@ export class MediaCompleteSection {
     block.appendChild(p1);
     const p2 = document.createElement("p");
     p2.innerHTML =
-      "To set it up: 1. Create a free account at <span class=\"mr-mono\">opensubtitles.com</span>. 2. Open <span class=\"mr-mono\">Profile → API</span> (the API consumers page) and create a consumer — any name works, e.g. “Fable Files” — and copy its API key. 3. Paste the API key below, plus the username and password you log in with (the login is what spends your account's allowance instead of the tiny anonymous one). All three live only in your system keyring — never in a settings file, a job, or a log.";
+      "To set it up: 1. Create a free account at <a class=\"guide-link mr-mono\" href=\"https://www.opensubtitles.com/en/users/sign_up\">opensubtitles.com</a>. 2. Open <a class=\"guide-link mr-mono\" href=\"https://www.opensubtitles.com/en/consumers\">Profile → API</a> (the API consumers page) and create a consumer — any name works, e.g. “Fable Files” — and copy its API key. 3. Paste the API key below, plus the username and password you log in with (the login is what spends your account's allowance instead of the tiny anonymous one). All three live only in your system keyring — never in a settings file, a job, or a log.";
     block.appendChild(p2);
+    wireGuideLinks(block);
     const creds = st.opensubs;
     const statusLine = el(
       "p",

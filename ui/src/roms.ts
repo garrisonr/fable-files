@@ -5,9 +5,19 @@
 // be deactivated from the hamburger menu. Storage mirrors labels/smart
 // folders: localStorage, seeded once, deletions stick.
 
+/** System kind. "standard" systems gather files (by ROM-list hash
+ * identification, or by extension when no list governs them).
+ * "placeholder" systems (Dickles, 2026-10-15: Xbox Series, Switch 2)
+ * hold a shelf for a system whose emulator cores and verified game
+ * lists don't exist yet: they appear in the sidebar like any system
+ * but gather NOTHING, promise NO identification, and stay out of the
+ * DAT / get-missing-media machinery entirely. Absent = standard. */
+export type RomSystemKind = "standard" | "placeholder";
+
 export interface RomSystem {
   name: string;
   extensions: string[];
+  kind?: RomSystemKind;
   /** Collection scope (Dickles 2026-10-14): which drives this
    * collection draws from. Absent = all drives. Persisted with the
    * system definition. Drive entries are location ids as the app
@@ -96,6 +106,12 @@ export function romSystemKey(sys: RomSystem): string | null {
   return ROM_SYSTEM_KEYS[sys.name] ?? null;
 }
 
+/** Placeholder systems make no identification promises — every
+ * surface (collection view, media fetch, editor) checks this. */
+export function isRomPlaceholder(sys: RomSystem): boolean {
+  return sys.kind === "placeholder";
+}
+
 /** The system's scope as a backend RomScope (default: all drives). */
 export function romScopeOf(sys: RomSystem): {
   mode: "all" | "boot" | "drives";
@@ -159,6 +175,7 @@ export const ROM_SYSTEM_META: Record<string, RomSystemMeta> = {
   "Nintendo 64": { maker: "Nintendo", gen: 5 },
   "Nintendo DS": { maker: "Nintendo", gen: 7 },
   "Nintendo Switch": { maker: "Nintendo", gen: 8 },
+  "Switch 2": { maker: "Nintendo", gen: 9 },
   "Odyssey²": { maker: "Magnavox", gen: 2 },
   "PC-FX": { maker: "NEC", gen: 5 },
   "PlayStation": { maker: "Sony", gen: 5 },
@@ -186,6 +203,7 @@ export const ROM_SYSTEM_META: Record<string, RomSystemMeta> = {
   "Wii U": { maker: "Nintendo", gen: 8 },
   "WonderSwan": { maker: "Bandai", gen: 5 },
   "Xbox": { maker: "Microsoft", gen: 6 },
+  "Xbox Series": { maker: "Microsoft", gen: 9 },
   "Xbox 360": { maker: "Microsoft", gen: 7 },
   "ZX Spectrum": { maker: "Sinclair", gen: 2 },
 };
@@ -350,6 +368,7 @@ const STORE_KEY = "ff-rom-systems";
 const SEED_FLAG = "ff-roms-v1";
 const SEED_FLAG_V2 = "ff-roms-v2";
 const SEED_FLAG_V3 = "ff-roms-v3";
+const SEED_FLAG_V4 = "ff-roms-v4";
 const ENABLED_KEY = "ff-roms-enabled";
 
 /** Round 7.1 additions (Dickles): modern consoles + arcade. Applied as a
@@ -400,7 +419,25 @@ export const ROM_NEW_SYSTEMS: Array<{ name: string; extensions: string[] }> = [
   { name: "VIC-20", extensions: ["prg", "crt", "tap", "d64"] },
 ];
 
+/** Placeholder systems (Dickles, 2026-10-15): 9th-generation
+ * shelves for machines with no emulator core and no verified game
+ * list yet. No extensions — a placeholder gathers nothing, by
+ * design. Existing installs gain them via the one-time v4 merge. */
+export const ROM_PLACEHOLDER_SYSTEMS: Array<{
+  name: string;
+  extensions: string[];
+  kind: RomSystemKind;
+}> = [
+  { name: "Xbox Series", extensions: [], kind: "placeholder" },
+  { name: "Switch 2", extensions: [], kind: "placeholder" },
+];
+
 export const ROM_SEED: RomSystem[] = [
+  ...ROM_PLACEHOLDER_SYSTEMS.map((s) => ({
+    name: s.name,
+    extensions: [...s.extensions],
+    kind: s.kind,
+  })),
   { name: "3DO", extensions: ["iso", "cue"] },
   { name: "Amiga", extensions: ["adf", "ipf", "lha"] },
   { name: "Arcade (MAME)", extensions: ["zip"] },
@@ -465,7 +502,11 @@ export function loadRomSystems(): RomSystem[] {
   if (!seeded) {
     for (const d of ROM_SEED) {
       if (!list.some((s) => s.name === d.name)) {
-        list.push({ name: d.name, extensions: [...d.extensions] });
+        list.push({
+          name: d.name,
+          extensions: [...d.extensions],
+          ...(d.kind ? { kind: d.kind } : {}),
+        });
       }
     }
     list.sort((a, b) => a.name.localeCompare(b.name));
@@ -518,6 +559,29 @@ export function loadRomSystems(): RomSystem[] {
     }
     try { localStorage.setItem(SEED_FLAG_V3, "1"); } catch { /* ignore */ }
   }
+  // Placeholder pass (2026-10-15): one-time additive merge of the
+  // placeholder systems (Xbox Series, Switch 2). Runs exactly once
+  // per install; a placeholder the user later deletes stays gone.
+  let mergedV4 = false;
+  try { mergedV4 = !!localStorage.getItem(SEED_FLAG_V4); } catch { mergedV4 = true; }
+  if (!mergedV4) {
+    let changed = false;
+    for (const d of ROM_PLACEHOLDER_SYSTEMS) {
+      if (!list.some((s) => s.name === d.name)) {
+        list.push({
+          name: d.name,
+          extensions: [...d.extensions],
+          kind: d.kind,
+        });
+        changed = true;
+      }
+    }
+    if (changed) {
+      list.sort((a, b) => a.name.localeCompare(b.name));
+      saveRomSystems(list);
+    }
+    try { localStorage.setItem(SEED_FLAG_V4, "1"); } catch { /* ignore */ }
+  }
   return list;
 }
 
@@ -543,4 +607,48 @@ export function setRomsEnabled(on: boolean): void {
   } catch {
     // storage unavailable
   }
+}
+
+/** Internet Archive destinations for the empty-system pointer
+ * (Dickles, 2026-10-15: an empty shelf should POINT somewhere).
+ * Verified 2026-10-15 against archive.org's own metadata service —
+ * every identifier below is a live collection carrying that
+ * system's library ("Software Library: NES", "…: Sega Game Gear",
+ * and so on). The /details/ pages bot-wall scripted fetchers, so
+ * the metadata service is the verification of record; systems
+ * without a collection of their own fall back to the general
+ * Software Library, which loads everywhere. */
+export const ROM_ARCHIVE_GENERAL =
+  "https://archive.org/details/softwarelibrary";
+
+const ROM_ARCHIVE_LINKS: Record<string, string> = {
+  amiga: "https://archive.org/details/softwarelibrary_amiga",
+  arcade: "https://archive.org/details/softwarelibrary_arcade",
+  atari2600: "https://archive.org/details/softwarelibrary_atari2600",
+  atari7800: "https://archive.org/details/softwarelibrary_atari7800",
+  atari8bit: "https://archive.org/details/softwarelibrary_atari800",
+  lynx: "https://archive.org/details/softwarelibrary_lynx",
+  c64: "https://archive.org/details/softwarelibrary_c64",
+  gb: "https://archive.org/details/softwarelibrary_gameboy",
+  gbc: "https://archive.org/details/softwarelibrary_gameboy",
+  gamegear: "https://archive.org/details/softwarelibrary_gamegear",
+  genesis: "https://archive.org/details/softwarelibrary_genesis",
+  mastersystem: "https://archive.org/details/softwarelibrary_sms",
+  nes: "https://archive.org/details/softwarelibrary_nes",
+  snes: "https://archive.org/details/softwarelibrary_snes",
+  tg16: "https://archive.org/details/softwarelibrary_turbografx",
+  jaguar: "https://archive.org/details/softwarelibrary_jaguar",
+  zxspectrum: "https://archive.org/details/softwarelibrary_zx_spectrum",
+};
+
+/** The archive.org shelf for a system key — its own collection
+ * where one exists, the general Software Library otherwise. */
+export function romArchiveLink(systemKey: string): {
+  url: string;
+  perSystem: boolean;
+} {
+  const url = ROM_ARCHIVE_LINKS[systemKey];
+  return url
+    ? { url, perSystem: true }
+    : { url: ROM_ARCHIVE_GENERAL, perSystem: false };
 }

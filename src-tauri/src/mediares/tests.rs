@@ -252,3 +252,36 @@ fn expand_inputs_walks_directories() {
     assert_eq!(files.len(), 1);
     assert!(files[0].ends_with("Show.S01E01.mkv"));
 }
+
+/// Manual on-box persistence proof (2026-10-15 keyring incident):
+/// run THREE separate times — three separate processes — against
+/// Dickles' real keyring, with his session bus in the environment:
+///   FABLE_KEYRING_PROOF=set   cargo test --release keyring_persistence_proof -- --ignored
+///   FABLE_KEYRING_PROOF=get   (same command)
+///   FABLE_KEYRING_PROOF=clear (same command)
+/// `get` passing in a NEW process is the proof the value truly
+/// persisted in the OS keyring (the mock store could never do it).
+/// The throwaway value occupies the mediares/tmdb slot only between
+/// set and clear; no real key has ever been stored there.
+#[test]
+#[ignore = "manual proof: three separate invocations, FABLE_KEYRING_PROOF=set|get|clear"]
+fn keyring_persistence_proof() {
+    const PROOF_VALUE: &str = "throwaway-proof-value";
+    match std::env::var("FABLE_KEYRING_PROOF").as_deref() {
+        Ok("set") => {
+            tmdb_key_set(Some(PROOF_VALUE)).expect("proof set must succeed");
+        }
+        Ok("get") => {
+            assert_eq!(
+                tmdb_key_get().as_deref(),
+                Some(PROOF_VALUE),
+                "a fresh process must read what an earlier process saved"
+            );
+        }
+        Ok("clear") => {
+            tmdb_key_set(None).expect("proof clear must succeed");
+            assert!(tmdb_key_get().is_none(), "cleared means cleared");
+        }
+        _ => panic!("set FABLE_KEYRING_PROOF to set, get, or clear"),
+    }
+}
