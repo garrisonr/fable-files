@@ -652,3 +652,73 @@ export function romArchiveLink(systemKey: string): {
     ? { url, perSystem: true }
     : { url: ROM_ARCHIVE_GENERAL, perSystem: false };
 }
+
+// ---------------------------------------------------------------------------
+// ROM SYSTEM ICON SETS (Dickles, 2026-10-15 — DESIGN.md "ROM SYSTEM ICON
+// SETS"): every built-in system gets a per-system icon in THREE complete
+// sets — "art" (full-color 3D art), "photo" (photorealistic) and "flat"
+// (hand-authored outline SVG, theme-tinted). The chooser lives in
+// Preferences ▸ Sidebar; the sidebar honors it immediately. Raster sets
+// ship as 192px WebP under /rom-icons/<set>/<slug>.webp; a system whose
+// icon is missing from the chosen set degrades per-system to the next
+// completed set (photo → art → flat), never to a placeholder glyph.
+// Custom (user-created) systems have no slug and keep the 🎮 glyph.
+// ---------------------------------------------------------------------------
+
+export type RomIconSet = "art" | "photo" | "flat";
+
+export const ROM_ICON_SET_INFO: { id: RomIconSet; label: string; blurb: string }[] = [
+  { id: "art", label: "3D Art", blurb: "Full-color 3D artwork of each console" },
+  { id: "photo", label: "Photorealistic", blurb: "Studio photographs of the real hardware" },
+  { id: "flat", label: "Flat Outline", blurb: "Single-color outlines that follow your theme" },
+];
+
+/** Built-in system name → icon slug. "Arcade" serves both Arcade names. */
+export const ROM_ICON_SLUGS: Record<string, string> = {
+  "3DO": "3do", "APF-MP1000": "apf-mp1000", "Amiga": "amiga", "Amiga CD32": "amiga-cd32",
+  "Arcade": "arcade", "Arcade (MAME)": "arcade", "Arcadia 2001": "arcadia-2001",
+  "Atari 2600": "atari-2600", "Atari 5200": "atari-5200", "Atari 7800": "atari-7800",
+  "Atari 8-Bit": "atari-8bit", "Atari Lynx": "atari-lynx", "Bally Astrocade": "bally-astrocade",
+  "CD-i": "cd-i", "Channel F": "channel-f", "ColecoVision": "colecovision",
+  "Commodore 64": "commodore-64", "Dreamcast": "dreamcast", "FM Towns": "fm-towns",
+  "GX4000": "gx4000", "Game Boy": "game-boy", "Game Boy Advance": "game-boy-advance",
+  "Game Boy Color": "game-boy-color", "Game Gear": "game-gear", "Game.com": "game-com",
+  "GameCube": "gamecube", "Genesis": "genesis", "Intellivision": "intellivision",
+  "Jaguar": "jaguar", "MSX": "msx", "Master System": "master-system", "NES": "nes",
+  "Neo Geo": "neo-geo", "Neo Geo CD": "neo-geo-cd", "Neo Geo Pocket": "neo-geo-pocket",
+  "Nintendo 3DS": "nintendo-3ds", "Nintendo 64": "nintendo-64", "Nintendo DS": "nintendo-ds",
+  "Nintendo Switch": "nintendo-switch", "Odyssey²": "odyssey2", "PC-FX": "pc-fx",
+  "PS Vita": "ps-vita", "PSP": "psp", "PV-1000": "pv-1000", "PlayStation": "playstation",
+  "PlayStation 2": "playstation-2", "PlayStation 3": "playstation-3",
+  "PlayStation 4": "playstation-4", "PlayStation 5": "playstation-5", "Playdia": "playdia",
+  "SG-1000": "sg-1000", "SNES": "snes", "Saturn": "saturn", "Sega 32X": "sega-32x",
+  "Sega CD": "sega-cd", "Studio II": "studio-ii", "Super A'can": "super-acan",
+  "Super Cassette Vision": "super-cassette-vision", "Switch 2": "switch-2",
+  "TurboGrafx-16": "turbografx-16", "VIC-20": "vic-20", "Vectrex": "vectrex",
+  "Virtual Boy": "virtual-boy", "Wii": "wii", "Wii U": "wii-u", "WonderSwan": "wonderswan",
+  "Xbox": "xbox", "Xbox 360": "xbox-360", "Xbox Series": "xbox-series",
+  "ZX Spectrum": "zx-spectrum",
+};
+
+export function romIconSlug(sysName: string): string | null {
+  return ROM_ICON_SLUGS[sysName] ?? null;
+}
+
+const ROM_ICON_SET_KEY = "ff-rom-icon-set";
+
+export function loadRomIconSet(): RomIconSet {
+  try {
+    const v = localStorage.getItem(ROM_ICON_SET_KEY);
+    return v === "photo" || v === "flat" ? v : "art";
+  } catch {
+    return "art";
+  }
+}
+
+export function saveRomIconSet(set: RomIconSet): void {
+  try {
+    localStorage.setItem(ROM_ICON_SET_KEY, set);
+  } catch {
+    /* storage unavailable — the chooser still applies for this session */
+  }
+}

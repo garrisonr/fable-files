@@ -13,6 +13,7 @@
 import type { ThemeInfo } from "./api";
 import { DISTRO_ENGINES } from "./themes";
 import { RomMediaSection } from "./rommedia";
+import { ROM_ICON_SET_INFO, type RomIconSet } from "./roms";
 import { MediaResSection } from "./mediares";
 import { MediaCompleteSection } from "./mediacomplete";
 import { LibraryMemorySection } from "./library";
@@ -35,6 +36,8 @@ export interface PreferencesHooks {
   stepIconSize(dir: 1 | -1): void;
   romsOn(): boolean;
   setRomsOn(on: boolean): void;
+  romIconSet(): RomIconSet;
+  setRomIconSet(set: RomIconSet): void;
   /** Folder chooser for the Game Media section (the shell's picker). */
   pickFolder(initial: string | null): Promise<string | null>;
   /** Library Memory: rebuild one connected volume's index from
@@ -134,6 +137,41 @@ export class PreferencesDialog {
     scopeNote.textContent =
       "ROM collection scope — which drives a system draws from — is set per system in the Roms system editor (sidebar ▸ Roms).";
     dialog.appendChild(scopeNote);
+
+    // ROM icon set chooser (Dickles, 2026-10-15): three complete sets —
+    // 3D art, photorealistic, flat outline. Applies to the sidebar the
+    // moment it's picked; the choice persists across launches.
+    const iconSetNote = document.createElement("p");
+    iconSetNote.className = "prefs-note";
+    iconSetNote.textContent =
+      "Icon set \u2014 how each game system is pictured in the sidebar. Every system has its own icon in every set.";
+    dialog.appendChild(iconSetNote);
+    const picker = document.createElement("div");
+    picker.className = "icon-set-picker";
+    const pickerBtns: HTMLButtonElement[] = [];
+    for (const info of ROM_ICON_SET_INFO) {
+      const btn = document.createElement("button");
+      btn.className = "icon-set-btn";
+      btn.dataset.set = info.id;
+      const strong = document.createElement("strong");
+      strong.textContent = info.label;
+      const blurb = document.createElement("span");
+      blurb.textContent = info.blurb;
+      btn.appendChild(strong);
+      btn.appendChild(blurb);
+      btn.addEventListener("click", () => {
+        hooks.setRomIconSet(info.id);
+        for (const b of pickerBtns) {
+          b.setAttribute("aria-pressed", b.dataset.set === info.id ? "true" : "false");
+        }
+      });
+      pickerBtns.push(btn);
+      picker.appendChild(btn);
+    }
+    for (const b of pickerBtns) {
+      b.setAttribute("aria-pressed", b.dataset.set === hooks.romIconSet() ? "true" : "false");
+    }
+    dialog.appendChild(picker);
 
     // Game Media (ROM media enrichment): its own section, mounted
     // async — it reads its settings + keyring state from the backend.

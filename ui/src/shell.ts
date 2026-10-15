@@ -33,7 +33,8 @@ import { FolderPicker, type PickerShortcut } from "./picker";
 import { RenameDialog } from "./rename";
 import { LabelManager, saveLabelRules } from "./labels";
 import { loadLabelDefs, migrateLabelAssignments, saveLabelDefs } from "./labels";
-import { loadRomSystems, saveRomSystems, romsEnabled, romScopeOf, romSystemKey, isRomPlaceholder, setRomsEnabled, romDivisions, loadRomGrouping, saveRomGrouping, loadOpenDivisions, saveOpenDivisions, type RomSystem, type OwnedHardware } from "./roms";
+import { loadRomSystems, saveRomSystems, romsEnabled, romScopeOf, romSystemKey, isRomPlaceholder, setRomsEnabled, romDivisions, loadRomGrouping, saveRomGrouping, loadOpenDivisions, saveOpenDivisions, romIconSlug, loadRomIconSet, saveRomIconSet, type RomSystem, type OwnedHardware } from "./roms";
+import { ROM_FLAT_ICONS } from "./romicons_flat";
 import { MusicPlayer } from "./music";
 import { isPlayableName, isVideoName } from "./video";
 import { OpenWithDialog } from "./openwith";
@@ -4204,6 +4205,11 @@ export class Shell {
         setRomsEnabled(on);
         void this.buildSidebar();
       },
+      romIconSet: () => loadRomIconSet(),
+      setRomIconSet: (set) => {
+        saveRomIconSet(set);
+        this.renderRomsSection();
+      },
       sectionCollapsed: (key) =>
         this.prefCollapsed(key, key === "ff-roms-collapsed"),
       setSectionCollapsed: (key, collapsed) => {
@@ -4595,13 +4601,65 @@ export class Shell {
     }
   }
 
+  /** The per-system icon for a sidebar ROM row, in the set chosen in
+   * Preferences (Dickles' ROM icon sets, 2026-10-15). Raster sets load
+   * /rom-icons/<set>/<slug>.webp; a miss degrades per-system through
+   * photo \u2192 art \u2192 the flat outline \u2192 the old \uD83C\uDFAE glyph
+   * (which is also what custom, user-created systems keep). */
+  private romIconEl(sys: RomSystem): HTMLElement {
+    const wrap = document.createElement("span");
+    wrap.className = "rom-sys-icon";
+    wrap.setAttribute("aria-hidden", "true");
+    const slug = romIconSlug(sys.name);
+    if (!slug) {
+      wrap.textContent = "\uD83C\uDFAE";
+      return wrap;
+    }
+    const flat = (): void => {
+      const svg = ROM_FLAT_ICONS[slug];
+      if (svg) {
+        wrap.innerHTML = svg;
+      } else {
+        wrap.textContent = "\uD83C\uDFAE";
+      }
+    };
+    const chosen = loadRomIconSet();
+    if (chosen === "flat") {
+      flat();
+      return wrap;
+    }
+    const chain: string[] = [];
+    for (const set of [chosen, "photo", "art"]) {
+      if (!chain.includes(set)) chain.push(set);
+    }
+    const img = document.createElement("img");
+    img.alt = "";
+    img.draggable = false;
+    let i = 0;
+    img.addEventListener("error", () => {
+      i += 1;
+      if (i < chain.length) {
+        img.src = `/rom-icons/${chain[i]}/${slug}.webp`;
+      } else {
+        img.remove();
+        flat();
+      }
+    });
+    img.src = `/rom-icons/${chain[0]}/${slug}.webp`;
+    wrap.appendChild(img);
+    return wrap;
+  }
+
   /** One system's sidebar row (click = run its collection; right
    * click = manage/delete). Behavior unchanged from the flat list —
    * only the grouping around it is new. */
   private romSystemButton(sys: RomSystem): HTMLButtonElement {
     const b = document.createElement("button");
-    b.className = "side-item";
-    b.textContent = "\uD83C\uDFAE " + sys.name;
+    b.className = "side-item side-item-rom";
+    b.appendChild(this.romIconEl(sys));
+    const label = document.createElement("span");
+    label.textContent = sys.name;
+    b.appendChild(label);
     const key = romSystemKey(sys);
     b.title = isRomPlaceholder(sys)
       ? "A placeholder for what's coming — no emulator core or verified game list for this system yet"
