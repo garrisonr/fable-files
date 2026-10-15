@@ -1,0 +1,30 @@
+{
+ "art/virtual-boy.webp": {
+  "bg_frac": 0.704,
+  "ring_frac": 0.06,
+  "fg_frac": 0.237,
+  "seed_frac": 0.183,
+  "params": {}
+ },
+ "photo/neo-geo-cd.webp": {
+  "bg_frac": 0.584,
+  "ring_frac": 0.037,
+  "fg_frac": 0.379,
+  "seed_frac": 0.188,
+  "params": {}
+ },
+ "photo/pc-fx.webp": {
+  "bg_frac": 0.891,
+  "ring_frac": 0.037,
+  "fg_frac": 0.072,
+  "seed_frac": 0.194,
+  "params": {}
+ },
+ "photo/virtual-boy.webp": {
+  "bg_frac": 0.726,
+  "ring_frac": 0.057,
+  "fg_frac": 0.217,
+  "seed_frac": 0.194,
+  "params": {}
+ }
+}
