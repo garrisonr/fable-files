@@ -2197,8 +2197,18 @@ impl Catalog {
 
     /// A file or folder was renamed/moved inside Fable: carry its
     /// stars and collection memberships to the new path. Prefix-aware:
-    /// descendants of a renamed folder follow. (Labels deliberately
+    /// descendants of a renamed folder follow. (Path labels deliberately
     /// keep their existing behavior — this serves the Phase 2 stores.)
+    ///
+    /// The item row itself follows too, in place: same id, new
+    /// provider_key (and name, for a rename). Everything keyed by item
+    /// id — media identities, item labels — rides along untouched.
+    /// Before this, a moved item kept its old path until the next
+    /// re-walk deleted the row as unseen, and the media identity the
+    /// user had confirmed died with it via ON DELETE CASCADE (the
+    /// 2026-10-16 Border incident: Organize for media servers moved a
+    /// confirmed film; its preview kept resolving the dead old path,
+    /// then the reconcile destroyed the match).
     pub fn rekey_path(&self, old: &str, new: &str) -> Result<()> {
         if old == new {
             return Ok(());
@@ -2225,6 +2235,110 @@ impl Catalog {
                     params![new, prefix_len, prefix_len, old_prefix],
                 )
                 .map_err(|e| UfmError::Database(e.to_string()))?;
+        }
+        self.rekey_item_row(old, new)?;
+        // Descendants of a moved folder follow, exactly like the
+        // stores above: provider_keys are re-prefixed, ids (and so
+        // identities) stay put, names don't change so the FTS index
+        // needs no work.
+        self.conn
+            .execute(
+                "UPDATE items SET provider_key = ?1 || substr(provider_key, ?2)
+                 WHERE substr(provider_key, 1, ?3) = ?4",
+                params![new, prefix_len, prefix_len, old_prefix],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Carry the item row at `old` to `new` (see rekey_path). If a
+    /// row already exists at `new` — a re-walk minted it before the
+    /// follow ran — the survivor keeps its id: hand it this row's
+    /// media identity and item labels where it has none, then retire
+    /// this row the way delete_unseen does (FTS entry first).
+    fn rekey_item_row(&self, old: &str, new: &str) -> Result<()> {
+        use rusqlite::OptionalExtension;
+        let old_row: Option<(String, i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, rowid, name FROM items WHERE provider_key = ?1 LIMIT 1",
+                params![old],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let Some((old_id, old_rowid, old_name)) = old_row else {
+            return Ok(());
+        };
+        let survivor: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM items WHERE provider_key = ?1 LIMIT 1",
+                params![new],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        match survivor {
+            Some(new_id) if new_id != old_id => {
+                // A destination identity, if one exists, wins; the
+                // moved one fills a gap, never overwrites.
+                self.conn
+                    .execute(
+                        "INSERT OR IGNORE INTO media_identities
+                         (item_id, media_kind, title, year, tmdb_id, platform,
+                          sha1, match_evidence_json, season, episode,
+                          episode_end, confidence, confirmed)
+                         SELECT ?1, media_kind, title, year, tmdb_id, platform,
+                                sha1, match_evidence_json, season, episode,
+                                episode_end, confidence, confirmed
+                         FROM media_identities WHERE item_id = ?2",
+                        params![new_id, old_id],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                self.conn
+                    .execute(
+                        "INSERT OR IGNORE INTO labels (item_id, label)
+                         SELECT ?1, label FROM labels WHERE item_id = ?2",
+                        params![new_id, old_id],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                self.conn
+                    .execute(
+                        "INSERT INTO items_fts (items_fts, rowid, name) VALUES ('delete', ?1, ?2)",
+                        params![old_rowid, old_name],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                self.conn
+                    .execute("DELETE FROM items WHERE id = ?1", params![old_id])
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+            }
+            _ => {
+                let new_name = std::path::Path::new(new)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| new.to_string());
+                self.conn
+                    .execute(
+                        "UPDATE items SET provider_key = ?2, name = ?3 WHERE id = ?1",
+                        params![old_id, new, new_name],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                if new_name != old_name {
+                    self.conn
+                        .execute(
+                            "INSERT INTO items_fts (items_fts, rowid, name) VALUES ('delete', ?1, ?2)",
+                            params![old_rowid, old_name],
+                        )
+                        .map_err(|e| UfmError::Database(e.to_string()))?;
+                    self.conn
+                        .execute(
+                            "INSERT OR REPLACE INTO items_fts (rowid, name) VALUES (?1, ?2)",
+                            params![old_rowid, new_name],
+                        )
+                        .map_err(|e| UfmError::Database(e.to_string()))?;
+                }
+            }
         }
         Ok(())
     }
@@ -6429,6 +6543,122 @@ mod phase2_tests {
             cat.collection_member_keys(&id).unwrap(),
             vec!["/papers/beta.txt".to_string()]
         );
+    }
+
+    #[test]
+    fn rekey_carries_item_row_and_its_identity() {
+        // The Border incident (2026-10-16): Organize moved a
+        // confirmed film and the catalog row stayed behind at the
+        // dead path — then delete_unseen + ON DELETE CASCADE took
+        // the user's confirmed match with it. The item row must
+        // follow the file, id (and identity) intact.
+        let (cat, _loc, a, _b) = seeded();
+        cat.upsert_video_identity(
+            &a.id,
+            "movie",
+            Some("Border"),
+            Some(2018),
+            Some(517839),
+            None,
+            None,
+            None,
+            Some(1.0),
+            true,
+            "{\"source\":\"user-confirm\"}",
+        )
+        .unwrap();
+        cat.rekey_path(
+            "/docs/alpha.txt",
+            "/docs/Border (2018)/Border (2018).txt",
+        )
+        .unwrap();
+        assert!(cat.item_by_provider_key("/docs/alpha.txt").unwrap().is_none());
+        let moved = cat
+            .item_by_provider_key("/docs/Border (2018)/Border (2018).txt")
+            .unwrap()
+            .expect("item row followed the move");
+        assert_eq!(moved.id, a.id, "same item id at the new path");
+        assert_eq!(moved.name, "Border (2018).txt");
+        let idn = cat
+            .media_identity_for(&a.id)
+            .unwrap()
+            .expect("identity survived the move");
+        assert_eq!(idn.tmdb_id, Some(517839));
+        assert!(idn.confirmed);
+        // Search finds the file under its new name.
+        let hits = cat.search_fts("border*", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0.id, a.id);
+    }
+
+    #[test]
+    fn rekey_merges_into_a_row_a_rewalk_already_minted() {
+        // Crash-resume ordering: the job completed while the app was
+        // down, a re-walk minted a fresh row at the destination, and
+        // only then did the move's follow run. The survivor keeps
+        // its id and inherits the identity it was missing.
+        let (cat, loc, a, _b) = seeded();
+        cat.upsert_video_identity(
+            &a.id,
+            "movie",
+            Some("Border"),
+            Some(2018),
+            Some(517839),
+            None,
+            None,
+            None,
+            Some(1.0),
+            true,
+            "{\"source\":\"user-confirm\"}",
+        )
+        .unwrap();
+        let fresh = item_at(loc, "alpha.txt", "/docs/moved/alpha.txt");
+        cat.insert_item(&fresh).unwrap();
+        let survivor_id = cat
+            .item_by_provider_key("/docs/moved/alpha.txt")
+            .unwrap()
+            .unwrap()
+            .id;
+        assert_ne!(survivor_id, a.id);
+        cat.rekey_path("/docs/alpha.txt", "/docs/moved/alpha.txt")
+            .unwrap();
+        assert!(cat.item_by_provider_key("/docs/alpha.txt").unwrap().is_none());
+        let after = cat
+            .item_by_provider_key("/docs/moved/alpha.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.id, survivor_id, "the re-walked row survives");
+        let idn = cat
+            .media_identity_for(&survivor_id)
+            .unwrap()
+            .expect("identity transferred to the survivor");
+        assert_eq!(idn.tmdb_id, Some(517839));
+    }
+
+    #[test]
+    fn rekey_folder_move_carries_child_items_and_identities() {
+        let (cat, _loc, a, _b) = seeded();
+        cat.upsert_video_identity(
+            &a.id,
+            "movie",
+            Some("Border"),
+            Some(2018),
+            Some(517839),
+            None,
+            None,
+            None,
+            Some(1.0),
+            true,
+            "{\"source\":\"user-confirm\"}",
+        )
+        .unwrap();
+        cat.rekey_path("/docs", "/papers").unwrap();
+        let child = cat
+            .item_by_provider_key("/papers/alpha.txt")
+            .unwrap()
+            .expect("child item followed the folder move");
+        assert_eq!(child.id, a.id);
+        assert!(cat.media_identity_for(&a.id).unwrap().is_some());
     }
 
     #[test]

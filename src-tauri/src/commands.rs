@@ -3390,6 +3390,63 @@ fn run_packed_pass(
     committed
 }
 
+/// A completed move must carry the catalog with it, in the same
+/// operation: re-path the item row (and everything keyed off it —
+/// above all a media identity the user confirmed) to the file's new
+/// home. Without this the row keeps pointing at the dead old path —
+/// Quick Look, thumbnails and Open all resolve through it — until
+/// the next re-walk deletes it as unseen and ON DELETE CASCADE takes
+/// the identity with it. (The 2026-10-16 Border incident: Organize
+/// for media servers filed a confirmed film under its new name and
+/// silently orphaned its match.) Two shapes count as a move: a Move
+/// step itself, and the Delete that tails a copy + verify + delete
+/// decomposition (its destination lives on the VerifyCopy step for
+/// the same source). Plain deletes, trash, and pure copies have no
+/// such pairing and are left alone. Best-effort, exactly like
+/// rename_item's rekey: the move already happened, and a missed
+/// follow is healed by the reconcile — never by failing the job.
+fn catalog_follow_completed_step(
+    catalog: &ufm_catalog::Catalog,
+    handle: &JobHandle,
+    step: &ufm_jobs::Step,
+) {
+    let pair: Option<(String, String)> = match &step.op {
+        ufm_jobs::StepOp::Move {
+            src,
+            dst_parent,
+            new_name,
+        } => match (src.provider_key.as_deref(), dst_parent.provider_key.as_deref()) {
+            (Some(s), Some(d)) => Some((s.to_string(), format!("{d}/{new_name}"))),
+            _ => None,
+        },
+        ufm_jobs::StepOp::Delete {
+            target,
+            use_trash,
+        } if !use_trash => match target.provider_key.as_deref() {
+            Some(t) => {
+                let j = handle.job.lock().unwrap();
+                j.steps.values().find_map(|s| match &s.op {
+                    ufm_jobs::StepOp::VerifyCopy { src, dst }
+                        if src.provider_key.as_deref() == Some(t)
+                            && matches!(
+                                s.state,
+                                ufm_jobs::StepState::Done | ufm_jobs::StepState::Skipped
+                            ) =>
+                    {
+                        dst.provider_key.clone().map(|d| (t.to_string(), d))
+                    }
+                    _ => None,
+                })
+            }
+            None => None,
+        },
+        _ => None,
+    };
+    if let Some((old, new)) = pair {
+        let _ = catalog.rekey_path(&old, &new);
+    }
+}
+
 /// The executor: one blocking task per running job. Replays the durable
 /// journal over the snapshot first (crash leftovers normalize Running ->
 /// Pending), then runs every unfinished step in DAG order.
@@ -3536,6 +3593,7 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
                     note,
                 );
                 bytes_done = fx.bytes_done;
+                catalog_follow_completed_step(&catalog, &handle, &step);
                 emit_from_handle(&app, &handle, bytes_done, None, None);
             }
             StepOutcome::Skipped => {
@@ -15245,6 +15303,173 @@ pub fn auditor_add_user_word(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn executor_follow_carries_catalog_on_completed_moves() {
+        // The Border incident (2026-10-16) at the executor seam: an
+        // Organize job moved a user-confirmed film and no step
+        // completion told the catalog — Quick Look kept resolving the
+        // dead old path until the reconcile deleted the row and
+        // ON DELETE CASCADE destroyed the confirmed match.
+        // catalog_follow_completed_step is the call run_job makes on
+        // every StepOutcome::Done; drive it here with the two step
+        // shapes that count as moves — and the shapes that must NOT
+        // rekey (trash, unpaired permanent delete, pure copy).
+        let cat = ufm_catalog::Catalog::open_in_memory().unwrap();
+        let loc = ufm_core::LocationId::new();
+        cat.insert_location(&ufm_vfs::Location {
+            id: loc,
+            provider: "local".into(),
+            display_name: "test".into(),
+            capabilities: ufm_vfs::Capabilities {
+                read: true,
+                ..Default::default()
+            },
+            protected: ufm_vfs::ProtectionTier::None,
+        })
+        .unwrap();
+        let mk_item = |name: &str, path: &str| ufm_vfs::Item {
+            id: ufm_core::ItemId::new(),
+            location: loc,
+            name: name.into(),
+            kind: ufm_vfs::ItemKind::File,
+            size_bytes: Some(10),
+            modified: None,
+            provider_key: Some(path.into()),
+            labels: Vec::new(),
+            starred: false,
+        };
+        let confirm = |item: &ufm_vfs::Item| {
+            cat.upsert_video_identity(
+                &item.id,
+                "movie",
+                Some("Border"),
+                Some(2018),
+                Some(517839),
+                None,
+                None,
+                None,
+                Some(1.0),
+                true,
+                "{\"source\":\"user-confirm\"}",
+            )
+            .unwrap();
+        };
+        let mk_step = |id: &str, op: ufm_jobs::StepOp| ufm_jobs::Step {
+            id: id.into(),
+            label: id.into(),
+            op,
+            depends_on: Vec::new(),
+            state: ufm_jobs::StepState::Done,
+            compensation: None,
+            outcome: false,
+            outcome_path: None,
+        };
+        let handle_with = |steps: Vec<ufm_jobs::Step>| {
+            let mut job = ufm_jobs::Job::new("proof", ufm_jobs::JobPreview::default());
+            for s in steps {
+                job.steps.insert(s.id.clone(), s);
+            }
+            super::JobHandle::new(job, false)
+        };
+        let assert_carried = |old: &str, new: &str, id: ufm_core::ItemId| {
+            assert!(
+                cat.item_by_provider_key(old).unwrap().is_none(),
+                "old path must be dead in the catalog: {old}"
+            );
+            let moved = cat
+                .item_by_provider_key(new)
+                .unwrap()
+                .expect("item row followed the move");
+            assert_eq!(moved.id, id, "same item id at the new path");
+            let idn = cat
+                .media_identity_for(&id)
+                .unwrap()
+                .expect("identity survived the move");
+            assert_eq!(idn.tmdb_id, Some(517839));
+            assert!(idn.confirmed);
+        };
+
+        // Shape 1: a plain Move step (same-device organize / drag move).
+        let a = mk_item("Old Name.mp4", "/media/Old Name.mp4");
+        cat.insert_item(&a).unwrap();
+        confirm(&a);
+        let parent = mk_item("media", "/media");
+        let step = mk_step(
+            "s1",
+            ufm_jobs::StepOp::Move {
+                src: a.clone(),
+                dst_parent: parent,
+                new_name: "New Name.mp4".into(),
+            },
+        );
+        let handle = handle_with(vec![step.clone()]);
+        super::catalog_follow_completed_step(&cat, &handle, &step);
+        assert_carried("/media/Old Name.mp4", "/media/New Name.mp4", a.id);
+
+        // Shape 2: copy + verify + delete (the cross-device organize
+        // decomposition that actually moved Border). The Delete step
+        // tails a completed VerifyCopy for the same source.
+        let b = mk_item("Raw.mp4", "/media2/Raw.mp4");
+        cat.insert_item(&b).unwrap();
+        confirm(&b);
+        let dst = mk_item("Raw.mp4", "/media2/Final/Raw.mp4");
+        let verify = mk_step(
+            "s2",
+            ufm_jobs::StepOp::VerifyCopy {
+                src: b.clone(),
+                dst,
+            },
+        );
+        let delete = mk_step(
+            "s3",
+            ufm_jobs::StepOp::Delete {
+                target: b.clone(),
+                use_trash: false,
+            },
+        );
+        let handle = handle_with(vec![verify, delete.clone()]);
+        super::catalog_follow_completed_step(&cat, &handle, &delete);
+        assert_carried("/media2/Raw.mp4", "/media2/Final/Raw.mp4", b.id);
+
+        // Negative shapes: none of these may move the catalog row.
+        let c = mk_item("Gone.mp4", "/media3/Gone.mp4");
+        cat.insert_item(&c).unwrap();
+        confirm(&c);
+        let trash = mk_step(
+            "s4",
+            ufm_jobs::StepOp::Delete {
+                target: c.clone(),
+                use_trash: true,
+            },
+        );
+        let handle = handle_with(vec![trash.clone()]);
+        super::catalog_follow_completed_step(&cat, &handle, &trash);
+        let perm = mk_step(
+            "s5",
+            ufm_jobs::StepOp::Delete {
+                target: c.clone(),
+                use_trash: false,
+            },
+        );
+        let handle = handle_with(vec![perm.clone()]);
+        super::catalog_follow_completed_step(&cat, &handle, &perm);
+        let copy = mk_step(
+            "s6",
+            ufm_jobs::StepOp::Copy {
+                src: c.clone(),
+                dst_parent: mk_item("elsewhere", "/elsewhere"),
+                new_name: "Gone.mp4".into(),
+            },
+        );
+        let handle = handle_with(vec![copy.clone()]);
+        super::catalog_follow_completed_step(&cat, &handle, &copy);
+        let still = cat
+            .item_by_provider_key("/media3/Gone.mp4")
+            .unwrap()
+            .expect("row must not move for trash/delete/copy shapes");
+        assert_eq!(still.id, c.id);
+    }
+
     #[test]
     fn auditor_fix_all_composes_one_job_for_all_matches() {
         // Fix All Similar (Dickles, 2026-10-15): every current
