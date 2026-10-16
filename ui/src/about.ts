@@ -43,6 +43,10 @@ export class AboutDialog {
     credit.className = "about-credit";
     credit.textContent = "Built by Richard Garrison with Grizz. Anyone bitching about the size can go use Nautilus.";
 
+    const emuCredit = document.createElement("p");
+    emuCredit.className = "about-credit";
+    emuCredit.textContent = "Emulator picks and launch templates are mined from ES-DE's system definitions (ES-DE, MIT License). Emulators themselves — RetroArch and the libretro cores — are their own projects, fetched on request and never bundled.";
+
     const actions = document.createElement("div");
     actions.className = "about-actions";
     const bug = document.createElement("button");
@@ -66,7 +70,7 @@ export class AboutDialog {
     closeBtn.addEventListener("click", () => this.close());
     actions.append(bug, feat, closeBtn);
 
-    dialog.append(bear, title, tagline, version, credit, actions);
+    dialog.append(bear, title, tagline, version, credit, emuCredit, actions);
     overlay.appendChild(dialog);
     document.body.appendChild(overlay);
     this.el = overlay;

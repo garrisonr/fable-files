@@ -140,6 +140,10 @@ pub fn packages_for(family: Family, logical: &str) -> Option<&'static [&'static 
         (Family::Suse, "poppler") => &["poppler-tools"],
         // Compress → .zip (the `zip` CLI).
         (_, "zip") => &["zip"],
+        // RetroArch: the emulation backbone's native fallback
+        // channel (Flatpak user install is primary — see emu.rs).
+        // Every family ships it under the same name.
+        (_, "retroarch") => &["retroarch"],
         // Clipboard helpers, per session type (Wayland / X11).
         (_, "wl-clipboard") => &["wl-clipboard"],
         (_, "xclip") => &["xclip"],

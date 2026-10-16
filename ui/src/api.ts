@@ -756,6 +756,34 @@ export const api = {
     invoke<string>("rom_home_save_smart_list", { name, queryJson }),
   romHomeUpdateSmartList: (id: string, queryJson: string) =>
     invoke<void>("rom_home_update_smart_list", { id, queryJson }),
+  // Emulation (SPEC-AMENDMENT, Architecture A): Play resolves
+  // (system → emulator/core) in the backend and launches the REAL
+  // catalog path. First Play with anything missing returns the
+  // ask-once sheet's data instead of launching.
+  emuPlay: (providerKey: string, platform: string) =>
+    invoke<EmuPlayOutcome>("emu_play", { providerKey, platform }),
+  emuSheet: (providerKey: string, platform: string) =>
+    invoke<EmuSheet>("emu_sheet", { providerKey, platform }),
+  emuInstallAndPlay: (
+    providerKey: string,
+    platform: string,
+    optionId: string,
+    remember: boolean,
+  ) =>
+    invoke<EmuPlayOutcome>("emu_install_and_play", {
+      providerKey,
+      platform,
+      optionId,
+      remember,
+    }),
+  emuOpenEmulator: (platform: string) =>
+    invoke<void>("emu_open_emulator", { platform }),
+  emuPrefs: () => invoke<EmuPrefs>("emu_prefs"),
+  emuSetChoice: (platform: string, optionId: string) =>
+    invoke<void>("emu_set_choice", { platform, optionId }),
+  emuSetView: (enabled: boolean, root: string | null) =>
+    invoke<EmuViewState>("emu_set_view", { enabled, root }),
+  emuRebuildView: () => invoke<EmuViewState>("emu_rebuild_view"),
   // Media Resolution (film/TV → Plex/Emby/Jellyfin): TMDB key lives
   // in the OS keyring — only its presence ever comes back. Scan is
   // parse + match + compliance; Organize is a journaled job planned
@@ -1783,6 +1811,120 @@ export interface RomHomeCounts {
   missingMedia: number;
   /** [platform, games, missing box art] */
   perSystem: Array<[string, number, number]>;
+}
+
+/** Emulation: one option's verified state on this machine. */
+export type EmuOptState =
+  | "ready"
+  | "needs-retro-arch"
+  | "needs-core"
+  | "needs-install"
+  | "needs-bios"
+  | "manual-only"
+  | "not-yet";
+
+/** Emulation: an option's honesty class (curated / also-good /
+ * specialist, in the amendment's vocabulary). */
+export type EmuOptClass = "default-able" | "best-effort" | "manual-only";
+
+/** Emulation: one row of the ask-once sheet / Play with… picker. */
+export interface EmuSheetOption {
+  id: string;
+  label: string;
+  verdict: string;
+  state: EmuOptState;
+  stateWord: string;
+  needsInstall: boolean;
+  class: EmuOptClass;
+  installNote: string | null;
+}
+
+/** Emulation: the sheet's full payload, rendered verbatim. */
+export interface EmuSheet {
+  gameTitle: string;
+  providerKey: string;
+  platform: string;
+  systemId: string;
+  systemName: string;
+  shortName: string;
+  options: EmuSheetOption[];
+  preselect: string;
+  /** "ask" (first Play) or "picker" (Play with…). */
+  mode: string;
+}
+
+/** Emulation: what pressing Play (or the sheet's primary) did. */
+export type EmuPlayOutcome =
+  | {
+      kind: "launched";
+      state: RomGameState;
+      optionId: string;
+      playedProviderKey: string;
+    }
+  | { kind: "sheet"; sheet: EmuSheet }
+  | { kind: "unavailable"; message: string };
+
+/** Emulation: one row of Preferences → ROMs → Emulators. */
+export interface EmuPrefsOption {
+  id: string;
+  label: string;
+  verdict: string;
+  state: EmuOptState;
+  stateWord: string;
+  class: EmuOptClass;
+}
+
+export interface EmuPrefsSystem {
+  platform: string;
+  systemId: string;
+  name: string;
+  shortName: string;
+  games: number;
+  chosen: string;
+  options: EmuPrefsOption[];
+}
+
+/** Emulation: one alias-keeper reconciliation report. */
+export interface EmuKeeperReport {
+  identities: number;
+  links: number;
+  created: number;
+  repointed: number;
+  removed: number;
+  blocked: string[];
+  playlists: string[];
+  drives: number;
+  error: string | null;
+}
+
+/** Emulation: the Unified view card's state. */
+export interface EmuViewState {
+  enabled: boolean;
+  root: string;
+  games: number;
+  drives: number;
+  linksOnDisk: number;
+  retroarchPresent: boolean;
+  lastReport: EmuKeeperReport;
+}
+
+export interface EmuPrefs {
+  systems: EmuPrefsSystem[];
+  view: EmuViewState;
+}
+
+/** Emulation: install progress event payload. */
+export interface EmuInstallProgress {
+  label: string;
+  pct: number | null;
+}
+
+export function onEmuInstallProgress(
+  cb: (p: EmuInstallProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<EmuInstallProgress>("emu-install-progress", (e) =>
+    cb(e.payload),
+  );
 }
 
 /** A Smart List: a saved filter whose rule renders as a sentence. */

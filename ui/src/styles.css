@@ -4077,3 +4077,291 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 .romhome.rh-tv .rh-row { width: auto; flex: none; }
 .romhome.rh-tv .rh-health { display: none; }
 .romhome.rh-tv .rh-inspector { width: 440px; }
+
+/* ------------------------------------------------------------ emulation
+ * The ask-once sheet + Play with… picker (emu.ts) and the
+ * Preferences → ROMs Emulators / Unified view cards. Same overlay
+ * family as props/confirm; every value from theme tokens.
+ */
+.emu-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1500;
+  background: color-mix(in srgb, var(--ufm-text) 38%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(var(--ufm-blur));
+}
+.emu-sheet {
+  background: var(--ufm-surface-elevated);
+  border: 1px solid var(--ufm-border);
+  border-radius: var(--ufm-card-radius);
+  padding: 1.25rem 1.25rem 1rem;
+  width: min(30rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 3rem);
+  overflow-y: auto;
+  box-shadow: 0 1.5rem 3.5rem color-mix(in srgb, var(--ufm-text) 35%, transparent);
+}
+.emu-sheet-title {
+  margin: 0 0 0.25rem;
+  font-size: 1.05rem;
+  font-weight: 650;
+  color: var(--ufm-text);
+}
+.emu-sheet-sub {
+  margin: 0 0 0.9rem;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--ufm-text-muted);
+}
+.emu-opt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+.emu-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.6rem;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--ufm-border);
+  border-radius: var(--ufm-radius-md);
+  background: var(--ufm-surface);
+  cursor: pointer;
+}
+.emu-opt:hover {
+  background: var(--ufm-surface-alt);
+}
+.emu-opt:has(input:checked) {
+  border-color: var(--ufm-accent);
+  background: color-mix(in srgb, var(--ufm-surface) 82%, var(--ufm-accent) 10%);
+}
+.emu-opt input {
+  margin-top: 0.2rem;
+  accent-color: var(--ufm-accent);
+}
+.emu-opt-main {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.emu-opt-label {
+  font-size: 0.88rem;
+  color: var(--ufm-text);
+}
+.emu-opt-verdict {
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--ufm-text-muted);
+}
+.emu-opt-note {
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--ufm-text-muted);
+  margin-top: 0.25rem;
+}
+.emu-opt-state {
+  flex: 0 0 auto;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--ufm-text-muted);
+  padding-top: 0.15rem;
+}
+.emu-opt-state.is-ready {
+  color: var(--ufm-accent-text);
+}
+.emu-sep {
+  border-top: 1px solid var(--ufm-border);
+  margin: 0.8rem 0 0.2rem;
+}
+.emu-os-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 0.5rem 0.25rem;
+  font: inherit;
+  font-size: 0.82rem;
+  color: var(--ufm-accent-text);
+  cursor: pointer;
+}
+.emu-os-row:hover {
+  text-decoration: underline;
+}
+.emu-remember {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.25rem 0;
+  font-size: 0.82rem;
+  color: var(--ufm-text);
+  cursor: pointer;
+}
+.emu-remember input {
+  accent-color: var(--ufm-accent);
+}
+.emu-progress {
+  margin-top: 0.9rem;
+}
+.emu-progress-label {
+  display: block;
+  font-size: 0.8rem;
+  color: var(--ufm-text-muted);
+  margin-bottom: 0.35rem;
+}
+.emu-progress-bar {
+  height: 0.4rem;
+  border-radius: var(--ufm-radius);
+  background: var(--ufm-surface-alt);
+  overflow: hidden;
+}
+.emu-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: var(--ufm-radius);
+  background: var(--ufm-accent);
+  transition: width 0.25s ease;
+}
+.emu-progress-bar.is-indeterminate .emu-progress-fill {
+  width: 40% !important;
+  animation: emu-slide 1.1s ease-in-out infinite alternate;
+}
+@keyframes emu-slide {
+  from { margin-left: 0; }
+  to { margin-left: 60%; }
+}
+.emu-receipt {
+  margin: 0.9rem 0 0;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--ufm-text);
+  background: var(--ufm-accent-soft);
+  border-radius: var(--ufm-radius-md);
+  padding: 0.6rem 0.75rem;
+}
+.emu-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+.emu-actions-spacer {
+  flex: 1 1 auto;
+}
+.emu-btn {
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.45rem 0.9rem;
+  min-height: var(--ufm-control-h);
+  border-radius: var(--ufm-radius-md);
+  border: 1px solid var(--ufm-border);
+  background: var(--ufm-surface);
+  color: var(--ufm-text);
+  cursor: pointer;
+}
+.emu-btn:hover {
+  background: var(--ufm-surface-alt);
+}
+.emu-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.emu-btn.primary {
+  background: var(--ufm-accent);
+  border-color: var(--ufm-accent);
+  color: var(--ufm-on-accent);
+  font-weight: 600;
+}
+.emu-btn.primary:hover {
+  background: color-mix(in srgb, var(--ufm-accent) 88%, var(--ufm-text) 6%);
+}
+.emu-btn-quiet {
+  border-color: transparent;
+  background: none;
+  color: var(--ufm-accent-text);
+  padding-left: 0.25rem;
+  padding-right: 0.25rem;
+}
+.emu-btn-quiet:hover {
+  background: none;
+  text-decoration: underline;
+}
+
+/* Preferences → ROMs cards */
+.emu-sys-row {
+  border: 1px solid var(--ufm-border);
+  border-radius: var(--ufm-radius-md);
+  padding: 0.7rem 0.85rem;
+  margin-bottom: 0.6rem;
+  background: var(--ufm-surface);
+}
+.emu-sys-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+.emu-sys-count {
+  font-size: 0.75rem;
+  color: var(--ufm-text-muted);
+}
+.emu-sys-pickrow {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.45rem;
+  font-size: 0.82rem;
+}
+.emu-sys-select {
+  font: inherit;
+  font-size: 0.82rem;
+  min-height: var(--ufm-control-h);
+  border-radius: var(--ufm-radius-md);
+  border: 1px solid var(--ufm-border);
+  background: var(--ufm-surface-alt);
+  color: var(--ufm-text);
+  padding: 0.2rem 0.5rem;
+  max-width: 100%;
+}
+.emu-sys-verdict {
+  margin: 0.45rem 0 0;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--ufm-text-muted);
+}
+.emu-view-card {
+  border: 1px solid var(--ufm-border);
+  border-radius: var(--ufm-radius-md);
+  padding: 0.7rem 0.85rem;
+  background: var(--ufm-surface);
+}
+.emu-view-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 550;
+  cursor: pointer;
+}
+.emu-view-toggle input {
+  accent-color: var(--ufm-accent);
+}
+.emu-view-state {
+  margin: 0.5rem 0 0;
+  font-size: 0.8rem;
+  color: var(--ufm-text);
+}
+.emu-view-root {
+  margin: 0.2rem 0 0;
+  font-size: 0.78rem;
+  color: var(--ufm-text-muted);
+  font-family: var(--ufm-font-mono);
+}
+.emu-view-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}

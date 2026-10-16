@@ -13,6 +13,7 @@
 import type { ThemeInfo } from "./api";
 import { DISTRO_ENGINES } from "./themes";
 import { RomMediaSection } from "./rommedia";
+import { EmuSection } from "./emu";
 import { ROM_ICON_SET_INFO, type RomIconSet } from "./roms";
 import { MediaResSection } from "./mediares";
 import { MediaCompleteSection } from "./mediacomplete";
@@ -179,6 +180,12 @@ export class PreferencesDialog {
     const mediaHost = document.createElement("div");
     dialog.appendChild(mediaHost);
     void new RomMediaSection().mount(mediaHost, hooks);
+
+    // Emulation (Preferences → ROMs): the Emulators + Unified view
+    // cards, right under Game Media — mounted async like its kin.
+    const emuHost = document.createElement("div");
+    dialog.appendChild(emuHost);
+    void new EmuSection().mount(emuHost, hooks);
 
     // Media Resolution (film/TV → media servers): the TMDB key
     // block, taught properly per the guidance law.

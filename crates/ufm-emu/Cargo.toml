@@ -5,7 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-ufm-core.workspace = true
 serde.workspace = true
-async-trait.workspace = true
-tokio.workspace = true
+serde_json.workspace = true
+# Both already in the workspace lockfile (quick-xml via the Tauri
+# stack, flate2 via the app crate) — declaring them here changes no
+# versions.
+quick-xml = "0.42"
+flate2 = "1"

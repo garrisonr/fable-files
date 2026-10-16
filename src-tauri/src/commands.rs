@@ -84,6 +84,7 @@ pub struct LocationSummary {
 // list_dir resolves them, never written to the catalog or the sidecar).
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
 pub(crate) struct MountedVolume {
     pub(crate) name: String,
     pub(crate) path: String,
@@ -491,7 +492,10 @@ pub async fn get_disk_info(path: String) -> Cmd<DiskSpaceInfo> {
 }
 
 #[tauri::command]
-pub async fn list_locations(state: State<'_, AppState>) -> Cmd<Vec<LocationSummary>> {
+pub async fn list_locations(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Cmd<Vec<LocationSummary>> {
     let volumes = tauri::async_runtime::spawn_blocking(enumerate_mounted_volumes)
         .await
         .unwrap_or_default();
@@ -503,6 +507,23 @@ pub async fn list_locations(state: State<'_, AppState>) -> Cmd<Vec<LocationSumma
     {
         let catalog = state.catalog.lock().unwrap();
         record_volume_sightings(&catalog);
+    }
+    // Emulation alias keeper: when the mounted set changes (a drive
+    // arrived or left), the unified view reconciles as a delta.
+    {
+        let mut now: Vec<String> = volumes.iter().map(|v| v.path.clone()).collect();
+        now.sort();
+        let changed = {
+            let mut seen = state.emu_mounts_seen.lock().unwrap();
+            let changed = *seen != now;
+            if changed {
+                *seen = now;
+            }
+            changed
+        };
+        if changed {
+            crate::emu_farm::spawn_keeper(app.clone());
+        }
     }
     let vol_paths: std::collections::HashSet<String> =
         volumes.iter().map(|v| v.path.clone()).collect();
@@ -8091,7 +8112,14 @@ pub async fn identify_roms(
         .rom_identify_running
         .store(false, Ordering::SeqCst);
     match result {
-        Ok(r) => r,
+        Ok(r) => {
+            // A fresh identify changes catalog membership — the
+            // unified view (alias farm + playlists) reconciles.
+            if r.is_ok() {
+                crate::emu_farm::spawn_keeper(app.clone());
+            }
+            r
+        }
         Err(e) => Err(CommandError::from(UfmError::InvalidInput(format!(
             "identify task failed: {e}"
         )))),

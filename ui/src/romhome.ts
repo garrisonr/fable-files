@@ -43,18 +43,22 @@ import { openGuideLink } from "./guidelinks";
 import { fmtDay } from "./search";
 import { springTo, reducedMotion } from "./motion";
 import { loadLabelDefs } from "./labels";
+import { showEmuSheet, type EmuSheetResult } from "./emu";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface RomHomeHooks {
   /** Leave the room; the shell restores the Files view as it was. */
   onExit(): void;
-  /** Play: the shell's existing launch path (openItem). */
+  /** Play's fallback launch path (openItem) — used when a game
+   * has no emulator resolution or the sheet is declined. */
   onPlayItem(item: Item): void;
   /** Space: Quick Look peek. */
   onPreviewItem(item: Item): void;
   /** "Show in Files": navigate the Files view to the item. */
   onRevealItem(item: Item): void;
-  /** "Play with…" — the app's Open With dialog. */
+  /** The OS-default open — reached from inside the "Play with…"
+   * picker ("Open with the system default app…") and as the sheet's
+   * "Not now" fallback: declining emulation keeps today's behavior. */
   onOpenWith(item: Item): void;
   /** "See in File Auditor". */
   onOpenAuditor(): void;
@@ -1938,18 +1942,109 @@ export class RomHome {
 
   private async playGame(g: RoomGame): Promise<void> {
     const pk = g.item.provider_key;
+    if (!pk || !g.platform) {
+      this.legacyPlay(g);
+      return;
+    }
+    // Emulation resolution (Architecture A): the backend checks
+    // presence, the saved choice and what's installed; Play either
+    // launches the real file or returns the ask-once sheet. Any
+    // failure falls back to the pre-emulation behavior — Play is
+    // never a dead button.
+    try {
+      const outcome = await api.emuPlay(pk, g.platform);
+      if (outcome.kind === "launched") {
+        this.afterEmuLaunch(g, outcome);
+        return;
+      }
+      if (outcome.kind === "unavailable") {
+        Toast.info(outcome.message);
+        return;
+      }
+      const result = await showEmuSheet(outcome.sheet, {
+        onOpenEmulator: (platform) => {
+          void api.emuOpenEmulator(platform).catch((err) => {
+            Toast.error(`Could not open the emulator: ${errText(err)}`);
+          });
+        },
+      });
+      this.applySheetResult(g, result, true);
+    } catch {
+      this.legacyPlay(g);
+    }
+  }
+
+  /** "Play with…" — the emulator/core picker (the ask-once sheet
+   * in picker mode), with the OS-default open demoted to an entry
+   * inside it. */
+  private async playWith(g: RoomGame): Promise<void> {
+    const pk = g.item.provider_key;
+    if (!pk || !g.platform) {
+      this.hooks.onOpenWith(g.item);
+      return;
+    }
+    try {
+      const sheet = await api.emuSheet(pk, g.platform);
+      const result = await showEmuSheet(sheet, {
+        onOpenEmulator: (platform) => {
+          void api.emuOpenEmulator(platform).catch((err) => {
+            Toast.error(`Could not open the emulator: ${errText(err)}`);
+          });
+        },
+      });
+      this.applySheetResult(g, result, false);
+    } catch {
+      this.hooks.onOpenWith(g.item);
+    }
+  }
+
+  private applySheetResult(
+    g: RoomGame,
+    result: EmuSheetResult,
+    fromPlay: boolean,
+  ): void {
+    if (result.action === "launched") {
+      this.afterEmuLaunch(g, result.outcome);
+    } else if (result.action === "os-default") {
+      // Declining is free of consequence: Play does what it did
+      // before emulation existed (from Play: launched + noted;
+      // from the picker: the plain OS open).
+      if (fromPlay) this.legacyPlay(g);
+      else this.hooks.onOpenWith(g.item);
+    }
+  }
+
+  private afterEmuLaunch(
+    g: RoomGame,
+    outcome: Extract<
+      Awaited<ReturnType<typeof api.emuPlay>>,
+      { kind: "launched" }
+    >,
+  ): void {
+    if (outcome.playedProviderKey === g.item.provider_key) {
+      g.state = outcome.state;
+    }
+    this.renderInspector();
+    // Recently Played's membership changed under us; the rail
+    // count and (if we're standing on it) the shelf follow.
+    this.renderRail();
+  }
+
+  /** The pre-emulation Play: shell launch + play bookkeeping. */
+  private legacyPlay(g: RoomGame): void {
+    const pk = g.item.provider_key;
     this.hooks.onPlayItem(g.item);
     if (pk) {
-      try {
-        const st = await api.romHomeNotePlay(pk);
-        g.state = st;
-        this.renderInspector();
-        // Recently Played's membership changed under us; the rail
-        // count and (if we're standing on it) the shelf follow.
-        this.renderRail();
-      } catch {
-        // the launch already happened; bookkeeping can lag honestly
-      }
+      api
+        .romHomeNotePlay(pk)
+        .then((st) => {
+          g.state = st;
+          this.renderInspector();
+          this.renderRail();
+        })
+        .catch(() => {
+          // the launch already happened; bookkeeping can lag honestly
+        });
     }
   }
 
@@ -2063,7 +2158,7 @@ export class RomHome {
       items.push({
         label: "Play with…",
         disabled: g.offline,
-        action: () => this.hooks.onOpenWith(g.item),
+        action: () => void this.playWith(g),
       });
       items.push({ label: "", separator: true, action: () => undefined });
     }
@@ -2408,7 +2503,7 @@ export class RomHome {
     play.addEventListener("click", () => void this.playGame(g));
     const withBtn = el("button", "pill-btn rh-playwith", "Play with…") as HTMLButtonElement;
     if (g.offline) withBtn.disabled = true;
-    withBtn.addEventListener("click", () => this.hooks.onOpenWith(g.item));
+    withBtn.addEventListener("click", () => void this.playWith(g));
     playRow.append(play, withBtn);
     insp.appendChild(playRow);
     if (g.offline) {

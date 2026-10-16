@@ -17,6 +17,8 @@ pub mod mediares;
 pub mod musiccomplete;
 pub mod opensubs;
 pub mod rommedia;
+pub mod emu;
+pub mod emu_farm;
 pub mod plugins;
 pub mod reader;
 pub mod templates;
@@ -79,6 +81,11 @@ pub struct AppState {
     /// Partial progress persists in the catalog, so the sweep
     /// resumes on the next visit instead of restarting.
     pub rule_probe_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Emulation alias keeper: the mounted-path set last seen by
+    /// list_locations (the unified view reconciles when drives
+    /// come and go) and a single-flight guard for keeper passes.
+    pub emu_mounts_seen: Mutex<Vec<String>>,
+    pub emu_keeper_running: std::sync::atomic::AtomicBool,
     pub previews: PreviewRegistry,
     pub themes_dir: PathBuf,
     pub active_theme: Mutex<String>,
@@ -241,6 +248,8 @@ impl AppState {
             jobs: Mutex::new(HashMap::new()),
             rom_dataset: Mutex::new(None),
             rom_identify_running: std::sync::atomic::AtomicBool::new(false),
+            emu_mounts_seen: Mutex::new(Vec::new()),
+            emu_keeper_running: std::sync::atomic::AtomicBool::new(false),
         };
 
         seed_themes(&themes_dir)?;
@@ -493,6 +502,10 @@ pub fn run() {
         .setup(|app| -> Result<(), Box<dyn std::error::Error>> {
             let state = AppState::build(app).map_err(|e| format!("state init: {e}"))?;
             app.manage(state);
+            // Emulation: reconcile the unified view (~/ROMs farm
+            // + RetroArch playlists) against the volumes Library
+            // Memory sees mounted right now.
+            emu_farm::spawn_keeper(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -604,6 +617,14 @@ pub fn run() {
             commands::rom_home_smart_lists,
             commands::rom_home_save_smart_list,
             commands::rom_home_update_smart_list,
+            emu::emu_play,
+            emu::emu_sheet,
+            emu::emu_install_and_play,
+            emu::emu_open_emulator,
+            emu_farm::emu_prefs,
+            emu_farm::emu_set_choice,
+            emu_farm::emu_set_view,
+            emu_farm::emu_rebuild_view,
             commands::mediares_get_settings,
             commands::mediares_set_key,
             commands::mediares_validate_key,
