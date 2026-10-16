@@ -8,6 +8,7 @@ license.workspace = true
 ufm-core.workspace = true
 ufm-vfs = { path = "../ufm-vfs" }
 ufm-jobs = { path = "../ufm-jobs" }
+ufm-media = { path = "../ufm-media" }
 serde.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true

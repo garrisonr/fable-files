@@ -1839,6 +1839,23 @@ export interface RomGameState {
 }
 
 /** ROM Home: one game as the room renders it — catalog truth only. */
+/** A game's parsed variant descriptor (Phase 3 grouping): region /
+ * revision / status / languages / flags from its DAT title, plus
+ * the default-pick ranks. Mirrors ufm-media's RomVariant. */
+export interface RomVariantInfo {
+  region: string | null;
+  revision: string | null;
+  status: string;
+  languages: string | null;
+  flags: string[];
+  disc: string | null;
+  descriptor: string;
+  regionRank: number;
+  statusRank: number;
+  revisionKey: number;
+  neverDefault: boolean;
+}
+
 export interface RomHomeGame {
   item: Item;
   /** DAT-verified title (display = state.titleOverride ?? this). */
@@ -1847,7 +1864,12 @@ export interface RomHomeGame {
   alsoPlatforms: string[];
   year: number | null;
   sha1: string | null;
+  crc: string | null;
   region: string | null;
+  /** Phase 3: the group this game folds into (one group = one
+   * shelf card) and its variant descriptor. */
+  groupKey: string;
+  variant: RomVariantInfo;
   media: RomGameMedia[];
   state: RomGameState;
   auditorFlagged: boolean;

@@ -1774,6 +1774,299 @@ pub fn parsed_base_title(raw: &str) -> String {
     s
 }
 
+/// The variant group key (Phase 3): one game = one key. Platform +
+/// the tag-stripped base title, lowercased. Sequel-safe by
+/// construction — title-internal numbers are never parenthesized in
+/// DAT names, so stripping tag groups can't merge "… '94" with
+/// "… '97" (AUDIT §8).
+pub fn rom_group_key(platform: &str, title: &str) -> String {
+    format!(
+        "{platform}\u{1}{}",
+        parsed_base_title(title).to_lowercase()
+    )
+}
+
+/// One version of a game, parsed from its DAT title (or a member /
+/// file name when that's all there is). Everything the variant
+/// picker shows and the default-variant rule reads. The parse is
+/// descriptive, never a claim: identity still comes from hashes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomVariant {
+    /// Region group verbatim ("USA", "Japan, USA"), when named.
+    pub region: Option<String>,
+    /// Revision group verbatim ("Rev 1", "v1.3"), when named.
+    pub revision: Option<String>,
+    /// release | beta | proto | sample | demo | promo.
+    pub status: String,
+    /// Language group verbatim ("En,Ja"), when named.
+    pub languages: Option<String>,
+    /// Canonical flag tokens: pirate, unlicensed, patched, hack,
+    /// trainer, bad-dump, overdump, alternate, fixed, verified.
+    pub flags: Vec<String>,
+    /// Disc group verbatim ("Disc 1") — multi-disc games fold into
+    /// one group (Q4); the disc rides here so the picker can differ.
+    pub disc: Option<String>,
+    /// Human one-liner: "USA · Rev 1 · Pirate" — region, revision,
+    /// status, languages, disc, flag labels, then any unrecognized
+    /// groups verbatim (a publisher tag like (Tengen) distinguishes
+    /// versions, so it is preserved rather than classified away).
+    pub descriptor: String,
+    /// Default-rule ranks: region USA 0 < World 1 < Europe 2 < other
+    /// 3 < unnamed 4 (multi-region groups rank by their best part).
+    pub region_rank: u8,
+    /// Release 0; beta/proto/sample/demo/promo 1.
+    pub status_rank: u8,
+    /// major*1000 + minor; -1 when no revision is named. Newest wins.
+    pub revision_key: i64,
+    /// Patched / hack / trainer / bad-dump / overdump: pickable and
+    /// badged (Q2), but NEVER the default while a clean variant
+    /// exists (Q1 lean + Dickles' default order).
+    pub never_default: bool,
+}
+
+const VARIANT_REGIONS: &[&str] = &[
+    "USA", "Europe", "Japan", "World", "UK", "France", "Germany", "Spain",
+    "Italy", "Australia", "Canada", "Korea", "Brazil", "Asia", "Netherlands",
+    "Sweden", "Denmark", "Finland", "Norway", "Russia", "China", "Taiwan",
+    "Hong Kong", "Latin America", "Mexico", "Portugal", "Greece", "Turkey",
+    "India", "New Zealand", "South Africa", "Argentina", "Chile", "Peru",
+    "Colombia", "Venezuela", "Belgium", "Austria", "Switzerland", "Poland",
+    "Czech Republic", "Hungary", "Romania", "Bulgaria", "Croatia", "Ireland",
+    "Scandinavia", "Middle East", "Africa", "Oceania", "Global", "Export",
+];
+
+const LANG_CODES: &[&str] = &[
+    "En", "Ja", "Fr", "De", "Es", "It", "Ko", "Zh", "Pt", "Nl", "Sv", "Da",
+    "Fi", "No", "Pl", "Ru", "Cs", "Hu", "El", "Tr", "Ar", "He",
+];
+
+fn region_rank_of(part: &str) -> u8 {
+    match part {
+        "USA" => 0,
+        "World" => 1,
+        "Europe" => 2,
+        _ => 3,
+    }
+}
+
+fn flag_label(token: &str) -> &str {
+    match token {
+        "pirate" => "Pirate",
+        "unlicensed" => "Unlicensed",
+        "patched" => "Patched",
+        "hack" => "Hack",
+        "trainer" => "Trainer",
+        "bad-dump" => "Bad dump",
+        "overdump" => "Overdump",
+        "alternate" => "Alternate",
+        "fixed" => "Fixed",
+        "verified" => "Verified",
+        _ => token,
+    }
+}
+
+/// Parse the tag groups of a DAT title / member name into a variant
+/// descriptor. Parenthesized groups classify as region / disc /
+/// revision / status / languages / flags; anything unrecognized is
+/// kept verbatim for the descriptor. Bracketed groups are GoodTools
+/// tags ([p1], [!], [b]…) and classify by their leading letter.
+pub fn variant_of_title(title: &str) -> RomVariant {
+    // Collect (...) and [...] group contents, in order.
+    let mut paren_groups: Vec<String> = Vec::new();
+    let mut brack_groups: Vec<String> = Vec::new();
+    let chars: Vec<char> = title.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (open, close, sink) = match chars[i] {
+            '(' => ('(', ')', 0),
+            '[' => ('[', ']', 1),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let _ = open;
+        let mut j = i + 1;
+        let mut content = String::new();
+        while j < chars.len() && chars[j] != close {
+            content.push(chars[j]);
+            j += 1;
+        }
+        if j < chars.len() {
+            let g = content.trim().to_string();
+            if !g.is_empty() {
+                if sink == 0 {
+                    paren_groups.push(g);
+                } else {
+                    brack_groups.push(g);
+                }
+            }
+            i = j + 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut v = RomVariant {
+        status: "release".to_string(),
+        region_rank: 4,
+        revision_key: -1,
+        ..Default::default()
+    };
+    let mut others: Vec<String> = Vec::new();
+    let mut push_flag = |v: &mut RomVariant, token: &str| {
+        if !v.flags.iter().any(|f| f == token) {
+            v.flags.push(token.to_string());
+        }
+    };
+
+    for group in &paren_groups {
+        let lower = group.to_lowercase();
+        let parts: Vec<&str> = group.split(',').map(|p| p.trim()).collect();
+        // Region: every part a known region.
+        if v.region.is_none()
+            && !parts.is_empty()
+            && parts.iter().all(|p| VARIANT_REGIONS.contains(p))
+        {
+            v.region = Some(group.clone());
+            v.region_rank = parts.iter().map(|p| region_rank_of(p)).min().unwrap_or(3);
+            continue;
+        }
+        // Disc: "Disc 1", "Disk 2", "CD 1".
+        let first_word = lower.split_whitespace().next().unwrap_or("");
+        if matches!(first_word, "disc" | "disk" | "cd")
+            && lower.chars().any(|c| c.is_ascii_digit())
+            && v.disc.is_none()
+        {
+            v.disc = Some(group.clone());
+            continue;
+        }
+        // Revision: "Rev …" or "v<digit>…".
+        let is_rev = lower.starts_with("rev")
+            || (lower.len() > 1
+                && lower.starts_with('v')
+                && lower.as_bytes()[1].is_ascii_digit());
+        if is_rev && v.revision.is_none() {
+            v.revision = Some(group.clone());
+            let nums: Vec<i64> = group
+                .split(|c: char| !(c.is_ascii_digit()))
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            v.revision_key = if !nums.is_empty() {
+                nums[0] * 1000 + nums.get(1).copied().unwrap_or(0)
+            } else if let Some(ch) =
+                group.chars().find(|c| c.is_ascii_alphabetic())
+            {
+                // "Rev A" style: A = 1.
+                (ch.to_ascii_lowercase() as i64 - 'a' as i64 + 1) * 1000
+            } else {
+                0
+            };
+            continue;
+        }
+        // Status.
+        let status = match lower.as_str() {
+            "beta" => Some("beta"),
+            "proto" | "prototype" => Some("proto"),
+            "sample" => Some("sample"),
+            "demo" => Some("demo"),
+            "promo" => Some("promo"),
+            _ if lower.starts_with("beta ") => Some("beta"),
+            _ if lower.starts_with("proto ") => Some("proto"),
+            _ => None,
+        };
+        if let Some(s) = status {
+            if v.status == "release" {
+                v.status = s.to_string();
+                v.status_rank = 1;
+            }
+            continue;
+        }
+        // Languages: every part a 2-letter code, at least one known.
+        if v.languages.is_none()
+            && !parts.is_empty()
+            && parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_alphabetic()))
+            && parts.iter().any(|p| LANG_CODES.contains(p))
+        {
+            v.languages = Some(group.clone());
+            continue;
+        }
+        // Flags named outright.
+        let mut flagged = false;
+        if lower == "pirate" {
+            push_flag(&mut v, "pirate");
+            flagged = true;
+        }
+        if lower == "unl" || lower.contains("unlicensed") {
+            push_flag(&mut v, "unlicensed");
+            flagged = true;
+        }
+        if lower.contains("patched") {
+            push_flag(&mut v, "patched");
+            flagged = true;
+        }
+        if lower == "hack" || lower.contains("hack ") {
+            push_flag(&mut v, "hack");
+            flagged = true;
+        }
+        if flagged {
+            continue;
+        }
+        others.push(group.clone());
+    }
+
+    for group in &brack_groups {
+        let lower = group.to_lowercase();
+        let token = match lower.chars().next() {
+            Some('!') => Some("verified"),
+            Some('b') => Some("bad-dump"),
+            Some('o') => Some("overdump"),
+            Some('t') => Some("trainer"),
+            Some('h') => Some("hack"),
+            Some('p') => Some("pirate"),
+            Some('a') => Some("alternate"),
+            Some('f') => Some("fixed"),
+            _ => None,
+        };
+        match token {
+            Some(t) => push_flag(&mut v, t),
+            None => others.push(format!("[{group}]")),
+        }
+    }
+
+    v.never_default = v
+        .flags
+        .iter()
+        .any(|f| matches!(f.as_str(), "patched" | "hack" | "trainer" | "bad-dump" | "overdump"));
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(r) = &v.region {
+        parts.push(r.clone());
+    }
+    if let Some(r) = &v.revision {
+        parts.push(r.clone());
+    }
+    if v.status != "release" {
+        let mut s = v.status.clone();
+        s.replace_range(..1, &v.status[..1].to_uppercase());
+        parts.push(s);
+    }
+    if let Some(l) = &v.languages {
+        parts.push(l.clone());
+    }
+    if let Some(d) = &v.disc {
+        parts.push(d.clone());
+    }
+    for f in &v.flags {
+        parts.push(flag_label(f).to_string());
+    }
+    parts.extend(others);
+    v.descriptor = parts.join(" · ");
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2125,5 +2418,108 @@ mod tests {
             Some("Packed Game (World)/Packed Game.img")
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- Phase 3: variant parsing + group keys ---------------------
+
+    #[test]
+    fn variant_parse_klax_family() {
+        let usa = variant_of_title("Klax (USA) (Unl)");
+        assert_eq!(usa.region.as_deref(), Some("USA"));
+        assert_eq!(usa.region_rank, 0);
+        assert_eq!(usa.flags, vec!["unlicensed".to_string()]);
+        assert_eq!(usa.descriptor, "USA · Unlicensed");
+        assert!(!usa.never_default);
+        let japan = variant_of_title("Klax (Japan)");
+        assert_eq!(japan.region_rank, 3);
+        // Same game, one group.
+        assert_eq!(
+            rom_group_key("nes", "Klax (USA) (Unl)"),
+            rom_group_key("nes", "Klax (Japan)")
+        );
+    }
+
+    #[test]
+    fn variant_parse_goodtools_dumps_differ() {
+        // Mario 16's two dumps: [p1][!] vs [p1][a1] — different
+        // versions of one group, neither blocked from default.
+        let good = variant_of_title("Mario 16 (Asia) (En) (Pirate) [p1][!]");
+        let alt = variant_of_title("Mario 16 (Asia) (En) (Pirate) [p1][a1]");
+        assert_ne!(good.descriptor, alt.descriptor);
+        assert!(good.flags.contains(&"verified".to_string()));
+        assert!(alt.flags.contains(&"alternate".to_string()));
+        assert!(!good.never_default && !alt.never_default);
+        assert_eq!(
+            rom_group_key("nes", "Mario 16 (Asia) (En) (Pirate) [p1][!]"),
+            rom_group_key("nes", "Mario 16 (Asia) (En) (Pirate) [p1][a1]")
+        );
+    }
+
+    #[test]
+    fn variant_parse_bad_dump_badged_never_default() {
+        let bad = variant_of_title("Some Game (USA) [b]");
+        assert!(bad.flags.contains(&"bad-dump".to_string()));
+        assert!(bad.never_default);
+        let trained = variant_of_title("Some Game (USA) [t1]");
+        assert!(trained.flags.contains(&"trainer".to_string()));
+        assert!(trained.never_default);
+    }
+
+    #[test]
+    fn variant_parse_multi_disc_one_group() {
+        let d1 = variant_of_title("Big RPG (USA) (Disc 1)");
+        let d2 = variant_of_title("Big RPG (USA) (Disc 2)");
+        assert_eq!(d1.disc.as_deref(), Some("Disc 1"));
+        assert_eq!(d2.disc.as_deref(), Some("Disc 2"));
+        assert_ne!(d1.descriptor, d2.descriptor);
+        assert_eq!(
+            rom_group_key("psx", "Big RPG (USA) (Disc 1)"),
+            rom_group_key("psx", "Big RPG (USA) (Disc 2)")
+        );
+    }
+
+    #[test]
+    fn variant_parse_regions_revisions_status() {
+        let w = variant_of_title("3 Count Bout (World) (En,Ja)");
+        assert_eq!(w.region.as_deref(), Some("World"));
+        assert_eq!(w.region_rank, 1);
+        assert_eq!(w.languages.as_deref(), Some("En,Ja"));
+        let punch = variant_of_title("Mike Tyson's Punch-Out!! (Japan, USA) (En) (Rev 1)");
+        assert_eq!(punch.region.as_deref(), Some("Japan, USA"));
+        assert_eq!(punch.region_rank, 0, "best part ranks the group");
+        assert_eq!(punch.revision_key, 1000);
+        let beta = variant_of_title("Game (USA) (Beta)");
+        assert_eq!(beta.status, "beta");
+        assert_eq!(beta.status_rank, 1);
+        let v13 = variant_of_title("King of Kings, The - The Early Years (USA) (v1.3)");
+        assert_eq!(v13.revision_key, 1003);
+        let patched = variant_of_title("Game (World) (CDZ patched)");
+        assert!(patched.flags.contains(&"patched".to_string()));
+        assert!(patched.never_default);
+    }
+
+    #[test]
+    fn variant_parse_publisher_tags_distinguish() {
+        let tengen = variant_of_title("Pac-Man (USA) (Tengen)");
+        let namco = variant_of_title("Pac-Man (USA) (Namco)");
+        assert_ne!(tengen.descriptor, namco.descriptor);
+        assert!(tengen.descriptor.contains("Tengen"));
+    }
+
+    #[test]
+    fn group_key_is_sequel_safe() {
+        assert_ne!(
+            rom_group_key("neogeo", "The King of Fighters '94 (Japan)"),
+            rom_group_key("neogeo", "The King of Fighters '97 (Japan)")
+        );
+        assert_ne!(
+            rom_group_key("nes", "Mega Man 2 (USA)"),
+            rom_group_key("nes", "Mega Man 3 (USA)")
+        );
+        // Different systems never group.
+        assert_ne!(
+            rom_group_key("nes", "Klax (USA)"),
+            rom_group_key("genesis", "Klax (USA)")
+        );
     }
 }

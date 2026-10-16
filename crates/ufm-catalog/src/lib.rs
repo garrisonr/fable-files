@@ -511,6 +511,28 @@ impl Catalog {
                 );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Phase 3 grouping: the GAME-scoped half of rom_game_state
+        // (rating, favorite, completed, title_override, genre,
+        // players, notes) lives here, keyed by group key
+        // (platform + normalized base title) — rating Klax once
+        // rates every Klax. Play history stays per-path in
+        // rom_game_state (it is history of a file). Rows arrive via
+        // backfill_rom_group_state at the end of migrate().
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS rom_group_state (
+                    group_key TEXT PRIMARY KEY,
+                    rating INTEGER,
+                    favorite INTEGER NOT NULL DEFAULT 0,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    title_override TEXT,
+                    genre TEXT,
+                    players TEXT,
+                    notes TEXT,
+                    updated_at TEXT NOT NULL
+                );",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
         // Indexer v2 (Library Memory): persistent per-volume records.
         // A volume's identity is its FILESYSTEM UUID; where it has
         // been mounted is history, never identity (the same drive at
@@ -722,6 +744,7 @@ impl Catalog {
                 );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
+        self.backfill_rom_group_state()?;
         Ok(())
     }
 
@@ -3262,6 +3285,15 @@ pub struct RomHomeGame {
     pub also_platforms: Vec<String>,
     pub year: Option<i64>,
     pub sha1: Option<String>,
+    /// The content CRC from the identity evidence (hex) — zip
+    /// identities carry zeroed sha1, so (title, crc) is the variant
+    /// discriminator there (AUDIT §8).
+    pub crc: Option<String>,
+    /// Phase 3: the group this game folds into (platform +
+    /// normalized base title) and its parsed variant descriptor.
+    /// One group = one shelf card; the room collapses by this key.
+    pub group_key: String,
+    pub variant: ufm_media::romdat::RomVariant,
     /// Region parsed from the DAT title ("USA", "USA, Europe", …).
     pub region: Option<String>,
     pub media: Vec<RomGameMedia>,
@@ -3481,6 +3513,62 @@ impl Catalog {
                 state_by_path.insert(pk, st);
             }
         }
+        // Phase 3: group state for every group these games belong
+        // to (scoped fields are the group's; play stays per-path).
+        let group_keys: Vec<String> = raw
+            .iter()
+            .map(|r| ufm_media::romdat::rom_group_key(&r.8, &r.7))
+            .collect();
+        let mut state_by_group: std::collections::HashMap<String, RomGameState> =
+            std::collections::HashMap::new();
+        {
+            let mut distinct: Vec<String> = group_keys.clone();
+            distinct.sort();
+            distinct.dedup();
+            for chunk in distinct.chunks(400) {
+                let placeholders: Vec<String> = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", i + 1))
+                    .collect();
+                let sql = format!(
+                    "SELECT group_key, rating, favorite, completed,
+                            title_override, genre, players, notes
+                     FROM rom_group_state WHERE group_key IN ({})",
+                    placeholders.join(",")
+                );
+                let mut stmt = self
+                    .conn
+                    .prepare(&sql)
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                let values: Vec<rusqlite::types::Value> = chunk
+                    .iter()
+                    .map(|s| rusqlite::types::Value::Text(s.clone()))
+                    .collect();
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            RomGameState {
+                                rating: row.get(1)?,
+                                favorite: row.get::<_, i64>(2)? != 0,
+                                completed: row.get::<_, i64>(3)? != 0,
+                                play_count: 0,
+                                last_played: None,
+                                title_override: row.get(4)?,
+                                genre: row.get(5)?,
+                                players: row.get(6)?,
+                                notes: row.get(7)?,
+                            },
+                        ))
+                    })
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                for r in rows {
+                    let (gk, st) = r.map_err(|e| UfmError::Database(e.to_string()))?;
+                    state_by_group.insert(gk, st);
+                }
+            }
+        }
         let starred = self.starred_paths(&paths).unwrap_or_default();
         let mut flagged: std::collections::HashSet<String> = std::collections::HashSet::new();
         for chunk in paths.chunks(400) {
@@ -3539,10 +3627,19 @@ impl Catalog {
                 .as_ref()
                 .map(|pk| starred.contains(pk))
                 .unwrap_or(false);
-            let state = provider_key
-                .as_ref()
-                .and_then(|pk| state_by_path.get(pk).cloned())
-                .unwrap_or_default();
+            let group_key = ufm_media::romdat::rom_group_key(&platform_s, &title);
+            let variant = ufm_media::romdat::variant_of_title(&title);
+            let crc: Option<String> =
+                serde_json::from_str::<serde_json::Value>(&evidence)
+                    .ok()
+                    .and_then(|v| v.get("crc").and_then(|c| c.as_u64()))
+                    .map(|n| format!("{n:08x}"));
+            let state = Self::compose_rom_state(
+                state_by_group.get(&group_key),
+                provider_key
+                    .as_ref()
+                    .and_then(|pk| state_by_path.get(pk)),
+            );
             let auditor_flagged = provider_key
                 .as_ref()
                 .map(|pk| flagged.contains(pk))
@@ -3569,6 +3666,9 @@ impl Catalog {
                 also_platforms,
                 year,
                 sha1,
+                crc,
+                group_key,
+                variant,
                 media: media_by_item.get(&id).cloned().unwrap_or_default(),
                 state,
                 auditor_flagged,
@@ -3577,16 +3677,17 @@ impl Catalog {
         Ok(out)
     }
 
-    /// The room's tallies, from the catalog alone: total identified
-    /// games, how many lack box art ("missing media" — box art is
-    /// the shelf's face; a game with no found box-art row counts),
-    /// and the per-system split under the same membership rule as
-    /// `rom_home_games`.
+    /// The room's tallies, from the catalog alone — counted in
+    /// GAMES (Phase 3 groups), not files: total = distinct group
+    /// keys; a group counts as missing media when NO member item
+    /// has found box art; the per-system split uses the same
+    /// membership rule as `rom_home_games` (primary + `also`
+    /// platforms), counting each group once per shelf it sits on.
     pub fn rom_home_counts(&self) -> Result<RomHomeCounts> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT mi.platform, mi.match_evidence_json,
+                "SELECT mi.platform, mi.title, mi.match_evidence_json,
                         EXISTS (SELECT 1 FROM rom_media AS rm
                                 WHERE rm.item_id = mi.item_id
                                   AND rm.media_type = 'boxart'
@@ -3602,21 +3703,25 @@ impl Catalog {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })
             .map_err(|e| UfmError::Database(e.to_string()))?;
         let mut counts = RomHomeCounts::default();
-        let mut per: std::collections::HashMap<String, (i64, i64)> =
+        // group key -> any member has box art (global, and per shelf).
+        let mut art_by_key: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
+        let mut art_by_shelf: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, bool>,
+        > = std::collections::HashMap::new();
         for r in rows {
-            let (platform, evidence, has_art) =
+            let (platform, title, evidence, has_art) =
                 r.map_err(|e| UfmError::Database(e.to_string()))?;
-            let missing = has_art == 0;
-            counts.total += 1;
-            if missing {
-                counts.missing_media += 1;
-            }
+            let key = ufm_media::romdat::rom_group_key(&platform, &title);
+            let art = has_art != 0;
+            *art_by_key.entry(key.clone()).or_insert(false) |= art;
             let mut shelves = vec![platform];
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&evidence) {
                 if let Some(also) = v.get("also").and_then(|a| a.as_array()) {
@@ -3630,25 +3735,69 @@ impl Catalog {
                 }
             }
             for s in shelves {
-                let e = per.entry(s).or_default();
-                e.0 += 1;
-                if missing {
-                    e.1 += 1;
-                }
+                *art_by_shelf
+                    .entry(s)
+                    .or_default()
+                    .entry(key.clone())
+                    .or_insert(false) |= art;
             }
         }
-        let mut per_system: Vec<(String, i64, i64)> = per
+        counts.total = art_by_key.len() as i64;
+        counts.missing_media =
+            art_by_key.values().filter(|art| !**art).count() as i64;
+        let mut per_system: Vec<(String, i64, i64)> = art_by_shelf
             .into_iter()
-            .map(|(p, (games, missing))| (p, games, missing))
+            .map(|(p, keys)| {
+                let missing = keys.values().filter(|art| !**art).count() as i64;
+                (p, keys.len() as i64, missing)
+            })
             .collect();
         per_system.sort_by(|a, b| a.0.cmp(&b.0));
         counts.per_system = per_system;
         Ok(counts)
     }
 
-    /// One game's personal state (the default — unrated, unplayed —
-    /// when the user has never touched it).
-    pub fn rom_game_state_for(&self, provider_key: &str) -> Result<RomGameState> {
+    // --------------------------------------------------------
+    // Phase 3 grouping: game-scoped state (rom_group_state).
+    // Resolution is path → item → identity → group key. Reads
+    // compose group-scoped fields over the path's own play fields;
+    // writes route to the group row whenever the path resolves.
+    // Backfill COPIES (donor path rows keep their fields, so a
+    // rollback build still sees them); once a group row exists it
+    // is the source of truth for scoped fields.
+    // --------------------------------------------------------
+
+    /// The group key a path's game belongs to, when the path is an
+    /// identified ROM item. None for unidentified / extension-rule
+    /// files — their state stays path-keyed, orphan-safe.
+    pub fn rom_group_key_for_path(&self, provider_key: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT mi.platform, mi.title FROM items AS i
+                 JOIN media_identities AS mi ON mi.item_id = i.id
+                 WHERE i.provider_key = ?1 AND mi.media_kind = 'rom'
+                   AND mi.title IS NOT NULL AND mi.platform IS NOT NULL
+                 LIMIT 1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![provider_key], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        match rows.next() {
+            Some(r) => {
+                let (platform, title) =
+                    r.map_err(|e| UfmError::Database(e.to_string()))?;
+                Ok(Some(ufm_media::romdat::rom_group_key(&platform, &title)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The raw path row, when one exists (no group composition).
+    fn rom_path_state_row(&self, provider_key: &str) -> Result<Option<RomGameState>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -3673,9 +3822,225 @@ impl Catalog {
             })
             .map_err(|e| UfmError::Database(e.to_string()))?;
         match rows.next() {
-            Some(r) => Ok(r.map_err(|e| UfmError::Database(e.to_string()))?),
-            None => Ok(RomGameState::default()),
+            Some(r) => Ok(Some(r.map_err(|e| UfmError::Database(e.to_string()))?)),
+            None => Ok(None),
         }
+    }
+
+    /// The group row's scoped fields as a state (play fields stay
+    /// default — history is per-path, never the group's).
+    fn rom_group_state_row(&self, group_key: &str) -> Result<Option<RomGameState>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT rating, favorite, completed, title_override,
+                        genre, players, notes
+                 FROM rom_group_state WHERE group_key = ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![group_key], |row| {
+                Ok(RomGameState {
+                    rating: row.get(0)?,
+                    favorite: row.get::<_, i64>(1)? != 0,
+                    completed: row.get::<_, i64>(2)? != 0,
+                    play_count: 0,
+                    last_played: None,
+                    title_override: row.get(3)?,
+                    genre: row.get(4)?,
+                    players: row.get(5)?,
+                    notes: row.get(6)?,
+                })
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r.map_err(|e| UfmError::Database(e.to_string()))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Compose the state a game shows: game-scoped fields from the
+    /// group row when one exists (it is the source of truth),
+    /// play history always from the item's own path row.
+    fn compose_rom_state(
+        group: Option<&RomGameState>,
+        path: Option<&RomGameState>,
+    ) -> RomGameState {
+        let mut out = path.cloned().unwrap_or_default();
+        if let Some(g) = group {
+            out.rating = g.rating;
+            out.favorite = g.favorite;
+            out.completed = g.completed;
+            out.title_override = g.title_override.clone();
+            out.genre = g.genre.clone();
+            out.players = g.players.clone();
+            out.notes = g.notes.clone();
+        }
+        out
+    }
+
+    /// Donate one group's path-row state into its group row, when
+    /// the group row doesn't exist yet. Merge rule (donors ordered
+    /// by updated_at): rating / title_override / genre / players /
+    /// notes — the newest non-empty write wins; favorite /
+    /// completed — OR (once marked anywhere, the game is marked).
+    /// Donors keep their fields (copies, not moves): a rollback
+    /// build reading path rows still sees them.
+    fn backfill_group(&self, group_key: &str) -> Result<()> {
+        if self.rom_group_state_row(group_key)?.is_some() {
+            return Ok(());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT provider_key, rating, favorite, completed,
+                        title_override, genre, players, notes
+                 FROM rom_game_state
+                 WHERE rating IS NOT NULL OR favorite != 0 OR completed != 0
+                    OR title_override IS NOT NULL OR genre IS NOT NULL
+                    OR players IS NOT NULL OR notes IS NOT NULL
+                 ORDER BY updated_at ASC",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let donors = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        drop(stmt);
+        let mut merged: Option<RomGameState> = None;
+        for (pk, rating, favorite, completed, title, genre, players, notes) in donors {
+            if self.rom_group_key_for_path(&pk)?.as_deref() != Some(group_key) {
+                continue;
+            }
+            let m = merged.get_or_insert_with(RomGameState::default);
+            if rating.is_some() {
+                m.rating = rating;
+            }
+            m.favorite = m.favorite || favorite;
+            m.completed = m.completed || completed;
+            if title.is_some() {
+                m.title_override = title;
+            }
+            if genre.is_some() {
+                m.genre = genre;
+            }
+            if players.is_some() {
+                m.players = players;
+            }
+            if notes.is_some() {
+                m.notes = notes;
+            }
+        }
+        if let Some(m) = merged {
+            let now = ufm_core::now_utc().to_rfc3339();
+            self.conn
+                .execute(
+                    "INSERT INTO rom_group_state (group_key, rating, favorite,
+                        completed, title_override, genre, players, notes, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        group_key,
+                        m.rating,
+                        m.favorite as i64,
+                        m.completed as i64,
+                        m.title_override,
+                        m.genre,
+                        m.players,
+                        m.notes,
+                        now
+                    ],
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// The open-time backfill: every group any donor path row
+    /// resolves to gets its group row. Idempotent (groups with a
+    /// row are skipped); orphan rows (no identity) never resolve
+    /// and keep their state untouched.
+    fn backfill_rom_group_state(&self) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT provider_key FROM rom_game_state
+                 WHERE rating IS NOT NULL OR favorite != 0 OR completed != 0
+                    OR title_override IS NOT NULL OR genre IS NOT NULL
+                    OR players IS NOT NULL OR notes IS NOT NULL",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let keys = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        drop(stmt);
+        let mut groups = std::collections::HashSet::new();
+        for pk in &keys {
+            if let Some(gk) = self.rom_group_key_for_path(pk)? {
+                groups.insert(gk);
+            }
+        }
+        for gk in groups {
+            self.backfill_group(&gk)?;
+        }
+        Ok(())
+    }
+
+    /// rom_game_state_touch for the group table — with the lazy
+    /// per-group backfill first, so a same-session sequence (rate a
+    /// file, THEN it identifies, then rate again) never strands the
+    /// earlier path-row values.
+    fn rom_group_state_touch(
+        &self,
+        group_key: &str,
+        apply: &str,
+        args: &[rusqlite::types::Value],
+    ) -> Result<()> {
+        self.backfill_group(group_key)?;
+        let now = ufm_core::now_utc().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO rom_group_state (group_key, updated_at)
+                 VALUES (?1, ?2)",
+                params![group_key, now],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let sql = format!(
+            "UPDATE rom_group_state SET {apply}, updated_at = ? WHERE group_key = ?"
+        );
+        let mut values: Vec<rusqlite::types::Value> = args.to_vec();
+        values.push(rusqlite::types::Value::Text(now));
+        values.push(rusqlite::types::Value::Text(group_key.to_string()));
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(values.iter()))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// One game's personal state (the default — unrated, unplayed —
+    /// when the user has never touched it). For identified games the
+    /// game-scoped fields come from the group row (Phase 3); play
+    /// history always comes from the item's own path row.
+    pub fn rom_game_state_for(&self, provider_key: &str) -> Result<RomGameState> {
+        let path = self.rom_path_state_row(provider_key)?;
+        let group = match self.rom_group_key_for_path(provider_key)? {
+            Some(gk) => self.rom_group_state_row(&gk)?,
+            None => None,
+        };
+        Ok(Self::compose_rom_state(group.as_ref(), path.as_ref()))
     }
 
     /// Ensure a state row exists, then apply `apply`'s column writes.
@@ -3707,10 +4072,26 @@ impl Catalog {
         Ok(())
     }
 
+    /// Route a game-scoped write: the group row when the path
+    /// resolves to an identified game (Phase 3 — the mark belongs
+    /// to the GAME), the path row otherwise (extension-rule and
+    /// not-yet-identified files keep today's behavior exactly).
+    fn rom_scoped_touch(
+        &self,
+        provider_key: &str,
+        apply: &str,
+        args: &[rusqlite::types::Value],
+    ) -> Result<()> {
+        match self.rom_group_key_for_path(provider_key)? {
+            Some(gk) => self.rom_group_state_touch(&gk, apply, args),
+            None => self.rom_game_state_touch(provider_key, apply, args),
+        }
+    }
+
     /// Set (or clear, with None) the user's star rating for a game.
     pub fn rom_game_set_rating(&self, provider_key: &str, rating: Option<i64>) -> Result<()> {
         let rating = rating.map(|r| r.clamp(1, 5));
-        self.rom_game_state_touch(
+        self.rom_scoped_touch(
             provider_key,
             "rating = ?",
             &[match rating {
@@ -3721,7 +4102,7 @@ impl Catalog {
     }
 
     pub fn rom_game_set_favorite(&self, provider_key: &str, on: bool) -> Result<()> {
-        self.rom_game_state_touch(
+        self.rom_scoped_touch(
             provider_key,
             "favorite = ?",
             &[rusqlite::types::Value::Integer(on as i64)],
@@ -3729,7 +4110,7 @@ impl Catalog {
     }
 
     pub fn rom_game_set_completed(&self, provider_key: &str, on: bool) -> Result<()> {
-        self.rom_game_state_touch(
+        self.rom_scoped_touch(
             provider_key,
             "completed = ?",
             &[rusqlite::types::Value::Integer(on as i64)],
@@ -3752,7 +4133,7 @@ impl Catalog {
                 None => rusqlite::types::Value::Null,
             }
         };
-        self.rom_game_state_touch(
+        self.rom_scoped_touch(
             provider_key,
             "title_override = ?, genre = ?, players = ?, notes = ?",
             &[
@@ -6787,6 +7168,98 @@ mod rom_home_tests {
         assert_eq!(games.len(), 1);
         assert!(games[0].state.favorite);
         assert_eq!(games[0].state.play_count, 2);
+    }
+
+    #[test]
+    fn rom_group_state_backfill_merges_donors_and_spares_orphans() {
+        // Pre-grouping world: two dumps of one game rated on their
+        // paths before either is identified, plus an orphan path
+        // that never identifies. The backfill must merge the donors
+        // into ONE group row, newest rating winning, favorite
+        // OR-merged, play history left per-path, orphan untouched.
+        let cat = Catalog::open_in_memory().unwrap();
+        let usa = "/roms/nes/klax-usa.nes";
+        let japan = "/roms/nes/klax-japan.nes";
+        let orphan = "/roms/nes/mystery.nes";
+        cat.rom_game_set_rating(usa, Some(5)).unwrap();
+        cat.rom_game_set_favorite(usa, true).unwrap();
+        cat.rom_game_set_rating(japan, Some(3)).unwrap();
+        cat.rom_game_set_rating(orphan, Some(2)).unwrap();
+        cat.rom_game_note_play(usa).unwrap();
+        cat.rom_game_note_play(usa).unwrap();
+        // Deterministic donor order: USA older, Japan newer.
+        cat.conn
+            .execute(
+                "UPDATE rom_game_state SET updated_at = '2026-01-01T00:00:00Z' WHERE provider_key = ?1",
+                rusqlite::params![usa],
+            )
+            .unwrap();
+        cat.conn
+            .execute(
+                "UPDATE rom_game_state SET updated_at = '2026-06-01T00:00:00Z' WHERE provider_key = ?1",
+                rusqlite::params![japan],
+            )
+            .unwrap();
+        // Now the dumps identify as one game.
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let it_usa = rom_item(&cat, loc, "Klax (USA) (Unl).nes", usa);
+        cat.upsert_media_identity(
+            &it_usa.id, "rom", Some("Klax (USA)"), Some("nes"), None,
+            r#"{"matched":true,"also":[],"crc":111}"#,
+        )
+        .unwrap();
+        let it_jp = rom_item(&cat, loc, "Klax (Japan).nes", japan);
+        cat.upsert_media_identity(
+            &it_jp.id, "rom", Some("Klax (Japan)"), Some("nes"), None,
+            r#"{"matched":true,"also":[],"crc":222}"#,
+        )
+        .unwrap();
+        cat.backfill_rom_group_state().unwrap();
+        // One group row; both paths see the merged game state…
+        let group_rows: i64 = cat
+            .conn
+            .query_row("SELECT COUNT(*) FROM rom_group_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(group_rows, 1);
+        for pk in [usa, japan] {
+            let st = cat.rom_game_state_for(pk).unwrap();
+            assert_eq!(st.rating, Some(3), "newest donor rating wins");
+            assert!(st.favorite, "favorite OR-merges");
+        }
+        // …while play history stays per-path.
+        assert_eq!(cat.rom_game_state_for(usa).unwrap().play_count, 2);
+        assert_eq!(cat.rom_game_state_for(japan).unwrap().play_count, 0);
+        // The orphan keeps its own state and gains no group.
+        assert_eq!(cat.rom_game_state_for(orphan).unwrap().rating, Some(2));
+        assert_eq!(cat.rom_group_key_for_path(orphan).unwrap(), None);
+        // Idempotent: a second backfill changes nothing.
+        cat.backfill_rom_group_state().unwrap();
+        let group_rows: i64 = cat
+            .conn
+            .query_row("SELECT COUNT(*) FROM rom_group_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(group_rows, 1);
+        // New writes land on the group: unfavorite via Japan clears
+        // it for USA too (the group is the source of truth).
+        cat.rom_game_set_favorite(japan, false).unwrap();
+        assert!(!cat.rom_game_state_for(usa).unwrap().favorite);
+        // The games query composes the same truth, and both dumps
+        // carry one group key with distinct variants + CRCs.
+        let games = cat.rom_home_games(Some("nes")).unwrap();
+        assert_eq!(games.len(), 2);
+        assert_eq!(games[0].group_key, games[1].group_key);
+        assert!(games.iter().all(|g| !g.state.favorite));
+        let crcs: Vec<&str> = games.iter().filter_map(|g| g.crc.as_deref()).collect();
+        assert_eq!(crcs.len(), 2);
+        assert_ne!(
+            games[0].variant.descriptor, games[1].variant.descriptor,
+            "USA vs Japan variants differ"
+        );
+        // Counts speak in games now: 2 files, 1 group.
+        let counts = cat.rom_home_counts().unwrap();
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.per_system, vec![("nes".to_string(), 1, 1)]);
     }
 
     #[test]

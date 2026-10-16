@@ -20,6 +20,7 @@ import {
   type RomGameState,
   type RomHomeGame,
   type RomNeedsIdEntry,
+  type RomVariantInfo,
   type RomSmartList,
 } from "./api";
 import {
@@ -131,6 +132,50 @@ export interface RoomGame {
   /** Personal state read from the catalog (DAT games arrive with
    * it; extension games hydrate once on join). */
   stateHydrated: boolean;
+  /** Phase 3 grouping (DAT games): the group this game folds into
+   * and its parsed variant descriptor. */
+  groupKey: string | null;
+  variant: RomVariantInfo | null;
+  crc: string | null;
+  /** Set on a group's shelf representative by the collapse:
+   * every version of the game, default first. Copies of a version
+   * ride inside it and never count as versions. */
+  versions?: VersionView[];
+  /** Group play totals (sheet display): sums across versions. */
+  playTotal?: number;
+  playLast?: string | null;
+}
+
+/** One version of a grouped game (Phase 3): a distinct dump /
+ * region / revision / status — with its copies folded inside. */
+export interface VersionView {
+  descriptor: string;
+  variant: RomVariantInfo | null;
+  /** All items holding this version (copies — folded silently). */
+  games: RoomGame[];
+  /** The copy Play reaches for: online first, then has-art. */
+  rep: RoomGame;
+  isDefault: boolean;
+}
+
+/** The tag-stripped base title of a DAT name — the group display
+ * form. Mirrors romdat::parsed_base_title (groups removed, ", The"
+ * undone); the backend computes keys from the same rule. */
+export function baseTitle(raw: string): string {
+  let out = "";
+  let dp = 0;
+  let db = 0;
+  for (const ch of raw) {
+    if (ch === "(") dp++;
+    else if (ch === ")") dp = Math.max(0, dp - 1);
+    else if (ch === "[") db++;
+    else if (ch === "]") db = Math.max(0, db - 1);
+    else if (dp === 0 && db === 0) out += ch;
+  }
+  let s = out.split(/\s+/).filter(Boolean).join(" ");
+  s = s.replace(/^[ ,-]+/, "").replace(/[ ,-]+$/, "");
+  if (s.toLowerCase().endsWith(", the")) s = `The ${s.slice(0, -5)}`;
+  return s || raw;
 }
 
 interface RoomSystem {
@@ -577,7 +622,10 @@ export class RomHome {
     return {
       key: g.item.provider_key ?? g.item.id,
       item: g.item,
-      title: g.state.titleOverride ?? g.title,
+      // Group display title: the user's override, else the DAT
+      // name with its tag groups stripped (Phase 3 — the canonical
+      // region-free form; the full DAT name rides in datTitle).
+      title: g.state.titleOverride ?? baseTitle(g.title),
       datTitle: g.title,
       platform: g.platform,
       alsoPlatforms: g.alsoPlatforms,
@@ -595,6 +643,9 @@ export class RomHome {
       volumeLastSeen: g.volumeLastSeen,
       source: "dat",
       stateHydrated: true,
+      groupKey: g.groupKey,
+      variant: g.variant,
+      crc: g.crc,
     };
   }
 
@@ -646,6 +697,9 @@ export class RomHome {
             volumeLastSeen: b?.last_seen ?? null,
             source: "ext",
             stateHydrated: false,
+            groupKey: null,
+            variant: null,
+            crc: null,
           });
           changed = true;
         }
@@ -762,9 +816,9 @@ export class RomHome {
     const lib = el("div", "rh-rail-group");
     const total = this.counts.total;
     lib.appendChild(this.shelfRow({ kind: "all" }, "🗄", "All Games", total > 0 ? String(total) : "—"));
-    const favCount = this.games.filter((g) => g.state.favorite).length;
+    const favCount = this.collapseGroups(this.games.filter((g) => g.state.favorite)).length;
     lib.appendChild(this.shelfRow({ kind: "favorites" }, "♥", "Favorites", favCount > 0 ? String(favCount) : ""));
-    const recentCount = this.games.filter((g) => g.state.lastPlayed).length;
+    const recentCount = this.collapseGroups(this.games.filter((g) => g.state.lastPlayed)).length;
     lib.appendChild(this.shelfRow({ kind: "recent" }, "🕘", "Recently Played", recentCount > 0 ? String(recentCount) : ""));
     lib.appendChild(
       this.shelfRow(
@@ -1118,9 +1172,10 @@ export class RomHome {
       if (!b || !f.players.includes(b)) return false;
     }
     for (const m of f.media) {
-      if (m === "has-art" && !g.media.has("boxart")) return false;
-      if (m === "missing-art" && g.media.has("boxart")) return false;
-      if (m === "has-video" && !g.media.has("trailer")) return false;
+      // Media presence is a group question now: any copy counts.
+      if (m === "has-art" && !this.groupHasMedia(g, "boxart")) return false;
+      if (m === "missing-art" && this.groupHasMedia(g, "boxart")) return false;
+      if (m === "has-video" && !this.groupHasMedia(g, "trailer")) return false;
     }
     for (const fl of f.flags) {
       if (fl === "starred" && !(g.starred || (g.state.rating ?? 0) >= 1)) return false;
@@ -1131,8 +1186,153 @@ export class RomHome {
     return true;
   }
 
+  // ------------------------------------------------------------ grouping (Phase 3)
+
+  /** The last collapsed shelf view — the inspector resolves group
+   * representatives through it. */
+  private lastVisible: RoomGame[] = [];
+
+  /** Fold items into games (AUDIT §8): DAT items sharing a group
+   * key become ONE representative carrying every version (default
+   * first); copies of a version fold inside it silently and never
+   * count as versions. Extension-rule games never group. */
+  private collapseGroups(games: RoomGame[]): RoomGame[] {
+    const byGroup = new Map<string, RoomGame[]>();
+    const out: RoomGame[] = [];
+    for (const g of games) {
+      if (g.source !== "dat" || !g.groupKey) {
+        out.push(g);
+        continue;
+      }
+      const arr = byGroup.get(g.groupKey);
+      if (arr) arr.push(g);
+      else byGroup.set(g.groupKey, [g]);
+    }
+    for (const members of byGroup.values()) out.push(this.collapseOne(members));
+    return out;
+  }
+
+  private collapseOne(members: RoomGame[]): RoomGame {
+    if (members.length === 1) {
+      const g = members[0];
+      const v = this.versionOf([g]);
+      v.isDefault = true;
+      g.versions = [v];
+      g.playTotal = g.state.playCount;
+      g.playLast = g.state.lastPlayed;
+      return g;
+    }
+    // Versions are distinct (descriptor, content) pairs — two
+    // dumps of Klax (USA) are two versions; the same dump in two
+    // places is one version with copies. Content = sha1 when real,
+    // else the evidence CRC (zip identities carry zeroed sha1),
+    // else the DAT title.
+    const byVersion = new Map<string, RoomGame[]>();
+    for (const g of members) {
+      const content =
+        g.sha1 && !/^0+$/.test(g.sha1) ? g.sha1 : (g.crc ?? g.datTitle);
+      const key = `${g.variant?.descriptor ?? ""}|${content}`;
+      const arr = byVersion.get(key);
+      if (arr) arr.push(g);
+      else byVersion.set(key, [g]);
+    }
+    const versions = [...byVersion.values()].map((copies) =>
+      this.versionOf(copies),
+    );
+    // The default (Dickles' order): never-default variants
+    // (badged hacks / patched / trainers / bad dumps) yield while
+    // any clean variant exists; then USA → World → Europe →
+    // other regions, a release over Beta/Proto/Sample/Demo, the
+    // newest revision, descriptor for stability.
+    const cmpRank = (a: VersionView, b: VersionView): number =>
+      (a.variant?.regionRank ?? 4) - (b.variant?.regionRank ?? 4) ||
+      (a.variant?.statusRank ?? 0) - (b.variant?.statusRank ?? 0) ||
+      (b.variant?.revisionKey ?? -1) - (a.variant?.revisionKey ?? -1) ||
+      a.descriptor.localeCompare(b.descriptor);
+    versions.sort(cmpRank);
+    const clean = versions.filter((v) => !v.variant?.neverDefault);
+    const def = (clean.length > 0 ? clean : versions)[0];
+    def.isDefault = true;
+    const rep = def.rep;
+    rep.versions = versions;
+    rep.playTotal = members.reduce((a, g) => a + g.state.playCount, 0);
+    rep.playLast = members.reduce<string | null>(
+      (acc, g) =>
+        g.state.lastPlayed && (!acc || g.state.lastPlayed > acc)
+          ? g.state.lastPlayed
+          : acc,
+      null,
+    );
+    return rep;
+  }
+
+  private versionOf(copies: RoomGame[]): VersionView {
+    const sorted = [...copies].sort(
+      (a, b) =>
+        Number(a.offline) - Number(b.offline) ||
+        Number(b.media.has("boxart")) - Number(a.media.has("boxart")) ||
+        a.key.localeCompare(b.key),
+    );
+    const rep = sorted[0];
+    return {
+      descriptor: rep.variant?.descriptor ?? "",
+      variant: rep.variant,
+      games: sorted,
+      rep,
+      isDefault: false,
+    };
+  }
+
+  /** The whole group a representative stands for, rebuilt from
+   * every loaded game — the Missing Media shelf collapses over a
+   * filtered member set, but its version lists must be complete. */
+  private expandGroup(rep: RoomGame): RoomGame {
+    if (!rep.groupKey || !rep.versions) return rep;
+    const held = rep.versions.reduce((a, v) => a + v.games.length, 0);
+    const members = this.games.filter((g) => g.groupKey === rep.groupKey);
+    if (members.length <= held) return rep;
+    return this.collapseOne(members);
+  }
+
+  /** The shelf representative for any member of a group (the
+   * inspector thinks in groups, selection may hold a member). */
+  private groupRepOf(g: RoomGame): RoomGame {
+    if (!g.groupKey) return g;
+    return this.lastVisible.find((v) => v.groupKey === g.groupKey) ?? g;
+  }
+
+  /** Any copy of any version carries this media type? */
+  private groupHasMedia(g: RoomGame, type: string): boolean {
+    if (!g.versions) return g.media.has(type);
+    return g.versions.some((v) => v.games.some((c) => c.media.has(type)));
+  }
+
+  /** Mirror a game-scoped state change onto every loaded member
+   * of the group (the backend stores it on the group; the room's
+   * copies must agree without a reload). */
+  private fanOutScoped(g: RoomGame): void {
+    if (!g.groupKey) return;
+    for (const m of this.games) {
+      if (m === g || m.groupKey !== g.groupKey || m.source !== "dat") continue;
+      m.state = {
+        ...m.state,
+        rating: g.state.rating,
+        favorite: g.state.favorite,
+        completed: g.state.completed,
+        titleOverride: g.state.titleOverride,
+        genre: g.state.genre,
+        players: g.state.players,
+        notes: g.state.notes,
+      };
+      m.title = m.state.titleOverride ?? baseTitle(m.datTitle);
+    }
+  }
+
   private visibleGames(): RoomGame[] {
-    let games = this.shelfGames();
+    let games = this.collapseGroups(this.shelfGames());
+    if (this.shelf.kind === "missing") {
+      games = games.map((rep) => this.expandGroup(rep));
+    }
     const f = this.filters;
     const hasFilters =
       f.systems.length + f.genres.length + f.players.length + f.media.length + f.flags.length > 0;
@@ -1148,15 +1348,16 @@ export class RomHome {
         games.sort((a, b) => (b.year ?? -1) - (a.year ?? -1) || byTitle(a, b));
         break;
       case "recent-played":
-        games.sort((a, b) => (b.state.lastPlayed ?? "").localeCompare(a.state.lastPlayed ?? "") || byTitle(a, b));
+        games.sort((a, b) => (b.playLast ?? b.state.lastPlayed ?? "").localeCompare(a.playLast ?? a.state.lastPlayed ?? "") || byTitle(a, b));
         break;
       case "most-played":
-        games.sort((a, b) => b.state.playCount - a.state.playCount || byTitle(a, b));
+        games.sort((a, b) => (b.playTotal ?? b.state.playCount) - (a.playTotal ?? a.state.playCount) || byTitle(a, b));
         break;
       case "recent-added":
         games.sort((a, b) => (b.item.modified ?? "").localeCompare(a.item.modified ?? "") || byTitle(a, b));
         break;
     }
+    this.lastVisible = games;
     return games;
   }
 
@@ -1390,7 +1591,7 @@ export class RomHome {
     switch (ref.kind) {
       case "all":
         title = "All Games";
-        sub = `${this.games.length.toLocaleString()} games`;
+        sub = `${this.collapseGroups(this.games).length.toLocaleString()} games`;
         missingForFetch = this.counts.missingMedia;
         break;
       case "favorites":
@@ -1420,7 +1621,7 @@ export class RomHome {
         hero.classList.add("rh-hero-icon");
         if (rs) {
           const meta = romSystemMeta(ref.name);
-          const n = this.shelfGames().length;
+          const n = this.collapseGroups(this.shelfGames()).length;
           const size = this.shelfGames().reduce((a, g) => a + (g.item.size_bytes ?? 0), 0);
           sub = `${meta.gen !== null ? `${ordinal(meta.gen)} Generation · ` : ""}${n.toLocaleString()} games${size > 0 ? ` · ${formatBytes(size)}` : ""}`;
           missingForFetch = rs.missing;
@@ -1782,6 +1983,11 @@ export class RomHome {
     t.title = g.title;
     titleRow.appendChild(t);
     if (g.year) titleRow.appendChild(el("span", "rh-tile-year", String(g.year)));
+    if ((g.versions?.length ?? 0) > 1) {
+      const pill = el("span", "rh-tile-ver", `${g.versions!.length} versions`);
+      pill.title = "Several versions of this game — open it to pick";
+      titleRow.appendChild(pill);
+    }
     tile.appendChild(titleRow);
 
     tile.addEventListener("click", (e) => {
@@ -1887,6 +2093,9 @@ export class RomHome {
     cells.forEach((text, i) => {
       const c = el("span", "rh-td", text);
       c.dataset.col = String(i);
+      if (i === 0 && (g.versions?.length ?? 0) > 1) {
+        c.appendChild(el("span", "rh-tile-ver", `${g.versions!.length} versions`));
+      }
       if (i === 4) {
         const dots = el("span", "rh-media-dots");
         for (const t of MEDIA_TYPES) {
@@ -2158,6 +2367,7 @@ export class RomHome {
   ): void {
     if (outcome.playedProviderKey === g.item.provider_key) {
       g.state = outcome.state;
+      this.fanOutScoped(g);
     }
     this.renderInspector();
     // Recently Played's membership changed under us; the rail
@@ -2187,6 +2397,7 @@ export class RomHome {
     const pk = g.item.provider_key;
     if (!pk) return;
     g.state.rating = rating;
+    this.fanOutScoped(g);
     // The tile ★ mirrors the room's stars; the path star follows a
     // fresh rating (and clears when the rating does).
     try {
@@ -2207,6 +2418,7 @@ export class RomHome {
     const pk = g.item.provider_key;
     if (!pk) return;
     g.state.favorite = on;
+    this.fanOutScoped(g);
     try {
       await api.romHomeSetFavorite(pk, on);
     } catch (err) {
@@ -2220,6 +2432,7 @@ export class RomHome {
     const pk = g.item.provider_key;
     if (!pk) return;
     g.state.completed = on;
+    this.fanOutScoped(g);
     try {
       await api.romHomeSetCompleted(pk, on);
     } catch (err) {
@@ -2244,6 +2457,10 @@ export class RomHome {
 
   /** Fetch one game's missing types (the chips' job), or one type. */
   private fetchForGames(games: RoomGame[], onlyType?: string): void {
+    // Groups fetch for every version's copies, not just the rep.
+    games = games.flatMap((g) =>
+      g.versions ? g.versions.flatMap((v) => v.games) : [g],
+    );
     const wanted = games.filter((g) => g.source === "dat" && !g.offline);
     const retry: { itemId: string; mediaType: "boxart" | "screenshot" | "titleshot" | "trailer" }[] = [];
     for (const g of wanted) {
@@ -2295,6 +2512,19 @@ export class RomHome {
         disabled: g.offline,
         action: () => void this.playWith(g),
       });
+      // Play a specific version (Phase 3): the picker's doors in
+      // the room's right-click menu, same as the sheet's list.
+      const rep = this.groupRepOf(g);
+      if (rep.versions && rep.versions.length > 1) {
+        for (const v of rep.versions) {
+          const playable = v.games.find((c) => !c.offline) ?? v.rep;
+          items.push({
+            label: `Play — ${v.descriptor || v.rep.datTitle}${v.isDefault ? " (default)" : ""}`,
+            disabled: v.games.every((c) => c.offline),
+            action: () => void this.playGame(playable),
+          });
+        }
+      }
       items.push({ label: "", separator: true, action: () => undefined });
     }
     items.push({
@@ -2481,7 +2711,10 @@ export class RomHome {
     const insp = this.inspectorEl;
     const chosen = [...this.selection]
       .map((k) => this.gamesByKey.get(k))
-      .filter((v): v is RoomGame => !!v);
+      .filter((v): v is RoomGame => !!v)
+      // The sheet thinks in groups: any member resolves to its
+      // group's shelf representative (versions ride along).
+      .map((g) => this.groupRepOf(g));
     if (chosen.length === 0) {
       if (!insp.hidden) {
         insp.hidden = true;
@@ -2577,6 +2810,54 @@ export class RomHome {
     }
   }
 
+  /** One version row in the sheet: descriptor, the badges that
+   * matter (bad dumps wear theirs openly — Q2), copies and play
+   * counts, and its own Play. */
+  private versionRow(v: VersionView): HTMLElement {
+    const row = el("div", "rh-ver-row");
+    const main = el("div", "rh-ver-main");
+    const name = el(
+      "span",
+      "rh-ver-name",
+      v.descriptor || v.rep.datTitle,
+    );
+    main.appendChild(name);
+    const badges = el("span", "rh-ver-badges");
+    if (v.isDefault) {
+      badges.appendChild(el("span", "rh-ver-badge rh-ver-default", "Default"));
+    }
+    const flagBadge: Record<string, [string, string]> = {
+      "bad-dump": ["Bad dump", "rh-ver-badge rh-ver-danger"],
+      overdump: ["Overdump", "rh-ver-badge rh-ver-danger"],
+      trainer: ["Trainer", "rh-ver-badge rh-ver-warn"],
+      hack: ["Hack", "rh-ver-badge rh-ver-warn"],
+      patched: ["Patched", "rh-ver-badge rh-ver-warn"],
+    };
+    for (const f of v.variant?.flags ?? []) {
+      const b = flagBadge[f];
+      if (b) badges.appendChild(el("span", b[1], b[0]));
+    }
+    main.appendChild(badges);
+    const plays = v.games.reduce((a, c) => a + c.state.playCount, 0);
+    const meta: string[] = [];
+    if (v.games.length > 1) meta.push(`${v.games.length} copies`);
+    if (plays > 0) meta.push(`played ${plays}×`);
+    meta.push(
+      v.games.some((c) => c.media.has("boxart")) ? "has box art" : "no box art",
+    );
+    main.appendChild(el("span", "rh-ver-meta", meta.join(" · ")));
+    row.appendChild(main);
+    const playable = v.games.find((c) => !c.offline) ?? v.rep;
+    const btn = el("button", "pill-btn rh-ver-play", "▶ Play") as HTMLButtonElement;
+    if (v.games.every((c) => c.offline)) {
+      btn.disabled = true;
+      btn.title = "On a disconnected volume";
+    }
+    btn.addEventListener("click", () => void this.playGame(playable));
+    row.appendChild(btn);
+    return row;
+  }
+
   private buildInspector(insp: HTMLElement, g: RoomGame): void {
     // ---- Hero: trailer (hover) or the best still.
     const hero = el("div", "rh-hero");
@@ -2653,6 +2934,27 @@ export class RomHome {
           `On ${g.volumeLabel ?? "a disconnected volume"} · last seen ${fmtDay(g.volumeLastSeen)} — reconnect it to play.`,
         ),
       );
+    }
+
+    // ---- Versions (Phase 3): every dump of this game, badged,
+    // each playable. The big Play button above plays the default
+    // (first row). Bad dumps show badged — never hidden (Q2).
+    if (g.versions && g.versions.length > 1) {
+      insp.appendChild(
+        el("span", "rh-insp-lab", `Versions (${g.versions.length})`),
+      );
+      for (const v of g.versions) {
+        insp.appendChild(this.versionRow(v));
+      }
+      if ((g.playTotal ?? 0) > 0) {
+        insp.appendChild(
+          el(
+            "p",
+            "rh-ver-total",
+            `Played ${g.playTotal} ${g.playTotal === 1 ? "time" : "times"} across all versions.`,
+          ),
+        );
+      }
     }
 
     // ---- Your marks: stars, favorite, completed.
@@ -2883,7 +3185,8 @@ export class RomHome {
               players: playersIn.value.trim() || null,
               notes: notesIn.value.trim() || null,
             };
-            g.title = g.state.titleOverride ?? g.datTitle;
+            g.title = g.state.titleOverride ?? baseTitle(g.datTitle);
+            this.fanOutScoped(g);
           } catch (err) {
             Toast.error(`Could not save: ${errText(err)}`);
             return;

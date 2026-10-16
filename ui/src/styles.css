@@ -3795,6 +3795,32 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
   margin-left: auto; text-align: right; overflow-wrap: anywhere;
 }
 
+/* ---- Variant grouping (Phase 3): pill, sheet version rows ---- */
+.rh-tile-ver {
+  flex: none; font-size: 0.68rem; font-weight: 650;
+  color: var(--ufm-text-muted);
+  border: 1px solid var(--ufm-border); border-radius: 999px;
+  padding: 0 6px; margin-left: 6px; white-space: nowrap;
+}
+.rh-ver-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 0; border-top: 1px solid var(--ufm-border);
+}
+.rh-ver-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.rh-ver-name { font-weight: 600; font-size: 0.9rem; overflow-wrap: anywhere; }
+.rh-ver-badges { display: flex; gap: 4px; flex-wrap: wrap; }
+.rh-ver-badge {
+  font-size: 0.66rem; font-weight: 700; letter-spacing: 0.02em;
+  border-radius: 4px; padding: 1px 5px;
+  border: 1px solid var(--ufm-border); color: var(--ufm-text-muted);
+}
+.rh-ver-default { color: var(--ufm-text); }
+.rh-ver-warn { color: var(--ufm-warning, #8c5300); border-color: currentColor; }
+.rh-ver-danger { color: var(--ufm-danger); border-color: currentColor; }
+.rh-ver-meta { color: var(--ufm-text-muted); font-size: 0.78rem; }
+.rh-ver-play { flex: none; }
+.rh-ver-total { color: var(--ufm-text-muted); font-size: 0.82rem; margin: 6px 0 0; }
+
 /* ---- Shelf ---- */
 .rh-shelf { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .rh-shelf-head {

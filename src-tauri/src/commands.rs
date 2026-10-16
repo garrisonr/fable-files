@@ -8662,7 +8662,12 @@ pub struct RomHomeGameWire {
     pub also_platforms: Vec<String>,
     pub year: Option<i64>,
     pub sha1: Option<String>,
+    pub crc: Option<String>,
     pub region: Option<String>,
+    /// Phase 3 grouping: the group this game folds into + its
+    /// parsed variant descriptor (the room collapses by group).
+    pub group_key: String,
+    pub variant: ufm_media::romdat::RomVariant,
     pub media: Vec<ufm_catalog::RomGameMedia>,
     pub state: ufm_catalog::RomGameState,
     pub auditor_flagged: bool,
@@ -8698,7 +8703,10 @@ pub async fn rom_home_games(
             also_platforms: row.also_platforms,
             year: row.year,
             sha1: row.sha1,
+            crc: row.crc,
             region: row.region,
+            group_key: row.group_key,
+            variant: row.variant,
             media: row.media,
             state: row.state,
             auditor_flagged: row.auditor_flagged,
