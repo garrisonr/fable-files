@@ -154,9 +154,9 @@ function bootAudioPlayer(params: URLSearchParams): void {
   time.className = "vp-time";
   time.textContent = "0:00 / 0:00";
   const ret = document.createElement("button");
-  ret.className = "vp-btn";
-  ret.textContent = "⤺";
-  ret.title = "Back to the Music Player";
+  ret.className = "vp-btn vp-return";
+  ret.textContent = "⤺ Return";
+  ret.title = "Return to the main window";
   bar.append(playBtn, seek, time, ret);
   main.append(title, bar);
   wrap.append(art, glyph, main);

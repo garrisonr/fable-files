@@ -2636,6 +2636,19 @@ tr.row[style*="--label-color"] {
   border-radius: 999px; padding: 0.2rem 0.6rem; cursor: pointer;
   font: inherit; font-size: 0.8rem;
 }
+/* Return chip (Dickles 2026-10-15): the detached player's way
+   home — labeled, pinned top-right, NEVER auto-hidden with the
+   transport bar. Same dark-pill material as the cast badge,
+   mirrored to the opposite corner. */
+.vp-return-chip {
+  position: absolute; top: 0.6rem; right: 0.6rem; z-index: 6;
+  appearance: none; border: 0; cursor: pointer;
+  background: rgb(0 0 0 / 0.62); color: #fff;
+  padding: 0.35rem 0.7rem; border-radius: 999px;
+  font: inherit; font-size: 0.85rem; backdrop-filter: blur(6px);
+  min-height: 2rem; display: inline-flex; align-items: center;
+}
+.vp-return-chip:hover { background: rgb(0 0 0 / 0.8); }
 .vp-bar {
   position: absolute; left: 0; right: 0; bottom: 0;
   display: flex; align-items: center; gap: 0.4rem;

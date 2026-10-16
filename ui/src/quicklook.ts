@@ -23,6 +23,7 @@ import {
   type PreviewKind,
 } from "./api";
 import { onPlayerClosed, onPlayerReturn, onPlayerState } from "./api";
+import { attachStep, type AttachSnapshot } from "./qlattach";
 import { VideoPlayer, isVideoName } from "./video";
 import type { CastDeviceLike } from "./video";
 import { audioTags, folderArtUrl } from "./audiometa";
@@ -44,6 +45,11 @@ export class QuickLook {
    * window's player-state stream — the inline player resumes from
    * here when the media comes home. */
   private detachedState = new Map<string, { t: number; playing: boolean }>();
+  /** Attachment rules (Dickles 2026-10-15): the selection the
+   * user moved to while this pane's media is detached. The pane
+   * stays pinned to its placeholder; when the pop-out goes away,
+   * the pane adopts this item (see qlattach.ts). */
+  private followPending: Item | null = null;
   private currentKind: PreviewKind | null = null;
   /** Live Quick Look audio element (Round 7.1): tracked so playback
    * can be stopped deterministically — a detached <audio> element
@@ -204,27 +210,103 @@ export class QuickLook {
     void onPlayerReturn(cacheState).catch(() => undefined);
   }
 
+  /** The attachment machine's view of this pane, derived fresh
+   * from the authoritative fields (qlattach.ts): what's open,
+   * which path a pop-out pins (the explicit detached flags),
+   * and the selection remembered while pinned. */
+  private attachSnapshot(): AttachSnapshot {
+    return {
+      openId: this.openItem?.id ?? null,
+      pinnedPath: this.detachedFor ?? this.detachedAudioFor ?? null,
+      pendingId: this.followPending?.id ?? null,
+    };
+  }
+
+  /** Selection changed on some surface (the shell routes them
+   * all here — browse views, search / Smart Folder results,
+   * mouse and keyboard alike). Attachment rules: an OPEN
+   * attached pane follows the selection; a pane whose media is
+   * detached stays pinned and remembers the selection for the
+   * return; a closed pane ignores all of it. */
+  followSelection(item: Item | null): void {
+    if (!this.openItem) return;
+    const { pendingId, effect } = attachStep(this.attachSnapshot(), {
+      type: "selection",
+      id: item?.id ?? null,
+    });
+    // attachStep reports a pending id only for the event's own
+    // item (the pinned branch), so the object in hand is it.
+    this.followPending =
+      pendingId !== null && item && item.id === pendingId ? item : null;
+    if (effect.type === "follow" && item) void this.open(item);
+  }
+
   /** A detach window for `path` is gone — by its close event or
    * by the tombstone watch finding it missing (fix batch item 4).
-   * Clears the detached flag; if the card on screen IS that media,
-   * it re-renders so playback resumes inline from the streamed
-   * state. If a different card is on screen, the resume state
-   * simply stays cached for when its own card returns. */
+   * Clears the detached flag, then the attachment rules decide
+   * the card: if the user moved the selection while the media
+   * was away, the pane ADOPTS that selection (rule 3); if the
+   * card on screen IS that media, it re-renders so playback
+   * resumes inline from the streamed state. If a different card
+   * is on screen, the resume state simply stays cached for when
+   * its own card returns. */
   private handleDetachGone(path: string): void {
-    let mine = false;
-    if (this.detachedFor === path) {
-      this.detachedFor = null;
-      mine = true;
-    }
-    if (this.detachedAudioFor === path) {
-      this.detachedAudioFor = null;
-      mine = true;
-    }
+    const mine =
+      this.detachedFor === path || this.detachedAudioFor === path;
     if (!mine) return;
+    // Snapshot BEFORE the flags clear: the machine needs the pin
+    // this pop-out held to judge the return.
+    const snap = this.attachSnapshot();
+    if (this.detachedFor === path) this.detachedFor = null;
+    if (this.detachedAudioFor === path) this.detachedAudioFor = null;
     this.stopDetachWatchIfIdle();
-    if (this.openItem?.provider_key === path) {
+    const { effect } = attachStep(snap, {
+      type: "detach-end",
+      path,
+      openPath: this.openItem?.provider_key ?? null,
+    });
+    const adopt = effect.type === "adopt" ? this.followPending : null;
+    this.followPending = null;
+    if (effect.type === "adopt" && adopt) {
+      void this.open(adopt);
+    } else if (effect.type === "render-home" && this.openItem) {
       void this.renderCard(this.openItem, this.currentKind);
     }
+  }
+
+  /** The shell popped this item out directly (double-click law):
+   *  when the pane is showing the same item, the pane becomes
+   *  its detached placeholder — the window owns playback, the
+   *  inline player stops (renderCard tears it down), and the
+   *  trip home runs through the usual detach-gone path. The
+   *  inline position seeds the resume cache; the window's own
+   *  state stream takes over from there. Without this, selection
+   *  follow (rule 1) starting a file inline and the double-click
+   *  pop-out would play it twice. */
+  notePoppedOut(item: Item): void {
+    if (!this.openItem || this.openItem.id !== item.id) return;
+    const path = item.provider_key;
+    if (!path) return;
+    if (this.videoPlayer && this.videoPlayer.sourcePath === path) {
+      this.detachedState.set(path, {
+        t: this.videoPlayer.position(),
+        playing: this.videoPlayer.isPlaying(),
+      });
+    } else if (this.audioEl && this.audioPath === path) {
+      this.detachedState.set(path, {
+        t: this.audioEl.currentTime || 0,
+        playing: !this.audioEl.paused && !this.audioEl.ended,
+      });
+    }
+    if (isVideoName(item.name)) {
+      if (this.detachedFor === path) return;
+      this.detachedFor = path;
+    } else {
+      if (this.detachedAudioFor === path) return;
+      this.detachedAudioFor = path;
+    }
+    this.startDetachWatch();
+    void this.renderCard(item, this.currentKind);
   }
 
   /** Tombstone watch (fix batch item 4): while any detach is
@@ -407,6 +489,7 @@ export class QuickLook {
     this.stopVideo();
     this.requestToken++;
     this.openItem = null;
+    this.followPending = null;
     this.slideTo(this.closedX(), () => {
       // A re-open mid-close re-targets the same spring; its stale onDone
       // must not hide a pane that is open again.

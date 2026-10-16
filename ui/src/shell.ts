@@ -506,6 +506,10 @@ export class Shell {
         }
         void this.quickLook.open(item);
       },
+      // Attachment rules (Dickles 2026-10-15): selection inside
+      // search / Smart Folder results reaches Quick Look through
+      // the same follow door as the browse views.
+      onSelectItem: (item) => this.quickLook.followSelection(item),
       onPopOutItem: (item) => this.popOutItem(item),
       onOfflineItem: (hit) => {
         // Library Memory: plain language, never a dead click.
@@ -1277,6 +1281,7 @@ export class Shell {
         start: 0,
         autoplay: true,
       })
+      .then(() => this.quickLook.notePoppedOut(item))
       .catch((err) =>
         Toast.error(`Could not open the player: ${errText(err)}`),
       );
@@ -1463,9 +1468,14 @@ export class Shell {
   }
 
   private onSelect(item: Item | null): void {
-    void item;
     this.renderStatus();
     this.renderCrumbs();
+    // Quick Look attachment (Dickles 2026-10-15): every browse
+    // view funnels selection through this hook — mouse clicks
+    // and keyboard navigation alike — so an open attached
+    // preview follows the selection from here. Detached media
+    // stays pinned inside QuickLook; a closed pane ignores it.
+    this.quickLook.followSelection(item);
   }
 
   private togglePreview(): void {

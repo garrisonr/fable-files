@@ -259,7 +259,7 @@ export class MusicPlayer {
     this.overlay.querySelector(".music-card")?.classList.add("detached");
     if (this.subEl) {
       this.subEl.textContent =
-        "Playing in the detached window — the ⤺ button there brings it back here";
+        "Playing in the detached window — the ⤺ Return button there brings it back here";
     }
   }
 

@@ -305,12 +305,19 @@ export class VideoPlayer {
       this.bar.appendChild(detachBtn);
     }
     if (opts.onReturn) {
-      const returnBtn = document.createElement("button");
-      returnBtn.className = "vp-btn vp-return";
-      returnBtn.textContent = "⤺ Preview";
-      returnBtn.title = "Back to the file preview";
-      returnBtn.addEventListener("click", () => opts.onReturn!());
-      this.bar.appendChild(returnBtn);
+      // Return home (Dickles 2026-10-15): a detached player must
+      // never read as a one-way door. The old in-bar button hid
+      // with the auto-fading transport bar — invisible exactly
+      // while a film plays. The Return control is now a labeled
+      // chip pinned to the player's top-right corner (the cast
+      // badge's visual language), on screen for the whole show.
+      const chip = document.createElement("button");
+      chip.className = "vp-return-chip";
+      chip.textContent = "⤺ Return";
+      chip.title = "Return to the preview in the main window";
+      chip.setAttribute("aria-label", "Return to preview");
+      chip.addEventListener("click", () => opts.onReturn!());
+      this.el.appendChild(chip);
     }
     const fsBtn = document.createElement("button");
     fsBtn.className = "vp-btn";

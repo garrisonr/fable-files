@@ -105,6 +105,16 @@ Craft, Delight.** In particular:
 
 - **QuickLook preview:** spring-anchored to the selected file, dismisses
   along its entry path, interruptible mid-animation.
+- **QuickLook attachment (Dickles, 2026-10-15):** an attached preview
+  FOLLOWS the selection — click or arrow to another file, in any view
+  including Smart Folder results, and the pane shows that file. Media
+  popped out to a detach window stays PINNED to its item no matter
+  where the selection wanders. Detaching is never a one-way door:
+  every pop-out carries a labeled, always-visible **⤺ Return**
+  control, and reattaching (Return, the placeholder's "Bring it back
+  here", or a plain window close) adopts the current selection if it
+  moved while the media was away. The decision logic lives in
+  `ui/src/qlattach.ts` as a pure, unit-tested state machine.
 - **Drag operations:** 1:1 tracking, velocity-aware drop, rubber-band
   resistance at invalid targets rather than silent refusal.
 - **View transitions** (icons ↔ list ↔ columns ↔ gallery): critically

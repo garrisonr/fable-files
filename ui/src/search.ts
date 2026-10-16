@@ -29,6 +29,11 @@ export interface SearchHooks {
   /** Locations for the scope picker (null id = everywhere). */
   scopes(): Array<{ id: string | null; name: string; provider?: string }>;
   onPreviewItem(item: Item): void;
+  /** Selection changed (attachment rules, Dickles 2026-10-15):
+   * the single selected hit's item, or null when the selection
+   * is empty or multi — so an open Quick Look follows clicks
+   * and arrow keys in results exactly like in the file views. */
+  onSelectItem?(item: Item | null): void;
   /** Trash the selected hits (shell owns the batch + toast + undo). */
   onTrashItems?(items: Item[]): void;
   /** Right-click on a hit: the shell shows the full item menu. */
@@ -586,6 +591,22 @@ export class SearchView {
     }
     this.deleteArmed = true;
     this.applySelection();
+    this.emitSelection();
+  }
+
+  /** Where the selection landed, for the shell's Quick Look
+   * follow (see SearchHooks.onSelectItem). Mouse (selectHit),
+   * keyboard (focusHit), and the right-click re-select all
+   * report through here — one door, every gesture. */
+  private emitSelection(): void {
+    if (!this.hooks.onSelectItem) return;
+    if (this.selected.size !== 1) {
+      this.hooks.onSelectItem(null);
+      return;
+    }
+    const key = [...this.selected][0];
+    const hit = this.hits.find((h) => SearchView.keyOf(h.item) === key);
+    this.hooks.onSelectItem(hit ? hit.item : null);
   }
 
   private applySelection(): void {
@@ -624,6 +645,7 @@ export class SearchView {
         this.deleteArmed = true;
       }
       this.applySelection();
+      this.emitSelection();
     }
   }
 
@@ -1247,6 +1269,7 @@ export class SearchView {
           this.selected.add(SearchView.keyOf(hit.item));
           this.anchor = i;
           this.applySelection();
+          this.emitSelection();
         }
         this.deleteArmed = true;
         row.focus();
