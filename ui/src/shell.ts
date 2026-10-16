@@ -190,6 +190,7 @@ export class Shell {
   private backBtn!: HTMLButtonElement;
   private fwdBtn!: HTMLButtonElement;
   private upBtn!: HTMLButtonElement;
+  private refreshBtn!: HTMLButtonElement;
   private tabBar!: HTMLElement;
   private sidebarList!: HTMLElement;
   private favList!: HTMLElement;
@@ -698,12 +699,15 @@ export class Shell {
     this.searchWrap.appendChild(this.searchView.field);
     // Re-index also rides beside the search field (Round 7.2): it is
     // in the hamburger menu and the results header too — an important
-    // feature earns the duplication (Dickles).
+    // feature earns the duplication (Dickles). Since 2026-10-16 it is
+    // WORD-labeled: as a bare ↻ glyph it impersonated a folder Refresh
+    // and users pressed it hunting for one (Dickles). The ↻ glyph now
+    // belongs to Refresh in the path bar, alone.
     const reindexBtn = document.createElement("button");
     reindexBtn.className = "icon-btn reindex-btn";
-    reindexBtn.textContent = "↻";
-    reindexBtn.title = "Re-index Library";
-    reindexBtn.setAttribute("aria-label", "Re-index Library");
+    reindexBtn.textContent = "Reindex";
+    reindexBtn.title = "Rebuild the catalog index";
+    reindexBtn.setAttribute("aria-label", "Rebuild the catalog index");
     reindexBtn.addEventListener("click", () => this.reindexLibrary());
     this.searchWrap.appendChild(reindexBtn);
     this.el.append(
@@ -915,7 +919,21 @@ export class Shell {
       e.stopPropagation();
       void this.copyCurrentPath(copyBtn);
     });
-    crumbsWrap.append(this.crumbBar, copyBtn);
+    // Refresh lives in the path bar, where instinct looks for it
+    // (Dickles, 2026-10-16): it re-reads the current view in place.
+    // The bare ↻ glyph means THIS and only this in the chrome now —
+    // the re-index control beside the search field is word-labeled.
+    const refreshBtn = document.createElement("button");
+    refreshBtn.className = "icon-btn refresh-btn";
+    refreshBtn.textContent = "↻";
+    refreshBtn.title = "Refresh (F5)";
+    refreshBtn.setAttribute("aria-label", "Refresh current view");
+    refreshBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.refreshCurrentView();
+    });
+    crumbsWrap.append(this.crumbBar, copyBtn, refreshBtn);
+    this.refreshBtn = refreshBtn;
     this.crumbsWrap = crumbsWrap;
 
     const searchWrap = document.createElement("div");
@@ -1819,6 +1837,54 @@ export class Shell {
     this.searchView.invalidateViewCache();
     const t = this.activeTab;
     if (t) void this.loadDir(t);
+  }
+
+  /** Manual Refresh (path-bar ↻ button / F5 / Ctrl+R): re-read what
+   * the user is looking at, in place — the folder from disk, the
+   * search / smart-folder view by re-running it, ROM Home by its soft
+   * refresh. Cheap and local: NO catalog re-index, NO navigation.
+   * (Dickles, 2026-10-16: there was no way to do this at all — the
+   * only ↻ in the chrome rebuilt the whole index.) */
+  private refreshCurrentView(): void {
+    // ROM Home is a room, not a tab: its own soft refresh reloads the
+    // shelves and keeps the selection.
+    if (this.romHome?.active) {
+      this.romHome.invalidate();
+      return;
+    }
+    // Search results and smart folders ARE the visible view: re-run
+    // whatever they are showing (query, rule, ROM shelf).
+    if (this.searchView.active) {
+      this.searchView.refreshCurrentView();
+      return;
+    }
+    const tab = this.activeTab;
+    if (!tab) return;
+    // FileView.render() returns the scroller to the top — right for
+    // navigation, wrong for a refresh in place. Snapshot and restore.
+    const scroller =
+      this.fileView.el.querySelector<HTMLElement>(".fileview-scroller");
+    const fileTop = scroller?.scrollTop ?? 0;
+    const colTop = this.columnsView.el.scrollTop;
+    const galTop = this.galleryView.el.scrollTop;
+    void this.loadDir(tab).then(() => {
+      if (tab !== this.activeTab) return;
+      // Files that vanished leave ghost ids in the selection; prune
+      // them so the status line never counts the dead as selected.
+      if (tab.selection.size > 0) {
+        const alive = new Set(tab.items.map((i) => i.id));
+        for (const id of [...tab.selection]) {
+          if (!alive.has(id)) tab.selection.delete(id);
+        }
+        this.renderStatus();
+      }
+      requestAnimationFrame(() => {
+        if (scroller) scroller.scrollTop = fileTop;
+        this.columnsView.el.scrollTop = colTop;
+        this.galleryView.el.scrollTop = galTop;
+      });
+      this.flashStatus("Refreshed");
+    });
   }
 
   private async clipboardSet(items: Item[], cut: boolean): Promise<void> {
@@ -4447,6 +4513,7 @@ export class Shell {
       [
         "Navigation & windows",
         [
+          ["F5 / Ctrl R", "Refresh the current view"],
           ["Ctrl T", "New tab"],
           ["Ctrl W", "Close tab"],
           ["Alt ↑", "Up one folder"],
@@ -4578,6 +4645,11 @@ export class Shell {
                 void this.buildSidebar();
                 this.refreshActiveDir();
               }),
+          },
+          {
+            label: "Refresh",
+            shortcut: "F5",
+            action: () => this.refreshCurrentView(),
           },
           { label: "Re-index Library", action: () => this.reindexLibrary() },
         ],
@@ -5302,6 +5374,24 @@ export class Shell {
         void this.toggleTerminal();
         return;
       }
+    }
+    if (e.key === "F5") {
+      // F5: refresh the current view in place — never a webview
+      // reload. Unbound before 2026-10-16; the instinct is universal,
+      // so the app honors it (Dickles).
+      e.preventDefault();
+      this.refreshCurrentView();
+      return;
+    }
+    if (
+      (e.ctrlKey || e.metaKey) &&
+      e.key.toLocaleLowerCase() === "r" &&
+      !inField
+    ) {
+      // Ctrl+R: the same refresh. Was unbound; nothing is stolen.
+      e.preventDefault();
+      this.refreshCurrentView();
+      return;
     }
     if (e.key === "F2" && !inField) {
       const sel = this.activeSelected();

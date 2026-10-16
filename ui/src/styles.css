@@ -1420,16 +1420,27 @@ body[data-layout="tv"] .cell-icon {
   min-width: 0;
 }
 
-/* Re-index button beside the search field (Round 7.2). */
+/* Re-index button beside the search field (Round 7.2). Word-labeled
+   since 2026-10-16: as a bare ↻ glyph it impersonated a folder
+   Refresh and users pressed it hunting for one (Dickles). */
 .reindex-btn {
   flex: 0 0 auto;
-  font-size: 15px;
+  font-size: 0.8125rem;
+  white-space: nowrap;
 }
 
 /* Copy path button */
 .crumb-copy {
   font-size: 16px;
   padding: 4px 8px;
+}
+
+/* Refresh button in the path bar (2026-10-16): the one bare ↻ in
+   the chrome — re-reads the current view in place (F5 / Ctrl+R). */
+.refresh-btn {
+  font-size: 16px;
+  padding: 4px 8px;
+  flex: 0 0 auto;
 }
 
 /* Toast notifications */

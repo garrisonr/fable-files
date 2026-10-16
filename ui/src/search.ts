@@ -720,9 +720,12 @@ export class SearchView {
     this.viewCache.clear();
   }
 
-  /** A library re-index just finished: refresh what the user is
-   * looking at so newly downloaded files appear without a restart. */
-  rerunAfterIndex(): void {
+  /** Re-gather whatever this view is showing — placeholder, ROM
+   * collection, smart-folder rule, or plain query — discarding every
+   * cached view (the data underneath may have changed). The manual
+   * Refresh (path-bar button / F5 / Ctrl+R) and the post-re-index
+   * path are the same operation: show the truth as it is now. */
+  refreshCurrentView(): void {
     this.viewCache.clear();
     if (!this.active) return;
     if (this.lastPlaceholder) {
@@ -736,6 +739,12 @@ export class SearchView {
     } else if (this.lastRule) {
       void this.runRule(this.lastRule.name, this.lastRule.rule);
     } else this.refresh();
+  }
+
+  /** A library re-index just finished: refresh what the user is
+   * looking at so newly downloaded files appear without a restart. */
+  rerunAfterIndex(): void {
+    this.refreshCurrentView();
   }
 
   /** Results header: status line + the Re-index button (Round 7.1). */
