@@ -3450,6 +3450,42 @@ fn catalog_follow_completed_step(
 /// The executor: one blocking task per running job. Replays the durable
 /// journal over the snapshot first (crash leftovers normalize Running ->
 /// Pending), then runs every unfinished step in DAG order.
+/// True when any of `step`'s dependencies failed outright or was
+/// itself blocked by an earlier failure (multi-trash fix, 2026-10-16).
+/// Only ids in the failed/blocked sets block — an ordinary Skipped
+/// dependency (idempotent re-run, verify-then-skip) never does.
+fn step_blocked_by_failure(
+    step: &ufm_jobs::Step,
+    failed: &std::collections::HashSet<String>,
+    blocked: &std::collections::HashSet<String>,
+) -> bool {
+    step.depends_on
+        .iter()
+        .any(|d| failed.contains(d) || blocked.contains(d))
+}
+
+/// The job-level error for a partially-failed job: every failed step
+/// named with its own message (the jobs panel keeps this text in a
+/// compact row with a Copy button; the journal holds each step's note
+/// regardless). Capped so a mass failure stays readable.
+fn step_failure_summary(failures: &[(String, String)]) -> String {
+    const MAX_SHOWN: usize = 10;
+    let shown: Vec<String> = failures
+        .iter()
+        .take(MAX_SHOWN)
+        .map(|(label, msg)| format!("{label}: {msg}"))
+        .collect();
+    let mut summary = if failures.len() == 1 {
+        shown[0].clone()
+    } else {
+        format!("{} steps failed — {}", failures.len(), shown.join(" · "))
+    };
+    if failures.len() > MAX_SHOWN {
+        summary.push_str(&format!(" · and {} more", failures.len() - MAX_SHOWN));
+    }
+    summary
+}
+
 fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
     let job_id = handle.snapshot().id;
     let catalog = match ufm_catalog::Catalog::open(&catalog_path) {
@@ -3525,6 +3561,16 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
         );
     }
 
+    // Partial-failure bookkeeping (multi-trash fix, 2026-10-16): a
+    // failed step no longer aborts the job. Independent steps still
+    // run, dependents of a failure are skipped, and the job finishes
+    // Failed with a per-item summary (see the loop's Failed arm).
+    let mut failed_steps: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut blocked_steps: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+
     for step_id in &order {
         let step = {
             let j = handle.job.lock().unwrap();
@@ -3541,6 +3587,26 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
         }
         if !wait_while_paused(&handle) {
             break; // cancelled while paused; finalize below
+        }
+        // A step whose dependency failed (or was itself blocked) must
+        // never run — a move's Delete companion dies with its Copy —
+        // but it blocks nothing else in the batch. An ordinary Skipped
+        // dependency (idempotent re-run, verify-then-skip) does NOT
+        // block; only failed/blocked ids live in the sets.
+        if step_blocked_by_failure(&step, &failed_steps, &blocked_steps) {
+            let fx = transition_step(
+                &handle,
+                &catalog,
+                &mut journal,
+                &mut gate,
+                step_id,
+                ufm_jobs::StepState::Skipped,
+                Some("skipped: a step it depends on failed".into()),
+            );
+            blocked_steps.insert(step_id.clone());
+            bytes_done = fx.bytes_done;
+            emit_from_handle(&app, &handle, bytes_done, None, None);
+            continue;
         }
         // A copy whose verify step was Skipped is itself Skipped:
         // the destination already holds the right bytes.
@@ -3619,13 +3685,15 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
                     ufm_jobs::StepState::Failed,
                     Some(msg.clone()),
                 );
-                let snap =
-                    transition_job(&handle, &catalog, ufm_jobs::JobState::Failed);
-                emit_job_progress(&app, &snap, bytes_done, None, Some(&msg));
-                handle
-                    .live
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                return;
+                // Record and KEEP GOING (multi-trash fix, 2026-10-16):
+                // one bad item must not strand the rest of a batch —
+                // the remaining independent steps still run, and the
+                // job finishes Failed below with a summary naming
+                // every failed item. (This arm used to fail the whole
+                // job on the spot and return.)
+                failed_steps.insert(step_id.clone());
+                failures.push((step.label.clone(), msg));
+                emit_from_handle(&app, &handle, bytes_done, Some(&step.label), None);
             }
             StepOutcome::Cancelled => {
                 // The partial file is already removed by execute_step;
@@ -3650,11 +3718,24 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
 
     let final_state = if flag(&handle.cancel) {
         ufm_jobs::JobState::Cancelled
+    } else if !failures.is_empty() {
+        ufm_jobs::JobState::Failed
     } else {
         ufm_jobs::JobState::Completed
     };
+    let final_error = if matches!(final_state, ufm_jobs::JobState::Failed) {
+        Some(step_failure_summary(&failures))
+    } else {
+        None
+    };
     let snap = transition_job(&handle, &catalog, final_state);
-    emit_job_progress(&app, &snap, job_bytes_done(&snap), None, None);
+    emit_job_progress(
+        &app,
+        &snap,
+        job_bytes_done(&snap),
+        None,
+        final_error.as_deref(),
+    );
     handle
         .live
         .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -16412,6 +16493,70 @@ mod tests {
         assert!(root.join("files/folder/inner.txt").exists());
         assert!(!d.exists());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn step_blocked_only_by_failed_or_blocked_deps() {
+        // Multi-trash fix: a step is blocked only when a dependency
+        // FAILED or was itself blocked — never by an ordinary
+        // (idempotent / verify) skip, and never with no deps.
+        let mk = |deps: &[&str]| ufm_jobs::Step {
+            id: "sx".into(),
+            label: "x".into(),
+            op: ufm_jobs::StepOp::Delete {
+                target: job_item(
+                    ItemId::new(),
+                    LocationId::default(),
+                    Path::new("/tmp/x"),
+                    ItemKind::File,
+                    None,
+                ),
+                use_trash: true,
+            },
+            depends_on: deps.iter().map(|d| d.to_string()).collect(),
+            state: ufm_jobs::StepState::Pending,
+            compensation: None,
+            outcome: false,
+            outcome_path: None,
+        };
+        let failed: std::collections::HashSet<String> =
+            ["s1".to_string()].into_iter().collect();
+        let blocked: std::collections::HashSet<String> =
+            ["s2".to_string()].into_iter().collect();
+        assert!(step_blocked_by_failure(&mk(&["s1"]), &failed, &blocked));
+        assert!(step_blocked_by_failure(&mk(&["s2"]), &failed, &blocked));
+        assert!(!step_blocked_by_failure(&mk(&["s3"]), &failed, &blocked));
+        assert!(!step_blocked_by_failure(&mk(&[]), &failed, &blocked));
+    }
+
+    #[test]
+    fn step_failure_summary_names_each_failed_item() {
+        // Multi-trash fix: the job-level error names every failed
+        // item with its own message; a single failure stays bare.
+        let one = vec![(
+            "trash /a/fanart.jpg".to_string(),
+            "permission denied".to_string(),
+        )];
+        assert_eq!(
+            step_failure_summary(&one),
+            "trash /a/fanart.jpg: permission denied"
+        );
+        let three = vec![
+            ("trash /a/fanart.jpg".to_string(), "denied".to_string()),
+            ("trash /a/poster.jpg".to_string(), "locked".to_string()),
+            ("trash /a/www.jpg".to_string(), "gone".to_string()),
+        ];
+        let s = step_failure_summary(&three);
+        assert!(s.starts_with("3 steps failed — "), "{s}");
+        assert!(s.contains("trash /a/fanart.jpg: denied"), "{s}");
+        assert!(s.contains("trash /a/poster.jpg: locked"), "{s}");
+        assert!(s.contains("trash /a/www.jpg: gone"), "{s}");
+        let many: Vec<(String, String)> = (0..12)
+            .map(|i| (format!("trash /f{i}"), "boom".to_string()))
+            .collect();
+        let s = step_failure_summary(&many);
+        assert!(s.starts_with("12 steps failed — "), "{s}");
+        assert!(s.contains("and 2 more"), "{s}");
     }
 
     #[test]

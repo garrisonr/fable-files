@@ -1773,18 +1773,25 @@ export class Shell {
           ? `Trash ${items[0].name}`
           : `Trash ${items.length} items`;
       this.trackTransfer(jobId, label, async (error) => {
-        if (error) {
+        // Partial failure is a real outcome now (the executor attempts
+        // every item and names the ones that failed): whatever DID
+        // trash still earns its undo entries, and the toast tells the
+        // whole truth — moved X of N, plus the failure summary (the
+        // panel row carries the same text with a Copy button).
+        const outcomes = await this.jobOutcomes(jobId);
+        const ok = this.pushTrashUndo(outcomes, nameByPath);
+        if (error && ok > 0 && ok < items.length) {
+          Toast.error(
+            `Moved ${ok} of ${items.length} items to Trash. ${errText(error)}`,
+          );
+        } else if (error) {
           Toast.error(`Could not trash items: ${errText(error)}`);
-        } else {
-          const outcomes = await this.jobOutcomes(jobId);
-          const ok = this.pushTrashUndo(outcomes, nameByPath);
-          if (ok === 1)
-            Toast.success(
-              `Moved “${items[0].name}” to Trash. Super+Z to undo.`,
-            );
-          else if (ok > 1)
-            Toast.success(`Moved ${ok} items to Trash. Super+Z to undo.`);
-        }
+        } else if (ok === 1)
+          Toast.success(
+            `Moved “${items[0].name}” to Trash. Super+Z to undo.`,
+          );
+        else if (ok > 1)
+          Toast.success(`Moved ${ok} items to Trash. Super+Z to undo.`);
         const t = this.activeTab;
         if (t) await this.loadDir(t);
         if (this.searchView.active) this.searchView.refresh();
@@ -3342,63 +3349,98 @@ export class Shell {
     void this.loadDir(tab);
   }
 
+  /** The effective payload of the in-flight drag: the whole
+   * selection when the grabbed item belongs to one (dragState.items,
+   * set by FileView with the context menu's targets rule), else the
+   * grabbed item alone. Drop targets act on THIS, never on the single
+   * item under the cursor (multi-trash fix, 2026-10-16). */
+  private draggedItems(grabbed: Item): Item[] {
+    const items = dragState.items;
+    return items && items.length > 0 ? items : [grabbed];
+  }
+
+  /** File a dropped selection into a folder as ONE job (move, or
+   * copy with Ctrl). Items already inside the destination are left
+   * where they are — only the rest travel. */
   private async fileDraggedIntoFolder(
-    dragged: Item,
+    draggedItems: Item[],
     target: FavoriteTarget,
     label: string,
     copy = false,
   ): Promise<void> {
+    const what =
+      draggedItems.length === 1
+        ? `“${draggedItems[0].name}”`
+        : `${draggedItems.length} items`;
     try {
       const dest = await api.getItemPath(target.dirId);
       if (!dest) return;
-      if (dragged.provider_key && dirname(dragged.provider_key) === dest) {
-        return; // already in this folder
-      }
+      const items = draggedItems.filter(
+        (i) => !i.provider_key || dirname(i.provider_key) !== dest,
+      );
+      if (items.length === 0) return; // everything already lives there
       if (copy) {
         // Ctrl+drop = copy (fix block item 2): the destination parent
         // is the folder's own item id, which is what start_copy wants.
-        const start = await api.startCopy([dragged.id], target.dirId);
+        const start = await api.startCopy(
+          items.map((i) => i.id),
+          target.dirId,
+        );
         const jobId = this.acceptJobStart(start, "copy");
         if (!jobId) return;
-        this.trackTransfer(jobId, `Copy ${dragged.name}`, async (error) => {
-          if (error) {
-            Toast.error(`Could not copy “${dragged.name}”: ${errText(error)}`);
-          } else {
-            Toast.success(`Copied “${dragged.name}” to ${label}.`);
-          }
-          const tab = this.activeTab;
-          if (tab) await this.loadDir(tab);
-        });
+        this.trackTransfer(
+          jobId,
+          items.length === 1 ? `Copy ${items[0].name}` : `Copy ${items.length} items`,
+          async (error) => {
+            if (error) {
+              Toast.error(`Could not copy ${what}: ${errText(error)}`);
+            } else {
+              Toast.success(`Copied ${what} to ${label}.`);
+            }
+            const tab = this.activeTab;
+            if (tab) await this.loadDir(tab);
+          },
+        );
         return;
       }
-      const start = await api.startMove([dragged.id], dest);
+      const start = await api.startMove(
+        items.map((i) => i.id),
+        dest,
+      );
       const jobId = this.acceptJobStart(start, "move");
       if (!jobId) return;
-      this.trackTransfer(jobId, `Move ${dragged.name}`, async (error) => {
-        if (error) {
-          Toast.error(`Could not move “${dragged.name}”: ${errText(error)}`);
-        } else {
-          const outcomes = await this.jobOutcomes(jobId);
-          for (const o of outcomes) {
-            if (!o.result_path) continue;
-            const fromDir = dirname(o.src_path);
-            if (fromDir) {
-              this.undoStack.push({
-                kind: "move",
-                newPath: o.result_path,
-                fromDir,
-                label: dragged.name,
-              });
+      const nameByPath = new Map(
+        items.map((i) => [i.provider_key ?? "", i.name] as [string, string]),
+      );
+      this.trackTransfer(
+        jobId,
+        items.length === 1 ? `Move ${items[0].name}` : `Move ${items.length} items`,
+        async (error) => {
+          if (error) {
+            Toast.error(`Could not move ${what}: ${errText(error)}`);
+          } else {
+            const outcomes = await this.jobOutcomes(jobId);
+            for (const o of outcomes) {
+              if (!o.result_path) continue;
+              const fromDir = dirname(o.src_path);
+              if (fromDir) {
+                this.undoStack.push({
+                  kind: "move",
+                  newPath: o.result_path,
+                  fromDir,
+                  label: nameByPath.get(o.src_path) ?? o.src_path,
+                });
+              }
             }
+            Toast.success(`Moved ${what} to ${label}. Super+Z to undo.`);
           }
-          Toast.success(`Moved “${dragged.name}” to ${label}. Super+Z to undo.`);
-        }
-        this.quickLook.close();
-        const tab = this.activeTab;
-        if (tab) await this.loadDir(tab);
-      });
+          this.quickLook.close();
+          const tab = this.activeTab;
+          if (tab) await this.loadDir(tab);
+        },
+      );
     } catch (err) {
-      Toast.error(`Could not move “${dragged.name}”: ${errText(err)}`);
+      Toast.error(`Could not move ${what}: ${errText(err)}`);
     }
   }
 
@@ -3509,103 +3551,16 @@ export class Shell {
           }
           const dragged = dragState.item;
           if (!dragged) return;
-          const copyWanted = e.ctrlKey;
-          try {
-            if (name === "Trash") {
-              const start = await api.startDelete([dragged.id], true);
-              const jobId = this.acceptJobStart(start, "trash");
-              if (!jobId) return;
-              this.trackTransfer(
-                jobId,
-                `Trash ${dragged.name}`,
-                async (error) => {
-                  if (error) {
-                    Toast.error(
-                      `Could not move “${dragged.name}”: ${errText(error)}`,
-                    );
-                  } else {
-                    const outcomes = await this.jobOutcomes(jobId);
-                    this.pushTrashUndo(
-                      outcomes,
-                      new Map([
-                        [dragged.provider_key ?? "", dragged.name],
-                      ]),
-                    );
-                    Toast.success(
-                      `Moved “${dragged.name}” to Trash. Super+Z to undo.`,
-                    );
-                  }
-                  this.quickLook.close();
-                  const tab = this.activeTab;
-                  if (tab) await this.loadDir(tab);
-                },
-              );
-            } else if (copyWanted) {
-              // Ctrl+drop = copy into the favorite (fix block item 2).
-              const dest = await api.getItemPath(target.dirId);
-              if (dragged.provider_key && dirname(dragged.provider_key) === dest) {
-                return; // already in this folder
-              }
-              const start = await api.startCopy([dragged.id], target.dirId);
-              const jobId = this.acceptJobStart(start, "copy");
-              if (!jobId) return;
-              this.trackTransfer(
-                jobId,
-                `Copy ${dragged.name}`,
-                async (error) => {
-                  if (error) {
-                    Toast.error(
-                      `Could not copy “${dragged.name}”: ${errText(error)}`,
-                    );
-                  } else {
-                    Toast.success(`Copied “${dragged.name}” to ${name}.`);
-                  }
-                  const tab = this.activeTab;
-                  if (tab) await this.loadDir(tab);
-                },
-              );
-            } else {
-              const dest = await api.getItemPath(target.dirId);
-              if (dragged.provider_key && dirname(dragged.provider_key) === dest) {
-                return; // already in this folder
-              }
-              const start = await api.startMove([dragged.id], dest);
-              const jobId = this.acceptJobStart(start, "move");
-              if (!jobId) return;
-              this.trackTransfer(
-                jobId,
-                `Move ${dragged.name}`,
-                async (error) => {
-                  if (error) {
-                    Toast.error(
-                      `Could not move “${dragged.name}”: ${errText(error)}`,
-                    );
-                  } else {
-                    const outcomes = await this.jobOutcomes(jobId);
-                    for (const o of outcomes) {
-                      if (!o.result_path) continue;
-                      const fromDir = dirname(o.src_path);
-                      if (fromDir) {
-                        this.undoStack.push({
-                          kind: "move",
-                          newPath: o.result_path,
-                          fromDir,
-                          label: dragged.name,
-                        });
-                      }
-                    }
-                    Toast.success(
-                      `Moved “${dragged.name}” to ${name}. Super+Z to undo.`,
-                    );
-                  }
-                  this.quickLook.close();
-                  const tab = this.activeTab;
-                  if (tab) await this.loadDir(tab);
-                },
-              );
-            }
-          } catch (err) {
-            Toast.error(`Could not move “${dragged.name}”: ${errText(err)}`);
+          // The drop acts on the drag's effective payload — the whole
+          // selection when the grabbed item belongs to one — never
+          // just the item under the cursor (multi-trash fix,
+          // 2026-10-16; this handler used to startDelete([dragged.id])).
+          const items = this.draggedItems(dragged);
+          if (name === "Trash") {
+            void this.trashItems(items);
+          } else {
+            // Ctrl+drop = copy into the favorite (fix block item 2).
+            void this.fileDraggedIntoFolder(items, target, name, e.ctrlKey);
           }
         });
         // Trash gets a right-click menu: Empty / Secure Delete
@@ -3719,7 +3674,12 @@ export class Shell {
         b.classList.remove("drop-hover");
         const dragged = dragState.item;
         if (!dragged || dragState.favName) return;
-        void this.fileDraggedIntoFolder(dragged, target, fav.name, e.ctrlKey);
+        void this.fileDraggedIntoFolder(
+          this.draggedItems(dragged),
+          target,
+          fav.name,
+          e.ctrlKey,
+        );
       });
       this.favList.appendChild(b);
     }
@@ -3885,7 +3845,7 @@ export class Shell {
         if (!dragged || dragState.favName) return;
         if (isOfflineServer) return;
         void this.fileDraggedIntoFolder(
-          dragged,
+          this.draggedItems(dragged),
           { locationId: loc.id, dirId: loc.root_item, display: loc.path ?? loc.display_name },
           loc.display_name,
           e.ctrlKey,
@@ -4044,7 +4004,8 @@ export class Shell {
         e.preventDefault();
         b.classList.remove("drop-hover");
         const it = dragState.item;
-        if (it) void this.addItemsToCollection([it], c.id, c.name);
+        if (it)
+          void this.addItemsToCollection(this.draggedItems(it), c.id, c.name);
       });
       this.collectionList.appendChild(b);
     }

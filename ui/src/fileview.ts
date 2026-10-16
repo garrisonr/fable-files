@@ -603,9 +603,19 @@ export async function showItemMenu(
 
 /** The item currently being dragged out of a file view, if any.
  * HTML5 drag events can't read dataTransfer payloads during dragover,
- * so drop targets consult this shared slot instead. */
-export const dragState: { item: Item | null; favName: string | null } = {
+ * so drop targets consult this shared slot instead. `items` is the
+ * drag's effective payload — the whole selection when the grabbed
+ * item belongs to a multi-selection (the context menu's targets rule),
+ * else the grabbed item alone — so a drop acts on what the user
+ * selected, never just the item under the cursor (multi-trash fix,
+ * 2026-10-16: drag-to-Trash used to move exactly one item). */
+export const dragState: {
+  item: Item | null;
+  items: Item[] | null;
+  favName: string | null;
+} = {
   item: null,
+  items: null,
   favName: null,
 };
 
@@ -1124,6 +1134,11 @@ export class FileView {
     cell.draggable = true;
     cell.addEventListener("dragstart", (e) => {
       dragState.item = item;
+      const tab = this.tab();
+      dragState.items =
+        tab.selection.has(item.id) && tab.selection.size > 1
+          ? sortedItems(tab).filter((i) => tab.selection.has(i.id))
+          : [item];
       if (e.dataTransfer) {
         e.dataTransfer.effectAllowed = "copyMove";
         e.dataTransfer.setData("text/plain", item.provider_key ?? item.name);
@@ -1132,6 +1147,7 @@ export class FileView {
     });
     cell.addEventListener("dragend", () => {
       dragState.item = null;
+      dragState.items = null;
       cell.classList.remove("dragging");
     });
   }
