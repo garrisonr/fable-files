@@ -73,6 +73,12 @@ pub struct AppState {
     /// Durable UI prefs sidecar (Round 7.2): ui-prefs.json in the app
     /// data dir — sidebar collapse state and future shell preferences.
     pub ui_prefs_path: PathBuf,
+    /// Smart-folder duration-sweep cancellation: set by the
+    /// rule_cancel_probe command when the user leaves a smart
+    /// folder; the running probe batch checks it between files.
+    /// Partial progress persists in the catalog, so the sweep
+    /// resumes on the next visit instead of restarting.
+    pub rule_probe_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub previews: PreviewRegistry,
     pub themes_dir: PathBuf,
     pub active_theme: Mutex<String>,
@@ -206,6 +212,7 @@ impl AppState {
             data_base: base.clone(),
             checkpoint_path,
             ui_prefs_path: base.join("ui-prefs.json"),
+            rule_probe_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             previews: ufm_preview::registry_with_builtins(),
             themes_dir: themes_dir.clone(),
             active_theme: Mutex::new("grizzette".to_string()),
@@ -572,6 +579,9 @@ pub fn run() {
             commands::delete_path_label,
             commands::list_items_by_label,
             commands::rule_items,
+            commands::rule_refresh,
+            commands::rule_probe,
+            commands::rule_cancel_probe,
             commands::apply_label_rules,
             commands::identify_roms,
             commands::rom_collection_items,

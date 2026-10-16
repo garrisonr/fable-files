@@ -382,8 +382,32 @@ export interface RuleItemsResult {
   items: Item[];
   probed: number;
   remaining: number;
+  /** Total members in the stored result (items may be truncated). */
+  total_members: number;
+  /** Unprobed candidates on offline volumes (never probed; they
+   * join when the volume returns). */
+  pending_offline: number;
+  /** True when no online probing remains for this rule. */
+  sweep_complete: boolean;
   /** Library Memory: volume badges for `items`, by item id. */
   badges: ItemVolumeBadge[];
+}
+
+export interface RuleProbeResult {
+  probed: number;
+  /** Unprobed candidates left on mounted volumes. */
+  remaining: number;
+  /** Unprobed candidates on offline volumes. */
+  remainingOffline: number;
+  /** Files this batch newly proved to be members. */
+  newMembers: Item[];
+  /** Library Memory: volume badges for `newMembers`, by item id. */
+  badges: ItemVolumeBadge[];
+  /** The batch stopped early (the view was left); probed progress
+   * is persisted and resumes next visit. */
+  cancelled: boolean;
+  /** Probing itself is unavailable (e.g. ffprobe missing). */
+  probeError: string | null;
 }
 
 export interface RuleOutcome {
@@ -588,6 +612,31 @@ export const api = {
       limit,
       probeBudget,
     }),
+  /** Reconcile a rule with the catalog (deltas only) — the instant
+   * snapshot paint never waits for this. */
+  ruleRefresh: (
+    extensions: string[],
+    minDurationSecs: number | null,
+    limit?: number,
+  ) =>
+    invoke<RuleItemsResult>("rule_refresh", {
+      extensions,
+      minDurationSecs,
+      limit,
+    }),
+  /** One background batch of the duration sweep. */
+  ruleProbe: (
+    extensions: string[],
+    minDurationSecs: number | null,
+    budget?: number,
+  ) =>
+    invoke<RuleProbeResult>("rule_probe", {
+      extensions,
+      minDurationSecs,
+      budget,
+    }),
+  /** Stop the running duration sweep; partial progress persists. */
+  ruleCancelProbe: () => invoke<void>("rule_cancel_probe"),
   applyLabelRules: (rules: LabelRule[]) =>
     invoke<RuleOutcome[]>("apply_label_rules", { rules }),
   addPathLocation: (name: string, path: string) =>

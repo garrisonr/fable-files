@@ -7495,6 +7495,14 @@ pub struct RuleItemsResult {
     pub items: Vec<Item>,
     pub probed: u32,
     pub remaining: u32,
+    /// Total members in the stored result (items may be truncated
+    /// to the caller's limit).
+    pub total_members: u32,
+    /// Unprobed candidates on OFFLINE volumes — never probed; they
+    /// join when the volume returns.
+    pub pending_offline: u32,
+    /// True when no online probing remains for this rule.
+    pub sweep_complete: bool,
     /// Library Memory: volume badges for the returned items, keyed
     /// by (remapped) item id — smart folders badge offline files
     /// exactly like search results do.
@@ -7544,13 +7552,19 @@ pub struct RuleOutcome {
     pub remaining: u32,
 }
 
-const MEDIA_EXTS: &[&str] = &[
-    "mp4", "mkv", "avi", "mov", "m4v", "webm", "mpg", "mpeg", "wmv", "ts", "m2ts",
-    "mp3", "aac", "flac", "ogg", "oga", "opus", "wav", "m4a", "m4b", "aif", "aiff", "wma",
-];
-
-/// (ffprobe ran, duration if readable)
-fn probe_duration(path: &std::path::Path) -> (bool, Option<f64>) {
+/// Probe one file's duration with ffprobe, in catalog ProbeOutcome
+/// terms. The rule sweep guarantees the path sits on a mounted
+/// volume; a path that vanished anyway reports Missing and is NEVER
+/// settled as zero-length (the old probe recorded exactly that for
+/// files on unmounted drives — ffprobe's exit status was ignored —
+/// poisoning them out of duration rules forever), and ffprobe
+/// failing to start reports Unavailable so the sweep stops honestly
+/// instead of spinning.
+fn probe_duration(path: &std::path::Path) -> ufm_catalog::ProbeOutcome {
+    use ufm_catalog::ProbeOutcome;
+    if !path.exists() {
+        return ProbeOutcome::Missing;
+    }
     let out = std::process::Command::new("ffprobe")
         .args([
             "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
@@ -7560,55 +7574,45 @@ fn probe_duration(path: &std::path::Path) -> (bool, Option<f64>) {
     match out {
         Ok(o) => {
             let text = String::from_utf8_lossy(&o.stdout);
-            (true, text.trim().parse::<f64>().ok().filter(|d| *d > 0.0))
+            match text.trim().parse::<f64>().ok().filter(|d| *d > 0.0) {
+                Some(d) => ProbeOutcome::Duration(d),
+                None => ProbeOutcome::NoDuration,
+            }
         }
-        Err(_) => (false, None),
+        Err(e) => ProbeOutcome::Unavailable(format!("ffprobe could not start ({e})")),
     }
 }
 
-fn eval_rule(
-    catalog: &ufm_catalog::Catalog,
-    exts: &[String],
-    min_duration_secs: Option<f64>,
-    probe_budget: u32,
-) -> std::result::Result<(Vec<Item>, u32, u32), CommandError> {
-    let candidates = catalog
-        .rule_candidates(exts)
-        .map_err(CommandError::from)?;
-    let mut probed = 0u32;
-    let mut remaining = 0u32;
-    let mut matched = Vec::new();
-    for (item, dur) in candidates {
-        let Some(pk) = item.provider_key.clone() else {
-            continue;
-        };
-        let mut d = dur;
-        if d.is_none() && min_duration_secs.is_some() {
-            let ext = pk.rsplit('.').next().unwrap_or("").to_lowercase();
-            if MEDIA_EXTS.contains(&ext.as_str()) {
-                if probed < probe_budget {
-                    probed += 1;
-                    let (ran, secs) = probe_duration(std::path::Path::new(&pk));
-                    if ran {
-                        let _ = catalog.set_duration(&pk, secs.unwrap_or(0.0));
-                        d = secs;
-                    } else {
-                        remaining += 1;
-                    }
-                } else {
-                    remaining += 1;
-                }
-            }
+/// The probe-eligibility predicate for rule sweeps, built once per
+/// command from Library Memory state: a path may be probed unless
+/// the volume/server it lives on is currently OFFLINE — the same
+/// resolution badges_for_items paints from. Offline items render
+/// from catalog data and are never probed (no mount-waits, no
+/// poisoned durations); they join when the volume returns.
+fn rule_online_predicate(catalog: &ufm_catalog::Catalog) -> impl Fn(&str) -> bool + '_ {
+    let mounted = current_filesystems();
+    let volumes = catalog.volumes().unwrap_or_default();
+    let network_records = catalog.network_locations().unwrap_or_default();
+    let live_net = crate::network::live_mounts();
+    move |pk: &str| {
+        if let Some(b) = volume_badge_for_path(&mounted, &volumes, pk) {
+            return !b.offline;
         }
-        let keep = match min_duration_secs {
-            None => true,
-            Some(min) => d.map(|x| x > min).unwrap_or(false),
-        };
-        if keep {
-            matched.push(item);
+        if let Some(b) = network_badge_for_path(&network_records, &live_net, pk) {
+            return !b.offline;
         }
+        true
     }
-    Ok((matched, probed, remaining))
+}
+
+fn rule_spec(
+    extensions: Vec<String>,
+    min_duration_secs: Option<f64>,
+) -> ufm_catalog::RuleSpec {
+    ufm_catalog::RuleSpec {
+        extensions,
+        min_duration_secs,
+    }
 }
 
 /// Re-anchor catalog items to session ids, exactly like
@@ -7632,6 +7636,28 @@ fn remap_session_items(state: &AppState, items: Vec<Item>) -> Vec<Item> {
     out
 }
 
+fn rule_result_from_status(
+    state: &AppState,
+    catalog: &ufm_catalog::Catalog,
+    status: ufm_catalog::RuleStatus,
+    limit: Option<u32>,
+) -> RuleItemsResult {
+    let total_members = status.member_count;
+    let mut items = status.members;
+    items.truncate(limit.unwrap_or(1000) as usize);
+    let items = remap_session_items(state, items);
+    let badges = badges_for_items(catalog, &items);
+    RuleItemsResult {
+        items,
+        probed: 0,
+        remaining: status.pending,
+        total_members,
+        pending_offline: status.pending_offline,
+        sweep_complete: status.sweep_complete,
+        badges,
+    }
+}
+
 #[tauri::command]
 pub async fn rule_items(
     state: State<'_, AppState>,
@@ -7640,23 +7666,133 @@ pub async fn rule_items(
     limit: Option<u32>,
     probe_budget: Option<u32>,
 ) -> Cmd<RuleItemsResult> {
+    // probe_budget is legacy and ignored: rule_items NEVER probes.
+    // The remembered result (the catalog rule store) paints
+    // instantly; the duration sweep runs in the background via
+    // rule_probe, behind the visible list. A first-ever evaluation
+    // runs one delta pass — stored durations only — to seed it.
+    let _ = probe_budget;
     let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
         .map_err(CommandError::from)?;
-    let (mut items, probed, remaining) = eval_rule(
-        &catalog,
-        &extensions,
-        min_duration_secs,
-        probe_budget.unwrap_or(250),
-    )?;
-    items.truncate(limit.unwrap_or(1000) as usize);
-    let items = remap_session_items(state.inner(), items);
-    let badges = badges_for_items(&catalog, &items);
-    Ok(RuleItemsResult {
-        items,
-        probed,
-        remaining,
+    let spec = rule_spec(extensions, min_duration_secs);
+    let status = match catalog.rule_snapshot(&spec).map_err(CommandError::from)? {
+        Some(s) => s,
+        None => {
+            let online = rule_online_predicate(&catalog);
+            let now = chrono::Utc::now().to_rfc3339();
+            catalog
+                .rule_refresh(&spec, &online, &now)
+                .map_err(CommandError::from)?
+        }
+    };
+    Ok(rule_result_from_status(state.inner(), &catalog, status, limit))
+}
+
+/// Reconcile a rule with the catalog: files added, changed, or
+/// removed since the remembered evaluation apply as deltas. The UI
+/// calls this behind the instant snapshot paint on every revisit,
+/// so the list never waits for it.
+#[tauri::command]
+pub async fn rule_refresh(
+    state: State<'_, AppState>,
+    extensions: Vec<String>,
+    min_duration_secs: Option<f64>,
+    limit: Option<u32>,
+) -> Cmd<RuleItemsResult> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let spec = rule_spec(extensions, min_duration_secs);
+    let online = rule_online_predicate(&catalog);
+    let now = chrono::Utc::now().to_rfc3339();
+    let status = catalog
+        .rule_refresh(&spec, &online, &now)
+        .map_err(CommandError::from)?;
+    Ok(rule_result_from_status(state.inner(), &catalog, status, limit))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleProbeResult {
+    /// Files probed in this batch.
+    pub probed: u32,
+    /// Unprobed candidates left on mounted volumes.
+    pub remaining: u32,
+    /// Unprobed candidates on offline volumes (they join when the
+    /// volume returns; never probed while offline).
+    pub remaining_offline: u32,
+    /// Files this batch newly proved to be members — the UI merges
+    /// them into the visible list live.
+    pub new_members: Vec<Item>,
+    /// Library Memory badges for `new_members`.
+    pub badges: Vec<ItemVolumeBadge>,
+    /// The batch stopped early: the user left the view. Everything
+    /// probed so far is persisted; the sweep resumes next visit.
+    pub cancelled: bool,
+    /// Probing itself is unavailable (e.g. ffprobe missing): the
+    /// sweep stopped without settling anything.
+    pub probe_error: Option<String>,
+}
+
+/// One batch of the background duration sweep (default 250 files).
+/// The ffprobe work runs on the blocking pool; every probe persists
+/// immediately in the catalog, so leaving mid-sweep loses nothing.
+#[tauri::command]
+pub async fn rule_probe(
+    state: State<'_, AppState>,
+    extensions: Vec<String>,
+    min_duration_secs: Option<f64>,
+    budget: Option<u32>,
+) -> Cmd<RuleProbeResult> {
+    let spec = rule_spec(extensions, min_duration_secs);
+    // A fresh batch is a new intent: clear a stale cancel left by a
+    // previous view. Leaving mid-batch sets it again.
+    let cancel = state.rule_probe_cancel.clone();
+    cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+    // The catalog opens INSIDE the blocking task: the online
+    // predicate borrows it, and spawn_blocking needs 'static.
+    let catalog_path = state.catalog_path.clone();
+    let batch = tauri::async_runtime::spawn_blocking(
+        move || -> Cmd<ufm_catalog::RuleProbeBatch> {
+            let catalog = ufm_catalog::Catalog::open(&catalog_path)
+                .map_err(CommandError::from)?;
+            let online = rule_online_predicate(&catalog);
+            let mut probe = |p: &std::path::Path| probe_duration(p);
+            catalog
+                .rule_probe_batch(
+                    &spec,
+                    budget.unwrap_or(250),
+                    &mut probe,
+                    &online,
+                    &cancel,
+                )
+                .map_err(CommandError::from)
+        },
+    )
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("rule probe task: {e}"))))??;
+    let new_members = remap_session_items(state.inner(), batch.new_members);
+    let badges_catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let badges = badges_for_items(&badges_catalog, &new_members);
+    Ok(RuleProbeResult {
+        probed: batch.probed,
+        remaining: batch.remaining,
+        remaining_offline: batch.remaining_offline,
+        new_members,
         badges,
+        cancelled: batch.cancelled,
+        probe_error: batch.probe_error,
     })
+}
+
+/// Cancel the running duration sweep (the user left the smart
+/// folder). The batch checks the flag between files; partial
+/// progress is already persisted in the catalog.
+#[tauri::command]
+pub fn rule_cancel_probe(state: State<'_, AppState>) {
+    state
+        .rule_probe_cancel
+        .store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 #[tauri::command]
@@ -7666,16 +7802,41 @@ pub async fn apply_label_rules(
 ) -> Cmd<Vec<RuleOutcome>> {
     let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
         .map_err(CommandError::from)?;
+    let online = rule_online_predicate(&catalog);
+    let now = chrono::Utc::now().to_rfc3339();
+    let never_cancel = std::sync::atomic::AtomicBool::new(false);
     let mut outcomes = Vec::new();
     for rule in &rules {
-        let (items, _probed, remaining) = eval_rule(
-            &catalog,
-            &rule.extensions,
-            rule.min_duration_secs,
-            250,
-        )?;
+        let spec = rule_spec(rule.extensions.clone(), rule.min_duration_secs);
+        // Evaluate from stored durations, then spend the historical
+        // per-rule probe budget (250) — the same reach as the old
+        // inline eval, except every probe now persists, so the
+        // budget buys permanent progress instead of a re-scan.
+        let mut status = catalog
+            .rule_refresh(&spec, &online, &now)
+            .map_err(CommandError::from)?;
+        let mut spent = 0u32;
+        while status.pending > 0 && spent < 250 {
+            let batch = catalog
+                .rule_probe_batch(
+                    &spec,
+                    250 - spent,
+                    &mut |p: &std::path::Path| probe_duration(p),
+                    &online,
+                    &never_cancel,
+                )
+                .map_err(CommandError::from)?;
+            spent += batch.probed;
+            if batch.probe_error.is_some() || batch.probed == 0 {
+                break;
+            }
+            status = catalog
+                .rule_snapshot(&spec)
+                .map_err(CommandError::from)?
+                .unwrap_or(status);
+        }
         let mut added = 0u32;
-        for item in &items {
+        for item in &status.members {
             if let Some(pk) = &item.provider_key {
                 if catalog
                     .tag_path_counted(pk, &rule.label)
@@ -7687,9 +7848,9 @@ pub async fn apply_label_rules(
         }
         outcomes.push(RuleOutcome {
             label: rule.label.clone(),
-            matched: items.len() as u32,
+            matched: status.member_count,
             added,
-            remaining,
+            remaining: status.pending,
         });
     }
     Ok(outcomes)

@@ -402,6 +402,33 @@ impl Catalog {
                 );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Rule (smart folder) result store: the durable memory of
+        // rule evaluations — see rule_snapshot / rule_refresh /
+        // rule_probe_batch. A rule's last result set renders instantly
+        // on revisit; the duration sweep resumes where it stopped.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS rule_results (
+                    rule_key TEXT PRIMARY KEY,
+                    extensions TEXT NOT NULL,
+                    min_duration_secs REAL,
+                    evaluated_at TEXT NOT NULL,
+                    candidates INTEGER NOT NULL DEFAULT 0,
+                    member_count INTEGER NOT NULL DEFAULT 0,
+                    pending INTEGER NOT NULL DEFAULT 0,
+                    pending_offline INTEGER NOT NULL DEFAULT 0,
+                    sweep_complete INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS rule_result_items (
+                    rule_key TEXT NOT NULL,
+                    provider_key TEXT NOT NULL,
+                    is_member INTEGER NOT NULL DEFAULT 0,
+                    size_bytes INTEGER,
+                    modified TEXT,
+                    PRIMARY KEY (rule_key, provider_key)
+                );",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
         // Migration 2: cached media durations (seconds), filled lazily
         // by ffprobe when duration-based rules / smart folders evaluate.
         let has_duration: bool = self
@@ -704,20 +731,55 @@ impl Catalog {
         // Re-walks mint fresh ItemIds; reuse the stored id for the same
         // (location_id, provider_key) so labels/collections survive a
         // refresh and the FTS row stays put.
-        let existing: Option<(String, i64, String)> = match item.provider_key.as_deref() {
+        let existing: Option<(
+            String,
+            i64,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<f64>,
+        )> = match item.provider_key.as_deref() {
             Some(pk) => self
                 .conn
                 .query_row(
-                    "SELECT id, rowid, name FROM items WHERE location_id = ?1 AND provider_key = ?2",
+                    "SELECT id, rowid, name, size_bytes, modified, duration_secs
+                     FROM items WHERE location_id = ?1 AND provider_key = ?2",
                     params![item.location.to_string(), pk],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
                 )
                 .ok(),
             None => None,
         };
+        // A probed duration describes THIS (size, modified) of the
+        // file. Carry it across the REPLACE when the file is
+        // unchanged; a changed file honestly becomes unprobed again
+        // instead of wearing a stale duration. (Before this, the
+        // REPLACE reset every re-indexed file's duration to NULL,
+        // so smart folders re-probed from scratch on every visit.)
+        let carried_duration: Option<f64> = match &existing {
+            Some((_, _, _, esize, emod, edur)) => {
+                let unchanged = *esize == item.size_bytes.map(|s| s as i64)
+                    && *emod == item.modified.map(|m| m.to_rfc3339());
+                if unchanged {
+                    *edur
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
         let stable_id: String = existing
             .as_ref()
-            .map(|(id, _, _)| id.clone())
+            .map(|(id, ..)| id.clone())
             .unwrap_or_else(|| item.id.to_string());
         // items_fts is external-content: the REPLACE below deletes the
         // items row and re-inserts it under a NEW rowid, which would
@@ -725,7 +787,7 @@ impl Catalog {
         // rowid can join the ghost to an unrelated item). Retire the
         // old entry with the FTS 'delete' command first, exactly as
         // delete_unseen does.
-        if let Some((_, old_rowid, old_name)) = &existing {
+        if let Some((_, old_rowid, old_name, _, _, _)) = &existing {
             self.conn
                 .execute(
                     "INSERT INTO items_fts (items_fts, rowid, name) VALUES ('delete', ?1, ?2)",
@@ -736,8 +798,8 @@ impl Catalog {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO items
-                 (id, location_id, name, kind, size_bytes, modified, provider_key)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (id, location_id, name, kind, size_bytes, modified, provider_key, duration_secs)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     stable_id,
                     item.location.to_string(),
@@ -746,6 +808,7 @@ impl Catalog {
                     item.size_bytes.map(|s| s as i64),
                     item.modified.map(|m| m.to_rfc3339()),
                     item.provider_key,
+                    carried_duration,
                 ],
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
@@ -3495,6 +3558,573 @@ impl Catalog {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Rule (smart folder) result store — the durable memory of rule
+// evaluations (Dickles' smart-folder amnesia fix, 2026-10-15).
+//
+// Before this, a rule view had NO memory: the only record of probing
+// was items.duration_secs (which insert_item silently wiped on every
+// re-index of a changed file), and the UI's view cache died with the
+// process. Evaluation now lives here, in the catalog:
+//
+//   * rule_snapshot — the remembered result set. Renders instantly on
+//     revisit; no probing, no rescan.
+//   * rule_refresh — ONE delta pass: classify every candidate from
+//     STORED durations only (zero probing), diffed against the stored
+//     snapshot so unchanged rows are never rewritten. New files are
+//     classified, changed files fall back to unprobed (their duration
+//     described the old bytes), removed files leave the snapshot.
+//   * rule_probe_batch — the duration sweep, in bounded batches.
+//     Every probe persists the moment it lands, so a cancelled or
+//     interrupted sweep resumes where it stopped instead of starting
+//     over. Candidates on OFFLINE volumes are never probed (the
+//     `online` predicate is Library Memory's mounted test): they
+//     render from catalog data and join when the volume returns.
+// ---------------------------------------------------------------------------
+
+/// A duration rule (a smart folder definition): file extensions plus
+/// an optional minimum duration in seconds. With no minimum, every
+/// candidate is a member and nothing is ever probed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleSpec {
+    pub extensions: Vec<String>,
+    pub min_duration_secs: Option<f64>,
+}
+
+/// The durable identity of a rule: sorted lowercase extensions plus
+/// the duration floor. Two rules that ask the same question share
+/// one stored result.
+pub fn rule_key(spec: &RuleSpec) -> String {
+    let mut exts: Vec<String> = spec
+        .extensions
+        .iter()
+        .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect();
+    exts.sort();
+    exts.dedup();
+    format!(
+        "{}|{}",
+        exts.join(","),
+        spec.min_duration_secs
+            .map(|m| m.to_string())
+            .unwrap_or_default()
+    )
+}
+
+/// Outcome of probing one file for its duration. Only outcomes for
+/// files that exist and were actually probed settle anything.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProbeOutcome {
+    /// Probed: the media duration in seconds.
+    Duration(f64),
+    /// Probed: no readable duration (not media, corrupt, …). Settles
+    /// as duration 0.0 — the file was examined; don't ask again
+    /// until its bytes change.
+    NoDuration,
+    /// The path vanished before probing (unmounted mid-sweep,
+    /// deleted). NEVER settles — recording this as zero-length was
+    /// the old poisoning bug.
+    Missing,
+    /// Probing itself is unavailable (the probe tool failed to
+    /// start). The batch stops and reports it; nothing settles.
+    Unavailable(String),
+}
+
+/// The durable state of one rule's evaluation.
+#[derive(Debug, Clone)]
+pub struct RuleStatus {
+    /// Member items, hydrated from the catalog (labels included),
+    /// in name order. On a snapshot this is the remembered set.
+    pub members: Vec<ufm_vfs::Item>,
+    pub member_count: u32,
+    /// Total candidates the last evaluation saw.
+    pub candidates: u32,
+    /// Unprobed candidates on mounted volumes — the sweep's
+    /// remaining work.
+    pub pending: u32,
+    /// Unprobed candidates on OFFLINE volumes. Never probed; they
+    /// join automatically when the volume returns.
+    pub pending_offline: u32,
+    /// True when no online probing remains.
+    pub sweep_complete: bool,
+    /// When the last full/delta evaluation ran (RFC 3339).
+    pub evaluated_at: Option<String>,
+}
+
+/// One bounded slice of the duration sweep.
+#[derive(Debug, Clone)]
+pub struct RuleProbeBatch {
+    /// Files actually probed in this batch (settled or not).
+    pub probed: u32,
+    /// Unprobed candidates remaining on mounted volumes.
+    pub remaining: u32,
+    /// Unprobed candidates on offline volumes (never probed).
+    pub remaining_offline: u32,
+    /// Files this batch newly proved to be members — the UI merges
+    /// them into the visible list live.
+    pub new_members: Vec<ufm_vfs::Item>,
+    /// The batch stopped early because cancellation was requested.
+    /// Everything probed so far is persisted.
+    pub cancelled: bool,
+    /// Probing is unavailable (see ProbeOutcome::Unavailable).
+    pub probe_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RuleHeader {
+    candidates: u32,
+    pending: u32,
+    pending_offline: u32,
+    sweep_complete: bool,
+    evaluated_at: String,
+}
+
+/// Membership from a stored duration: `None` = undecided (not
+/// probed yet). A stored 0.0 is a settled "no duration" and fails
+/// every positive floor.
+fn rule_is_member(min_duration_secs: Option<f64>, dur: Option<f64>) -> Option<bool> {
+    match min_duration_secs {
+        None => Some(true),
+        Some(min) => dur.map(|d| d > min),
+    }
+}
+
+impl Catalog {
+    fn rule_header(&self, key: &str) -> Result<Option<RuleHeader>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT candidates, pending, pending_offline, sweep_complete, evaluated_at
+                 FROM rule_results WHERE rule_key = ?1",
+                params![key],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .ok();
+        Ok(row.map(|(c, p, po, sc, at)| RuleHeader {
+            candidates: c.max(0) as u32,
+            pending: p.max(0) as u32,
+            pending_offline: po.max(0) as u32,
+            sweep_complete: sc != 0,
+            evaluated_at: at,
+        }))
+    }
+
+    /// Rule candidates with their stored durations, WITHOUT label
+    /// hydration (the sweep classifies thousands of rows; labels are
+    /// only paid for members, at hydration time).
+    fn rule_candidates_bare(
+        &self,
+        exts: &[String],
+    ) -> Result<Vec<(ufm_vfs::Item, Option<f64>)>> {
+        if exts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conds: Vec<String> = exts
+            .iter()
+            .map(|_| "lower(i.name) LIKE '%.' || ?".to_string())
+            .collect();
+        let sql = format!(
+            "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes,
+                    i.modified, i.provider_key, i.duration_secs
+             FROM items AS i
+             WHERE ({})
+             ORDER BY i.name COLLATE NOCASE",
+            conds.join(" OR ")
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(exts.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<f64>>(7)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, location_id, name, kind_s, size_bytes, modified_s, provider_key, duration) =
+                row.map_err(|e| UfmError::Database(e.to_string()))?;
+            let item = self.hydrate_item(
+                &id,
+                &location_id,
+                name,
+                &kind_s,
+                size_bytes,
+                modified_s,
+                provider_key,
+            )?;
+            out.push((item, duration));
+        }
+        Ok(out)
+    }
+
+    /// The stored member items of a rule, fully hydrated.
+    fn rule_member_items(&self, key: &str) -> Result<Vec<ufm_vfs::Item>> {
+        self.items_by_query(
+            "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes,
+                    i.modified, i.provider_key
+             FROM rule_result_items AS r
+             JOIN items AS i ON i.provider_key = r.provider_key
+             WHERE r.rule_key = ?1 AND r.is_member = 1
+             ORDER BY i.name COLLATE NOCASE",
+            key,
+        )
+    }
+
+    /// Fully-hydrated items for an explicit provider-key list (the
+    /// probe batch's new members).
+    fn rule_items_by_provider_keys(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<ufm_vfs::Item>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: Vec<String> = keys.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes,
+                    i.modified, i.provider_key
+             FROM items AS i
+             WHERE i.provider_key IN ({})
+             ORDER BY i.name COLLATE NOCASE",
+            placeholders.join(", ")
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(keys.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, location_id, name, kind_s, size_bytes, modified_s, provider_key) =
+                row.map_err(|e| UfmError::Database(e.to_string()))?;
+            out.push(self.hydrate_item(
+                &id,
+                &location_id,
+                name,
+                &kind_s,
+                size_bytes,
+                modified_s,
+                provider_key,
+            )?);
+        }
+        Ok(out)
+    }
+
+    /// The remembered result for a rule, if it has ever been
+    /// evaluated. Pure reads: no probing, no candidate rescan.
+    pub fn rule_snapshot(&self, spec: &RuleSpec) -> Result<Option<RuleStatus>> {
+        let key = rule_key(spec);
+        let Some(header) = self.rule_header(&key)? else {
+            return Ok(None);
+        };
+        let members = self.rule_member_items(&key)?;
+        Ok(Some(RuleStatus {
+            member_count: members.len() as u32,
+            candidates: header.candidates,
+            pending: header.pending,
+            pending_offline: header.pending_offline,
+            sweep_complete: header.sweep_complete,
+            evaluated_at: Some(header.evaluated_at),
+            members,
+        }))
+    }
+
+    /// One delta evaluation of a rule: classify every candidate from
+    /// stored durations ONLY (zero probing), diff against the stored
+    /// snapshot, and persist the new snapshot. Unchanged snapshot
+    /// rows are not rewritten — a steady-state refresh writes only
+    /// the header. `online` decides probe eligibility per path
+    /// (Library Memory's mounted test); offline candidates are
+    /// counted apart and never block completion of the online set.
+    pub fn rule_refresh(
+        &self,
+        spec: &RuleSpec,
+        online: &dyn Fn(&str) -> bool,
+        now: &str,
+    ) -> Result<RuleStatus> {
+        let key = rule_key(spec);
+        let candidates = self.rule_candidates_bare(&spec.extensions)?;
+        // Previous snapshot rows: provider_key -> (is_member, size, modified).
+        let mut prev: std::collections::HashMap<
+            String,
+            (bool, Option<i64>, Option<String>),
+        > = std::collections::HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT provider_key, is_member, size_bytes, modified
+                     FROM rule_result_items WHERE rule_key = ?1",
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![key], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for row in rows {
+                let (pk, is_member, size, modified) =
+                    row.map_err(|e| UfmError::Database(e.to_string()))?;
+                prev.insert(pk, (is_member != 0, size, modified));
+            }
+        }
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut total = 0u32;
+        let mut member_count = 0u32;
+        let mut pending = 0u32;
+        let mut pending_offline = 0u32;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        for (item, dur) in &candidates {
+            let Some(pk) = &item.provider_key else {
+                continue;
+            };
+            total += 1;
+            seen.insert(pk.clone());
+            let member = match rule_is_member(spec.min_duration_secs, *dur) {
+                Some(m) => m,
+                None => {
+                    // Unprobed: not a member YET. Which pending pile
+                    // it lands in depends on its volume being here.
+                    if online(pk) {
+                        pending += 1;
+                    } else {
+                        pending_offline += 1;
+                    }
+                    false
+                }
+            };
+            if member {
+                member_count += 1;
+            }
+            let size = item.size_bytes.map(|s| s as i64);
+            let modified = item.modified.map(|m| m.to_rfc3339());
+            let stale = match prev.get(pk) {
+                None => true,
+                Some((m, s, md)) => *m != member || *s != size || *md != modified,
+            };
+            if stale {
+                tx.execute(
+                    "INSERT OR REPLACE INTO rule_result_items
+                     (rule_key, provider_key, is_member, size_bytes, modified)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![key, pk, member as i64, size, modified],
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            }
+        }
+        // Candidates that vanished (deleted files) leave the snapshot.
+        for pk in prev.keys() {
+            if !seen.contains(pk) {
+                tx.execute(
+                    "DELETE FROM rule_result_items
+                     WHERE rule_key = ?1 AND provider_key = ?2",
+                    params![key, pk],
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            }
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO rule_results
+             (rule_key, extensions, min_duration_secs, evaluated_at,
+              candidates, member_count, pending, pending_offline, sweep_complete)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                key,
+                spec.extensions.join(","),
+                spec.min_duration_secs,
+                now,
+                total as i64,
+                member_count as i64,
+                pending as i64,
+                pending_offline as i64,
+                (pending == 0) as i64,
+            ],
+        )
+        .map_err(|e| UfmError::Database(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let members = self.rule_member_items(&key)?;
+        Ok(RuleStatus {
+            members,
+            member_count,
+            candidates: total,
+            pending,
+            pending_offline,
+            sweep_complete: pending == 0,
+            evaluated_at: Some(now.to_string()),
+        })
+    }
+
+    /// Probe up to `budget` unprobed, ONLINE candidates of a rule, in
+    /// stable (name) order, persisting every settled duration the
+    /// moment it lands. Checks `cancel` between files; a cancelled or
+    /// interrupted batch leaves all partial progress in the catalog,
+    /// so the next batch resumes instead of restarting. Offline
+    /// candidates are counted, never probed. A rule with no duration
+    /// floor never probes at all.
+    pub fn rule_probe_batch(
+        &self,
+        spec: &RuleSpec,
+        budget: u32,
+        probe: &mut dyn FnMut(&std::path::Path) -> ProbeOutcome,
+        online: &dyn Fn(&str) -> bool,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<RuleProbeBatch> {
+        let mut batch = RuleProbeBatch {
+            probed: 0,
+            remaining: 0,
+            remaining_offline: 0,
+            new_members: Vec::new(),
+            cancelled: false,
+            probe_error: None,
+        };
+        let Some(min) = spec.min_duration_secs else {
+            return Ok(batch);
+        };
+        let key = rule_key(spec);
+        let has_snapshot = self.rule_header(&key)?.is_some();
+        let candidates = self.rule_candidates_bare(&spec.extensions)?;
+        let mut new_member_keys: Vec<String> = Vec::new();
+        for (item, dur) in &candidates {
+            if dur.is_some() {
+                continue; // settled already — never re-probed
+            }
+            let Some(pk) = &item.provider_key else {
+                continue;
+            };
+            if !online(pk) {
+                batch.remaining_offline += 1;
+                continue;
+            }
+            if batch.probed >= budget || batch.probe_error.is_some() {
+                batch.remaining += 1;
+                continue;
+            }
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                batch.cancelled = true;
+                batch.remaining += 1;
+                continue;
+            }
+            batch.probed += 1;
+            match probe(std::path::Path::new(pk)) {
+                ProbeOutcome::Duration(d) => {
+                    self.set_duration(pk, d)?;
+                    let member = d > min;
+                    if member {
+                        new_member_keys.push(pk.clone());
+                    }
+                    if has_snapshot {
+                        self.rule_note_probe_result(&key, item, member)?;
+                    }
+                }
+                ProbeOutcome::NoDuration => {
+                    self.set_duration(pk, 0.0)?;
+                    if has_snapshot {
+                        self.rule_note_probe_result(&key, item, false)?;
+                    }
+                }
+                ProbeOutcome::Missing => {
+                    // Vanished between listing and probing: settles
+                    // NOTHING. It stays pending and honest.
+                    batch.remaining += 1;
+                }
+                ProbeOutcome::Unavailable(msg) => {
+                    batch.probe_error = Some(msg);
+                    batch.remaining += 1;
+                }
+            }
+        }
+        if !new_member_keys.is_empty() {
+            batch.new_members = self.rule_items_by_provider_keys(&new_member_keys)?;
+        }
+        if has_snapshot {
+            self.conn
+                .execute(
+                    "UPDATE rule_results
+                     SET pending = ?2, pending_offline = ?3,
+                         member_count = member_count + ?4,
+                         sweep_complete = ?5
+                     WHERE rule_key = ?1",
+                    params![
+                        key,
+                        batch.remaining as i64,
+                        batch.remaining_offline as i64,
+                        new_member_keys.len() as i64,
+                        (batch.remaining == 0) as i64,
+                    ],
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+        }
+        Ok(batch)
+    }
+
+    /// Record one settled probe outcome in the rule snapshot.
+    fn rule_note_probe_result(
+        &self,
+        key: &str,
+        item: &ufm_vfs::Item,
+        member: bool,
+    ) -> Result<()> {
+        let Some(pk) = &item.provider_key else {
+            return Ok(());
+        };
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO rule_result_items
+                 (rule_key, provider_key, is_member, size_bytes, modified)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    key,
+                    pk,
+                    member as i64,
+                    item.size_bytes.map(|s| s as i64),
+                    item.modified.map(|m| m.to_rfc3339()),
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -4764,5 +5394,319 @@ mod phase2_tests {
         assert_eq!(cat.auditor_user_words().unwrap(), vec!["garrison".to_string()]);
         // Clearing an already-empty list is a reported no-op.
         assert_eq!(cat.clear_auditor_flags().unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::sync::atomic::AtomicBool;
+
+    const T1: &str = "2026-10-15T00:00:00Z";
+    const T2: &str = "2026-10-16T00:00:00Z";
+
+    fn ts(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn seed_location(cat: &Catalog) -> LocationId {
+        let loc_id = LocationId::new();
+        cat.insert_location(&ufm_vfs::Location {
+            id: loc_id,
+            provider: "local".into(),
+            display_name: "Drive".into(),
+            capabilities: ufm_vfs::Capabilities::default(),
+            protected: ufm_vfs::ProtectionTier::None,
+        })
+        .unwrap();
+        loc_id
+    }
+
+    fn seed_item(cat: &Catalog, loc: LocationId, pk: &str, size: u64, modified: &str) {
+        let name = pk.rsplit('/').next().unwrap().to_string();
+        cat.insert_item(&ufm_vfs::Item {
+            id: ItemId::new(),
+            location: loc,
+            name,
+            kind: ufm_vfs::ItemKind::File,
+            size_bytes: Some(size),
+            modified: Some(ts(modified)),
+            provider_key: Some(pk.to_string()),
+            labels: vec![],
+            starred: false,
+        })
+        .unwrap();
+    }
+
+    fn music_spec() -> RuleSpec {
+        RuleSpec {
+            extensions: vec!["mp3".to_string()],
+            min_duration_secs: Some(30.0),
+        }
+    }
+
+    fn online(pk: &str) -> bool {
+        !pk.starts_with("/offline")
+    }
+
+    /// The standard world: one known member, three unprobed files on
+    /// a mounted volume (a future member, a no-duration, a short),
+    /// one unprobed file on an offline volume, one non-candidate.
+    struct World {
+        cat: Catalog,
+        loc: LocationId,
+    }
+
+    fn world() -> World {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = seed_location(&cat);
+        seed_item(&cat, loc, "/music/known.mp3", 100, T1);
+        cat.set_duration("/music/known.mp3", 100.0).unwrap();
+        seed_item(&cat, loc, "/music/song-a.mp3", 100, T1);
+        seed_item(&cat, loc, "/music/song-b.mp3", 100, T1);
+        seed_item(&cat, loc, "/music/short.mp3", 100, T1);
+        seed_item(&cat, loc, "/offline/song-c.mp3", 100, T1);
+        seed_item(&cat, loc, "/music/notes.txt", 10, T1);
+        World { cat, loc }
+    }
+
+    /// A probe with scripted outcomes that records every path it was
+    /// asked about — the record proves settled files are never
+    /// re-probed and offline files are never probed at all.
+    fn scripted_probe(
+        log: &RefCell<Vec<String>>,
+    ) -> impl FnMut(&std::path::Path) -> ProbeOutcome + '_ {
+        move |p: &std::path::Path| {
+            let s = p.to_string_lossy().into_owned();
+            log.borrow_mut().push(s.clone());
+            match s.as_str() {
+                "/music/song-a.mp3" => ProbeOutcome::Duration(200.0),
+                "/music/short.mp3" => ProbeOutcome::Duration(10.0),
+                "/music/song-b.mp3" => ProbeOutcome::NoDuration,
+                _ => ProbeOutcome::Missing,
+            }
+        }
+    }
+
+    #[test]
+    fn insert_item_preserves_duration_until_file_changes() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = seed_location(&cat);
+        seed_item(&cat, loc, "/music/track.mp3", 100, T1);
+        cat.set_duration("/music/track.mp3", 212.0).unwrap();
+        let dur = |c: &Catalog| {
+            c.rule_candidates(&["mp3".to_string()]).unwrap()[0]
+                .1
+        };
+        assert_eq!(dur(&cat), Some(212.0));
+        // A re-walk re-inserts the UNCHANGED file (fresh ItemId, same
+        // size + mtime): the probed duration must survive.
+        seed_item(&cat, loc, "/music/track.mp3", 100, T1);
+        assert_eq!(dur(&cat), Some(212.0), "unchanged file keeps its duration");
+        // The file changed (retagging rewrites bytes + mtime): the
+        // old duration described other bytes — unprobed again.
+        seed_item(&cat, loc, "/music/track.mp3", 101, T2);
+        assert_eq!(dur(&cat), None, "changed file loses its stale duration");
+    }
+
+    #[test]
+    fn rule_refresh_classifies_and_persists() {
+        let w = world();
+        let spec = music_spec();
+        let st = w.cat.rule_refresh(&spec, &online, T1).unwrap();
+        assert_eq!(st.candidates, 5);
+        assert_eq!(st.member_count, 1);
+        assert_eq!(st.members.len(), 1);
+        assert_eq!(
+            st.members[0].provider_key.as_deref(),
+            Some("/music/known.mp3")
+        );
+        assert_eq!(st.pending, 3, "short + song-a + song-b await probing");
+        assert_eq!(st.pending_offline, 1, "song-c sits on the offline volume");
+        assert!(!st.sweep_complete);
+        // The snapshot reads back identically with no re-evaluation:
+        // this is the instant paint a revisit gets.
+        let snap = w
+            .cat
+            .rule_snapshot(&spec)
+            .unwrap()
+            .expect("snapshot stored");
+        assert_eq!(snap.member_count, 1);
+        assert_eq!(snap.pending, 3);
+        assert_eq!(snap.pending_offline, 1);
+        assert_eq!(snap.evaluated_at.as_deref(), Some(T1));
+    }
+
+    #[test]
+    fn rule_probe_batch_streams_persists_and_resumes() {
+        let w = world();
+        let spec = music_spec();
+        w.cat.rule_refresh(&spec, &online, T1).unwrap();
+        let log = RefCell::new(Vec::new());
+        let mut probe = scripted_probe(&log);
+        let cancel = AtomicBool::new(false);
+        // Budget 2 — name order settles short.mp3 (10s: not a member)
+        // and then song-a.mp3 (200s: member, streamed back).
+        let b1 = w
+            .cat
+            .rule_probe_batch(&spec, 2, &mut probe, &online, &cancel)
+            .unwrap();
+        assert_eq!(b1.probed, 2);
+        assert_eq!(b1.remaining, 1, "only song-b remains");
+        assert_eq!(b1.remaining_offline, 1);
+        assert_eq!(b1.new_members.len(), 1);
+        assert_eq!(
+            b1.new_members[0].provider_key.as_deref(),
+            Some("/music/song-a.mp3")
+        );
+        assert!(!b1.cancelled && b1.probe_error.is_none());
+        // Partial progress is durable the moment the batch ends.
+        let snap = w.cat.rule_snapshot(&spec).unwrap().unwrap();
+        assert_eq!(snap.member_count, 2);
+        assert_eq!(snap.pending, 1);
+        // Resume: only the unsettled file is probed. Settled files
+        // are never asked again, offline files never at all.
+        let b2 = w
+            .cat
+            .rule_probe_batch(&spec, 10, &mut probe, &online, &cancel)
+            .unwrap();
+        assert_eq!(b2.probed, 1);
+        assert_eq!(b2.remaining, 0);
+        assert!(b2.new_members.is_empty(), "song-b has no duration");
+        let asked = log.borrow().clone();
+        assert_eq!(
+            asked,
+            vec![
+                "/music/short.mp3".to_string(),
+                "/music/song-a.mp3".to_string(),
+                "/music/song-b.mp3".to_string(),
+            ]
+        );
+        let snap = w.cat.rule_snapshot(&spec).unwrap().unwrap();
+        assert!(snap.sweep_complete);
+        assert_eq!(snap.member_count, 2);
+    }
+
+    #[test]
+    fn rule_probe_batch_honours_cancellation() {
+        let w = world();
+        let spec = music_spec();
+        w.cat.rule_refresh(&spec, &online, T1).unwrap();
+        let log = RefCell::new(Vec::new());
+        let mut probe = scripted_probe(&log);
+        let cancel = AtomicBool::new(true); // the user already left
+        let b = w
+            .cat
+            .rule_probe_batch(&spec, 250, &mut probe, &online, &cancel)
+            .unwrap();
+        assert_eq!(b.probed, 0);
+        assert!(b.cancelled);
+        assert_eq!(b.remaining, 3);
+        assert!(log.borrow().is_empty(), "a cancelled sweep probes nothing");
+    }
+
+    #[test]
+    fn rule_result_survives_reopen() {
+        let path =
+            std::env::temp_dir().join(format!("ufm-rule-reopen-{}.db", std::process::id()));
+        let cleanup = |path: &std::path::Path| {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+            }
+        };
+        cleanup(&path);
+        let spec = music_spec();
+        {
+            let cat = Catalog::open(&path).unwrap();
+            let loc = seed_location(&cat);
+            seed_item(&cat, loc, "/music/known.mp3", 100, T1);
+            cat.set_duration("/music/known.mp3", 100.0).unwrap();
+            seed_item(&cat, loc, "/music/song-a.mp3", 100, T1);
+            let st = cat.rule_refresh(&spec, &online, T1).unwrap();
+            assert_eq!(st.member_count, 1);
+            assert_eq!(st.pending, 1);
+        }
+        // A brand-new process (fresh Catalog on the same file) paints
+        // the remembered result without evaluating anything.
+        let cat = Catalog::open(&path).unwrap();
+        let snap = cat
+            .rule_snapshot(&spec)
+            .unwrap()
+            .expect("the remembered result must survive a restart");
+        assert_eq!(snap.member_count, 1);
+        assert_eq!(snap.pending, 1);
+        assert_eq!(
+            snap.members[0].provider_key.as_deref(),
+            Some("/music/known.mp3")
+        );
+        drop(cat);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn rule_refresh_applies_deltas() {
+        let w = world();
+        let spec = music_spec();
+        let log = RefCell::new(Vec::new());
+        let mut probe = scripted_probe(&log);
+        let cancel = AtomicBool::new(false);
+        w.cat.rule_refresh(&spec, &online, T1).unwrap();
+        w.cat
+            .rule_probe_batch(&spec, 10, &mut probe, &online, &cancel)
+            .unwrap();
+        let settled = w.cat.rule_snapshot(&spec).unwrap().unwrap();
+        assert_eq!(settled.member_count, 2);
+        assert!(settled.sweep_complete);
+        // Delta 1: a NEW file arrives with its duration already known
+        // (probed by another door) — member at refresh, no probing.
+        seed_item(&w.cat, w.loc, "/music/song-d.mp3", 100, T1);
+        w.cat.set_duration("/music/song-d.mp3", 55.0).unwrap();
+        // Delta 2: song-a is retagged (size + mtime change) — its
+        // duration is dropped by insert_item, so it must re-queue.
+        seed_item(&w.cat, w.loc, "/music/song-a.mp3", 104, T2);
+        // Delta 3: short.mp3 is deleted; the indexer's prune removes
+        // its catalog row.
+        let seen: std::collections::HashSet<String> = [
+            "/music/known.mp3",
+            "/music/song-a.mp3",
+            "/music/song-b.mp3",
+            "/music/song-d.mp3",
+            "/music/notes.txt",
+            "/offline/song-c.mp3",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        w.cat.delete_unseen(&w.loc, &seen).unwrap();
+        // The revisit evaluates ONLY the deltas.
+        let st = w.cat.rule_refresh(&spec, &online, T2).unwrap();
+        assert_eq!(st.candidates, 5, "5 before + song-d − short = 5");
+        assert_eq!(st.pending, 1, "only the changed song-a re-queues");
+        assert_eq!(st.pending_offline, 1);
+        let names: Vec<&str> = st
+            .members
+            .iter()
+            .filter_map(|i| i.provider_key.as_deref())
+            .collect();
+        assert!(names.contains(&"/music/known.mp3"));
+        assert!(names.contains(&"/music/song-d.mp3"));
+        assert!(
+            !names.contains(&"/music/song-a.mp3"),
+            "a changed file leaves membership until it is re-probed"
+        );
+        assert!(!names.contains(&"/music/short.mp3"));
+        // The re-probe heals the delta and completes the sweep again.
+        let b = w
+            .cat
+            .rule_probe_batch(&spec, 10, &mut probe, &online, &cancel)
+            .unwrap();
+        assert_eq!(b.probed, 1);
+        assert_eq!(b.new_members.len(), 1);
+        let snap = w.cat.rule_snapshot(&spec).unwrap().unwrap();
+        assert!(snap.sweep_complete);
+        assert_eq!(snap.member_count, 3);
     }
 }

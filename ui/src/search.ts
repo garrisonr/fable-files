@@ -12,6 +12,7 @@ import {
   onRomIdentifyProgress,
   type Item,
   type ItemVolumeBadge,
+  type RuleItemsResult,
   type RomScope,
   type SearchHit,
 } from "./api";
@@ -155,6 +156,13 @@ export class SearchView {
   /** Set by runExternal so run() can tell a smart-folder invocation
    * (keep titleHint) from a hand-typed search (clear titleHint). */
   private externalRun = false;
+  /** Token for runRule's background duration sweep: bumped by every
+   * new rule run and by clear(), so a sweep loop that wakes after
+   * the user moved on stops instead of painting over the new view. */
+  private ruleRunToken = 0;
+  /** The "still reading durations" note under a rule view's list:
+   * sweep progress rides UNDER the results, never instead of them. */
+  private ruleNoteEl: HTMLParagraphElement | null = null;
   /** Indexing state mirrored from the shell's IndexTracker (inc-2
    * item 13): while the index is incomplete, results are partial
    * and must SAY so — a bare "No results" during indexing is a lie
@@ -668,6 +676,8 @@ export class SearchView {
     this.beforeDate = "";
     this.afterInput.value = "";
     this.beforeInput.value = "";
+    this.ruleRunToken++;
+    void api.ruleCancelProbe().catch(() => undefined);
     this.active = false;
     this.titleHint = null;
     this.lastResults = null;
@@ -794,8 +804,46 @@ export class SearchView {
     }
   }
 
+  /** Show (or clear) the sweep-progress note under the results. */
+  private setRuleNote(text: string | null): void {
+    if (this.ruleNoteEl) {
+      this.ruleNoteEl.remove();
+      this.ruleNoteEl = null;
+    }
+    if (!text) return;
+    const p = document.createElement("p");
+    p.className = "search-hint";
+    p.textContent = text;
+    this.resultsEl.appendChild(p);
+    this.ruleNoteEl = p;
+  }
+
+  /** Collection scope filter for rule views (ROM systems without a
+   * DAT keep extension rules; their scope filters client-side by
+   * item location). */
+  private scopeRuleItems(items: Item[], scope?: RomScope): Item[] {
+    if (!scope || scope.mode === "all") return items;
+    const allowed =
+      scope.mode === "boot"
+        ? new Set(
+            this.hooks
+              .scopes()
+              .filter((l) => l.provider !== "volume")
+              .map((l) => l.id),
+          )
+        : new Set<string | null>(scope.drives);
+    return items.filter((it) => allowed.has(it.location));
+  }
+
   /** Evaluate a rule smart folder (extensions + optional minimum
-   * duration), looping while the backend is still probing durations. */
+   * duration). The backend's rule store remembers the result:
+   * rule_items paints the remembered members instantly and NEVER
+   * probes; a background delta refresh reconciles new / changed /
+   * removed files; the duration sweep then runs in probe batches
+   * BEHIND the visible list — it can only add members, never gate
+   * them. Leaving the view cancels the sweep; everything probed so
+   * far persists in the catalog, so the next visit resumes where
+   * this one stopped instead of starting from scratch. */
   async runRule(
     name: string,
     rule: { extensions: string[]; minDurationSecs?: number | null },
@@ -811,7 +859,7 @@ export class SearchView {
     this.hooks.onResults();
     // View cache (fix batch item 2): re-entering a smart folder
     // paints its last result set instantly — the duration probe
-    // loop below runs ONCE per data change, not per visit.
+    // runs in the background, not per visit.
     const key = `rule|${name}|${rule.extensions.join(",")}|${rule.minDurationSecs ?? ""}|${this.scopeKey(scope)}`;
     this.saveScroll();
     const cached = this.viewCache.get(key);
@@ -821,48 +869,99 @@ export class SearchView {
       this.restoreScroll(key);
       return;
     }
-    this.renderStatus(`Gathering “${name}”…`);
+    const token = ++this.ruleRunToken;
+    const stale = () =>
+      token !== this.ruleRunToken ||
+      !this.active ||
+      this.currentViewKey !== key;
+    this.renderStatus(`Gathering \u201c${name}\u201d\u2026`);
     try {
-      let items: Item[] = [];
-      let badges: ItemVolumeBadge[] = [];
-      for (let pass = 0; pass < 40; pass++) {
-        const res = await api.ruleItems(
-          rule.extensions,
-          rule.minDurationSecs ?? null,
-          1000,
-          250,
-        );
-        items = res.items;
-        badges = res.badges ?? [];
-        if (res.remaining === 0) break;
-        this.renderStatus(
-          `Reading media durations for “${name}”… (${items.length} so far)`,
-        );
+      const exts = rule.extensions;
+      const minDur = rule.minDurationSecs ?? null;
+      let current = await api.ruleItems(exts, minDur, 1000, 0);
+      if (stale()) return;
+      // Paint a stored result, preserving scroll across the
+      // streaming re-renders below.
+      const paint = (res: RuleItemsResult): Item[] => {
+        const items = this.scopeRuleItems(res.items, scope);
+        const scroll = this.el.scrollTop;
+        this.viewCache.set(key, {
+          items,
+          hits: null,
+          displayNames: null,
+          scrollTop: 0,
+          badges: res.badges ?? [],
+        });
+        this.renderItems(name, items, res.badges ?? undefined);
+        this.el.scrollTop = scroll;
+        return items;
+      };
+      let items = paint(current);
+      // Background reconciliation: deltas since the remembered
+      // evaluation apply without the paint above ever waiting.
+      const fresh = await api.ruleRefresh(exts, minDur, 1000).catch(() => null);
+      if (stale()) return;
+      if (fresh) {
+        const before = current.items
+          .map((i) => i.provider_key ?? i.id)
+          .join("|");
+        const after = fresh.items.map((i) => i.provider_key ?? i.id).join("|");
+        current = fresh;
+        if (before !== after) items = paint(fresh);
       }
-      // Collection scope (ROM systems without a DAT keep extension
-      // rules; their scope filters client-side by item location).
-      if (scope && scope.mode !== "all") {
-        const allowed =
-          scope.mode === "boot"
-            ? new Set(
-                this.hooks
-                  .scopes()
-                  .filter((l) => l.provider !== "volume")
-                  .map((l) => l.id),
-              )
-            : new Set<string | null>(scope.drives);
-        items = items.filter((it) => allowed.has(it.location));
+      // The duration sweep: batches behind the visible list.
+      let pending = current.remaining;
+      let offline = current.pending_offline;
+      const offlineNote =
+        "Some files sit on drives that aren\u2019t connected right now \u2014 they\u2019ll join when the drive returns.";
+      if (pending === 0 && offline > 0) this.setRuleNote(offlineNote);
+      while (pending > 0) {
+        this.setRuleNote(
+          `Reading media durations for \u201c${name}\u201d\u2026 (${pending.toLocaleString()} to go) \u2014 results so far are live.`,
+        );
+        const batch = await api.ruleProbe(exts, minDur, 250);
+        if (stale()) {
+          void api.ruleCancelProbe().catch(() => undefined);
+          return;
+        }
+        if (batch.probeError) {
+          this.setRuleNote(`Duration reading paused \u2014 ${batch.probeError}`);
+          return;
+        }
+        pending = batch.remaining;
+        offline = batch.remainingOffline;
+        if (batch.newMembers.length > 0) {
+          const have = new Set(items.map((i) => i.id));
+          const freshItems = this.scopeRuleItems(
+            batch.newMembers,
+            scope,
+          ).filter((i) => !have.has(i.id));
+          if (freshItems.length > 0) {
+            items = items.concat(freshItems);
+            const badges = [
+              ...(this.viewCache.get(key)?.badges ?? []),
+              ...(batch.badges ?? []),
+            ];
+            const scroll = this.el.scrollTop;
+            this.viewCache.set(key, {
+              items,
+              hits: null,
+              displayNames: null,
+              scrollTop: 0,
+              badges,
+            });
+            this.renderItems(name, items, badges);
+            this.el.scrollTop = scroll;
+          }
+        }
+        if (batch.cancelled || batch.probed === 0) break;
       }
-      this.viewCache.set(key, {
-        items,
-        hits: null,
-        displayNames: null,
-        scrollTop: 0,
-        badges,
-      });
-      this.renderItems(name, items, badges);
+      if (pending === 0) {
+        this.setRuleNote(offline > 0 ? offlineNote : null);
+      }
     } catch {
-      this.renderStatus(`Could not gather “${name}”. Please try again.`);
+      if (token !== this.ruleRunToken) return;
+      this.renderStatus(`Could not gather \u201c${name}\u201d. Please try again.`);
     }
   }
 
