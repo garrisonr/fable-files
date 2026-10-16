@@ -26,6 +26,7 @@ import { Toast, confirmDialog, promptDialog, errText} from "./toast";
 import { openConnectDialog } from "./network";
 import { showPluginRunDialog } from "./plugins";
 import { SearchView, fmtDay } from "./search";
+import { RomHome } from "./romhome";
 import { MediaResDialog } from "./mediares";
 import { MusicCompleteDialog } from "./musiccomplete";
 import { PropertiesDialog } from "./properties";
@@ -154,6 +155,7 @@ export class Shell {
   >();
   private quickLook: QuickLook;
   private searchView: SearchView;
+  private romHome: RomHome;
   private themeManager: ThemeManager;
   private indexTracker: IndexTracker;
   private ctxMenu = new ContextMenu();
@@ -178,6 +180,9 @@ export class Shell {
   private profileLocByTab = new Map<number, string>();
   private smartList!: HTMLElement;
   private romsHead!: HTMLElement;
+  /** ROM Home door tallies (2026-10-15). */
+  private romsDoorCount: HTMLElement | null = null;
+  private romsDoorDot: HTMLElement | null = null;
   private romsList!: HTMLElement;
   /** Chevron spans of the collapsible sidebar sections (Round 7.2:
    * kept so boot can re-apply durable collapse prefs to the DOM). */
@@ -232,6 +237,22 @@ export class Shell {
       onPlayMusic: (items: Item[]) => this.musicPlayer.open(items),
       onOpen: (item) => this.openItem(item),
       onOpenInNewTab: (item) => void this.openItemInNewTab(item),
+      onOpenInRomHome: (item) => {
+        const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
+        const systems = loadRomSystems().filter(
+          (s) => s.extensions.includes(ext) && !isRomPlaceholder(s),
+        );
+        systems.sort(
+          (a, b) =>
+            Number(romSystemKey(b) !== null) -
+            Number(romSystemKey(a) !== null),
+        );
+        this.enterRomHome(
+          systems[0] ? { kind: "system", name: systems[0].name } : undefined,
+        );
+      },
+      onOpenRomFolder: (systemName) =>
+        this.enterRomHome({ kind: "system", name: systemName }),
       isFavorite: (item) => this.isFavoriteItem(item),
       onToggleFavorite: (item) => void this.toggleFavorite(item),
       onSelect: (item) => this.onSelect(item),
@@ -545,11 +566,59 @@ export class Shell {
       onReindex: () => this.reindexLibrary(),
       onSaveSmartFolder: () => void this.saveSmartFolder(),
     });
+    this.romHome = new RomHome({
+      onExit: () => this.exitRomHome(),
+      onPlayItem: (item) => this.openItem(item),
+      onPreviewItem: (item) => void this.quickLook.open(item),
+      onRevealItem: (item) => void this.revealRomInFiles(item),
+      onOpenWith: (item) => this.searchOpenWith.open(item),
+      onOpenAuditor: () => this.openAuditor(),
+      onAddRomFolder: () => void this.addRomFolder(),
+      onSearchAllFiles: (query) => {
+        this.exitRomHome();
+        this.searchView.focus();
+        const input = this.searchView.field.querySelector("input");
+        if (input) {
+          input.value = query;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+      },
+      onManageSystem: (sys, x, y) => {
+        this.ctxMenu.open(x, y, [
+          {
+            label: `Manage "${sys.name}"…`,
+            action: () => this.openRomEditor(sys),
+          },
+          {
+            label: `Delete "${sys.name}"`,
+            danger: true,
+            action: () => {
+              void (async () => {
+                const ok = await confirmDialog(
+                  `Delete "${sys.name}"?`,
+                  "The system is removed from the collection. Your ROM files are not touched.",
+                  "Delete",
+                  true,
+                );
+                if (!ok) return;
+                saveRomSystems(
+                  loadRomSystems().filter((s) => s.name !== sys.name),
+                );
+                void this.buildSidebar();
+                this.romHome.invalidate();
+                Toast.success(`Deleted system "${sys.name}".`);
+              })();
+            },
+          },
+        ]);
+      },
+    });
     this.viewport.append(
       this.fileView.el,
       this.columnsView.el,
       this.galleryView.el,
       this.searchView.el,
+      this.romHome.el,
       this.quickLook.el
     );
     // The search field lives in the toolbar; its results panel is in the viewport.
@@ -941,17 +1010,32 @@ export class Shell {
     // Round 7.1: collapsible, mirroring the Labels section exactly —
     // chevron, list visibility toggle, persisted ff-roms-collapsed.
     // The right-click Add-a-System menu is preserved.
+    // ROM Home (2026-10-15): the Roms Collection section is now a
+    // single door into the room — the per-system tree retired. The
+    // right-click Add-a-System menu is preserved on the door.
     const romsHead = document.createElement("button");
-    romsHead.className = "side-head side-collapse";
-    romsHead.setAttribute("aria-label", "Toggle Roms Collection section");
+    romsHead.className = "side-head rom-door";
+    romsHead.setAttribute("aria-label", "Open ROM Home");
+    const romsGlyph = document.createElement("span");
+    romsGlyph.className = "rom-door-glyph";
+    romsGlyph.textContent = "\uD83C\uDFAE";
     const romsHeadText = document.createElement("span");
-    romsHeadText.textContent = "Roms Collection";
+    romsHeadText.className = "rom-door-label";
+    romsHeadText.textContent = "ROMs";
+    const romsCount = document.createElement("span");
+    romsCount.className = "rom-door-count";
+    const romsDot = document.createElement("span");
+    romsDot.className = "rom-door-dot";
+    romsDot.title = "Some games are missing media";
+    romsDot.hidden = true;
     const romsChev = document.createElement("span");
     romsChev.className = "side-chev";
-    romsChev.textContent = "▾";
-    romsHead.append(romsHeadText, romsChev);
+    romsChev.hidden = true;
+    romsHead.append(romsGlyph, romsHeadText, romsCount, romsDot, romsChev);
     this.romsChevEl = romsChev;
-    romsHead.title = "Right-click to add a system";
+    this.romsDoorCount = romsCount;
+    this.romsDoorDot = romsDot;
+    romsHead.title = "ROM Home — right-click to add a system";
     romsHead.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -959,21 +1043,11 @@ export class Shell {
         { label: "Add a System\u2026", action: () => this.openRomEditor(null) },
       ]);
     });
+    romsHead.addEventListener("click", () => this.enterRomHome());
     this.romsHead = romsHead;
     this.romsList = document.createElement("div");
     this.romsList.className = "side-list";
-    // Inc-2 item 11 fix: same as Labels above — prefCollapsed, not
-    // a localStorage-only read, so every rebuild honors the durable
-    // collapse state.
-    const romsCollapsed = this.romsCollapsedPref();
-    this.romsList.hidden = romsCollapsed;
-    romsChev.style.transform = romsCollapsed ? "rotate(-90deg)" : "";
-    romsHead.addEventListener("click", () => {
-      const nowHidden = !this.romsList.hidden;
-      this.romsList.hidden = nowHidden;
-      romsChev.style.transform = nowHidden ? "rotate(-90deg)" : "";
-      this.setCollapsedPref("ff-roms-collapsed", nowHidden);
-    });
+    this.romsList.hidden = true;
     sidebar.append(
       favHead,
       this.favList,
@@ -1116,6 +1190,7 @@ export class Shell {
 
   private async loadDir(tab: Tab): Promise<void> {
     const dir = currentDir(tab);
+    if (tab === this.activeTab && this.romHome?.active) this.exitRomHome();
     // Round 7 (Gemini audit): capture a load token; if a newer load for
     // this tab starts while we await, this result is stale — discard it
     // silently instead of overwriting the current view.
@@ -1177,6 +1252,7 @@ export class Shell {
 
   private navigateTo(dir: { locationId: string; dirId: string; crumbs: { dirId: string; name: string }[] }): void {
     if (this.searchView.active) this.searchView.clear();
+    if (this.romHome?.active) this.exitRomHome();
     const tab = this.requireTab();
     this.quickLook.close();
     navigate(tab, dir);
@@ -4548,240 +4624,115 @@ export class Shell {
     setTimeout(() => location.reload(), 800);
   }
 
-  /** Render the Roms Collection sidebar section. Built-in systems are
-   * governed by the ROM Lists (DAT identification); custom systems
-   * keep their extension rules. */
-  private renderRomsSection(): void {
-    if (!this.romsList || !this.romsHead) return;
-    const on = romsEnabled();
-    this.romsHead.hidden = !on;
-    // Fix block item 6: this render runs on EVERY sidebar rebuild and
-    // used to force hidden = !on, stomping the user's collapse pref a
-    // beat after every rebuild. The durable pref wins here too.
-    this.romsList.hidden = !on || this.romsCollapsedPref();
-    const chev = this.romsHead.querySelector(".side-chev");
-    if (chev) chev.textContent = this.romsList.hidden ? "▸" : "▾";
-    this.romsList.innerHTML = "";
-    if (!on) return;
-    const systems = loadRomSystems();
-    // Grouping switch (Dickles, 2026-10-14): systems live under
-    // collapsible division headers — By Manufacturer or By
-    // Generation. Divisions are collapsed unless he opened them;
-    // Arcade is its own division in both schemes.
-    const grouping = loadRomGrouping();
-    const switcher = document.createElement("div");
-    switcher.className = "rom-group-switch";
-    switcher.setAttribute("role", "group");
-    switcher.setAttribute("aria-label", "Group systems by");
-    for (const [mode, label] of [
-      ["maker", "Maker"],
-      ["generation", "Generation"],
-    ] as const) {
-      const opt = document.createElement("button");
-      opt.className = "rom-group-opt";
-      opt.textContent = label;
-      opt.setAttribute("aria-pressed", String(grouping === mode));
-      opt.addEventListener("click", () => {
-        if (loadRomGrouping() !== mode) {
-          saveRomGrouping(mode);
-          this.renderRomsSection();
-        }
-      });
-      switcher.appendChild(opt);
+  // ------------------------------------------------------------ ROM Home
+
+  /** Enter the room: the browse views hide, the room paints from
+   * the catalog alone. Leaving restores this view exactly (SPEC
+   * §5 — the room is a place you visit, state intact both ways). */
+  private enterRomHome(target?: { kind: "system"; name: string }): void {
+    if (this.searchView.active) this.searchView.clear();
+    this.quickLook.close();
+    this.fileView.el.hidden = true;
+    this.columnsView.el.hidden = true;
+    this.galleryView.el.hidden = true;
+    this.searchView.el.hidden = true;
+    this.romsHead?.classList.add("selected");
+    void this.romHome.open(target);
+  }
+
+  private exitRomHome(): void {
+    if (!this.romHome) return;
+    const wasActive = this.romHome.active;
+    this.romHome.close();
+    this.romHome.el.hidden = true;
+    this.romsHead?.classList.remove("selected");
+    if (wasActive) {
+      this.showFileView();
+      this.renderCrumbs();
+      void this.refreshRomDoor();
     }
-    this.romsList.appendChild(switcher);
-    if (systems.length === 0) {
-      const p = document.createElement("p");
-      p.className = "side-empty";
-      p.textContent = "No systems yet. Right-click the heading to add one.";
-      this.romsList.appendChild(p);
+  }
+
+  /** The door's numbers — straight from the catalog, never a scan. */
+  private async refreshRomDoor(): Promise<void> {
+    const counts = await api.romHomeCounts().catch(() => null);
+    if (!counts) return;
+    if (this.romsDoorCount) {
+      this.romsDoorCount.textContent =
+        counts.total > 0 ? counts.total.toLocaleString() : "";
+    }
+    if (this.romsDoorDot) this.romsDoorDot.hidden = counts.missingMedia === 0;
+    if (this.romsHead) {
+      this.romsHead.title =
+        counts.total > 0
+          ? `ROM Home — ${counts.total.toLocaleString()} games${counts.missingMedia > 0 ? `, ${counts.missingMedia.toLocaleString()} missing media` : ""} (right-click to add a system)`
+          : "ROM Home — right-click to add a system";
+    }
+  }
+
+  /** "Add a ROM folder…": register the folder as a location; the
+   * indexer + identification fill the shelves from there. */
+  private async addRomFolder(): Promise<void> {
+    const path = await this.picker.pick("Add a ROM folder…", [], null);
+    if (!path) return;
+    const name = path.split("/").filter(Boolean).pop() ?? "ROMs";
+    try {
+      const summary = await api.addPathLocation(name, path);
+      await this.refreshLocations();
+      void this.indexTracker.reindexAll([summary.id]);
+      Toast.success(
+        `Added “${name}” — its games join the shelves as they're identified.`,
+      );
+      this.romHome.invalidate();
+      void this.refreshRomDoor();
+    } catch (err) {
+      Toast.error(`Could not add that folder: ${errText(err)}`);
+    }
+  }
+
+  /** The inspector's "Show in Files": leave the room, walk the
+   * Files view to the game's real folder, select the game. */
+  private async revealRomInFiles(item: Item): Promise<void> {
+    this.exitRomHome();
+    const loc =
+      this.locations.find((l) => l.id === item.location) ?? this.locations[0];
+    if (!loc || !item.provider_key) {
+      Toast.info(`“${item.name}” — ${item.provider_key ?? "no local path"}`);
       return;
     }
-    const open = loadOpenDivisions();
-    for (const div of romDivisions(systems, grouping)) {
-      const isOpen = open.has(div.title);
-      const head = document.createElement("button");
-      head.className = "rom-div-head";
-      head.setAttribute("aria-expanded", String(isOpen));
-      const dchev = document.createElement("span");
-      dchev.className = "side-chev";
-      dchev.textContent = isOpen ? "▾" : "▸";
-      const dtitle = document.createElement("span");
-      dtitle.className = "rom-div-title";
-      dtitle.textContent = div.title;
-      const dcount = document.createElement("span");
-      dcount.className = "rom-div-count";
-      dcount.textContent = String(div.systems.length + div.hardware.length);
-      head.append(dchev, dtitle, dcount);
-      head.addEventListener("click", () => {
-        const cur = loadOpenDivisions();
-        if (cur.has(div.title)) cur.delete(div.title);
-        else cur.add(div.title);
-        saveOpenDivisions(cur);
-        this.renderRomsSection();
-      });
-      this.romsList.appendChild(head);
-      if (!isOpen) continue;
-      const box = document.createElement("div");
-      box.className = "rom-div-body";
-      for (const sys of div.systems) {
-        box.appendChild(this.romSystemButton(sys));
-      }
-      for (const hw of div.hardware) {
-        box.appendChild(this.romHardwareButton(hw));
-      }
-      this.romsList.appendChild(box);
+    const walked = await this.crumbsForPath(loc, dirname(item.provider_key));
+    if (!walked) {
+      Toast.info(
+        `“${item.name}” lives at ${item.provider_key} — that folder isn't reachable right now.`,
+        6000,
+      );
+      return;
+    }
+    const tab = this.requireTab();
+    navigate(tab, {
+      locationId: loc.id,
+      dirId: walked.dirId,
+      crumbs: walked.crumbs,
+    });
+    await this.loadDir(tab);
+    if (tab.items.some((i) => i.id === item.id)) {
+      tab.selection.clear();
+      tab.selection.add(item.id);
+      this.renderActiveView();
+      this.renderCrumbs();
     }
   }
 
-  /** The per-system icon for a sidebar ROM row, in the set chosen in
-   * Preferences (Dickles' ROM icon sets, 2026-10-15). Raster sets load
-   * /rom-icons/<set>/<slug>.webp; a miss degrades per-system through
-   * photo \u2192 art \u2192 the flat outline \u2192 the old \uD83C\uDFAE glyph
-   * (which is also what custom, user-created systems keep). */
-  private romIconEl(sys: RomSystem): HTMLElement {
-    const wrap = document.createElement("span");
-    wrap.className = "rom-sys-icon";
-    wrap.setAttribute("aria-hidden", "true");
-    const slug = romIconSlug(sys.name);
-    if (!slug) {
-      wrap.textContent = "\uD83C\uDFAE";
-      return wrap;
+  /** The door's render: no tree anymore — just the visibility gate
+   * (Preferences ▸ Sidebar) and the live tallies. */
+  private renderRomsSection(): void {
+    if (!this.romsHead) return;
+    this.romsHead.hidden = !romsEnabled();
+    if (this.romsList) {
+      this.romsList.innerHTML = "";
+      this.romsList.hidden = true;
     }
-    const flat = (): void => {
-      const svg = ROM_FLAT_ICONS[slug];
-      if (svg) {
-        wrap.innerHTML = svg;
-      } else {
-        wrap.textContent = "\uD83C\uDFAE";
-      }
-    };
-    const chosen = loadRomIconSet();
-    if (chosen === "flat") {
-      flat();
-      return wrap;
-    }
-    const chain: string[] = [];
-    for (const set of [chosen, "photo", "art"]) {
-      if (!chain.includes(set)) chain.push(set);
-    }
-    const img = document.createElement("img");
-    img.alt = "";
-    img.draggable = false;
-    let i = 0;
-    img.addEventListener("error", () => {
-      i += 1;
-      if (i < chain.length) {
-        img.src = `/rom-icons/${chain[i]}/${slug}.webp`;
-      } else {
-        img.remove();
-        flat();
-      }
-    });
-    img.src = `/rom-icons/${chain[0]}/${slug}.webp`;
-    wrap.appendChild(img);
-    return wrap;
-  }
-
-  /** One system's sidebar row (click = run its collection; right
-   * click = manage/delete). Behavior unchanged from the flat list —
-   * only the grouping around it is new. */
-  private romSystemButton(sys: RomSystem): HTMLButtonElement {
-    const b = document.createElement("button");
-    b.className = "side-item side-item-rom";
-    b.appendChild(this.romIconEl(sys));
-    const label = document.createElement("span");
-    label.textContent = sys.name;
-    b.appendChild(label);
-    const key = romSystemKey(sys);
-    b.title = isRomPlaceholder(sys)
-      ? "A placeholder for what's coming — no emulator core or verified game list for this system yet"
-      : key
-        ? "Verified by the ROM lists (No-Intro / Redump / MAME) — only exact matches appear"
-        : "ROM files: " + sys.extensions.map((x) => "." + x).join(", ");
-    b.addEventListener("click", () => {
-      if (isRomPlaceholder(sys)) {
-        void this.searchView.runRomPlaceholder(sys.name);
-      } else if (key) {
-        void this.searchView.runRomCollection(sys.name, key, romScopeOf(sys));
-      } else {
-        void this.searchView.runRule(
-          sys.name,
-          { extensions: sys.extensions },
-          romScopeOf(sys),
-        );
-      }
-    });
-    b.addEventListener("contextmenu", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      this.ctxMenu.open(e.clientX, e.clientY, [
-        {
-          label: `Manage "${sys.name}"\u2026`,
-          action: () => this.openRomEditor(sys),
-        },
-        {
-          label: `Delete "${sys.name}"`,
-          danger: true,
-          action: () => {
-            void (async () => {
-              const ok = await confirmDialog(
-                `Delete "${sys.name}"?`,
-                "The system is removed from Roms Collection. Your ROM files are not touched.",
-                "Delete",
-                true,
-              );
-              if (!ok) return;
-              saveRomSystems(loadRomSystems().filter((s) => s.name !== sys.name));
-              void this.buildSidebar();
-              Toast.success(`Deleted system "${sys.name}".`);
-            })();
-          },
-        },
-      ]);
-    });
-    return b;
-  }
-
-  /** An owned-hardware row: a machine from Dickles' collection with
-   * no ROM library. Opens an honest detail card — never a file list,
-   * never a game count. */
-  private romHardwareButton(hw: OwnedHardware): HTMLButtonElement {
-    const b = document.createElement("button");
-    b.className = "side-item rom-hw-item";
-    b.textContent = "\uD83D\uDD79 " + hw.name;
-    b.title = `Owned hardware (${hw.year}) — no ROM library to identify`;
-    b.addEventListener("click", () => this.openOwnedHardware(hw));
-    return b;
-  }
-
-  private openOwnedHardware(hw: OwnedHardware): void {
-    const overlay = document.createElement("div");
-    overlay.className = "picker-overlay";
-    overlay.innerHTML = `
-      <div class="picker-card labels-card" role="dialog" aria-label="Owned hardware">
-        <h3 class="picker-title"></h3>
-        <p class="rom-hw-meta"></p>
-        <p class="rom-hw-note"></p>
-        <p class="smart-hint">Part of the collection — honored here, but this machine has no ROM library for Fable to identify, so there's no file list and no game count.</p>
-        <div class="picker-actions">
-          <button class="rom-hw-close primary">Close</button>
-        </div>
-      </div>`;
-    document.body.appendChild(overlay);
-    const title = overlay.querySelector(".picker-title");
-    if (title) title.textContent = hw.name;
-    const meta = overlay.querySelector(".rom-hw-meta");
-    if (meta) meta.textContent = `${hw.maker} · ${hw.year}`;
-    const note = overlay.querySelector(".rom-hw-note");
-    if (note) note.textContent = hw.note;
-    const close = () => overlay.remove();
-    overlay
-      .querySelector(".rom-hw-close")
-      ?.addEventListener("click", close);
-    overlay.addEventListener("pointerdown", (e) => {
-      if (e.target === overlay) close();
-    });
+    if (romsEnabled()) void this.refreshRomDoor();
   }
 
   /** Add or edit a Roms Collection system. Built-in systems are

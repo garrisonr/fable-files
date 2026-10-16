@@ -490,6 +490,27 @@ impl Catalog {
                 );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
+        // ROM Home (2026-10-15): per-game personal state — ratings,
+        // favorites, completion, play history, and the user's own
+        // overrides — keyed by path like path_stars so it survives
+        // re-indexing. The room's shelf queries join it in.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS rom_game_state (
+                    provider_key TEXT PRIMARY KEY,
+                    rating INTEGER,
+                    favorite INTEGER NOT NULL DEFAULT 0,
+                    completed INTEGER NOT NULL DEFAULT 0,
+                    play_count INTEGER NOT NULL DEFAULT 0,
+                    last_played TEXT,
+                    title_override TEXT,
+                    genre TEXT,
+                    players TEXT,
+                    notes TEXT,
+                    updated_at TEXT NOT NULL
+                );",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
         // Indexer v2 (Library Memory): persistent per-volume records.
         // A volume's identity is its FILESYSTEM UUID; where it has
         // been mounted is history, never identity (the same drive at
@@ -3000,6 +3021,661 @@ impl Catalog {
 // ---------------------------------------------------------------------------
 // Indexer v2 — Library Memory: volumes, manifests, purge, job hygiene.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// ROM Home (Dickles, 2026-10-15): per-game personal state + the shelf
+// queries the room renders from. Everything here reads the catalog
+// alone — no disk scans — so shelves paint instantly and offline
+// volumes browse with Library Memory honesty.
+// ---------------------------------------------------------------------------
+
+/// Personal state for one game, keyed by provider_key (the file's
+/// path) exactly like `path_stars` / `path_labels`, so it survives
+/// re-indexing, moves within a volume's history, and item-id churn.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomGameState {
+    /// The user's star rating, 1..=5 (None = unrated).
+    pub rating: Option<i64>,
+    pub favorite: bool,
+    pub completed: bool,
+    pub play_count: i64,
+    /// RFC 3339 — the last time Play was pressed for this game.
+    pub last_played: Option<String>,
+    /// The user's own title, which wins over the DAT title in display.
+    pub title_override: Option<String>,
+    /// User-supplied facts (the Edit sheet): no metadata source in the
+    /// enrichment machinery carries these, so they are the user's
+    /// words or absent — never invented.
+    pub genre: Option<String>,
+    pub players: Option<String>,
+    pub notes: Option<String>,
+}
+
+/// One game's media presence for one media type (ROM Home inspector
+/// chips): whether the enrichment cascade (or the user, by hand)
+/// landed a file, and where it lives.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomGameMedia {
+    pub media_type: String,
+    pub found: bool,
+    pub local_path: Option<String>,
+    pub source: Option<String>,
+}
+
+/// One row of the ROM Home shelf queries: everything the room
+/// renders for a game.
+#[derive(Debug, Clone)]
+pub struct RomHomeGame {
+    pub item: ufm_vfs::Item,
+    /// The DAT-verified title (display title = state.title_override
+    /// when set, else this).
+    pub title: String,
+    /// The identity's primary platform (dataset key).
+    pub platform: String,
+    /// Further platforms the identity cross-lists under (the DAT
+    /// evidence's `also` sets — a MAME set that is also Neo Geo
+    /// belongs on both shelves, like the collections before it).
+    pub also_platforms: Vec<String>,
+    pub year: Option<i64>,
+    pub sha1: Option<String>,
+    /// Region parsed from the DAT title ("USA", "USA, Europe", …).
+    pub region: Option<String>,
+    pub media: Vec<RomGameMedia>,
+    pub state: RomGameState,
+    /// An open File Auditor flag names this game's path.
+    pub auditor_flagged: bool,
+}
+
+/// Catalog-only collection tallies for the room: total identified
+/// games, how many lack box art, and the same pair per system.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomHomeCounts {
+    pub total: i64,
+    pub missing_media: i64,
+    /// (platform, games, missing box art) — membership counts a game
+    /// on every shelf it belongs to (primary + `also` platforms);
+    /// `total` / `missing_media` count each game once.
+    pub per_system: Vec<(String, i64, i64)>,
+}
+
+/// The region named by a DAT title's parenthesized region group —
+/// "1943 - The Battle of Midway (USA)" → "USA", "(USA, Europe)" →
+/// "USA, Europe". Groups naming anything else (Rev 1, En, Pirate…)
+/// are not regions. Pure and testable.
+pub fn region_of_title(title: &str) -> Option<String> {
+    const REGIONS: &[&str] = &[
+        "USA", "Europe", "Japan", "World", "UK", "France", "Germany", "Spain",
+        "Italy", "Australia", "Canada", "Korea", "Brazil", "Asia", "Netherlands",
+        "Sweden", "Denmark", "Finland", "Norway", "Russia", "China", "Taiwan",
+        "Hong Kong", "Latin America", "Mexico", "Portugal", "Greece", "Turkey",
+        "India", "New Zealand", "South Africa", "Argentina", "Chile", "Peru",
+        "Colombia", "Venezuela", "Belgium", "Austria", "Switzerland", "Poland",
+        "Czech Republic", "Hungary", "Romania", "Bulgaria", "Croatia", "Ireland",
+        "Scandinavia", "Middle East", "Africa", "Oceania", "Global",
+    ];
+    let mut rest = title;
+    while let Some(open) = rest.find('(') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(')') else { break };
+        let group = after[..close].trim();
+        let parts: Vec<&str> = group.split(',').map(|p| p.trim()).collect();
+        if !parts.is_empty()
+            && parts.iter().all(|p| REGIONS.contains(p))
+        {
+            return Some(group.to_string());
+        }
+        rest = &after[close + 1..];
+    }
+    None
+}
+
+impl Catalog {
+    /// Every DAT-identified game (title + platform known), or only
+    /// one platform's shelf when `platform` is set — membership is
+    /// the ROM Lists rule: the primary platform, or a cross-listed
+    /// `also` platform. Each game arrives with its media presence,
+    /// its personal state, and its Auditor flag state, all from the
+    /// catalog. Ordered by platform, then title.
+    pub fn rom_home_games(&self, platform: Option<&str>) -> Result<Vec<RomHomeGame>> {
+        let mut sql = String::from(
+            "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes,
+                    i.modified, i.provider_key, mi.title, mi.platform,
+                    mi.year, mi.sha1, mi.match_evidence_json
+             FROM media_identities AS mi
+             JOIN items AS i ON i.id = mi.item_id
+             WHERE mi.media_kind = 'rom' AND mi.title IS NOT NULL
+               AND mi.platform IS NOT NULL",
+        );
+        if platform.is_some() {
+            sql.push_str(
+                " AND (mi.platform = ?1
+                    OR EXISTS (SELECT 1 FROM json_each(mi.match_evidence_json, '$.also')
+                               WHERE value = ?1))",
+            );
+        }
+        sql.push_str(" ORDER BY mi.platform, mi.title COLLATE NOCASE");
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let raw: Vec<(
+            String,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            String,
+        )> = match platform {
+            Some(p) => stmt
+                .query_map(params![p], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| UfmError::Database(e.to_string()))?,
+            None => stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| UfmError::Database(e.to_string()))?,
+        };
+        drop(stmt);
+        // Batch the side data: media rows per item, personal state
+        // per path, the starred set, the open Auditor flag paths.
+        let item_ids: Vec<String> = raw.iter().map(|r| r.0.clone()).collect();
+        let paths: Vec<String> = raw.iter().filter_map(|r| r.6.clone()).collect();
+        let mut media_by_item: std::collections::HashMap<String, Vec<RomGameMedia>> =
+            std::collections::HashMap::new();
+        for chunk in item_ids.chunks(400) {
+            let placeholders: Vec<String> =
+                chunk.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT item_id, media_type, status, source, local_path FROM rom_media
+                 WHERE item_id IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let values: Vec<rusqlite::types::Value> =
+                chunk.iter().map(|s| rusqlite::types::Value::Text(s.clone())).collect();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                let (item_id, media_type, status, source, local_path) =
+                    r.map_err(|e| UfmError::Database(e.to_string()))?;
+                media_by_item.entry(item_id).or_default().push(RomGameMedia {
+                    media_type,
+                    found: status == "found" && local_path.is_some(),
+                    local_path,
+                    source,
+                });
+            }
+        }
+        let mut state_by_path: std::collections::HashMap<String, RomGameState> =
+            std::collections::HashMap::new();
+        for chunk in paths.chunks(400) {
+            let placeholders: Vec<String> =
+                chunk.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT provider_key, rating, favorite, completed, play_count,
+                        last_played, title_override, genre, players, notes
+                 FROM rom_game_state WHERE provider_key IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let values: Vec<rusqlite::types::Value> =
+                chunk.iter().map(|s| rusqlite::types::Value::Text(s.clone())).collect();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        RomGameState {
+                            rating: row.get(1)?,
+                            favorite: row.get::<_, i64>(2)? != 0,
+                            completed: row.get::<_, i64>(3)? != 0,
+                            play_count: row.get(4)?,
+                            last_played: row.get(5)?,
+                            title_override: row.get(6)?,
+                            genre: row.get(7)?,
+                            players: row.get(8)?,
+                            notes: row.get(9)?,
+                        },
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                let (pk, st) = r.map_err(|e| UfmError::Database(e.to_string()))?;
+                state_by_path.insert(pk, st);
+            }
+        }
+        let starred = self.starred_paths(&paths).unwrap_or_default();
+        let mut flagged: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for chunk in paths.chunks(400) {
+            let placeholders: Vec<String> =
+                chunk.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT DISTINCT path FROM auditor_flags
+                 WHERE state = 'open' AND path IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let values: Vec<rusqlite::types::Value> =
+                chunk.iter().map(|s| rusqlite::types::Value::Text(s.clone())).collect();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                flagged.insert(r.map_err(|e| UfmError::Database(e.to_string()))?);
+            }
+        }
+        let parse_id = |s: &str, what: &str| {
+            uuid::Uuid::parse_str(s)
+                .map_err(|e| UfmError::Database(format!("bad {what} id {s:?}: {e}")))
+        };
+        let mut out = Vec::with_capacity(raw.len());
+        for (
+            id,
+            location_id,
+            name,
+            kind_s,
+            size_bytes,
+            modified_s,
+            provider_key,
+            title,
+            platform_s,
+            year,
+            sha1,
+            evidence,
+        ) in raw
+        {
+            let also_platforms: Vec<String> = serde_json::from_str::<serde_json::Value>(&evidence)
+                .ok()
+                .and_then(|v| v.get("also").cloned())
+                .and_then(|a| serde_json::from_value(a).ok())
+                .unwrap_or_default();
+            let labels = match &provider_key {
+                Some(pk) => self.labels_for_path(pk).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let is_starred = provider_key
+                .as_ref()
+                .map(|pk| starred.contains(pk))
+                .unwrap_or(false);
+            let state = provider_key
+                .as_ref()
+                .and_then(|pk| state_by_path.get(pk).cloned())
+                .unwrap_or_default();
+            let auditor_flagged = provider_key
+                .as_ref()
+                .map(|pk| flagged.contains(pk))
+                .unwrap_or(false);
+            out.push(RomHomeGame {
+                item: ufm_vfs::Item {
+                    id: ufm_core::ItemId(parse_id(&id, "item")?),
+                    location: ufm_core::LocationId(parse_id(&location_id, "location")?),
+                    name,
+                    kind: parse_kind(&kind_s),
+                    size_bytes: size_bytes.map(|s| s as u64),
+                    modified: modified_s.and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&chrono::Utc))
+                    }),
+                    provider_key: provider_key.clone(),
+                    labels,
+                    starred: is_starred,
+                },
+                region: region_of_title(&title),
+                title,
+                platform: platform_s,
+                also_platforms,
+                year,
+                sha1,
+                media: media_by_item.get(&id).cloned().unwrap_or_default(),
+                state,
+                auditor_flagged,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The room's tallies, from the catalog alone: total identified
+    /// games, how many lack box art ("missing media" — box art is
+    /// the shelf's face; a game with no found box-art row counts),
+    /// and the per-system split under the same membership rule as
+    /// `rom_home_games`.
+    pub fn rom_home_counts(&self) -> Result<RomHomeCounts> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT mi.platform, mi.match_evidence_json,
+                        EXISTS (SELECT 1 FROM rom_media AS rm
+                                WHERE rm.item_id = mi.item_id
+                                  AND rm.media_type = 'boxart'
+                                  AND rm.status = 'found'
+                                  AND rm.local_path IS NOT NULL)
+                 FROM media_identities AS mi
+                 WHERE mi.media_kind = 'rom' AND mi.title IS NOT NULL
+                   AND mi.platform IS NOT NULL",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut counts = RomHomeCounts::default();
+        let mut per: std::collections::HashMap<String, (i64, i64)> =
+            std::collections::HashMap::new();
+        for r in rows {
+            let (platform, evidence, has_art) =
+                r.map_err(|e| UfmError::Database(e.to_string()))?;
+            let missing = has_art == 0;
+            counts.total += 1;
+            if missing {
+                counts.missing_media += 1;
+            }
+            let mut shelves = vec![platform];
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&evidence) {
+                if let Some(also) = v.get("also").and_then(|a| a.as_array()) {
+                    for a in also {
+                        if let Some(s) = a.as_str() {
+                            if !shelves.iter().any(|x| x == s) {
+                                shelves.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            for s in shelves {
+                let e = per.entry(s).or_default();
+                e.0 += 1;
+                if missing {
+                    e.1 += 1;
+                }
+            }
+        }
+        let mut per_system: Vec<(String, i64, i64)> = per
+            .into_iter()
+            .map(|(p, (games, missing))| (p, games, missing))
+            .collect();
+        per_system.sort_by(|a, b| a.0.cmp(&b.0));
+        counts.per_system = per_system;
+        Ok(counts)
+    }
+
+    /// One game's personal state (the default — unrated, unplayed —
+    /// when the user has never touched it).
+    pub fn rom_game_state_for(&self, provider_key: &str) -> Result<RomGameState> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT rating, favorite, completed, play_count, last_played,
+                        title_override, genre, players, notes
+                 FROM rom_game_state WHERE provider_key = ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![provider_key], |row| {
+                Ok(RomGameState {
+                    rating: row.get(0)?,
+                    favorite: row.get::<_, i64>(1)? != 0,
+                    completed: row.get::<_, i64>(2)? != 0,
+                    play_count: row.get(3)?,
+                    last_played: row.get(4)?,
+                    title_override: row.get(5)?,
+                    genre: row.get(6)?,
+                    players: row.get(7)?,
+                    notes: row.get(8)?,
+                })
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        match rows.next() {
+            Some(r) => Ok(r.map_err(|e| UfmError::Database(e.to_string()))?),
+            None => Ok(RomGameState::default()),
+        }
+    }
+
+    /// Ensure a state row exists, then apply `apply`'s column writes.
+    fn rom_game_state_touch(
+        &self,
+        provider_key: &str,
+        apply: &str,
+        args: &[rusqlite::types::Value],
+    ) -> Result<()> {
+        let now = ufm_core::now_utc().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO rom_game_state (provider_key, updated_at)
+                 VALUES (?1, ?2)",
+                params![provider_key, now],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Anonymous `?` placeholders bind in order of appearance:
+        // the apply-columns first, then updated_at, then the key.
+        let sql = format!(
+            "UPDATE rom_game_state SET {apply}, updated_at = ? WHERE provider_key = ?"
+        );
+        let mut values: Vec<rusqlite::types::Value> = args.to_vec();
+        values.push(rusqlite::types::Value::Text(now));
+        values.push(rusqlite::types::Value::Text(provider_key.to_string()));
+        self.conn
+            .execute(&sql, rusqlite::params_from_iter(values.iter()))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Set (or clear, with None) the user's star rating for a game.
+    pub fn rom_game_set_rating(&self, provider_key: &str, rating: Option<i64>) -> Result<()> {
+        let rating = rating.map(|r| r.clamp(1, 5));
+        self.rom_game_state_touch(
+            provider_key,
+            "rating = ?",
+            &[match rating {
+                Some(r) => rusqlite::types::Value::Integer(r),
+                None => rusqlite::types::Value::Null,
+            }],
+        )
+    }
+
+    pub fn rom_game_set_favorite(&self, provider_key: &str, on: bool) -> Result<()> {
+        self.rom_game_state_touch(
+            provider_key,
+            "favorite = ?",
+            &[rusqlite::types::Value::Integer(on as i64)],
+        )
+    }
+
+    pub fn rom_game_set_completed(&self, provider_key: &str, on: bool) -> Result<()> {
+        self.rom_game_state_touch(
+            provider_key,
+            "completed = ?",
+            &[rusqlite::types::Value::Integer(on as i64)],
+        )
+    }
+
+    /// The Edit sheet's fields: the user's own words for a game.
+    /// Empty strings clear back to absent.
+    pub fn rom_game_set_overrides(
+        &self,
+        provider_key: &str,
+        title_override: Option<&str>,
+        genre: Option<&str>,
+        players: Option<&str>,
+        notes: Option<&str>,
+    ) -> Result<()> {
+        let clean = |v: Option<&str>| -> rusqlite::types::Value {
+            match v.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                Some(s) => rusqlite::types::Value::Text(s.to_string()),
+                None => rusqlite::types::Value::Null,
+            }
+        };
+        self.rom_game_state_touch(
+            provider_key,
+            "title_override = ?, genre = ?, players = ?, notes = ?",
+            &[
+                clean(title_override),
+                clean(genre),
+                clean(players),
+                clean(notes),
+            ],
+        )
+    }
+
+    /// Play was pressed: the count climbs and last-played lands.
+    /// Returns the new state so the caller can paint truth.
+    pub fn rom_game_note_play(&self, provider_key: &str) -> Result<RomGameState> {
+        let now = ufm_core::now_utc().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO rom_game_state (provider_key, play_count, last_played, updated_at)
+                 VALUES (?1, 1, ?2, ?2)
+                 ON CONFLICT(provider_key) DO UPDATE SET
+                     play_count = play_count + 1,
+                     last_played = excluded.last_played,
+                     updated_at = excluded.updated_at",
+                params![provider_key, now],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        self.rom_game_state_for(provider_key)
+    }
+
+    /// A Smart List: a saved filter, stored as a smart collection
+    /// whose query_json is the owner's own filter model (the ROM
+    /// Home's filter state). Membership is evaluated by the room
+    /// against the loaded games — the sentence on the rail IS the
+    /// rule, rendered from the same JSON.
+    pub fn create_smart_collection(
+        &self,
+        id: &CollectionId,
+        name: &str,
+        query_json: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO collections (id, name, kind, query_json)
+                 VALUES (?1, ?2, 'smart', ?3)",
+                params![id.to_string(), name, query_json],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Rewrite a Smart List's rule in place (the room's chip
+    /// editor: open the list, adjust the chips, save — same list,
+    /// new sentence). Only kind='smart' rows can be rewritten.
+    pub fn update_smart_collection(&self, id: &str, query_json: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE collections SET query_json = ?1 WHERE id = ?2 AND kind = 'smart'",
+                params![query_json, id],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Every Smart List as (id, name, query_json), name-ordered —
+    /// the ROM Home rail's Lists section reads these.
+    pub fn smart_collections(&self) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, COALESCE(query_json, '{}') FROM collections
+                 WHERE kind = 'smart' ORDER BY name COLLATE NOCASE",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// The stored filter model for a smart collection, when it is one.
+
+    pub fn smart_collection_query(&self, id: &CollectionId) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT query_json FROM collections WHERE id = ?1 AND kind = 'smart'")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![id.to_string()], |row| row.get::<_, Option<String>>(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        match rows.next() {
+            Some(r) => Ok(r.map_err(|e| UfmError::Database(e.to_string()))?),
+            None => Ok(None),
+        }
+    }
+}
 
 /// One recorded mount of a volume (a path it has been seen at).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -5708,5 +6384,296 @@ mod rule_tests {
         let snap = w.cat.rule_snapshot(&spec).unwrap().unwrap();
         assert!(snap.sweep_complete);
         assert_eq!(snap.member_count, 3);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ROM Home tests (2026-10-15): shelf queries, counts, per-game state.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod rom_home_tests {
+    use super::*;
+    use ufm_vfs::{Item, ItemKind};
+
+    fn sample_location(id: LocationId) -> ufm_vfs::Location {
+        ufm_vfs::Location {
+            id,
+            provider: "local".into(),
+            display_name: "test".into(),
+            capabilities: ufm_vfs::Capabilities {
+                read: true,
+                ..Default::default()
+            },
+            protected: ufm_vfs::ProtectionTier::None,
+        }
+    }
+
+    fn named_item(location: LocationId, name: &str, kind: ItemKind) -> Item {
+        Item {
+            id: ItemId::new(),
+            location,
+            name: name.into(),
+            kind,
+            size_bytes: Some(2048),
+            modified: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            provider_key: Some(format!("/fake/{name}")),
+            labels: vec![],
+            starred: false,
+        }
+    }
+
+    fn rom_item(cat: &Catalog, loc: LocationId, name: &str, pk: &str) -> Item {
+        let mut it = named_item(loc, name, ItemKind::File);
+        it.provider_key = Some(pk.into());
+        cat.insert_item(&it).unwrap();
+        it
+    }
+
+    fn seed_library(cat: &Catalog) -> (Item, Item, Item) {
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        // NES with box art found; SNES without; a MAME set that is
+        // also Neo Geo, without art.
+        let nes = rom_item(cat, loc, "1942 (JU).nes", "/roms/nes/1942.nes");
+        cat.upsert_media_identity(
+            &nes.id,
+            "rom",
+            Some("1942 (Japan, USA) (En)"),
+            Some("nes"),
+            Some("aaaa"),
+            r#"{"matched":true,"also":[]}"#,
+        )
+        .unwrap();
+        cat.upsert_rom_media(
+            &nes.id.to_string(),
+            "boxart",
+            "found",
+            Some("libretro"),
+            Some("/media/nes/1942.png"),
+            "{}",
+        )
+        .unwrap();
+        let snes = rom_item(cat, loc, "smw.sfc", "/roms/snes/smw.sfc");
+        cat.upsert_media_identity(
+            &snes.id,
+            "rom",
+            Some("Super Mario World (USA)"),
+            Some("snes"),
+            Some("bbbb"),
+            r#"{"matched":true,"also":[]}"#,
+        )
+        .unwrap();
+        cat.upsert_rom_media(
+            &snes.id.to_string(),
+            "boxart",
+            "missing",
+            None,
+            None,
+            "{}",
+        )
+        .unwrap();
+        let mame = rom_item(cat, loc, "mslug.zip", "/roms/arcade/mslug.zip");
+        cat.upsert_media_identity(
+            &mame.id,
+            "rom",
+            Some("Metal Slug - Super Vehicle-001"),
+            Some("arcade"),
+            Some("cccc"),
+            r#"{"matched":true,"also":["neogeo"]}"#,
+        )
+        .unwrap();
+        (nes, snes, mame)
+    }
+
+    #[test]
+    fn rom_home_counts_split_per_system_and_missing() {
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_library(&cat);
+        let counts = cat.rom_home_counts().unwrap();
+        assert_eq!(counts.total, 3);
+        // SNES (missing row) + MAME (no row at all) lack box art.
+        assert_eq!(counts.missing_media, 2);
+        let per: std::collections::HashMap<&str, (i64, i64)> = counts
+            .per_system
+            .iter()
+            .map(|(p, g, m)| (p.as_str(), (*g, *m)))
+            .collect();
+        assert_eq!(per["nes"], (1, 0));
+        assert_eq!(per["snes"], (1, 1));
+        assert_eq!(per["arcade"], (1, 1));
+        // The cross-listed set counts on the Neo Geo shelf too.
+        assert_eq!(per["neogeo"], (1, 1));
+    }
+
+    #[test]
+    fn rom_home_games_carry_media_state_and_region() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let (nes, _snes, _mame) = seed_library(&cat);
+        let all = cat.rom_home_games(None).unwrap();
+        assert_eq!(all.len(), 3);
+        let g = all.iter().find(|g| g.platform == "nes").unwrap();
+        assert_eq!(g.title, "1942 (Japan, USA) (En)");
+        assert_eq!(g.region.as_deref(), Some("Japan, USA"));
+        assert_eq!(g.sha1.as_deref(), Some("aaaa"));
+        let art = g
+            .media
+            .iter()
+            .find(|m| m.media_type == "boxart")
+            .expect("boxart row");
+        assert!(art.found);
+        assert_eq!(art.local_path.as_deref(), Some("/media/nes/1942.png"));
+        // Shelf membership: the cross-listed set is on both shelves.
+        assert_eq!(cat.rom_home_games(Some("neogeo")).unwrap().len(), 1);
+        assert_eq!(cat.rom_home_games(Some("arcade")).unwrap().len(), 1);
+        assert_eq!(cat.rom_home_games(Some("nes")).unwrap().len(), 1);
+        assert!(cat.rom_home_games(Some("genesis")).unwrap().is_empty());
+        // The item identity survives the round trip.
+        let g2 = cat.rom_home_games(Some("nes")).unwrap();
+        assert_eq!(g2[0].item.id, nes.id);
+    }
+
+    #[test]
+    fn rom_home_generation_grouping_inputs_are_stable() {
+        // The rail groups by generation from the UI's system table;
+        // the catalog side must hand back every platform it knows,
+        // sorted — the counts test above pins membership; this pins
+        // that a platform with games never vanishes from the split.
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_library(&cat);
+        let counts = cat.rom_home_counts().unwrap();
+        let names: Vec<&str> = counts.per_system.iter().map(|(p, _, _)| p.as_str()).collect();
+        assert!(names.contains(&"nes"));
+        assert!(names.contains(&"snes"));
+        assert!(names.contains(&"arcade"));
+        assert!(names.contains(&"neogeo"));
+    }
+
+    #[test]
+    fn rom_game_state_round_trip_and_play() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let pk = "/roms/nes/1942.nes";
+        // Untouched: the honest default.
+        let st = cat.rom_game_state_for(pk).unwrap();
+        assert_eq!(st, RomGameState::default());
+        cat.rom_game_set_rating(pk, Some(4)).unwrap();
+        cat.rom_game_set_favorite(pk, true).unwrap();
+        cat.rom_game_set_completed(pk, true).unwrap();
+        cat.rom_game_set_overrides(pk, Some("My 1942"), Some("Shooter"), Some("2"), Some("beat it"))
+            .unwrap();
+        let st = cat.rom_game_state_for(pk).unwrap();
+        assert_eq!(st.rating, Some(4));
+        assert!(st.favorite);
+        assert!(st.completed);
+        assert_eq!(st.title_override.as_deref(), Some("My 1942"));
+        assert_eq!(st.genre.as_deref(), Some("Shooter"));
+        assert_eq!(st.players.as_deref(), Some("2"));
+        // Rating clamps and clears.
+        cat.rom_game_set_rating(pk, Some(9)).unwrap();
+        assert_eq!(cat.rom_game_state_for(pk).unwrap().rating, Some(5));
+        cat.rom_game_set_rating(pk, None).unwrap();
+        assert_eq!(cat.rom_game_state_for(pk).unwrap().rating, None);
+        // Empty override strings clear back to absent.
+        cat.rom_game_set_overrides(pk, Some("  "), None, None, None).unwrap();
+        let st = cat.rom_game_state_for(pk).unwrap();
+        assert_eq!(st.title_override, None);
+        assert_eq!(st.genre, None);
+        // Play accrues.
+        let st = cat.rom_game_note_play(pk).unwrap();
+        assert_eq!(st.play_count, 1);
+        assert!(st.last_played.is_some());
+        let st = cat.rom_game_note_play(pk).unwrap();
+        assert_eq!(st.play_count, 2);
+        // State surfaces through the games query.
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let it = rom_item(&cat, loc, "1942 (JU).nes", pk);
+        cat.upsert_media_identity(
+            &it.id,
+            "rom",
+            Some("1942 (Japan, USA) (En)"),
+            Some("nes"),
+            None,
+            r#"{"matched":true,"also":[]}"#,
+        )
+        .unwrap();
+        let games = cat.rom_home_games(Some("nes")).unwrap();
+        assert_eq!(games.len(), 1);
+        assert!(games[0].state.favorite);
+        assert_eq!(games[0].state.play_count, 2);
+    }
+
+    #[test]
+    fn rom_home_favorites_and_recents_inputs() {
+        // Favorites / Recently Played shelves are UI derivations of
+        // the state the games query returns — pin that the inputs
+        // (favorite flag, last_played ordering data) round-trip.
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_library(&cat);
+        cat.rom_game_set_favorite("/roms/snes/smw.sfc", true).unwrap();
+        cat.rom_game_note_play("/roms/nes/1942.nes").unwrap();
+        let all = cat.rom_home_games(None).unwrap();
+        let favs: Vec<&str> = all
+            .iter()
+            .filter(|g| g.state.favorite)
+            .map(|g| g.platform.as_str())
+            .collect();
+        assert_eq!(favs, vec!["snes"]);
+        let played: Vec<&str> = all
+            .iter()
+            .filter(|g| g.state.last_played.is_some())
+            .map(|g| g.platform.as_str())
+            .collect();
+        assert_eq!(played, vec!["nes"]);
+    }
+
+    #[test]
+    fn region_of_title_reads_only_region_groups() {
+        assert_eq!(
+            region_of_title("1943 - The Battle of Midway (USA)").as_deref(),
+            Some("USA")
+        );
+        assert_eq!(
+            region_of_title("1942 (Japan, USA) (En)").as_deref(),
+            Some("Japan, USA")
+        );
+        assert_eq!(
+            region_of_title("Game (Europe) (Rev 1)").as_deref(),
+            Some("Europe")
+        );
+        assert_eq!(region_of_title("Game (Rev 1) (Pirate)"), None);
+        assert_eq!(region_of_title("Game"), None);
+        // A non-region group first doesn't hide the region behind it.
+        assert_eq!(
+            region_of_title("Game (En) (World)").as_deref(),
+            Some("World")
+        );
+    }
+
+    #[test]
+    fn smart_collection_stores_its_sentence() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let id = CollectionId::new();
+        let q = r#"{"genres":["Platformer"],"players":"2+","hasBoxArt":true}"#;
+        cat.create_smart_collection(&id, "Platformers for two", q).unwrap();
+        assert_eq!(
+            cat.smart_collection_query(&id).unwrap().as_deref(),
+            Some(q)
+        );
+        // The rule is editable in place (the room's chip editor).
+        cat.update_smart_collection(&id.to_string(), r#"{"genres":["RPG"]}"#)
+            .unwrap();
+        assert_eq!(
+            cat.smart_collection_query(&id).unwrap().as_deref(),
+            Some(r#"{"genres":["RPG"]}"#)
+        );
+        // A manual collection is not a smart one.
+        let mid = CollectionId::new();
+        cat.create_collection(&mid, "Manual", "manual").unwrap();
+        assert!(cat.smart_collection_query(&mid).unwrap().is_none());
     }
 }

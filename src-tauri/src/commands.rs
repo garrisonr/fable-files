@@ -8167,6 +8167,232 @@ pub async fn rom_collection_items(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// ROM Home (Dickles, 2026-10-15): the room's data doors. Shelf
+// queries read the catalog alone (never the disk), so an unplugged
+// drive's collection paints instantly with Library Memory badges;
+// personal state writes are path-keyed in the catalog.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomHomeGameWire {
+    pub item: Item,
+    /// DAT-verified title (the display title is the state's
+    /// title_override when set, else this).
+    pub title: String,
+    pub platform: String,
+    pub also_platforms: Vec<String>,
+    pub year: Option<i64>,
+    pub sha1: Option<String>,
+    pub region: Option<String>,
+    pub media: Vec<ufm_catalog::RomGameMedia>,
+    pub state: ufm_catalog::RomGameState,
+    pub auditor_flagged: bool,
+    /// Library Memory: the volume this game lives on, when known.
+    pub volume_label: Option<String>,
+    pub volume_offline: bool,
+    /// RFC 3339 — when that volume was last seen mounted.
+    pub volume_last_seen: Option<String>,
+}
+
+#[tauri::command]
+pub async fn rom_home_games(
+    state: State<'_, AppState>,
+    platform: Option<String>,
+) -> Cmd<Vec<RomHomeGameWire>> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let rows = catalog
+        .rom_home_games(platform.as_deref())
+        .map_err(CommandError::from)?;
+    let items: Vec<Item> = rows.iter().map(|r| r.item.clone()).collect();
+    let remapped = remap_session_items(state.inner(), items);
+    let badges = badges_for_items(&catalog, &remapped);
+    let badge_by_id: std::collections::HashMap<String, ItemVolumeBadge> =
+        badges.into_iter().map(|b| (b.item_id.clone(), b)).collect();
+    let mut out = Vec::with_capacity(rows.len());
+    for (row, item) in rows.into_iter().zip(remapped.into_iter()) {
+        let badge = badge_by_id.get(&item.id.to_string());
+        out.push(RomHomeGameWire {
+            item,
+            title: row.title,
+            platform: row.platform,
+            also_platforms: row.also_platforms,
+            year: row.year,
+            sha1: row.sha1,
+            region: row.region,
+            media: row.media,
+            state: row.state,
+            auditor_flagged: row.auditor_flagged,
+            volume_label: badge.map(|b| b.volume_label.clone()),
+            volume_offline: badge.map(|b| b.offline).unwrap_or(false),
+            volume_last_seen: badge.and_then(|b| b.last_seen.clone()),
+        });
+    }
+    Ok(out)
+}
+
+/// The sidebar door's numbers (total games · games missing media),
+/// plus the per-system split the rail renders counts from. Catalog
+/// only — this never touches the disk.
+#[tauri::command]
+pub fn rom_home_counts(
+    state: State<'_, AppState>,
+) -> Cmd<ufm_catalog::RomHomeCounts> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    catalog.rom_home_counts().map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn rom_home_set_rating(
+    state: State<'_, AppState>,
+    provider_key: String,
+    rating: Option<i64>,
+) -> Cmd<()> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    catalog
+        .rom_game_set_rating(&provider_key, rating)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn rom_home_set_favorite(
+    state: State<'_, AppState>,
+    provider_key: String,
+    on: bool,
+) -> Cmd<()> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    catalog
+        .rom_game_set_favorite(&provider_key, on)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn rom_home_set_completed(
+    state: State<'_, AppState>,
+    provider_key: String,
+    on: bool,
+) -> Cmd<()> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    catalog
+        .rom_game_set_completed(&provider_key, on)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+pub fn rom_home_set_overrides(
+    state: State<'_, AppState>,
+    provider_key: String,
+    title_override: Option<String>,
+    genre: Option<String>,
+    players: Option<String>,
+    notes: Option<String>,
+) -> Cmd<()> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    catalog
+        .rom_game_set_overrides(
+            &provider_key,
+            title_override.as_deref(),
+            genre.as_deref(),
+            players.as_deref(),
+            notes.as_deref(),
+        )
+        .map_err(CommandError::from)
+}
+
+/// One game's personal state by path — the read side for
+/// extension-rule games, whose shelf rows don't come from the
+/// identified-ROMs query.
+#[tauri::command]
+pub fn rom_home_state(
+    state: State<'_, AppState>,
+    provider_key: String,
+) -> Cmd<ufm_catalog::RomGameState> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    catalog
+        .rom_game_state_for(&provider_key)
+        .map_err(CommandError::from)
+}
+
+/// Play was pressed in the room: the launch itself rides the
+/// existing open path (the shell's openItem); this records the
+/// relationship — count + last played — and returns the new state.
+#[tauri::command]
+pub fn rom_home_note_play(
+    state: State<'_, AppState>,
+    provider_key: String,
+) -> Cmd<ufm_catalog::RomGameState> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    catalog
+        .rom_game_note_play(&provider_key)
+        .map_err(CommandError::from)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomSmartList {
+    pub id: String,
+    pub name: String,
+    /// The stored filter model (the room's own filter JSON).
+    pub query_json: String,
+}
+
+/// Save an edited rule back onto the same Smart List.
+#[tauri::command]
+pub fn rom_home_update_smart_list(
+    state: State<'_, AppState>,
+    id: String,
+    query_json: String,
+) -> Cmd<()> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    catalog
+        .update_smart_collection(&id, &query_json)
+        .map_err(CommandError::from)
+}
+
+/// Every Smart List (a saved filter with its readable rule).
+#[tauri::command]
+pub fn rom_home_smart_lists(state: State<'_, AppState>) -> Cmd<Vec<RomSmartList>> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let rows = catalog
+        .smart_collections()
+        .map_err(CommandError::from)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, query_json)| RomSmartList {
+            id,
+            name,
+            query_json,
+        })
+        .collect())
+}
+
+/// Keep the room's current filter as a Smart List. Returns the id.
+#[tauri::command]
+pub fn rom_home_save_smart_list(
+    state: State<'_, AppState>,
+    name: String,
+    query_json: String,
+) -> Cmd<String> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let id = CollectionId::new();
+    catalog
+        .create_smart_collection(&id, &name, &query_json)
+        .map_err(CommandError::from)?;
+    Ok(id.to_string())
+}
+
 /// Register a local file with the built-in media server and return a
 /// loopback URL. WebKit's media stack handles plain HTTP + Range
 /// natively; the Tauri asset protocol is where video goes to die

@@ -722,6 +722,40 @@ export const api = {
     invoke<string>("confirm_rom_media_match", { req }),
   romMediaArt: (itemIds: string[]) =>
     invoke<Record<string, string>>("rom_media_art", { itemIds }),
+  // ROM Home: shelf queries + per-game personal state. All reads
+  // are catalog-only; writes are path-keyed so they survive re-index.
+  romHomeGames: (platform?: string | null) =>
+    invoke<RomHomeGame[]>("rom_home_games", { platform: platform ?? null }),
+  romHomeCounts: () => invoke<RomHomeCounts>("rom_home_counts"),
+  romHomeSetRating: (providerKey: string, rating: number | null) =>
+    invoke<void>("rom_home_set_rating", { providerKey, rating }),
+  romHomeSetFavorite: (providerKey: string, on: boolean) =>
+    invoke<void>("rom_home_set_favorite", { providerKey, on }),
+  romHomeSetCompleted: (providerKey: string, on: boolean) =>
+    invoke<void>("rom_home_set_completed", { providerKey, on }),
+  romHomeSetOverrides: (
+    providerKey: string,
+    titleOverride: string | null,
+    genre: string | null,
+    players: string | null,
+    notes: string | null,
+  ) =>
+    invoke<void>("rom_home_set_overrides", {
+      providerKey,
+      titleOverride,
+      genre,
+      players,
+      notes,
+    }),
+  romHomeNotePlay: (providerKey: string) =>
+    invoke<RomGameState>("rom_home_note_play", { providerKey }),
+  romHomeState: (providerKey: string) =>
+    invoke<RomGameState>("rom_home_state", { providerKey }),
+  romHomeSmartLists: () => invoke<RomSmartList[]>("rom_home_smart_lists"),
+  romHomeSaveSmartList: (name: string, queryJson: string) =>
+    invoke<string>("rom_home_save_smart_list", { name, queryJson }),
+  romHomeUpdateSmartList: (id: string, queryJson: string) =>
+    invoke<void>("rom_home_update_smart_list", { id, queryJson }),
   // Media Resolution (film/TV → Plex/Emby/Jellyfin): TMDB key lives
   // in the OS keyring — only its presence ever comes back. Scan is
   // parse + match + compliance; Organize is a journaled job planned
@@ -1688,6 +1722,61 @@ export interface RomHit {
   item: Item;
   datName: string;
   system: string;
+}
+
+/** ROM Home: one game's media presence for one type (inspector chips). */
+export interface RomGameMedia {
+  mediaType: string;
+  found: boolean;
+  localPath: string | null;
+  source: string | null;
+}
+
+/** ROM Home: a game's personal state — the user's relationship
+ * with it (rating, favorite, completed, play history, overrides). */
+export interface RomGameState {
+  rating: number | null;
+  favorite: boolean;
+  completed: boolean;
+  playCount: number;
+  lastPlayed: string | null;
+  titleOverride: string | null;
+  genre: string | null;
+  players: string | null;
+  notes: string | null;
+}
+
+/** ROM Home: one game as the room renders it — catalog truth only. */
+export interface RomHomeGame {
+  item: Item;
+  /** DAT-verified title (display = state.titleOverride ?? this). */
+  title: string;
+  platform: string;
+  alsoPlatforms: string[];
+  year: number | null;
+  sha1: string | null;
+  region: string | null;
+  media: RomGameMedia[];
+  state: RomGameState;
+  auditorFlagged: boolean;
+  volumeLabel: string | null;
+  volumeOffline: boolean;
+  volumeLastSeen: string | null;
+}
+
+/** ROM Home tallies (the sidebar door + the rail health line). */
+export interface RomHomeCounts {
+  total: number;
+  missingMedia: number;
+  /** [platform, games, missing box art] */
+  perSystem: Array<[string, number, number]>;
+}
+
+/** A Smart List: a saved filter whose rule renders as a sentence. */
+export interface RomSmartList {
+  id: string;
+  name: string;
+  queryJson: string;
 }
 
 export function onRomIdentifyProgress(

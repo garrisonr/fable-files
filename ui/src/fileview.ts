@@ -5,16 +5,22 @@
  */
 import { api, formatBytes, formatDate, type Item } from "./api";
 import { animateFromLive, liveOpacity, reducedMotion, fadeTo, rubberBand, springTo, cancelSpring } from "./motion";
-import { sortedItems, type SortDir, type SortKey, type Tab, type ViewMode } from "./tabs";
+import { currentDir, sortedItems, type SortDir, type SortKey, type Tab, type ViewMode } from "./tabs";
 import { ContextMenu, type MenuItem } from "./contextmenu";
 import { OpenWithDialog } from "./openwith";
 import { labelColor, loadLabelDefs } from "./labels";
 import { isVideoName } from "./video";
+import { loadRomSystems, romSystemKey, isRomPlaceholder } from "./roms";
 import { isAudioName } from "./music";
 
 export interface FileViewHooks {
   onOpen(item: Item): void; // Enter / double-click on a folder (or file)
   onOpenInNewTab?(item: Item): void; // right-click: open in a new tab
+  /** ROM Home reverse door (2026-10-15): open the room at the
+   * item's system shelf. */
+  onOpenInRomHome?(item: Item): void;
+  /** The ROM-folder banner's door: open the room at this system. */
+  onOpenRomFolder?(systemName: string): void;
   /** Inc-2 item 14: sidebar Favorites doors. State is read live when
    * the menu opens, so the Add/Remove label is never stale. */
   isFavorite?(item: Item): boolean;
@@ -145,6 +151,21 @@ function isMediaName(name: string): boolean {
   ].includes(ext);
 }
 
+export function romSystemForItem(item: Item): string | null {
+  if (item.kind === "folder") return null;
+  const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
+  if (!ext || !item.name.includes(".")) return null;
+  const systems = loadRomSystems().filter(
+    (s) => s.extensions.includes(ext) && !isRomPlaceholder(s),
+  );
+  if (systems.length === 0) return null;
+  systems.sort(
+    (a, b) =>
+      Number(romSystemKey(b) !== null) - Number(romSystemKey(a) !== null),
+  );
+  return systems[0].name;
+}
+
 export async function showItemMenu(
   menu: ContextMenu,
   x: number,
@@ -202,6 +223,11 @@ export async function showItemMenu(
     items.push({
       label: "Open in New Tab",
       action: () => hooks.onOpenInNewTab!(item),
+    });
+  if (hooks.onOpenInRomHome && romSystemForItem(item))
+    items.push({
+      label: "Open in ROM Home",
+      action: () => hooks.onOpenInRomHome!(item),
     });
   items.push({ label: "Open With...", action: () => openWith(item) });
   if (isArchiveItem(item) && hooks.onExtractArchive) {
@@ -586,6 +612,8 @@ export class FileView {
   private lastSelected: Item | null = null;
   private colWidths: Map<string, number> = new Map();
   private ctxMenu = new ContextMenu();
+  /** ROM banner dismissals, per directory (session only). */
+  private romBannerDismissed = new Set<string>();
   private openWithDialog = new OpenWithDialog();
 
   constructor(
@@ -721,6 +749,7 @@ export class FileView {
     }
     if (tab.view === "grid") this.renderGrid(tab);
     else this.renderList(tab);
+    this.maybeRomBanner(tab);
     this.updateSelection();
     // Scroll back to top on navigation; keep position on re-render of sorts.
     this.scroller.scrollTop = 0;
@@ -769,6 +798,52 @@ export class FileView {
   }
 
   // ------------------------------------------------------------- rendering
+
+  /** ROM Home reverse door: a folder that is mostly one
+   * system's games offers the room — slim, and dismissible per
+   * folder so it never becomes a nag. */
+  private maybeRomBanner(tab: Tab): void {
+    if (!this.hooks.onOpenRomFolder) return;
+    const files = tab.items.filter((i) => i.kind !== "folder");
+    if (files.length < 4) return;
+    const counts = new Map<string, number>();
+    for (const f of files) {
+      const s = romSystemForItem(f);
+      if (s) counts.set(s, (counts.get(s) ?? 0) + 1);
+    }
+    let best: string | null = null;
+    let bestN = 0;
+    for (const [s, n] of counts) {
+      if (n > bestN) {
+        best = s;
+        bestN = n;
+      }
+    }
+    if (!best || bestN / files.length < 0.6) return;
+    const dir = currentDir(tab);
+    if (this.romBannerDismissed.has(dir.dirId)) return;
+    const banner = document.createElement("div");
+    banner.className = "rom-folder-banner";
+    const text = document.createElement("span");
+    text.textContent = `\uD83C\uDFAE This folder is mostly ${best} games.`;
+    const open = document.createElement("button");
+    open.className = "pill-btn rom-banner-open";
+    open.textContent = "Open in ROM Home";
+    const system = best;
+    open.addEventListener("click", () =>
+      this.hooks.onOpenRomFolder!(system),
+    );
+    const x = document.createElement("button");
+    x.className = "icon-btn rom-banner-x";
+    x.textContent = "\u2715";
+    x.setAttribute("aria-label", "Dismiss");
+    x.addEventListener("click", () => {
+      this.romBannerDismissed.add(dir.dirId);
+      banner.remove();
+    });
+    banner.append(text, open, x);
+    this.scroller.insertBefore(banner, this.scroller.firstChild);
+  }
 
   private renderGrid(tab: Tab): void {
     this.scroller.className = "fileview-scroller grid";
