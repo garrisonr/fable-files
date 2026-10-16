@@ -102,7 +102,7 @@ export class MediaCompleteSection {
     if (!body || !s || !st) return;
     body.innerHTML = "";
     body.appendChild(this.renderArtwork(s));
-    body.appendChild(this.renderOpensubs(st));
+    body.appendChild(this.renderOpensubsPointer(st));
     body.appendChild(this.renderScheduler(s, st));
     body.appendChild(this.renderRuns());
   }
@@ -169,88 +169,26 @@ export class MediaCompleteSection {
   }
 
   // ---------------------------------------------------------------
-  // OpenSubtitles account (guidance-law block)
+  // OpenSubtitles account — moved to Preferences → Metadata
+  // Accounts (2026-10-16 cleanup); the state truth stays visible
+  // here, the credentials live with the other accounts.
   // ---------------------------------------------------------------
 
-  private renderOpensubs(st: McStatus): HTMLElement {
+  private renderOpensubsPointer(st: McStatus): HTMLElement {
     const block = el("div", "mr-tmdb");
     block.appendChild(el("h4", "mc-h", "OpenSubtitles (subtitles)"));
-    const p1 = document.createElement("p");
-    p1.innerHTML =
-      "<strong>Free account, real limits.</strong> OpenSubtitles is the big community subtitle library. Searching it is unlimited, but <strong>downloading is limited per day</strong> — with just an API key it's 5 downloads per day per address; your free account's own allowance is larger but isn't a fixed published number, so Fable never prints one: after every download it shows you the exact remaining count OpenSubtitles reports back. That's why subtitles on Organize are opt-in, and why a scheduled run stops fetching subtitles when the allowance runs out and says so in the morning report.";
-    block.appendChild(p1);
-    const p2 = document.createElement("p");
-    p2.innerHTML =
-      "To set it up: 1. Create a free account at <a class=\"guide-link mr-mono\" href=\"https://www.opensubtitles.com/en/users/sign_up\">opensubtitles.com</a>. 2. Open <a class=\"guide-link mr-mono\" href=\"https://www.opensubtitles.com/en/consumers\">Profile → API</a> (the API consumers page) and create a consumer — any name works, e.g. “Fable Files” — and copy its API key. 3. Paste the API key below, plus the username and password you log in with (the login is what spends your account's allowance instead of the tiny anonymous one). All three live only in your system keyring — never in a settings file, a job, or a log.";
-    block.appendChild(p2);
-    wireGuideLinks(block);
     const creds = st.opensubs;
-    const statusLine = el(
-      "p",
-      "mr-status",
-      !creds.keyringOk
-        ? "The system keyring is unavailable on this machine."
-        : creds.hasApiKey
-          ? `Saved: API key${creds.hasLogin ? " + account login" : " (no account login yet — downloads use the anonymous allowance)"}.`
-          : "Nothing saved yet.",
+    block.appendChild(
+      el(
+        "p",
+        "prefs-note",
+        !creds.keyringOk
+          ? "The system keyring is unavailable on this machine, so no OpenSubtitles account can be saved."
+          : creds.hasApiKey
+            ? `Account saved${creds.hasLogin ? " (API key + account login)" : " (API key only — subtitle downloads use the small anonymous allowance)"}. Manage it under Preferences → Metadata Accounts.`
+            : "No account saved yet. Add one under Preferences → Metadata Accounts.",
+      ),
     );
-    block.appendChild(statusLine);
-
-    const mkSecret = (
-      kind: string,
-      label: string,
-      placeholder: string,
-      password: boolean,
-    ): HTMLElement => {
-      const row = el("div", "mr-keyrow");
-      const input = document.createElement("input");
-      input.className = "mr-in mr-key";
-      input.type = password ? "password" : "text";
-      input.placeholder = placeholder;
-      input.setAttribute("aria-label", label);
-      const save = el("button", "pill-btn", `Save ${label}`);
-      save.addEventListener("click", async () => {
-        const v = input.value.trim();
-        if (!v) return;
-        try {
-          await api.opensubsSetSecret(kind, v);
-          input.value = "";
-          Toast.success(`${label} saved to the keyring.`);
-          await this.reload();
-        } catch (err) {
-          Toast.error(`Could not save: ${errText(err)}`);
-        }
-      });
-      const clear = el("button", "pill-btn", "Remove");
-      clear.addEventListener("click", async () => {
-        try {
-          await api.opensubsSetSecret(kind, null);
-          await this.reload();
-        } catch (err) {
-          Toast.error(`Could not remove: ${errText(err)}`);
-        }
-      });
-      row.append(input, save, clear);
-      return row;
-    };
-    block.appendChild(mkSecret("opensubs-apikey", "API key", "OpenSubtitles API key", true));
-    block.appendChild(mkSecret("opensubs-username", "username", "OpenSubtitles username", false));
-    block.appendChild(mkSecret("opensubs-password", "password", "OpenSubtitles password", true));
-
-    const validateRow = el("div", "mr-keyrow");
-    const validate = el("button", "pill-btn", "Check account");
-    const vOut = el("span", "mr-status");
-    validate.addEventListener("click", async () => {
-      vOut.textContent = "Checking…";
-      try {
-        const r = await api.opensubsValidate();
-        vOut.textContent = r.message;
-      } catch (err) {
-        vOut.textContent = `Check failed: ${errText(err)}`;
-      }
-    });
-    validateRow.append(validate, vOut);
-    block.appendChild(validateRow);
     return block;
   }
 
@@ -575,5 +513,133 @@ export class MediaCompleteSection {
       row.appendChild(btn);
     }
     return row;
+  }
+}
+
+// ---------------------------------------------------------------------
+// The OpenSubtitles account (Preferences → Metadata Accounts, Movies
+// & TV group). Split out of MediaCompleteSection in the 2026-10-16
+// Preferences cleanup — same controls, same commands; the account's
+// home is with the other accounts.
+// ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------
+// OpenSubtitles account (guidance-law block)
+// ---------------------------------------------------------------
+
+function buildOpenSubtitlesBlock(st: McStatus, reload: () => Promise<void>): HTMLElement {
+  const block = el("div", "mr-tmdb");
+  block.appendChild(el("h4", "mc-h", "OpenSubtitles (subtitles)"));
+  const p1 = document.createElement("p");
+  p1.innerHTML =
+    "<strong>Free account, real limits.</strong> OpenSubtitles is the big community subtitle library. Searching it is unlimited, but <strong>downloading is limited per day</strong> — with just an API key it's 5 downloads per day per address; your free account's own allowance is larger but isn't a fixed published number, so Fable never prints one: after every download it shows you the exact remaining count OpenSubtitles reports back. That's why subtitles on Organize are opt-in, and why a scheduled run stops fetching subtitles when the allowance runs out and says so in the morning report.";
+  block.appendChild(p1);
+  const p2 = document.createElement("p");
+  p2.innerHTML =
+    "To set it up: 1. Create a free account at <a class=\"guide-link mr-mono\" href=\"https://www.opensubtitles.com/en/users/sign_up\">opensubtitles.com</a>. 2. Open <a class=\"guide-link mr-mono\" href=\"https://www.opensubtitles.com/en/consumers\">Profile → API</a> (the API consumers page) and create a consumer — any name works, e.g. “Fable Files” — and copy its API key. 3. Paste the API key below, plus the username and password you log in with (the login is what spends your account's allowance instead of the tiny anonymous one). All three live only in your system keyring — never in a settings file, a job, or a log.";
+  block.appendChild(p2);
+  wireGuideLinks(block);
+  const creds = st.opensubs;
+  const statusLine = el(
+    "p",
+    "mr-status",
+    !creds.keyringOk
+      ? "The system keyring is unavailable on this machine."
+      : creds.hasApiKey
+        ? `Saved: API key${creds.hasLogin ? " + account login" : " (no account login yet — downloads use the anonymous allowance)"}.`
+        : "Nothing saved yet.",
+  );
+  block.appendChild(statusLine);
+
+  const mkSecret = (
+    kind: string,
+    label: string,
+    placeholder: string,
+    password: boolean,
+  ): HTMLElement => {
+    const row = el("div", "mr-keyrow");
+    const input = document.createElement("input");
+    input.className = "mr-in mr-key";
+    input.type = password ? "password" : "text";
+    input.placeholder = placeholder;
+    input.setAttribute("aria-label", label);
+    const save = el("button", "pill-btn", `Save ${label}`);
+    save.addEventListener("click", async () => {
+      const v = input.value.trim();
+      if (!v) return;
+      try {
+        await api.opensubsSetSecret(kind, v);
+        input.value = "";
+        Toast.success(`${label} saved to the keyring.`);
+        await reload();
+      } catch (err) {
+        Toast.error(`Could not save: ${errText(err)}`);
+      }
+    });
+    const clear = el("button", "pill-btn", "Remove");
+    clear.addEventListener("click", async () => {
+      try {
+        await api.opensubsSetSecret(kind, null);
+        await reload();
+      } catch (err) {
+        Toast.error(`Could not remove: ${errText(err)}`);
+      }
+    });
+    row.append(input, save, clear);
+    return row;
+  };
+  block.appendChild(mkSecret("opensubs-apikey", "API key", "OpenSubtitles API key", true));
+  block.appendChild(mkSecret("opensubs-username", "username", "OpenSubtitles username", false));
+  block.appendChild(mkSecret("opensubs-password", "password", "OpenSubtitles password", true));
+
+  const validateRow = el("div", "mr-keyrow");
+  const validate = el("button", "pill-btn", "Check account");
+  const vOut = el("span", "mr-status");
+  validate.addEventListener("click", async () => {
+    vOut.textContent = "Checking…";
+    try {
+      const r = await api.opensubsValidate();
+      vOut.textContent = r.message;
+    } catch (err) {
+      vOut.textContent = `Check failed: ${errText(err)}`;
+    }
+  });
+  validateRow.append(validate, vOut);
+  block.appendChild(validateRow);
+  return block;
+}
+
+
+export class OpenSubtitlesAccountSection {
+  private body: HTMLElement | null = null;
+  private status: McStatus | null = null;
+
+  async mount(host: HTMLElement): Promise<void> {
+    this.body = el("div", "mc-prefs");
+    this.body.appendChild(el("p", "prefs-note", "Loading…"));
+    host.appendChild(this.body);
+    await this.reload();
+  }
+
+  private async reload(): Promise<void> {
+    try {
+      this.status = await api.getMcStatus();
+      this.render();
+    } catch (err) {
+      if (this.body) {
+        this.body.innerHTML = "";
+        this.body.appendChild(
+          el("p", "prefs-note", `OpenSubtitles account could not load: ${errText(err)}`),
+        );
+      }
+    }
+  }
+
+  private render(): void {
+    if (!this.body || !this.status) return;
+    this.body.innerHTML = "";
+    this.body.appendChild(
+      buildOpenSubtitlesBlock(this.status, () => this.reload()),
+    );
   }
 }

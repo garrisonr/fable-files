@@ -209,7 +209,7 @@ export class MusicCompleteDialog {
         el(
           "p",
           "mrx-note",
-          "Fingerprint matching (AcoustID) is off — fpcalc is installed, but it also needs your own free AcoustID key (paste it in Preferences → Music Completion). Tag and filename matching are unaffected.",
+          "Fingerprint matching (AcoustID) is off — fpcalc is installed, but it also needs your own free AcoustID key (paste it in Preferences → Metadata Accounts). Tag and filename matching are unaffected.",
         ),
       );
       return;
@@ -219,7 +219,7 @@ export class MusicCompleteDialog {
       "Fingerprint matching (AcoustID) is off — it needs the free fpcalc tool" +
         (view.acoustidKeySaved
           ? "."
-          : " plus your own AcoustID key (Preferences → Music Completion).") +
+          : " plus your own AcoustID key (Preferences → Metadata Accounts).") +
         " Fable can set fpcalc up right now: ",
     );
     const btn = el("button", "pill-btn", "Install fpcalc");
@@ -684,10 +684,10 @@ export class MusicCompleteSection {
     guide.innerHTML = `
       <p class="prefs-note">Where the answers come from — all free, no accounts, no keys:</p>
       <ul class="prefs-note">
-        <li><a href="https://musicbrainz.org/" target="_blank" rel="noreferrer">MusicBrainz</a> — the open encyclopedia of music (the Wikipedia of albums, run by a nonprofit). Fable asks it politely, about one question a second, which is why a big folder takes a while.</li>
-        <li><a href="https://coverartarchive.org/" target="_blank" rel="noreferrer">Cover Art Archive</a> — album artwork kept by MusicBrainz and the Internet Archive. If a match has a cover, Fable can embed it in the file. Art you already have always wins.</li>
-        <li><a href="https://lrclib.net/" target="_blank" rel="noreferrer">LRCLIB</a> — a community lyrics library. It has plain lyrics and, for many songs, synced lyrics timed to the music.</li>
-        <li><a href="https://acoustid.org/" target="_blank" rel="noreferrer">AcoustID</a> — the optional last resort: it identifies a track by HOW IT SOUNDS when names and tags are hopeless. It needs the free fpcalc helper tool and your own free AcoustID key — see "When names aren't enough" below. Without them, fingerprinting simply stays off and everything else still works.</li>
+        <li><a class="guide-link" href="https://musicbrainz.org/">MusicBrainz</a> — the open encyclopedia of music (the Wikipedia of albums, run by a nonprofit). Fable asks it politely, about one question a second, which is why a big folder takes a while.</li>
+        <li><a class="guide-link" href="https://coverartarchive.org/">Cover Art Archive</a> — album artwork kept by MusicBrainz and the Internet Archive. If a match has a cover, Fable can embed it in the file. Art you already have always wins.</li>
+        <li><a class="guide-link" href="https://lrclib.net/">LRCLIB</a> — a community lyrics library. It has plain lyrics and, for many songs, synced lyrics timed to the music.</li>
+        <li><a class="guide-link" href="https://acoustid.org/">AcoustID</a> — the optional last resort: it identifies a track by HOW IT SOUNDS when names and tags are hopeless. It needs the free fpcalc helper tool and your own free AcoustID key — see "When names aren't enough" below. Without them, fingerprinting simply stays off and everything else still works.</li>
       </ul>
       <p class="prefs-note">Start it from the browser: right-click music files or a folder → Complete Music Tags & Lyrics…, or Organize ▸ Complete Music Tags & Lyrics…. To save asking file by file, schedules below can do it overnight — but only matches Fable is CONFIDENT about are completed unattended; the rest wait here as a morning checklist, never guessed.</p>`;
     wireGuideLinks(guide);
@@ -770,7 +770,7 @@ export class MusicCompleteSection {
     lyr.appendChild(fetchArt);
     host.appendChild(lyr);
 
-    this.renderAcoustid(host);
+    this.renderAcoustidPointer(host);
     this.renderSchedules(host);
     const runs = el("div", "prefs-form");
     runs.appendChild(el("h4", "", "Runs — the journal"));
@@ -787,113 +787,25 @@ export class MusicCompleteSection {
     void this.refreshRuns();
   }
 
-  private renderAcoustid(host: HTMLElement): void {
+  /** AcoustID moved to Preferences → Metadata Accounts
+   * (2026-10-16 cleanup); the state truth stays visible here. */
+  private renderAcoustidPointer(host: HTMLElement): void {
     const st = this.status;
     const box = el("div", "prefs-form");
     box.appendChild(el("h4", "", "When names aren't enough (AcoustID, optional)"));
-    if (!st) {
-      host.appendChild(box);
-      return;
-    }
-    if (!st.fpcalcAvailable) {
-      box.appendChild(
-        el(
-          "p",
-          "prefs-note",
-          "The fpcalc fingerprint tool isn't installed on this computer yet, so sound-based matching is off. That's fine — tags and filenames identify most libraries. Fable can set fpcalc up for you: one click, the system asks for the admin password once, and this section lights up.",
-        ),
-      );
-      const installRow = el("div", "prefs-form-row");
-      const installBtn = el("button", "pill-btn", "Install fpcalc");
-      installBtn.addEventListener("click", async () => {
-        installBtn.disabled = true;
-        installBtn.textContent = "Installing fpcalc — approve the system prompt…";
-        try {
-          await api.muInstallFpcalc();
-          this.status = await api.getMuStatus();
-          Toast.success("fpcalc installed — fingerprinting is ready once your key is saved.");
-          this.render(host);
-        } catch (err) {
-          Toast.error(`fpcalc setup didn't finish: ${errText(err)}`);
-          installBtn.disabled = false;
-          installBtn.textContent = "Install fpcalc";
-        }
-      });
-      installRow.appendChild(installBtn);
-      box.appendChild(installRow);
-    } else if (!st.acoustidKeySaved) {
-      box.appendChild(
-        el(
-          "p",
-          "prefs-note",
-          "fpcalc is installed. It still needs a free AcoustID application key: sign in at acoustid.org, choose “Register your application” (a name is all it asks for), and paste the API key it gives you here. It lives in your system keyring, is used only to identify tracks by sound, and Fable shows you only whether one is saved.",
-        ),
-      );
-    } else {
-      box.appendChild(
-        el(
-          "p",
-          "prefs-note",
-          "Fingerprinting is ready: unidentified tracks can be matched by how they sound. The key is stored in your system keyring.",
-        ),
-      );
-    }
-    {
-      // The key row is always here — pasting the key before or
-      // after the fpcalc install are both fine.
-      const row = el("div", "prefs-form-row");
-      const input = document.createElement("input");
-      input.type = "password";
-      input.placeholder = st.acoustidKeySaved
-        ? "AcoustID key saved (keyring) — paste to replace"
-        : "Paste your AcoustID API key";
-      input.autocomplete = "off";
-      row.appendChild(input);
-      const saveKey = el("button", "pill-btn", "Save key");
-      saveKey.addEventListener("click", async () => {
-        const v = input.value.trim();
-        if (!v) {
-          Toast.error("Paste the key first, then Save.");
-          return;
-        }
-        try {
-          this.status = await api.setMuAcoustidKey(v);
-          input.value = "";
-          Toast.success(
-            this.status.acoustidKeySaved
-              ? "AcoustID key saved to your keyring and read back to prove it."
-              : "The keyring would not confirm that save — the key was NOT kept.",
-          );
-          this.render(host);
-        } catch (err) {
-          Toast.error(`Could not save the key: ${errText(err)}`);
-        }
-      });
-      row.appendChild(saveKey);
-      if (st.acoustidKeySaved) {
-        const remove = el("button", "pill-btn", "Remove key");
-        remove.addEventListener("click", async () => {
-          try {
-            this.status = await api.setMuAcoustidKey(null);
-            Toast.success("AcoustID key removed.");
-            this.render(host);
-          } catch (err) {
-            Toast.error(`Could not remove the key: ${errText(err)}`);
-          }
-        });
-        row.appendChild(remove);
-      }
-      box.appendChild(row);
-    }
-    if (!st.keyringOk) {
-      box.appendChild(
-        el(
-          "p",
-          "prefs-note",
-          "Heads up: your system keyring isn't answering right now, so a key can't be saved until it's unlocked.",
-        ),
-      );
-    }
+    box.appendChild(
+      el(
+        "p",
+        "prefs-note",
+        !st
+          ? "Fingerprinting state could not be loaded. Manage the AcoustID key under Preferences → Metadata Accounts."
+          : !st.fpcalcAvailable
+            ? "The fpcalc fingerprint tool isn't installed yet, and no AcoustID key is saved. Set both up under Preferences → Metadata Accounts."
+            : st.acoustidKeySaved
+              ? "Fingerprinting is ready: fpcalc is installed and your AcoustID key is saved in the system keyring. Manage it under Preferences → Metadata Accounts."
+              : "fpcalc is installed; it still needs your free AcoustID key. Paste it under Preferences → Metadata Accounts.",
+      ),
+    );
     host.appendChild(box);
   }
 
@@ -1170,4 +1082,142 @@ export class MusicCompleteSection {
       Toast.error(`Could not save music settings: ${errText(err)}`);
     }
   }
+}
+
+
+// ---------------------------------------------------------------------
+// The AcoustID key + fpcalc setup (Preferences → Metadata Accounts,
+// Music group). Split out of MusicCompleteSection in the 2026-10-16
+// Preferences cleanup — same controls, same commands; the account's
+// home is with the other accounts.
+// ---------------------------------------------------------------------
+
+export class AcoustidAccountSection {
+  private status: MuStatus | null = null;
+
+  async mount(host: HTMLElement): Promise<void> {
+    try {
+      this.status = await api.getMuStatus();
+    } catch {
+      this.status = null;
+    }
+    this.render(host);
+  }
+
+  private render(host: HTMLElement): void {
+    host.innerHTML = "";
+    const head = el("h5", "rm-source-name", "AcoustID");
+    host.appendChild(head);
+    this.renderAcoustid(host);
+  }
+
+private renderAcoustid(host: HTMLElement): void {
+  const st = this.status;
+  const box = el("div", "prefs-form");
+  box.appendChild(el("h4", "", "When names aren't enough (AcoustID, optional)"));
+  if (!st) {
+    host.appendChild(box);
+    return;
+  }
+  if (!st.fpcalcAvailable) {
+    box.appendChild(
+      el(
+        "p",
+        "prefs-note",
+        "The fpcalc fingerprint tool isn't installed on this computer yet, so sound-based matching is off. That's fine — tags and filenames identify most libraries. Fable can set fpcalc up for you: one click, the system asks for the admin password once, and this section lights up.",
+      ),
+    );
+    const installRow = el("div", "prefs-form-row");
+    const installBtn = el("button", "pill-btn", "Install fpcalc");
+    installBtn.addEventListener("click", async () => {
+      installBtn.disabled = true;
+      installBtn.textContent = "Installing fpcalc — approve the system prompt…";
+      try {
+        await api.muInstallFpcalc();
+        this.status = await api.getMuStatus();
+        Toast.success("fpcalc installed — fingerprinting is ready once your key is saved.");
+        this.render(host);
+      } catch (err) {
+        Toast.error(`fpcalc setup didn't finish: ${errText(err)}`);
+        installBtn.disabled = false;
+        installBtn.textContent = "Install fpcalc";
+      }
+    });
+    installRow.appendChild(installBtn);
+    box.appendChild(installRow);
+  } else if (!st.acoustidKeySaved) {
+    box.appendChild(
+      el(
+        "p",
+        "prefs-note",
+        "fpcalc is installed. It still needs a free AcoustID application key: sign in at acoustid.org, choose “Register your application” (a name is all it asks for), and paste the API key it gives you here. It lives in your system keyring, is used only to identify tracks by sound, and Fable shows you only whether one is saved.",
+      ),
+    );
+  } else {
+    box.appendChild(
+      el(
+        "p",
+        "prefs-note",
+        "Fingerprinting is ready: unidentified tracks can be matched by how they sound. The key is stored in your system keyring.",
+      ),
+    );
+  }
+  {
+    // The key row is always here — pasting the key before or
+    // after the fpcalc install are both fine.
+    const row = el("div", "prefs-form-row");
+    const input = document.createElement("input");
+    input.type = "password";
+    input.placeholder = st.acoustidKeySaved
+      ? "AcoustID key saved (keyring) — paste to replace"
+      : "Paste your AcoustID API key";
+    input.autocomplete = "off";
+    row.appendChild(input);
+    const saveKey = el("button", "pill-btn", "Save key");
+    saveKey.addEventListener("click", async () => {
+      const v = input.value.trim();
+      if (!v) {
+        Toast.error("Paste the key first, then Save.");
+        return;
+      }
+      try {
+        this.status = await api.setMuAcoustidKey(v);
+        input.value = "";
+        Toast.success(
+          this.status.acoustidKeySaved
+            ? "AcoustID key saved to your keyring and read back to prove it."
+            : "The keyring would not confirm that save — the key was NOT kept.",
+        );
+        this.render(host);
+      } catch (err) {
+        Toast.error(`Could not save the key: ${errText(err)}`);
+      }
+    });
+    row.appendChild(saveKey);
+    if (st.acoustidKeySaved) {
+      const remove = el("button", "pill-btn", "Remove key");
+      remove.addEventListener("click", async () => {
+        try {
+          this.status = await api.setMuAcoustidKey(null);
+          Toast.success("AcoustID key removed.");
+          this.render(host);
+        } catch (err) {
+          Toast.error(`Could not remove the key: ${errText(err)}`);
+        }
+      });
+      row.appendChild(remove);
+    }
+    box.appendChild(row);
+  }
+  if (!st.keyringOk) {
+    box.appendChild(
+      el(
+        "p",
+        "prefs-note",
+        "Heads up: your system keyring isn't answering right now, so a key can't be saved until it's unlocked.",
+      ),
+    );
+  }
+  host.appendChild(box);
+}
 }

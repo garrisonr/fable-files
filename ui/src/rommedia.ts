@@ -150,37 +150,10 @@ export class RomMediaSection {
       body.appendChild(this.typeRow(row.key, row.type, row.label, row.blurb));
     }
 
-    // --- Sources --------------------------------------------------------
-    const srcHead = el("h4", "prefs-subhead", "Where it comes from");
-    body.appendChild(srcHead);
-    body.appendChild(
-      el(
-        "p",
-        "prefs-note",
-        "Fable asks these in order and stops at the first one that has your game. Free and keyless first, always.",
-      ),
-    );
-    body.appendChild(this.libretroBlock());
-    body.appendChild(this.screenscraperBlock());
-    body.appendChild(this.emumoviesBlock());
-    body.appendChild(
-      this.keyBlock(
-        "thegamesdb",
-        "TheGamesDB",
-        view.secretPresent["thegamesdb"] ?? false,
-        "A second opinion for box art and screenshots. Keys are free but human-issued: ask on the [TheGamesDB forums](https://api.thegamesdb.net/key.php) (Developers → API key requests) — it can take a little while — then paste the key here. It comes with a monthly request budget, and Fable shows it as it spends.",
-        "Paste API key",
-      ),
-    );
-    body.appendChild(
-      this.keyBlock(
-        "steamgriddb",
-        "SteamGridDB",
-        view.secretPresent["steamgriddb"] ?? false,
-        "Extra-pretty poster art for games the other sources miss. Free account at [steamgriddb.com](https://www.steamgriddb.com) → your profile → Preferences → API → create a key, then paste it here.",
-        "Paste API key",
-      ),
-    );
+    // --- Sources (summary — the accounts themselves live under
+    // Preferences → Metadata Accounts since the 2026-10-16 cleanup;
+    // this page shows which sources are armed, in fetch order) -------
+    body.appendChild(this.sourcesSummary());
 
     // --- The free path, stated plainly (guidance law) ------------------
     const free = el("div", "rm-freebox");
@@ -358,6 +331,138 @@ export class RomMediaSection {
     return outer;
   }
 
+  /** Which sources are armed, in the order Fable asks them. The
+   * accounts and keys themselves are managed under Preferences →
+   * Metadata Accounts; this is the at-a-glance truth on this page. */
+  private sourcesSummary(): HTMLElement {
+    const view = this.view!;
+    const s = this.settings();
+    const outer = el("div", "rm-block");
+    outer.appendChild(el("h4", "prefs-subhead", "Where it comes from"));
+    outer.appendChild(
+      el(
+        "p",
+        "prefs-note",
+        "Fable asks these in order and stops at the first one that has your game. Free and keyless first, always.",
+      ),
+    );
+    outer.appendChild(this.libretroBlock());
+    const rows: Array<[string, string]> = [
+      [
+        "ScreenScraper",
+        view.secretPresent["screenscraper"]
+          ? s.screenscraperUser
+            ? `Signed in as ${s.screenscraperUser}${view.secretPresent["screenscraper-dev"] ? "" : " — waiting on developer credentials (see Metadata Accounts)"}`
+            : "Details saved"
+          : "Not connected",
+      ],
+      [
+        "EmuMovies",
+        view.secretPresent["emumovies"]
+          ? s.emumoviesUser
+            ? `Signed in as ${s.emumoviesUser}`
+            : "Details saved"
+          : "Not connected",
+      ],
+      ["TheGamesDB", view.secretPresent["thegamesdb"] ? "Key saved" : "Not connected"],
+      ["SteamGridDB", view.secretPresent["steamgriddb"] ? "Key saved" : "Not connected"],
+    ];
+    for (const [name, state] of rows) {
+      const row = el("div", "rm-source-line");
+      row.appendChild(el("span", "rm-source-line-name", name));
+      row.appendChild(el("span", "rm-status", state));
+      outer.appendChild(row);
+    }
+    outer.appendChild(
+      el(
+        "p",
+        "prefs-note",
+        "Connect, test or replace these accounts under Preferences → Metadata Accounts.",
+      ),
+    );
+    return outer;
+  }
+}
+
+/**
+ * The Game Media accounts (Preferences → Metadata Accounts, Games
+ * group): ScreenScraper, EmuMovies, TheGamesDB, SteamGridDB. Split
+ * out of RomMediaSection in the 2026-10-16 Preferences cleanup — the
+ * controls and the commands underneath are exactly the ones Game
+ * Media always had; only their home moved, so every provider's
+ * account state sits in one place.
+ */
+export class GameAccountsSection {
+  private view: RomMediaSettingsView | null = null;
+  private body: HTMLElement | null = null;
+
+  async mount(host: HTMLElement): Promise<void> {
+    this.body = el("div", "rm-body");
+    this.body.appendChild(el("p", "prefs-note", "Loading…"));
+    host.appendChild(this.body);
+    try {
+      this.view = await api.getRomMediaSettings();
+      this.render();
+    } catch (err) {
+      this.body.innerHTML = "";
+      this.body.appendChild(
+        el("p", "prefs-note", `Game accounts could not load: ${errText(err)}`),
+      );
+    }
+  }
+
+  private settings(): RomMediaSettings {
+    return this.view!.settings;
+  }
+
+  private async save(): Promise<void> {
+    try {
+      await api.setRomMediaSettings(this.settings());
+    } catch (err) {
+      Toast.error(`Could not save media settings: ${errText(err)}`);
+    }
+  }
+
+  private render(): void {
+    const body = this.body;
+    const view = this.view;
+    if (!body || !view) return;
+    body.innerHTML = "";
+    body.appendChild(this.screenscraperBlock());
+    body.appendChild(this.emumoviesBlock());
+    body.appendChild(
+      this.keyBlock(
+        "thegamesdb",
+        "TheGamesDB",
+        view.secretPresent["thegamesdb"] ?? false,
+        "A second opinion for box art and screenshots. Keys are free but human-issued: ask on the [TheGamesDB forums](https://api.thegamesdb.net/key.php) (Developers → API key requests) — it can take a little while — then paste the key here. It comes with a monthly request budget, and Fable shows it as it spends.",
+        "Paste API key",
+      ),
+    );
+    body.appendChild(
+      this.keyBlock(
+        "steamgriddb",
+        "SteamGridDB",
+        view.secretPresent["steamgriddb"] ?? false,
+        "Extra-pretty poster art for games the other sources miss. Free account at [steamgriddb.com](https://www.steamgriddb.com) → your profile → Preferences → API → create a key, then paste it here.",
+        "Paste API key",
+      ),
+    );
+    if (!view.keyringOk) {
+      body.appendChild(
+        el(
+          "p",
+          "prefs-note rm-warn",
+          "Heads up: the system keyring is not answering right now, so account details cannot be saved on this machine.",
+        ),
+      );
+    }
+  }
+
+  private statusLine(text: string): HTMLElement {
+    return el("p", "rm-status", text);
+  }
+
   private credentialFields(
     userPlaceholder: string,
     passPlaceholder: string,
@@ -438,9 +543,16 @@ export class RomMediaSection {
           const v = await api.validateRomMediaSource(opts.kind);
           verdict.hidden = false;
           verdict.textContent = v.message;
+          // A refused check with details on file is "saved", not
+          // "not connected" — the verdict below carries the server's
+          // own words (2026-10-16 honesty fix; a wrong-host refusal
+          // once masqueraded as a dead account here).
+          const hasNow = opts.hasSecret || u !== "";
           status.textContent = v.ok
             ? `Signed in as ${opts.connectedUser ?? u}`
-            : "Not connected";
+            : hasNow
+              ? "Saved — check the verdict below"
+              : "Not connected";
         } catch (err) {
           verdict.hidden = false;
           verdict.textContent = `The check itself failed: ${errText(err)}`;
@@ -533,7 +645,7 @@ export class RomMediaSection {
       connectedUser: s.emumoviesUser,
       hasSecret: view.secretPresent["emumovies"] ?? false,
       teacher:
-        "The trailer library — the deepest collection of game videos in the hobby, in small, standard and HD sizes. You sign in with the name on your EmuMovies account. Free accounts browse the website; [paid membership](https://emumovies.com/subscriptions/) opens the file server Fable connects to, with full-quality video and no download limits — Connect will tell you honestly which door your account opens.",
+        "The trailer library — the deepest collection of game videos in the hobby, in small, standard and HD sizes. You sign in with the name on your EmuMovies account. Which accounts open the file server is EmuMovies' call — their [subscriptions page](https://emumovies.com/subscriptions/) lays out the tiers, and Fable can't see which one you're on. Connect simply asks the server and reports exactly what it says.",
       userPlaceholder: "EmuMovies user name",
       onConnectedUser: (u) => {
         s.emumoviesUser = u;

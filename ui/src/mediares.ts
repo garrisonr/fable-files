@@ -575,9 +575,60 @@ export class MediaResSection {
     if (!body) return;
     body.innerHTML = "";
     const block = el("div", "mr-tmdb");
+    // The TMDB key itself moved to Preferences → Metadata Accounts
+    // (2026-10-16 cleanup) — this section keeps the state truth and
+    // the do-it-yourself naming guide, which is feature guidance.
+    const state = document.createElement("p");
+    state.innerHTML = this.hasKey
+      ? "TMDB verification is <strong>on</strong> — a key is saved in your system keyring. Manage it under <strong>Preferences → Metadata Accounts</strong>."
+      : keyringOk
+        ? "TMDB verification is <strong>off</strong> — no key saved. Add one under <strong>Preferences → Metadata Accounts</strong>."
+        : "The system keyring is unavailable on this machine, so no TMDB key can be saved.";
+    block.appendChild(state);
+    const p3 = document.createElement("p");
+    p3.innerHTML =
+      "Prefer to do it yourself? Name films <span class=\"mr-mono\">Title (Year).mkv</span> inside a folder of the same name, and episodes <span class=\"mr-mono\">Show (Year) - S01E02.mkv</span> inside <span class=\"mr-mono\">Show (Year)/Season 01</span> — every server will match them, and Fable's checker will call them server-ready with no key at all.";
+    block.appendChild(p3);
+    body.appendChild(block);
+  }
+}
+
+// ---------------------------------------------------------------------
+// The TMDB key (Preferences → Metadata Accounts, Movies & TV group).
+// Split out of MediaResSection in the 2026-10-16 Preferences cleanup —
+// same controls, same commands; the key's home is with the accounts.
+// ---------------------------------------------------------------------
+
+export class TmdbAccountSection {
+  private body: HTMLElement | null = null;
+  private hasKey = false;
+
+  async mount(host: HTMLElement): Promise<void> {
+    this.body = el("div", "mrx-prefs");
+    this.body.appendChild(el("p", "prefs-note", "Loading…"));
+    host.appendChild(this.body);
+    try {
+      const view = await api.getMediaresSettings();
+      this.hasKey = view.hasKey;
+      this.render(view.keyringOk);
+    } catch (err) {
+      this.body.innerHTML = "";
+      this.body.appendChild(
+        el("p", "prefs-note", `TMDB account could not load: ${errText(err)}`),
+      );
+    }
+  }
+
+  private render(keyringOk: boolean): void {
+    const body = this.body;
+    if (!body) return;
+    body.innerHTML = "";
+    const block = el("div", "mr-tmdb");
+    const name = el("h5", "rm-source-name", "TMDB");
+    block.appendChild(name);
     const p1 = document.createElement("p");
     p1.innerHTML =
-      "<strong>TMDB verification (optional, free).</strong> The Movie Database is a free, community-run catalogue of films and shows. With a free TMDB API key, Fable checks each file's title and year against it and shows you how sure the match is, instead of trusting a messy file name. Without a key, Fable still parses names, judges the layout, and organizes files you confirm yourself — the key only adds verification.";
+      "<strong>TMDB verification (optional, free).</strong> The Movie Database is a free, community-run catalogue of films and shows. With a free TMDB API key, Fable checks each file's title and year against it and shows you how sure the match is, instead of trusting a messy file name. Without a key, Media Resolution still parses names, judges the layout, and organizes files you confirm yourself — the key only adds verification.";
     block.appendChild(p1);
     const p2 = document.createElement("p");
     p2.innerHTML =
@@ -640,10 +691,6 @@ export class MediaResSection {
     });
     row.append(input, save, check, clear, status);
     block.appendChild(row);
-    const p3 = document.createElement("p");
-    p3.innerHTML =
-      "Prefer to do it yourself? Name films <span class=\"mr-mono\">Title (Year).mkv</span> inside a folder of the same name, and episodes <span class=\"mr-mono\">Show (Year) - S01E02.mkv</span> inside <span class=\"mr-mono\">Show (Year)/Season 01</span> — every server will match them, and Fable's checker will call them server-ready with no key at all.";
-    block.appendChild(p3);
     body.appendChild(block);
   }
 }

@@ -19,9 +19,15 @@
  * pages on 2026-10-15 (see the ship notes) — never construct one.
  */
 import { api } from "./api";
+import { Toast } from "./toast";
 
 export function openGuideLink(url: string): void {
-  void api.openUrl(url);
+  // Never swallow a failure: a click that silently does nothing is
+  // how the dead Preferences links hid for a day (2026-10-16 — the
+  // backend gate rejected every non-project URL and `void` ate it).
+  api.openUrl(url).catch(() => {
+    Toast.error(`That link could not be opened: ${url}`);
+  });
 }
 
 /** Build a teaching paragraph with real links from [label](url) copy. */

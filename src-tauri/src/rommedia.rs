@@ -1290,13 +1290,21 @@ fn sgdb_fetch(
 // documented, so the client walks directories defensively: bounded
 // depth, bounded calls, honest misses). A minimal passive-mode FTP
 // client over TcpStream — the protocol needs nothing more.
+//
+// HOST (verified against the live service 2026-10-16): the file
+// server is files.emumovies.com — root holds Official/ and
+// Submissions/; the library lives under Official/Video Snaps
+// (<tier>)/<system>/. ftp.emumovies.com is a DIFFERENT server
+// (Pure-FTPd) that refuses the same account credentials, plain and
+// over FTPS alike — pointing there made every stored login look
+// like a bad password. Do not "fix" this back.
 // ---------------------------------------------------------------------------
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-const EMU_HOST: &str = "ftp.emumovies.com";
+const EMU_HOST: &str = "files.emumovies.com";
 const VIDEO_EXTS: [&str; 7] = ["mp4", "avi", "mkv", "webm", "flv", "wmv", "mov"];
 
 struct Ftp {
@@ -1353,18 +1361,24 @@ impl Ftp {
     }
 
     fn login(&mut self, user: &str, pass: &str) -> Result<(), String> {
-        let (code, _) = self.cmd(&format!("USER {user}"))?;
+        let (code, text) = self.cmd(&format!("USER {user}"))?;
         if code == 230 {
             return Ok(());
         }
         if code != 331 {
-            return Err("the file server did not accept that user name".into());
+            return Err(format!(
+                "the file server did not accept that user name ({})",
+                reply_tail(&text)
+            ));
         }
-        let (code, _) = self.cmd(&format!("PASS {pass}"))?;
+        let (code, text) = self.cmd(&format!("PASS {pass}"))?;
         if code == 230 {
             Ok(())
         } else {
-            Err("sign-in refused".into())
+            Err(format!(
+                "sign-in refused by the file server ({})",
+                reply_tail(&text)
+            ))
         }
     }
 
@@ -1393,11 +1407,14 @@ impl Ftp {
         if !(code == 150 || code == 125) {
             return Err("the file server would not list that folder".into());
         }
-        let mut text = String::new();
-        data.read_to_string(&mut text)
+        // Listings carry file names in whatever encoding the source
+        // used (the live library has Latin-1 names) — decode lossy
+        // rather than failing the whole listing on one bad byte.
+        let mut bytes = Vec::new();
+        data.read_to_end(&mut bytes)
             .map_err(|e| format!("listing download failed ({e})"))?;
         let _ = self.read_reply();
-        Ok(parse_list(&text))
+        Ok(parse_list(&String::from_utf8_lossy(&bytes)))
     }
 
     fn retr_to_file(
@@ -1448,6 +1465,18 @@ impl Ftp {
     }
 }
 
+/// The last non-empty line of a server reply, trimmed — the part a
+/// human would quote back. Server text only: replies answer our
+/// commands, they never echo them, so this cannot carry credentials.
+fn reply_tail(text: &str) -> String {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// "(227 Entering Passive Mode (192,168,1,1,195,80)" -> host, port.
 pub fn parse_pasv(text: &str) -> Option<(String, u16)> {
     let start = text.find('(')?;
@@ -1468,11 +1497,23 @@ pub fn parse_pasv(text: &str) -> Option<(String, u16)> {
 pub fn parse_list(text: &str) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     for line in text.lines() {
+        // MS-DOS / IIS LIST: "MM-DD-YY  hh:mmAM  <DIR>|<size>  name".
+        // The live file server speaks this dialect; without this
+        // branch every entry silently dropped and the walk saw an
+        // empty tree.
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 4 && is_dos_date(fields[0]) && is_dos_time(fields[1]) {
+            let is_dir = fields[2] == "<DIR>";
+            let name = fields[3..].join(" ");
+            if name != "." && name != ".." {
+                out.push((name, is_dir));
+            }
+            continue;
+        }
         let is_dir = line.starts_with('d');
         // Unix LIST: 8 whitespace-separated fields, the rest of the
         // line is the name (names may contain spaces).
-        let name_parts: Vec<&str> =
-            line.split_whitespace().skip(8).collect();
+        let name_parts: Vec<&str> = line.split_whitespace().skip(8).collect();
         if name_parts.is_empty() {
             continue;
         }
@@ -1483,6 +1524,20 @@ pub fn parse_list(text: &str) -> Vec<(String, bool)> {
         out.push((name, is_dir));
     }
     out
+}
+
+/// "04-11-26" / "10-29-2025" — the date token of a DOS-style listing.
+fn is_dos_date(tok: &str) -> bool {
+    let parts: Vec<&str> = tok.split('-').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// "02:58AM" / "12:13PM" — the time token of a DOS-style listing.
+fn is_dos_time(tok: &str) -> bool {
+    (tok.ends_with("AM") || tok.ends_with("PM")) && tok.contains(':')
 }
 
 /// Score a folder for a trailer tier: the user's quality appetite
@@ -1532,27 +1587,73 @@ fn emu_inventory(
     result
 }
 
+/// How promising a folder is for this system's trailers. The live
+/// layout is root → Official → Video Snaps (<tier>) → <system> →
+/// files, and the root also carries deep branches that hold no
+/// trailers (Artwork, Bezels, Themes…). A naive stack dive spends
+/// the whole call budget in those branches and never reaches a
+/// snap folder (proven against the live server 2026-10-16: 48/48
+/// calls, zero systems found), so the walk descends content-first.
+fn dir_rank(name: &str, tokens: &[&str]) -> usize {
+    let d = name.to_lowercase();
+    if d == "official" {
+        0
+    } else if tokens.iter().any(|t| d.contains(t)) {
+        1
+    } else if d.contains("video snaps") {
+        2
+    } else {
+        3
+    }
+}
+
 fn emu_walk(sys: &str, creds: &AccountCreds) -> Result<Vec<(String, String)>, String> {
     let map = system_map(sys)
         .ok_or_else(|| "no sources cover this system".to_string())?;
     let mut ftp = Ftp::connect(EMU_HOST)?;
     ftp.login(&creds.user, &creds.pass)
-        .map_err(|_| "EmuMovies sign-in was refused".to_string())?;
-    // BFS to depth 3 with a call budget. A directory is interesting
-    // when its name carries a system token, or it is a container the
-    // walk should pass through (anything at depth 0-1).
-    let mut found: Vec<(String, String)> = Vec::new();
+        .map_err(|e| format!("EmuMovies {e}"))?;
     let mut calls = 0usize;
+    // Guided pass first: descend only through the container chain
+    // and folders naming this system — the known live layout, ~17
+    // calls for a mainstream system. If it finds nothing, the
+    // layout has changed: fall back to the defensive full walk with
+    // whatever budget remains.
+    let mut found = emu_walk_pass(&mut ftp, &map, true, &mut calls);
+    if found.is_empty() {
+        found = emu_walk_pass(&mut ftp, &map, false, &mut calls);
+    }
+    let _ = ftp.cmd("QUIT");
+    Ok(found)
+}
+
+/// One breadth-first pass to depth 3 under the shared call budget,
+/// best-first at every level (see dir_rank). Guided passes skip
+/// rank-3 folders outright; defensive passes enter everything but
+/// still prune the last level to the folders naming this system
+/// when any do — the budget belongs to the system being
+/// inventoried, not its hundred neighbours.
+fn emu_walk_pass(
+    ftp: &mut Ftp,
+    map: &SystemMap,
+    guided: bool,
+    calls: &mut usize,
+) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = Vec::new();
     let mut queue: Vec<(String, usize)> = vec![(String::new(), 0usize)];
-    while let Some((dir, depth)) = queue.pop() {
-        if calls >= 48 {
+    let mut head = 0usize;
+    while head < queue.len() {
+        if *calls >= 48 {
             break;
         }
-        calls += 1;
+        let (dir, depth) = queue[head].clone();
+        head += 1;
+        *calls += 1;
         let entries = match ftp.list(if dir.is_empty() { None } else { Some(dir.as_str()) }) {
             Ok(e) => e,
             Err(_) => continue,
         };
+        let mut child_dirs: Vec<(String, String)> = Vec::new();
         for (name, is_dir) in entries {
             let path = if dir.is_empty() {
                 name.clone()
@@ -1561,7 +1662,7 @@ fn emu_walk(sys: &str, creds: &AccountCreds) -> Result<Vec<(String, String)>, St
             };
             if is_dir {
                 if depth < 3 {
-                    queue.push((path, depth + 1));
+                    child_dirs.push((name, path));
                 }
             } else {
                 let lower = name.to_lowercase();
@@ -1576,9 +1677,21 @@ fn emu_walk(sys: &str, creds: &AccountCreds) -> Result<Vec<(String, String)>, St
                 }
             }
         }
+        child_dirs.sort_by_cached_key(|(name, _)| {
+            (dir_rank(name, map.emu_tokens), name.to_lowercase())
+        });
+        let any_system = child_dirs
+            .iter()
+            .any(|(name, _)| dir_rank(name, map.emu_tokens) == 1);
+        for (name, path) in child_dirs {
+            let r = dir_rank(&name, map.emu_tokens);
+            if r == 3 && (guided || (depth == 2 && any_system)) {
+                continue;
+            }
+            queue.push((path, depth + 1));
+        }
     }
-    let _ = ftp.cmd("QUIT");
-    Ok(found)
+    found
 }
 
 fn emumovies_fetch(
@@ -1618,9 +1731,9 @@ fn emumovies_fetch(
         Ok(f) => f,
         Err(note) => return FetchResult::Error { note },
     };
-    if ftp.login(&creds.user, &creds.pass).is_err() {
+    if let Err(e) = ftp.login(&creds.user, &creds.pass) {
         return FetchResult::Error {
-            note: "EmuMovies sign-in was refused".into(),
+            note: format!("EmuMovies {e}"),
         };
     }
     let ext = ext_from(&remote, "mp4");
@@ -2536,9 +2649,11 @@ pub fn validate_source(base: &Path, kind: &str) -> ValidateResult {
                             ),
                         }
                     }
-                    Err(_) => ValidateResult {
+                    Err(note) => ValidateResult {
                         ok: false,
-                        message: "The EmuMovies file server refused that sign-in. If the password is right, this usually means a free account: free accounts download from the website only, and the file server is a paid-membership door. Trailers will come from ScreenScraper clips until then \u{2014} nothing else is affected.".into(),
+                        message: format!(
+                            "The EmuMovies file server refused that sign-in \u{2014} its own words: \u{201c}{note}\u{201d}. That is the server's answer about the file-server door, not proof the password is wrong: if the same name and password sign you in on emumovies.com, the account is real, and whether it also opens the file server is set by the membership on it (Fable cannot see your tier). Trailers will come from ScreenScraper clips until then \u{2014} nothing else is affected."
+                        ),
                     },
                 },
                 Err(note) => ValidateResult { ok: false, message: note },
@@ -2847,6 +2962,46 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0], ("NES Video Snaps".to_string(), true));
         assert_eq!(entries[1], ("Contra (USA).mp4".to_string(), false));
+    }
+
+    #[test]
+    fn ftp_listings_parse_dos_style() {
+        // The live file server (files.emumovies.com, IIS) answers
+        // LIST in MS-DOS format — without this dialect the walk saw
+        // an empty tree even with a working sign-in.
+        let text = "10-29-25  12:13PM       <DIR>          Official\r\n04-11-26  02:58AM       <DIR>          Video Snaps (HQ)\r\n01-22-26  09:41PM            3805457 Contra (USA).mp4\r\n";
+        let entries = parse_list(text);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0], ("Official".to_string(), true));
+        assert_eq!(entries[1], ("Video Snaps (HQ)".to_string(), true));
+        assert_eq!(entries[2], ("Contra (USA).mp4".to_string(), false));
+    }
+
+    #[test]
+    fn reply_tail_quotes_the_servers_last_word() {
+        assert_eq!(
+            reply_tail("530 Login authentication failed\r\n"),
+            "530 Login authentication failed"
+        );
+        assert_eq!(
+            reply_tail("221-Goodbye.\r\n221 Logout.\r\n"),
+            "221 Logout."
+        );
+        assert_eq!(reply_tail(""), "");
+    }
+
+    #[test]
+    fn walk_visits_content_before_containers() {
+        let nes: &[&str] = &["nes", "nintendo entertainment"];
+        assert!(dir_rank("Official", nes) < dir_rank("Video Snaps (HQ)", nes));
+        assert!(
+            dir_rank("Nintendo Entertainment System (Video Snaps)(HQ)", nes)
+                < dir_rank("Video Snaps (HQ)", nes)
+        );
+        assert!(
+            dir_rank("Nintendo Entertainment System (Video Snaps)(HQ)", nes)
+                < dir_rank("Artwork", nes)
+        );
     }
 
     #[test]

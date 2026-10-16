@@ -2155,6 +2155,41 @@ body[data-layout="tv"] .cell-icon {
 .prefs-toggle input[type="checkbox"] { width: 1.125rem; height: 1.125rem; accent-color: var(--ufm-accent); }
 .prefs-toggle-note { flex-basis: 100%; padding-left: 1.75rem; margin: 0; }
 .prefs-foot { display: flex; justify-content: space-between; gap: 0.75rem; margin-top: 1.25rem; }
+
+/* Preferences with the nav rail (2026-10-16 cleanup): the dialog
+ * stops being one long scroll — head and foot stay put, the rail
+ * names six calm pages, and only the page scrolls. */
+.prefs-dialog-nav { width: min(58rem, calc(100vw - 3rem)); display: flex; flex-direction: column; overflow: hidden; }
+.prefs-dialog-nav .prefs-head { flex: 0 0 auto; }
+.prefs-dialog-nav .prefs-foot { flex: 0 0 auto; }
+.prefs-layout { display: flex; gap: 1.5rem; flex: 1 1 auto; min-height: 0; margin-top: 0.25rem; }
+.prefs-nav { flex: 0 0 11rem; display: flex; flex-direction: column; gap: 0.125rem; }
+.prefs-nav-btn { appearance: none; border: 0; background: transparent; color: var(--ufm-text-muted); font: inherit; font-size: 0.875rem; font-weight: 600; text-align: left; padding: 0.5rem 0.75rem; border-radius: 10px; cursor: pointer; }
+.prefs-nav-btn:hover { background: color-mix(in srgb, var(--ufm-text) 6%, transparent); color: var(--ufm-text); }
+.prefs-nav-btn.active { background: color-mix(in srgb, var(--ufm-text) 9%, transparent); color: var(--ufm-text); box-shadow: inset 2px 0 0 var(--ufm-accent); }
+.prefs-pages { flex: 1 1 auto; min-width: 0; overflow-y: auto; padding-right: 0.25rem; }
+.prefs-page[hidden] { display: none; }
+.prefs-page > .prefs-section:first-child, .prefs-page > div > .prefs-section:first-child { margin-top: 0; }
+@media (max-width: 640px) {
+  .prefs-layout { flex-direction: column; gap: 0.75rem; }
+  .prefs-nav { flex: 0 0 auto; flex-direction: row; flex-wrap: wrap; }
+}
+
+/* Metadata Accounts summary strip: one honest row per provider. */
+.acct-strip { border: 1px solid var(--ufm-border); border-radius: 12px; padding: 0.375rem 0.875rem; margin: 0.5rem 0 1rem; }
+.acct-row { display: flex; align-items: center; gap: 0.625rem; padding: 0.4375rem 0; font-size: 0.875rem; flex-wrap: wrap; }
+.acct-row + .acct-row { border-top: 1px solid color-mix(in srgb, var(--ufm-border) 55%, transparent); }
+.acct-dot { flex: 0 0 auto; width: 0.625rem; height: 0.625rem; border-radius: 50%; background: transparent; box-shadow: inset 0 0 0 2px var(--ufm-text-muted); }
+.acct-dot[data-state="saved"] { background: var(--ufm-text-muted); box-shadow: none; }
+.acct-dot[data-state="connected"] { background: var(--ufm-accent); box-shadow: none; }
+.acct-dot[data-state="failed"] { background: var(--ufm-danger); box-shadow: none; }
+.acct-name { font-weight: 600; min-width: 8.5rem; }
+.acct-state { flex: 1 1 auto; color: var(--ufm-text-muted); font-size: 0.8125rem; }
+.acct-verdict { flex-basis: 100%; color: var(--ufm-text-muted); font-size: 0.8125rem; padding-left: 1.25rem; }
+
+/* Game Media "Where it comes from" summary lines. */
+.rm-source-line { display: flex; align-items: baseline; gap: 0.75rem; padding: 0.1875rem 0; font-size: 0.875rem; }
+.rm-source-line-name { font-weight: 600; min-width: 8.5rem; }
 .shortcuts-row { display: flex; align-items: baseline; gap: 0.875rem; padding: 0.25rem 0; font-size: 0.875rem; }
 .shortcuts-key { flex: 0 0 11rem; font-family: inherit; font-size: 0.8125rem; font-weight: 600; background: color-mix(in srgb, var(--ufm-text) 8%, transparent); border: 1px solid var(--ufm-border); border-radius: 6px; padding: 0.125rem 0.5rem; text-align: center; }
 

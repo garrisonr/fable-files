@@ -6730,14 +6730,59 @@ pub async fn move_path_to(src_path: String, dest_dir: String) -> Cmd<String> {
     .map_err(|e| CommandError::from(UfmError::Internal(e)))
 }
 
-/// Open one of the project's own web pages (bug reports, feature requests).
+/// Hosts the app's own UI is allowed to open in the system browser:
+/// the project pages plus every guide/account site the interface
+/// itself links to (provider sign-ups, key pages, the archive.org
+/// shelves). Kept as an explicit list so a stray URL from file
+/// metadata can never turn this command into a general opener.
+const OPEN_URL_HOSTS: &[&str] = &[
+    "alternativeto.net",
+    "archive.org",
+    "www.screenscraper.fr",
+    "screenscraper.fr",
+    "api.thegamesdb.net",
+    "www.thegamesdb.net",
+    "thegamesdb.net",
+    "www.steamgriddb.com",
+    "steamgriddb.com",
+    "emumovies.com",
+    "www.emumovies.com",
+    "www.themoviedb.org",
+    "themoviedb.org",
+    "www.opensubtitles.com",
+    "opensubtitles.com",
+    "musicbrainz.org",
+    "coverartarchive.org",
+    "lrclib.net",
+    "acoustid.org",
+    "www.acoustid.org",
+];
+
+/// Pure gate for `open_url` (unit-tested): https only; github.com is
+/// restricted to the project's own pages; every other destination
+/// must be a host the UI itself links to.
+fn open_url_allowed(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        return false;
+    }
+    if host == "github.com" {
+        return rest.starts_with("github.com/garrisonr/fable-files");
+    }
+    OPEN_URL_HOSTS.contains(&host)
+}
+
+/// Open one of the web pages the app itself links to (project pages,
+/// provider sign-ups and key pages, archive.org shelves) in the
+/// system browser.
 #[tauri::command]
 pub async fn open_url(url: String) -> Cmd<()> {
-    if !url.starts_with("https://github.com/garrisonr/fable-files")
-        && !url.starts_with("https://alternativeto.net/")
-    {
+    if !open_url_allowed(&url) {
         return Err(CommandError::from(UfmError::InvalidInput(
-            "only Fable Files project pages can be opened".into(),
+            "that page is not one Fable Files links to".into(),
         )));
     }
     open::that(&url).map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))
@@ -15711,6 +15756,41 @@ mod tests {
             .unwrap()
             .expect("row must not move for trash/delete/copy shapes");
         assert_eq!(still.id, c.id);
+    }
+
+    #[test]
+    fn open_url_gate_admits_the_apps_own_links() {
+        // Every destination the UI itself links to must open
+        // (2026-10-16: the gate once admitted only GitHub +
+        // AlternativeTo, silently killing every Preferences guide
+        // link — ScreenScraper, TMDB, OpenSubtitles, archive.org…).
+        for url in [
+            "https://github.com/garrisonr/fable-files/issues/new?title=x",
+            "https://alternativeto.net/browse/search/?q=vlc",
+            "https://www.screenscraper.fr/membreinscription.php",
+            "https://api.thegamesdb.net/key.php",
+            "https://www.steamgriddb.com",
+            "https://emumovies.com/subscriptions/",
+            "https://www.themoviedb.org/settings/api",
+            "https://www.opensubtitles.com/en/consumers",
+            "https://musicbrainz.org/",
+            "https://coverartarchive.org/",
+            "https://lrclib.net/",
+            "https://acoustid.org/",
+            "https://archive.org/details/softwarelibrary_nes",
+        ] {
+            assert!(open_url_allowed(url), "should open: {url}");
+        }
+        for url in [
+            "http://www.themoviedb.org/settings/api",
+            "https://github.com/someone-else/their-repo",
+            "https://example.com/phish",
+            "https://themoviedb.org.evil.example/",
+            "file:///etc/passwd",
+            "",
+        ] {
+            assert!(!open_url_allowed(url), "should refuse: {url}");
+        }
     }
 
     #[test]

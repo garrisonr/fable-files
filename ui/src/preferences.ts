@@ -1,14 +1,22 @@
 /**
- * PreferencesDialog — the app's settings surface (UI round item 1).
+ * PreferencesDialog — the app's settings surface.
  *
- * Hosts the settings that used to live only implicitly: the theme
- * (as a visual gallery — item 2), text size, grid icon size,
- * sidebar section state, and the ROM Collections switch. The dialog
- * owns no storage: every control writes through the shell's hooks
- * into the durable ui-prefs sidecar / the existing stores, so a
- * preference set here is the same preference the rest of the app
- * reads. Library Memory (Indexer v2) mounts its own section below
- * Game Media — remembered drives and how long they're kept.
+ * A left nav + one page at a time (cleanup, Dickles 2026-10-16:
+ * "these preferences are still way too busy… clean it up!"). The
+ * dialog owns no storage: every control writes through the shell's
+ * hooks into the durable ui-prefs sidecar / the existing stores,
+ * so a preference set here is the same preference the rest of the
+ * app reads.
+ *
+ * Pages: Appearance (theme gallery, text/icon size, sidebar state,
+ * ROM icon set) · Library & Indexing (Library Memory) · ROMs &
+ * Emulation (the ROM Collections switch, the EmuSection cards —
+ * fleet prep, updates, System files/BIOS, Reset ROM collection —
+ * and Game Media) · Metadata Accounts (every provider account in
+ * one place, with honest saved-vs-connected state) · Movies, TV &
+ * Music (Media Resolution, Media Completion, Music Completion —
+ * their accounts live under Metadata Accounts) · Advanced (Plugins,
+ * Folder Templates).
  */
 import type { ThemeInfo } from "./api";
 import { DISTRO_ENGINES } from "./themes";
@@ -21,6 +29,24 @@ import { MusicCompleteSection } from "./musiccomplete";
 import { LibraryMemorySection } from "./library";
 import { PluginsSection } from "./plugins";
 import { TemplatesSection } from "./templates";
+import { MetadataAccountsPage } from "./accounts";
+
+export type PrefsPage =
+  | "appearance"
+  | "library"
+  | "roms"
+  | "accounts"
+  | "media"
+  | "advanced";
+
+const PREFS_PAGES: Array<{ id: PrefsPage; label: string }> = [
+  { id: "appearance", label: "Appearance" },
+  { id: "library", label: "Library & Indexing" },
+  { id: "roms", label: "ROMs & Emulation" },
+  { id: "accounts", label: "Metadata Accounts" },
+  { id: "media", label: "Movies, TV & Music" },
+  { id: "advanced", label: "Advanced" },
+];
 
 export interface PreferencesHooks {
   /** Backend (built-in) themes from list_themes. */
@@ -54,8 +80,9 @@ export class PreferencesDialog {
   private el: HTMLElement | null = null;
   private hooks: PreferencesHooks | null = null;
   private galleryEl: HTMLElement | null = null;
+  private lastPage: PrefsPage = "appearance";
 
-  open(hooks: PreferencesHooks): void {
+  open(hooks: PreferencesHooks, page?: PrefsPage): void {
     this.close();
     this.hooks = hooks;
     const overlay = document.createElement("div");
@@ -64,7 +91,7 @@ export class PreferencesDialog {
       if (e.target === overlay) this.close();
     });
     const dialog = document.createElement("div");
-    dialog.className = "prefs-dialog";
+    dialog.className = "prefs-dialog prefs-dialog-nav";
     dialog.setAttribute("role", "dialog");
     dialog.setAttribute("aria-label", "Preferences");
 
@@ -81,18 +108,96 @@ export class PreferencesDialog {
     head.append(title, closeBtn);
     dialog.appendChild(head);
 
-    dialog.appendChild(this.section("Appearance"));
+    const layout = document.createElement("div");
+    layout.className = "prefs-layout";
+    const nav = document.createElement("nav");
+    nav.className = "prefs-nav";
+    nav.setAttribute("aria-label", "Preferences sections");
+    const pagesEl = document.createElement("div");
+    pagesEl.className = "prefs-pages";
+    layout.append(nav, pagesEl);
+    dialog.appendChild(layout);
+
+    const pageHosts = new Map<PrefsPage, HTMLElement>();
+    const navBtns = new Map<PrefsPage, HTMLButtonElement>();
+    const showPage = (id: PrefsPage): void => {
+      this.lastPage = id;
+      for (const [pid, host] of pageHosts) host.hidden = pid !== id;
+      for (const [pid, btn] of navBtns) {
+        btn.classList.toggle("active", pid === id);
+        btn.setAttribute("aria-selected", pid === id ? "true" : "false");
+      }
+      pagesEl.scrollTop = 0;
+    };
+    for (const p of PREFS_PAGES) {
+      const btn = document.createElement("button");
+      btn.className = "prefs-nav-btn";
+      btn.textContent = p.label;
+      btn.setAttribute("role", "tab");
+      btn.addEventListener("click", () => showPage(p.id));
+      nav.appendChild(btn);
+      navBtns.set(p.id, btn);
+      const host = document.createElement("div");
+      host.className = "prefs-page";
+      host.dataset.page = p.id;
+      pagesEl.appendChild(host);
+      pageHosts.set(p.id, host);
+    }
+
+    this.buildAppearance(pageHosts.get("appearance")!, hooks);
+    this.buildLibrary(pageHosts.get("library")!, hooks);
+    this.buildRoms(pageHosts.get("roms")!, hooks);
+    this.buildAccounts(pageHosts.get("accounts")!);
+    this.buildMedia(pageHosts.get("media")!);
+    this.buildAdvanced(pageHosts.get("advanced")!, hooks);
+
+    const foot = document.createElement("div");
+    foot.className = "prefs-foot";
+    const keys = document.createElement("button");
+    keys.className = "pill-btn";
+    keys.textContent = "Keyboard Shortcuts…";
+    keys.addEventListener("click", () => {
+      this.close();
+      hooks.showShortcuts();
+    });
+    const done = document.createElement("button");
+    done.className = "pill-btn primary";
+    done.textContent = "Done";
+    done.addEventListener("click", () => this.close());
+    foot.append(keys, done);
+    dialog.appendChild(foot);
+
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+    this.el = overlay;
+    showPage(page ?? this.lastPage);
+    closeBtn.focus();
+  }
+
+  close(): void {
+    if (this.el) {
+      this.el.remove();
+      this.el = null;
+    }
+    this.galleryEl = null;
+  }
+
+  // ---------------------------------------------------------------
+  // Appearance: themes, sizes, sidebar state, ROM icon set.
+  // ---------------------------------------------------------------
+  private buildAppearance(page: HTMLElement, hooks: PreferencesHooks): void {
+    page.appendChild(this.section("Theme"));
     const gallery = document.createElement("div");
     this.galleryEl = gallery;
-    dialog.appendChild(gallery);
+    page.appendChild(gallery);
     this.renderGallery();
     const galleryNote = document.createElement("p");
     galleryNote.className = "prefs-note";
     galleryNote.textContent =
       "Themes apply the moment you pick one — the whole app is the preview.";
-    dialog.appendChild(galleryNote);
+    page.appendChild(galleryNote);
 
-    dialog.appendChild(
+    page.appendChild(
       this.stepperRow(
         "Text size",
         () => `${Math.round(hooks.fontScale() * 100)}%`,
@@ -100,7 +205,7 @@ export class PreferencesDialog {
         () => hooks.setFontScale(hooks.fontScale() + 0.1),
       ),
     );
-    dialog.appendChild(
+    page.appendChild(
       this.stepperRow(
         "Icon size (grid view)",
         () => `${hooks.iconSize()} px`,
@@ -109,16 +214,8 @@ export class PreferencesDialog {
       ),
     );
 
-    dialog.appendChild(this.section("Sidebar"));
-    dialog.appendChild(
-      this.toggleRow(
-        "ROM Collections",
-        "Game systems in the sidebar, identified against the No-Intro / Redump / MAME lists.",
-        hooks.romsOn(),
-        (on) => hooks.setRomsOn(on),
-      ),
-    );
-    dialog.appendChild(
+    page.appendChild(this.section("Sidebar"));
+    page.appendChild(
       this.toggleRow(
         "Labels section expanded",
         null,
@@ -126,7 +223,7 @@ export class PreferencesDialog {
         (on) => hooks.setSectionCollapsed("ff-labels-collapsed", !on),
       ),
     );
-    dialog.appendChild(
+    page.appendChild(
       this.toggleRow(
         "ROMs section expanded",
         null,
@@ -134,20 +231,16 @@ export class PreferencesDialog {
         (on) => hooks.setSectionCollapsed("ff-roms-collapsed", !on),
       ),
     );
-    const scopeNote = document.createElement("p");
-    scopeNote.className = "prefs-note";
-    scopeNote.textContent =
-      "ROM collection scope — which drives a system draws from — is set per system in the Roms system editor (sidebar ▸ Roms).";
-    dialog.appendChild(scopeNote);
 
     // ROM icon set chooser (Dickles, 2026-10-15): three complete sets —
     // 3D art, photorealistic, flat outline. Applies to the sidebar the
     // moment it's picked; the choice persists across launches.
+    page.appendChild(this.section("ROM icons"));
     const iconSetNote = document.createElement("p");
     iconSetNote.className = "prefs-note";
     iconSetNote.textContent =
-      "Icon set \u2014 how each game system is pictured in the sidebar. Every system has its own icon in every set.";
-    dialog.appendChild(iconSetNote);
+      "Icon set — how each game system is pictured in the sidebar. Every system has its own icon in every set.";
+    page.appendChild(iconSetNote);
     const picker = document.createElement("div");
     picker.className = "icon-set-picker";
     const pickerBtns: HTMLButtonElement[] = [];
@@ -173,84 +266,88 @@ export class PreferencesDialog {
     for (const b of pickerBtns) {
       b.setAttribute("aria-pressed", b.dataset.set === hooks.romIconSet() ? "true" : "false");
     }
-    dialog.appendChild(picker);
-
-    // Game Media (ROM media enrichment): its own section, mounted
-    // async — it reads its settings + keyring state from the backend.
-    const mediaHost = document.createElement("div");
-    dialog.appendChild(mediaHost);
-    void new RomMediaSection().mount(mediaHost, hooks);
-
-    // Emulation (Preferences → ROMs): the Emulators + Unified view
-    // cards, right under Game Media — mounted async like its kin.
-    const emuHost = document.createElement("div");
-    dialog.appendChild(emuHost);
-    void new EmuSection().mount(emuHost, hooks);
-
-    // Media Resolution (film/TV → media servers): the TMDB key
-    // block, taught properly per the guidance law.
-    const mresHost = document.createElement("div");
-    dialog.appendChild(mresHost);
-    void new MediaResSection().mount(mresHost);
-
-    // Media Completion (posters + subtitles + overnight scheduler):
-    // mounted right under Media Resolution — the trio reads as one.
-    const mcHost = document.createElement("div");
-    dialog.appendChild(mcHost);
-    void new MediaCompleteSection().mount(mcHost);
-
-    // Music Completion (tags + cover art + lyrics + its own
-    // schedules on the shared agent): the music sibling, mounted
-    // right under Media Completion.
-    const muHost = document.createElement("div");
-    dialog.appendChild(muHost);
-    void new MusicCompleteSection().mount(muHost);
-
-    // Library Memory (Indexer v2): remembered drives + retention,
-    // same pattern — backend-owned state, mounted async.
-    const libHost = document.createElement("div");
-    dialog.appendChild(libHost);
-    void new LibraryMemorySection().mount(libHost, hooks);
-
-    // Plugins (Phase 6): sandboxed WASM extensions — what's
-    // installed, what each declares, enabled or not.
-    const pluginsHost = document.createElement("div");
-    dialog.appendChild(pluginsHost);
-    void new PluginsSection().mount(pluginsHost);
-
-    // Folder Templates (Phase 6): the New Folder template set.
-    const templatesHost = document.createElement("div");
-    dialog.appendChild(templatesHost);
-    void new TemplatesSection().mount(templatesHost, hooks);
-
-    const foot = document.createElement("div");
-    foot.className = "prefs-foot";
-    const keys = document.createElement("button");
-    keys.className = "pill-btn";
-    keys.textContent = "Keyboard Shortcuts…";
-    keys.addEventListener("click", () => {
-      this.close();
-      hooks.showShortcuts();
-    });
-    const done = document.createElement("button");
-    done.className = "pill-btn primary";
-    done.textContent = "Done";
-    done.addEventListener("click", () => this.close());
-    foot.append(keys, done);
-    dialog.appendChild(foot);
-
-    overlay.appendChild(dialog);
-    document.body.appendChild(overlay);
-    this.el = overlay;
-    closeBtn.focus();
+    page.appendChild(picker);
   }
 
-  close(): void {
-    if (this.el) {
-      this.el.remove();
-      this.el = null;
-    }
-    this.galleryEl = null;
+  // ---------------------------------------------------------------
+  // Library & Indexing: Library Memory (remembered drives).
+  // ---------------------------------------------------------------
+  private buildLibrary(page: HTMLElement, hooks: PreferencesHooks): void {
+    const libHost = document.createElement("div");
+    page.appendChild(libHost);
+    void new LibraryMemorySection().mount(libHost, hooks);
+  }
+
+  // ---------------------------------------------------------------
+  // ROMs & Emulation: the Collections switch, Game Media, and the
+  // EmuSection cards (Emulators, System files, Unified view,
+  // Emulator updates, ES-DE, Drive access, ROM collection incl.
+  // the Reset card).
+  // ---------------------------------------------------------------
+  private buildRoms(page: HTMLElement, hooks: PreferencesHooks): void {
+    page.appendChild(
+      this.toggleRow(
+        "ROM Collections",
+        "Game systems in the sidebar, identified against the No-Intro / Redump / MAME lists.",
+        hooks.romsOn(),
+        (on) => hooks.setRomsOn(on),
+      ),
+    );
+    const scopeNote = document.createElement("p");
+    scopeNote.className = "prefs-note";
+    scopeNote.textContent =
+      "ROM collection scope — which drives a system draws from — is set per system in the Roms system editor (sidebar ▸ Roms).";
+    page.appendChild(scopeNote);
+
+    // Game Media (ROM media enrichment): mounted from its own
+    // backend state; its provider accounts live under Metadata
+    // Accounts.
+    const mediaHost = document.createElement("div");
+    page.appendChild(mediaHost);
+    void new RomMediaSection().mount(mediaHost, hooks);
+
+    // Emulation: the Emulators + System files + updates cards.
+    const emuHost = document.createElement("div");
+    page.appendChild(emuHost);
+    void new EmuSection().mount(emuHost, hooks);
+  }
+
+  // ---------------------------------------------------------------
+  // Metadata Accounts: every provider account in one place.
+  // ---------------------------------------------------------------
+  private buildAccounts(page: HTMLElement): void {
+    void new MetadataAccountsPage().mount(page);
+  }
+
+  // ---------------------------------------------------------------
+  // Movies, TV & Music: Media Resolution, Media Completion,
+  // Music Completion (their accounts live under Metadata Accounts).
+  // ---------------------------------------------------------------
+  private buildMedia(page: HTMLElement): void {
+    const mresHost = document.createElement("div");
+    page.appendChild(mresHost);
+    void new MediaResSection().mount(mresHost);
+
+    const mcHost = document.createElement("div");
+    page.appendChild(mcHost);
+    void new MediaCompleteSection().mount(mcHost);
+
+    const muHost = document.createElement("div");
+    page.appendChild(muHost);
+    void new MusicCompleteSection().mount(muHost);
+  }
+
+  // ---------------------------------------------------------------
+  // Advanced: Plugins + Folder Templates.
+  // ---------------------------------------------------------------
+  private buildAdvanced(page: HTMLElement, hooks: PreferencesHooks): void {
+    const pluginsHost = document.createElement("div");
+    page.appendChild(pluginsHost);
+    void new PluginsSection().mount(pluginsHost);
+
+    const templatesHost = document.createElement("div");
+    page.appendChild(templatesHost);
+    void new TemplatesSection().mount(templatesHost, hooks);
   }
 
   private section(title: string): HTMLElement {

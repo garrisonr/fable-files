@@ -77,7 +77,7 @@ import {
   type ViewMode,
 } from "./tabs";
 import { DEFAULT_THEME, DISTRO_ENGINES, ThemeManager, type MenuThemeItem } from "./themes";
-import { PreferencesDialog } from "./preferences";
+import { PreferencesDialog, type PrefsPage } from "./preferences";
 
 /** Parent directory of an absolute path: dirname("/a/b") === "/a",
  * dirname("/foo.mp3") === "/", dirname("/") === "/". Never returns ""
@@ -4414,7 +4414,7 @@ export class Shell {
    * control writes through to the stores the rest of the app
    * already reads — the ui-prefs sidecar, the theme manager, the
    * ROM store — so there is one source of truth per setting. */
-  private openPreferences(): void {
+  private openPreferences(page?: PrefsPage): void {
     this.preferencesDialog.open({
       pickFolder: async (_initial: string | null) =>
         this.picker.pick("Choose a folder", [], null),
@@ -4458,7 +4458,7 @@ export class Shell {
         this.applyCollapsePrefs();
       },
       showShortcuts: () => this.showShortcuts(),
-    });
+    }, page);
   }
 
   /** Keyboard shortcuts overlay (UI round item 3b, Ctrl+?): the
