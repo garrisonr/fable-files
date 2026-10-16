@@ -621,6 +621,8 @@ pub fn run() {
             emu::emu_sheet,
             emu::emu_install_and_play,
             emu::emu_open_emulator,
+            emu::emu_bios_state,
+            emu::emu_bios_add,
             emu_farm::emu_prefs,
             emu_farm::emu_set_choice,
             emu_farm::emu_set_view,

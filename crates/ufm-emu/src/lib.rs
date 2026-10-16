@@ -24,11 +24,17 @@
 //!   paths — for RetroArch, the playlist IS the unified view).
 //! - [`zipx`] extracts one entry from a zip in memory (libretro
 //!   buildbot cores ship as single-file zips).
+//! - [`bios`] carries the system-file requirements (§3's BIOS
+//!   column, §6's System-files card): which systems need which
+//!   console-dumped files, whether a set is satisfied, and the
+//!   names the Add flow files under. The files themselves are the
+//!   user's own — never fetched, never bundled.
 //!
 //! Anything that touches the machine (probing installs, downloading,
 //! spawning, writing links) lives in the app crate's `emu` module and
 //! feeds this crate plain data.
 
+pub mod bios;
 pub mod es;
 pub mod expand;
 pub mod farm;
@@ -37,8 +43,12 @@ pub mod resolve;
 pub mod table;
 pub mod zipx;
 
+pub use bios::{requirement_for, BiosNeed, BiosRequirement, BiosSet, BIOS_REQUIREMENTS};
 pub use expand::{expand_template, Expanded};
-pub use farm::{desired_links, farm_delta, DesiredLink, FarmCopy, FarmGame, FarmOp};
+pub use farm::{
+    desired_links, desired_m3us, disc_base_title, farm_delta, m3u_delta, DesiredLink, DesiredM3u,
+    FarmCopy, FarmGame, FarmOp, M3uOp,
+};
 pub use playlist::{playlist_json, PlaylistEntry};
 pub use resolve::{decide, option_state, Decision, EnvProbe, OptState, RaFlavor};
 pub use table::{systems_table, EmuOption, InstallSpec, OptClass, OptionKind, SystemEntry};

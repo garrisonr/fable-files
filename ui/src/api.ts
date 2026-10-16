@@ -778,6 +778,9 @@ export const api = {
     }),
   emuOpenEmulator: (platform: string) =>
     invoke<void>("emu_open_emulator", { platform }),
+  emuBiosState: () => invoke<EmuBiosSystem[]>("emu_bios_state"),
+  emuBiosAdd: (systemId: string) =>
+    invoke<EmuBiosAddResult>("emu_bios_add", { systemId }),
   emuPrefs: () => invoke<EmuPrefs>("emu_prefs"),
   emuSetChoice: (platform: string, optionId: string) =>
     invoke<void>("emu_set_choice", { platform, optionId }),
@@ -1827,6 +1830,16 @@ export type EmuOptState =
  * specialist, in the amendment's vocabulary). */
 export type EmuOptClass = "default-able" | "best-effort" | "manual-only";
 
+/** Emulation: the sheet's BIOS row — a system file this option
+ * needs that isn't there yet (shown before any launch, §6). */
+export interface EmuBiosGate {
+  /** Display names of the missing files. */
+  files: string[];
+  note: string;
+  /** True when the missing files block this launch. */
+  blocking: boolean;
+}
+
 /** Emulation: one row of the ask-once sheet / Play with… picker. */
 export interface EmuSheetOption {
   id: string;
@@ -1837,6 +1850,7 @@ export interface EmuSheetOption {
   needsInstall: boolean;
   class: EmuOptClass;
   installNote: string | null;
+  bios: EmuBiosGate | null;
 }
 
 /** Emulation: the sheet's full payload, rendered verbatim. */
@@ -1893,8 +1907,42 @@ export interface EmuKeeperReport {
   removed: number;
   blocked: string[];
   playlists: string[];
+  sets: number;
+  m3usWritten: number;
+  m3usRemoved: number;
   drives: number;
   error: string | null;
+}
+
+/** Emulation: one set of system files on the BIOS card. */
+export interface EmuBiosSet {
+  what: string;
+  names: string[];
+  /** True when every name is needed (vs any one of them). */
+  all: boolean;
+  present: boolean;
+  missing: string[];
+}
+
+/** Emulation: one system's row on Preferences → ROMs → System files. */
+export interface EmuBiosSystem {
+  systemId: string;
+  title: string;
+  need: "required" | "recommended" | "optional";
+  satisfied: boolean;
+  gatePlay: boolean;
+  /** Where the files live, home-relative. */
+  home: string;
+  sets: EmuBiosSet[];
+  note: string;
+}
+
+/** Emulation: the Add flow's result (picker → filed copies). */
+export interface EmuBiosAddResult {
+  cancelled: boolean;
+  system: EmuBiosSystem;
+  filed: { picked: string; filedAs: string }[];
+  rejected: { picked: string; reason: string }[];
 }
 
 /** Emulation: the Unified view card's state. */
@@ -1911,6 +1959,7 @@ export interface EmuViewState {
 export interface EmuPrefs {
   systems: EmuPrefsSystem[];
   view: EmuViewState;
+  bios: EmuBiosSystem[];
 }
 
 /** Emulation: install progress event payload. */

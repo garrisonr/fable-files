@@ -4365,3 +4365,37 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
   gap: 0.5rem;
   margin-top: 0.6rem;
 }
+
+/* The sheet's BIOS row + the System files card's actions */
+.emu-bios-row {
+  margin-top: 0.8rem;
+  border: 1px solid var(--ufm-border);
+  border-radius: var(--ufm-radius-md);
+  background: var(--ufm-surface);
+  padding: 0.7rem 0.85rem;
+}
+.emu-bios-row.is-blocking {
+  border-color: color-mix(in srgb, var(--ufm-accent) 55%, var(--ufm-border));
+  background: color-mix(in srgb, var(--ufm-surface) 88%, var(--ufm-accent) 7%);
+}
+.emu-bios-text {
+  margin: 0 0 0.55rem;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  color: var(--ufm-text);
+}
+.emu-bios-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  margin-top: 0.55rem;
+}
+.emu-bios-home {
+  font-size: 0.75rem;
+  color: var(--ufm-text-muted);
+  font-family: var(--ufm-font-mono);
+}
+.emu-sys-count.is-ready {
+  color: var(--ufm-accent-text);
+  font-weight: 600;
+}

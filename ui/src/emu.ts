@@ -103,43 +103,130 @@ export function showEmuSheet(
       ),
     );
 
-    // ---- the options
+    // ---- the options (re-renderable: the BIOS Add flow and the
+    // post-install gate swap in fresh sheet data in place)
+    let activeSheet = sheet;
     const list = el("div", "emu-opt-list");
     const radios: HTMLInputElement[] = [];
     const noteByOption = new Map<string, HTMLElement>();
     let selected = sheet.preselect;
-    for (const opt of sheet.options) {
-      const row = el("label", "emu-opt");
-      const radio = document.createElement("input");
-      radio.type = "radio";
-      radio.name = "emu-opt";
-      radio.value = opt.id;
-      radio.checked = opt.id === sheet.preselect;
-      radios.push(radio);
-      const main = el("div", "emu-opt-main");
-      main.appendChild(el("strong", "emu-opt-label", opt.label));
-      main.appendChild(el("span", "emu-opt-verdict", opt.verdict));
-      if (opt.installNote) {
-        const note = el("span", "emu-opt-note", opt.installNote);
-        note.hidden = opt.id !== sheet.preselect;
-        noteByOption.set(opt.id, note);
-        main.appendChild(note);
+    function renderOptions(): void {
+      list.innerHTML = "";
+      radios.length = 0;
+      noteByOption.clear();
+      for (const opt of activeSheet.options) {
+        const row = el("label", "emu-opt");
+        const radio = document.createElement("input");
+        radio.type = "radio";
+        radio.name = "emu-opt";
+        radio.value = opt.id;
+        radio.checked = opt.id === selected;
+        radios.push(radio);
+        const main = el("div", "emu-opt-main");
+        main.appendChild(el("strong", "emu-opt-label", opt.label));
+        main.appendChild(el("span", "emu-opt-verdict", opt.verdict));
+        if (opt.installNote) {
+          const note = el("span", "emu-opt-note", opt.installNote);
+          note.hidden = opt.id !== selected;
+          noteByOption.set(opt.id, note);
+          main.appendChild(note);
+        }
+        const state = el(
+          "span",
+          `emu-opt-state${opt.state === "ready" ? " is-ready" : ""}`,
+          opt.stateWord,
+        );
+        row.append(radio, main, state);
+        radio.addEventListener("change", () => {
+          if (radio.checked) {
+            selected = opt.id;
+            refresh();
+          }
+        });
+        list.appendChild(row);
       }
-      const state = el(
-        "span",
-        `emu-opt-state${opt.state === "ready" ? " is-ready" : ""}`,
-        opt.stateWord,
-      );
-      row.append(radio, main, state);
-      radio.addEventListener("change", () => {
-        if (radio.checked) {
-          selected = opt.id;
+    }
+    renderOptions();
+    dialog.appendChild(list);
+
+    // ---- the BIOS row (§6): when the selected option's system
+    // needs a system file that isn't there, the sheet says so
+    // BEFORE any launch — with the Add flow right here.
+    const biosRow = el("div", "emu-bios-row");
+    biosRow.hidden = true;
+    const biosText = el("p", "emu-bios-text", "");
+    const biosAdd = el(
+      "button",
+      "emu-btn emu-bios-add",
+      "Add the file…",
+    ) as HTMLButtonElement;
+    biosRow.append(biosText, biosAdd);
+    dialog.appendChild(biosRow);
+    function renderBiosRow(): void {
+      const bios = selectedOpt()?.bios ?? null;
+      if (!bios) {
+        biosRow.hidden = true;
+        return;
+      }
+      biosRow.hidden = false;
+      biosRow.classList.toggle("is-blocking", bios.blocking);
+      biosText.textContent = bios.blocking
+        ? `Before ${activeSheet.systemName} games can play, Fable needs ${bios.files.join(", ")}. ${bios.note} Fable can't download these — they come from a console you own.`
+        : `Nice to have: ${bios.files.join(", ")}. ${bios.note}`;
+      biosAdd.textContent =
+        bios.files.length > 1 ? "Add the files…" : "Add the file…";
+    }
+    biosAdd.addEventListener("click", () => {
+      if (busy) return;
+      busy = true;
+      biosAdd.disabled = true;
+      biosAdd.textContent = "Choose the file…";
+      void (async () => {
+        try {
+          const result = await api.emuBiosAdd(activeSheet.systemId);
+          if (!result.cancelled) {
+            receipt.hidden = false;
+            if (result.filed.length > 0) {
+              const filedNames = result.filed
+                .map((f) => f.filedAs)
+                .join(", ");
+              receipt.textContent = result.system.satisfied
+                ? `Filed ${filedNames} — all set.`
+                : `Filed ${filedNames}. Still missing: ${result.system.sets
+                    .flatMap((s) => s.missing)
+                    .join(", ")}.`;
+            } else if (result.rejected.length > 0) {
+              receipt.textContent = result.rejected[0].reason;
+            }
+            await reloadSheet();
+          }
+        } catch (err) {
+          Toast.error(`That didn't work: ${errText(err)}`);
+        } finally {
+          busy = false;
+          biosAdd.disabled = false;
           refresh();
         }
-      });
-      list.appendChild(row);
+      })();
+    });
+
+    /** Re-read the sheet from the backend (states changed under
+     * us — a file was filed, a core landed), keeping the man's
+     * selection and the sheet's mode. */
+    async function reloadSheet(): Promise<void> {
+      try {
+        const fresh = await api.emuSheet(sheet.providerKey, sheet.platform);
+        fresh.mode = activeSheet.mode;
+        activeSheet = fresh;
+        if (!activeSheet.options.some((o) => o.id === selected)) {
+          selected = activeSheet.preselect;
+        }
+        renderOptions();
+      } catch {
+        // Keep the current sheet; its states may lag one beat.
+      }
+      refresh();
     }
-    dialog.appendChild(list);
 
     // ---- picker-only doors: the OS escape + the remember choice
     let rememberBox: HTMLInputElement | null = null;
@@ -204,13 +291,15 @@ export function showEmuSheet(
     dialog.appendChild(actions);
 
     const selectedOpt = (): EmuSheetOption =>
-      sheet.options.find((o) => o.id === selected) ?? sheet.options[0];
+      activeSheet.options.find((o) => o.id === selected) ??
+      activeSheet.options[0];
 
     function refresh(): void {
       const opt = selectedOpt();
       primary.textContent = primaryLabel(opt);
       primary.disabled = !primaryEnabled(opt);
       for (const [id, note] of noteByOption) note.hidden = id !== selected;
+      renderBiosRow();
     }
 
     let busy = false;
@@ -249,16 +338,32 @@ export function showEmuSheet(
           );
           if (outcome.kind === "launched") {
             finish({ action: "launched", outcome });
+          } else if (outcome.kind === "sheet") {
+            // Installed fine — but a system file is still missing.
+            // The backend handed back a fresh sheet whose BIOS row
+            // carries the Add flow; swap it in and say so plainly.
+            busy = false;
+            progress.hidden = true;
+            activeSheet = outcome.sheet;
+            if (activeSheet.options.some((o) => o.id === outcome.sheet.preselect)) {
+              selected = outcome.sheet.preselect;
+            }
+            renderOptions();
+            for (const r of radios) r.disabled = false;
+            receipt.hidden = false;
+            receipt.textContent =
+              "Almost there — this system needs one of its own files first. It's listed above, and you can add it right here.";
+            refresh();
+            notNow.disabled = false;
+            notNow.textContent = picker ? "Cancel" : "Not now";
+            biosRow.scrollIntoView({ block: "nearest" });
           } else {
             // Calm receipt: what happened, nothing is broken, and
             // the doors stay open (retry, or the OS default).
             busy = false;
             progress.hidden = true;
             receipt.hidden = false;
-            receipt.textContent =
-              outcome.kind === "unavailable"
-                ? outcome.message
-                : "That still needs setup before it can play.";
+            receipt.textContent = outcome.message;
             for (const r of radios) r.disabled = false;
             primary.disabled = !primaryEnabled(selectedOpt());
             notNow.disabled = false;
@@ -353,6 +458,20 @@ export class EmuSection {
     for (const sys of this.prefs.systems) {
       this.body.appendChild(this.systemRow(sys));
     }
+    // ---- System files (BIOS) card (§6)
+    const bh = el("h3", "prefs-section", "System files");
+    bh.style.marginTop = "1.4rem";
+    this.body.appendChild(bh);
+    this.body.appendChild(
+      el(
+        "p",
+        "prefs-note",
+        "Some systems need a small file from the console itself before their games can play. These files come from consoles you own — Fable never downloads them. If you have one, add it here and Fable files it where the emulator looks.",
+      ),
+    );
+    for (const bios of this.prefs.bios) {
+      this.body.appendChild(this.biosRow(bios));
+    }
     // ---- Unified view card
     const h = el("h3", "prefs-section", "Unified view");
     h.style.marginTop = "1.4rem";
@@ -408,6 +527,81 @@ export class EmuSection {
         );
       }
     });
+    return row;
+  }
+
+  private biosRow(bios: EmuPrefs["bios"][number]): HTMLElement {
+    const row = el("div", "emu-sys-row");
+    const head = el("div", "emu-sys-head");
+    head.appendChild(el("strong", "", bios.title));
+    const stateWord = bios.satisfied
+      ? "Ready"
+      : bios.need === "required"
+        ? "Missing"
+        : "Not added";
+    head.appendChild(
+      el(
+        "span",
+        `emu-sys-count${bios.satisfied ? " is-ready" : ""}`,
+        stateWord,
+      ),
+    );
+    row.appendChild(head);
+    for (const set of bios.sets) {
+      const names = set.names.join(set.all ? ", " : " or ");
+      const line = set.present
+        ? `${set.what}: ${names} ✓`
+        : `${set.what}: ${names}`;
+      row.appendChild(el("p", "emu-sys-verdict", line));
+    }
+    row.appendChild(el("p", "emu-sys-verdict", bios.note));
+    const actions = el("div", "emu-bios-actions");
+    const add = el(
+      "button",
+      "emu-btn",
+      bios.satisfied ? "Add files…" : "Add the file…",
+    ) as HTMLButtonElement;
+    add.addEventListener("click", () => {
+      add.disabled = true;
+      add.textContent = "Choose the file…";
+      void (async () => {
+        try {
+          const result = await api.emuBiosAdd(bios.systemId);
+          if (!result.cancelled && this.prefs) {
+            const idx = this.prefs.bios.findIndex(
+              (b) => b.systemId === bios.systemId,
+            );
+            if (idx >= 0) this.prefs.bios[idx] = result.system;
+            if (result.filed.length > 0) {
+              Toast.success(
+                result.system.satisfied
+                  ? `${bios.title}: filed ${result.filed
+                      .map((f) => f.filedAs)
+                      .join(", ")} — all set.`
+                  : `${bios.title}: filed ${result.filed
+                      .map((f) => f.filedAs)
+                      .join(", ")}. Still missing: ${result.system.sets
+                      .flatMap((s) => s.missing)
+                      .join(", ")}.`,
+              );
+            } else if (result.rejected.length > 0) {
+              Toast.error(result.rejected[0].reason);
+            }
+            this.render();
+          }
+        } catch (err) {
+          Toast.error(`That didn't work: ${errText(err)}`);
+        } finally {
+          add.disabled = false;
+          add.textContent = bios.satisfied ? "Add files…" : "Add the file…";
+        }
+      })();
+    });
+    actions.appendChild(add);
+    actions.appendChild(
+      el("span", "emu-bios-home", `Lives in ${homeShort(bios.home)}`),
+    );
+    row.appendChild(actions);
     return row;
   }
 

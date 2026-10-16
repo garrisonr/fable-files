@@ -1,0 +1,46 @@
+Emulation v1.1: core families, BIOS/System-files card, farm sets, badge fix
+
+Per SPEC-AMENDMENT §7 (staging) — the §3 table beyond NES/SNES:
+
+- Core families: curated override rows for 39 systems (GB/GBC/GBA,
+  N64, DS, the Sega line incl. Sega CD/32X, TurboGrafx + CD, Saturn,
+  Dreamcast, FBNeo arcade + Neo Geo, the Beetle family, Atari
+  2600/7800/5200/Lynx, ColecoVision, Intellivision, Odyssey2,
+  Vectrex, Virtual Boy, WonderSwan pair, 3DO, PC-FX, Neo Geo CD,
+  MSX, C64, Amiga CD32, Channel F, Jaguar (best-effort), PSX
+  (Beetle PSX HW; DuckStation rides manual-only until the v2
+  standalone wave). Defaults are the amendment's picks; every core
+  installs through the v1 buildbot machinery; tg16 gets the
+  pcengine curation. PS4/Vita/360/Game.com/A'Can marked NotYet.
+- BIOS: new ufm-emu::bios requirement table (any-of region sets,
+  all-of trios, dc/ subdir, Kickstart glob; Required/Recommended/
+  Optional; gate_play). state_of layers the gate under install
+  needs; Play and Install&Play re-check it and hand back the sheet
+  instead of launching (never a black screen). Preferences -> ROMs
+  gains the System files card (all requirement systems, games or
+  not); the Add flow files the user's own console dumps by
+  canonical name through a Rust-side dialog command (the app
+  defines no capability ACL) and verifies by size. Fable never
+  downloads or bundles BIOS files.
+- Farm completion (§5.3): multi-file sets are detected from the
+  launch file (cue FILE lines, gdi tracks, ccd sibling sweep, m3u
+  lists) and represented as a folder of member links named by the
+  real files; multi-disc groups get one Fable-marked .m3u beside
+  them and one RetroArch playlist entry pointing at it; foreign
+  files are never overwritten; unplug/repoint semantics hold for
+  sets exactly as for single files.
+- volume_badge_for_path: one claim contest across live mounts and
+  mount history (longest wins, live wins ties) — the two-stage
+  version badged unplugged-drive items ONLINE via the "/" live
+  catch-all (v1.1 probe verdict: bug was real; regression tests
+  pin the unplugged case).
+
+Gates: workspace 307 passed / 0 failed (lib 120+12i, ufm-emu 33,
+catalog 44, media 36, jobs 11, mcp 6, plugins 9, preview 20+2i,
+search 15, themes 5, torrent 2, vfs 3, hygiene 1) — baseline 284,
++23 new tests; tsc + vite clean. Acceptance: all 38 pipeline
+families resolve to the curated default; 26 read Ready with real
+buildbot core fetches, 12 gate on their missing BIOS by design;
+spawn-alive proofs for Neo Geo CD (his real 3 Count Bout set,
+extracted for the occasion and cleaned up) and Jaguar; BIOS Add
+harness green; keeper regression 1,342/1,342 links, zero churn.

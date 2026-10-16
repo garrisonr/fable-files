@@ -280,9 +280,10 @@ pub fn probe_env() -> (EnvProbe, Option<RaLayout>) {
     )
 }
 
-/// BIOS presence for an option: every required file exists in the
-/// RetroArch system directory (v1 systems need none; the check is
-/// wired so v1.1's BIOS systems inherit it).
+/// Legacy BIOS presence for an option (mined systems only): every
+/// file on the option's own list exists in the RetroArch system
+/// directory. Curated systems go through the requirement table —
+/// see `state_of`.
 pub fn bios_present(opt: &EmuOption, layout: Option<&RaLayout>) -> bool {
     if opt.bios.is_empty() {
         return true;
@@ -294,9 +295,306 @@ pub fn bios_present(opt: &EmuOption, layout: Option<&RaLayout>) -> bool {
     opt.bios.iter().all(|f| system_dir.join(f).is_file())
 }
 
+// ---------------------------------------------------------------------------
+// BIOS / system files (amendment §6): presence, the card's data,
+// and the Add flow. The requirement table lives in ufm_emu::bios;
+// the files themselves are the man's own console dumps — Fable
+// never downloads and never bundles them (the law).
+// ---------------------------------------------------------------------------
+
+/// Where system files live and where the Add flow files them: the
+/// ACTIVE RetroArch flavor's system directory. When RetroArch
+/// isn't installed yet, the Flatpak flavor's — that's the channel
+/// Fable installs, so files filed now are exactly where the first
+/// launch will look.
+pub fn bios_system_root(layout: Option<&RaLayout>) -> PathBuf {
+    match layout {
+        Some(l) => l.config_dir.join("system"),
+        None => ra_layout(RaFlavor::Flatpak).config_dir.join("system"),
+    }
+}
+
+fn dir_listing(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The requirement's unsatisfied sets against a system root.
+pub fn bios_missing_sets<'a>(
+    req: &'a ufm_emu::BiosRequirement,
+    system_root: &Path,
+) -> Vec<&'a ufm_emu::BiosSet> {
+    req.missing_sets(|set| dir_listing(&system_root.join(set.subdir)))
+}
+
+pub fn bios_satisfied(req: &ufm_emu::BiosRequirement, system_root: &Path) -> bool {
+    bios_missing_sets(req, system_root).is_empty()
+}
+
 /// One option's state here, BIOS included.
-pub fn state_of(opt: &EmuOption, env: &EnvProbe, layout: Option<&RaLayout>) -> OptState {
-    with_bios(option_state(opt, env), opt, bios_present(opt, layout))
+///
+/// Layering rules (v1.1): the requirement table decides gating —
+/// a gating requirement unsatisfied in the system dir makes a
+/// libretro-core option `NeedsBios`, layered UNDER any install
+/// need (install first, then the sheet explains the file — never
+/// a launch into a black screen). Non-gating requirements
+/// (optional / recommended / only-some-games) inform through the
+/// card and the sheet but never change the state. Standalones
+/// keep their own homes and are never gated by the RetroArch
+/// system dir. Mined systems without a requirement keep the
+/// legacy per-option list check.
+pub fn state_of(
+    sys: &SystemEntry,
+    opt: &EmuOption,
+    env: &EnvProbe,
+    layout: Option<&RaLayout>,
+) -> OptState {
+    let base = option_state(opt, env);
+    if opt.kind != OptionKind::LibretroCore {
+        return base;
+    }
+    match ufm_emu::requirement_for(&sys.id) {
+        Some(req) if req.gate_play => {
+            if base.needs_install() {
+                return base;
+            }
+            if bios_satisfied(req, &bios_system_root(layout)) {
+                base
+            } else {
+                OptState::NeedsBios
+            }
+        }
+        Some(_) => base,
+        None => with_bios(base, opt, bios_present(opt, layout)),
+    }
+}
+
+/// The sheet's BIOS row data for one option, when its system's
+/// requirement has anything unsatisfied worth saying: gating
+/// requirements always; recommended ones quietly; optional ones
+/// never (the card carries those).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BiosGateWire {
+    /// Display names of the missing files.
+    pub files: Vec<String>,
+    /// The requirement's plain note.
+    pub note: String,
+    /// True when the missing files block this launch.
+    pub blocking: bool,
+}
+
+fn bios_gate_wire(
+    sys: &SystemEntry,
+    opt: &EmuOption,
+    layout: Option<&RaLayout>,
+    state: OptState,
+) -> Option<BiosGateWire> {
+    if opt.kind != OptionKind::LibretroCore {
+        return None;
+    }
+    let req = ufm_emu::requirement_for(&sys.id)?;
+    if !req.gate_play && req.need != ufm_emu::BiosNeed::Recommended {
+        return None;
+    }
+    let root = bios_system_root(layout);
+    let missing = bios_missing_sets(req, &root);
+    if missing.is_empty() {
+        return None;
+    }
+    let mut files: Vec<String> = Vec::new();
+    for set in missing {
+        if set.all {
+            // Every missing name is needed (Channel F's trio).
+            files.extend(set.missing_names(&dir_listing(&root.join(set.subdir))));
+        } else {
+            // Any ONE of the names does (region variants) — say so
+            // as one alternative list, not a shopping list.
+            files.push(set.display_names().join(" or "));
+        }
+    }
+    Some(BiosGateWire {
+        files,
+        note: req.note.to_string(),
+        blocking: state == OptState::NeedsBios,
+    })
+}
+
+/// One set's row on the System-files card.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BiosSetWire {
+    pub what: String,
+    pub names: Vec<String>,
+    /// True when every name is needed (vs any one of them).
+    pub all: bool,
+    pub present: bool,
+    pub missing: Vec<String>,
+}
+
+/// One system's row on the System-files card (Preferences → ROMs).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BiosSystemWire {
+    pub system_id: String,
+    pub title: String,
+    pub need: ufm_emu::BiosNeed,
+    pub satisfied: bool,
+    pub gate_play: bool,
+    /// Where these files live, home-relative ("~/.var/app/…").
+    pub home: String,
+    pub sets: Vec<BiosSetWire>,
+    pub note: String,
+}
+
+fn home_relative(path: &Path) -> String {
+    let home = home_dir();
+    match path.strip_prefix(&home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
+pub fn bios_system_wire(req: &ufm_emu::BiosRequirement, system_root: &Path) -> BiosSystemWire {
+    let sets: Vec<BiosSetWire> = req
+        .sets
+        .iter()
+        .map(|set| {
+            let listing = dir_listing(&system_root.join(set.subdir));
+            BiosSetWire {
+                what: set.what.to_string(),
+                names: set.display_names(),
+                all: set.all,
+                present: set.satisfied_by(&listing),
+                missing: set.missing_names(&listing),
+            }
+        })
+        .collect();
+    BiosSystemWire {
+        system_id: req.system.to_string(),
+        title: req.title.to_string(),
+        need: req.need,
+        satisfied: sets.iter().all(|s| s.present),
+        gate_play: req.gate_play,
+        home: home_relative(system_root),
+        sets,
+        note: req.note.to_string(),
+    }
+}
+
+/// The whole card: every requirement system, games or not
+/// (amendment §6 — state display is cheap; the flow is the feature).
+pub fn bios_state_wires(layout: Option<&RaLayout>) -> Vec<BiosSystemWire> {
+    let root = bios_system_root(layout);
+    ufm_emu::BIOS_REQUIREMENTS
+        .iter()
+        .map(|req| bios_system_wire(req, &root))
+        .collect()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BiosFiledWire {
+    /// The file the man picked (base name).
+    pub picked: String,
+    /// The name it was filed under.
+    pub filed_as: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BiosRejectedWire {
+    pub picked: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BiosAddWire {
+    pub cancelled: bool,
+    /// The system's refreshed card row after the filing.
+    pub system: BiosSystemWire,
+    pub filed: Vec<BiosFiledWire>,
+    pub rejected: Vec<BiosRejectedWire>,
+}
+
+/// File picked files into a system's system-file home (the Add
+/// flow's engine — the picker command feeds it, the acceptance
+/// harness feeds it paths directly). Each file whose name matches
+/// a needed file is copied under the canonical name (temp +
+/// rename, then verified by size); unknown names are refused with
+/// a plain reason. Nothing is ever fetched.
+pub fn add_bios_files(
+    system_id: &str,
+    picked: &[PathBuf],
+    system_root: &Path,
+) -> Result<BiosAddWire, String> {
+    let req = ufm_emu::requirement_for(system_id)
+        .ok_or_else(|| "Fable doesn't track system files for that system.".to_string())?;
+    let mut filed = Vec::new();
+    let mut rejected = Vec::new();
+    for path in picked {
+        let picked_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let matched = req
+            .sets
+            .iter()
+            .find_map(|set| set.match_pick(&picked_name).map(|canon| (set, canon)));
+        let Some((set, canonical)) = matched else {
+            rejected.push(BiosRejectedWire {
+                picked: picked_name,
+                reason: format!(
+                    "That isn't one of the {} system files Fable is looking for ({}).",
+                    req.title,
+                    req.all_names().join(", ")
+                ),
+            });
+            continue;
+        };
+        let dest_dir = system_root.join(set.subdir);
+        let dest = dest_dir.join(&canonical);
+        let outcome = (|| -> Result<(), String> {
+            std::fs::create_dir_all(&dest_dir)
+                .map_err(|e| format!("couldn't open the system folder: {e}"))?;
+            let tmp = dest_dir.join(format!(".{canonical}.part"));
+            std::fs::copy(path, &tmp).map_err(|e| format!("couldn't copy the file: {e}"))?;
+            std::fs::rename(&tmp, &dest).map_err(|e| format!("couldn't file the copy: {e}"))?;
+            // Verification: the filed copy is whole and non-empty
+            // (the amendment names no hashes — name + a verified
+            // copy is the check).
+            let src_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let dst_len = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+            if dst_len == 0 || dst_len != src_len {
+                let _ = std::fs::remove_file(&dest);
+                return Err("The copy didn't verify — the original is untouched.".to_string());
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => filed.push(BiosFiledWire {
+                picked: picked_name,
+                filed_as: canonical,
+            }),
+            Err(reason) => rejected.push(BiosRejectedWire {
+                picked: picked_name,
+                reason,
+            }),
+        }
+    }
+    Ok(BiosAddWire {
+        cancelled: false,
+        system: bios_system_wire(req, system_root),
+        filed,
+        rejected,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -474,8 +772,10 @@ pub fn fetch_core(
 }
 
 /// Install whatever an option needs, in dependency order, then
-/// verify it reads Ready. The sheet's "Install & Play" is this
-/// function followed by a launch.
+/// verify the install itself reads Ready. The sheet's "Install &
+/// Play" is this function followed by the BIOS gate and a launch.
+/// Verification is deliberately BIOS-free: a missing system file
+/// is the sheet's gate to explain, never an install failure.
 pub fn ensure_option(
     opt: &EmuOption,
     progress: &Progress,
@@ -494,7 +794,7 @@ pub fn ensure_option(
                 fetch_core(&layout, &core, progress)?;
             }
             let (env, layout2) = probe_env();
-            if state_of(opt, &env, layout2.as_ref()) != OptState::Ready {
+            if option_state(opt, &env) != OptState::Ready {
                 return Err(
                     "The setup finished, but the emulator still isn't ready — nothing else is affected, and you can try again from the same place."
                         .to_string(),
@@ -531,6 +831,23 @@ pub fn ensure_option(
 // Launching — the real path, always (prime directive).
 // ---------------------------------------------------------------------------
 
+/// The `%EMULATOR_…%` tokens a template names (without the `%`s).
+fn emulator_tokens(template: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = template;
+    while let Some(i) = rest.find("%EMULATOR_") {
+        let tail = &rest[i + 1..];
+        match tail.find('%') {
+            Some(j) => {
+                out.push(tail[..j].to_string());
+                rest = &tail[j + 1..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
 /// Build the launch argv for an option + game path.
 pub fn launch_argv(
     opt: &EmuOption,
@@ -542,19 +859,22 @@ pub fn launch_argv(
     if let Some(l) = layout {
         emulators.insert("EMULATOR_RETROARCH".to_string(), l.command.join(" "));
     }
-    // Standalone find-rules for the curated options: the probed
-    // binary's name is its own command.
+    // Standalone find-rules: a probed binary answers its own
+    // %EMULATOR_<NAME>% token in the option's template (the token's
+    // suffix IS the binary's name — MESEN ↔ mesen, FS-UAE ↔
+    // fs-uae; a longer binary name that starts with the suffix,
+    // snes9x-gtk for SNES9X, also answers).
     for bin in &opt.probe_bins {
-        if crate::deps::tool_present(bin) {
-            let token = match opt.id.as_str() {
-                "mesen-standalone" => "EMULATOR_MESEN",
-                "snes9x-standalone" => "EMULATOR_SNES9X",
-                _ => "",
-            };
-            if !token.is_empty() {
-                emulators.insert(token.to_string(), bin.clone());
+        if !crate::deps::tool_present(bin) {
+            continue;
+        }
+        for token in emulator_tokens(&opt.template) {
+            let suffix = token.strip_prefix("EMULATOR_").unwrap_or("");
+            if suffix.eq_ignore_ascii_case(bin)
+                || bin.to_lowercase().starts_with(&suffix.to_lowercase())
+            {
+                emulators.insert(token, bin.clone());
             }
-            break;
         }
     }
     let core_dir = layout
@@ -637,6 +957,9 @@ pub struct SheetOptionWire {
     pub needs_install: bool,
     pub class: ufm_emu::OptClass,
     pub install_note: Option<String>,
+    /// The BIOS row (§6): present when this option's system needs
+    /// a system file that isn't there — shown BEFORE any launch.
+    pub bios: Option<BiosGateWire>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -831,7 +1154,7 @@ fn sheet_wire(
             .options
             .iter()
             .map(|o| {
-                let st = state_of(o, env, layout);
+                let st = state_of(sys, o, env, layout);
                 SheetOptionWire {
                     id: o.id.clone(),
                     label: o.label.clone(),
@@ -841,6 +1164,7 @@ fn sheet_wire(
                     needs_install: st.needs_install(),
                     class: o.class,
                     install_note: o.install_note.clone(),
+                    bios: bios_gate_wire(sys, o, layout, st),
                 }
             })
             .collect(),
@@ -945,6 +1269,24 @@ pub async fn emu_play(
                 match decide(p.sys, &p.env, saved) {
                     Decision::PlayNow { option_id } => {
                         let opt = p.sys.option(&option_id).unwrap().clone();
+                        // The BIOS gate (§6): a saved choice whose
+                        // system file went missing (or was never
+                        // filed) gets the sheet's explanation —
+                        // never a launch into a black screen.
+                        if state_of(p.sys, &opt, &p.env, p.layout.as_ref())
+                            == OptState::NeedsBios
+                        {
+                            let sheet = sheet_wire(
+                                p.sys,
+                                &p.group,
+                                &provider_key,
+                                &p.env,
+                                p.layout.as_ref(),
+                                &option_id,
+                                "ask",
+                            );
+                            return EmuPlayOutcome::Sheet { sheet };
+                        }
                         let rom_path = p
                             .launch_row
                             .item
@@ -1048,10 +1390,11 @@ pub async fn emu_install_and_play(
                 serde_json::json!({ "label": label, "pct": pct }),
             );
         };
-        let st = state_of(&opt, &prelude.env, prelude.layout.as_ref());
-        let layout = if st.needs_install() {
+        let st = state_of(prelude.sys, &opt, &prelude.env, prelude.layout.as_ref());
+        let mut layout = prelude.layout.clone();
+        if st.needs_install() {
             match ensure_option(&opt, &progress) {
-                Ok((_, layout)) => layout,
+                Ok((_, l)) => layout = l,
                 Err(e) => return EmuPlayOutcome::Unavailable { message: e },
             }
         } else if st == OptState::ManualOnly {
@@ -1060,15 +1403,34 @@ pub async fn emu_install_and_play(
                     "That emulator isn't installed, and Fable can't install it yet.".to_string()
                 }),
             };
-        } else {
-            prelude.layout.clone()
-        };
+        }
         if remember {
             let mut settings = load_settings(&state.data_base);
             settings
                 .choices
                 .insert(platform.clone(), option_id.clone());
             let _ = save_settings(&state.data_base, &settings);
+        }
+        // The BIOS gate (§6), after install and BEFORE launch:
+        // re-probe (the install changed the machine) and, when a
+        // required system file is still missing, hand back a fresh
+        // sheet whose BIOS row offers the Add flow — the game is
+        // never launched into a black screen.
+        let (env2, layout2) = probe_env();
+        if let Some(l) = layout2 {
+            layout = Some(l);
+        }
+        if state_of(prelude.sys, &opt, &env2, layout.as_ref()) == OptState::NeedsBios {
+            let sheet = sheet_wire(
+                prelude.sys,
+                &prelude.group,
+                &provider_key,
+                &env2,
+                layout.as_ref(),
+                &option_id,
+                "ask",
+            );
+            return EmuPlayOutcome::Sheet { sheet };
         }
         let rom_path = prelude
             .launch_row
@@ -1088,6 +1450,69 @@ pub async fn emu_install_and_play(
     })
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("install task failed: {e}"))))
+}
+
+/// Preferences → ROMs → System files: every requirement system's
+/// present/missing state, read from the emulator's expected
+/// location (the active RetroArch flavor's system folder).
+#[tauri::command]
+pub async fn emu_bios_state(app: tauri::AppHandle) -> Cmd<Vec<BiosSystemWire>> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = &app;
+        let (_, layout) = probe_env();
+        Ok(bios_state_wires(layout.as_ref()))
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("bios state task failed: {e}"))))?
+}
+
+/// The Add flow (§6): a file picker → the man's own system files,
+/// filed under the right names in the emulator's system folder
+/// and verified by a fresh state read (see `add_bios_files`).
+/// Fable never downloads these files — they come from consoles
+/// he owns. Available from the sheet's BIOS row and the
+/// Preferences card alike (one command, both doors).
+///
+/// The picker is driven from Rust (the dialog plugin's blocking
+/// API) rather than the webview: the app defines no capability
+/// ACL for plugin commands, and Rust-side dialog calls are the
+/// trusted side of that line.
+#[tauri::command]
+pub async fn emu_bios_add(app: tauri::AppHandle, system_id: String) -> Cmd<BiosAddWire> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        let req = ufm_emu::requirement_for(&system_id).ok_or_else(|| {
+            CommandError::from(UfmError::NotFound(format!(
+                "no system files tracked for {system_id}"
+            )))
+        })?;
+        let picked = app
+            .dialog()
+            .file()
+            .set_title(format!("Choose the {} system file", req.title))
+            .add_filter("System files", &["bin", "img", "rom", "pce", "zip", "dat"])
+            .blocking_pick_files();
+        let (_, layout) = probe_env();
+        let root = bios_system_root(layout.as_ref());
+        match picked {
+            None => Ok(BiosAddWire {
+                cancelled: true,
+                system: bios_system_wire(req, &root),
+                filed: Vec::new(),
+                rejected: Vec::new(),
+            }),
+            Some(files) => {
+                let paths: Vec<PathBuf> = files
+                    .into_iter()
+                    .filter_map(|f| f.into_path().ok())
+                    .collect();
+                add_bios_files(&system_id, &paths, &root)
+                    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+            }
+        }
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("bios add task failed: {e}"))))?
 }
 
 /// Open the chosen emulator with no game (the sheet footer's
@@ -1200,6 +1625,148 @@ mod acceptance {
                 eprintln!("LAUNCHED AND STAYED UP");
             }
         }
+    }
+
+    /// v1.1 pipeline proof for every core family: the sheet
+    /// decision preselects the amendment's default, the default's
+    /// core fetches through the v1 machinery, and the launch argv
+    /// expands. BIOS-gated families assert the gate instead (their
+    /// launch proof is the designed refusal — no BIOS exists on
+    /// this box, by law Fable never fetches one).
+    #[test]
+    #[ignore]
+    fn families_pipeline_acceptance() {
+        if std::env::var("FABLE_EMU_ACCEPT").is_err() {
+            return;
+        }
+        const FAMILIES: &[&str] = &[
+            "gb", "gbc", "gba", "n64", "nds", "genesis", "mastersystem", "gamegear",
+            "sg-1000", "segacd", "sega32x", "pcengine", "pcenginecd", "tg16", "saturn",
+            "dreamcast", "arcade", "neogeo", "ngpc", "atari2600", "atari7800",
+            "atari5200", "atarilynx", "colecovision", "intellivision", "odyssey2",
+            "vectrex", "virtualboy", "wonderswan", "wonderswancolor", "3do", "pcfx",
+            "neogeocd", "msx", "c64", "amigacd32", "channelf", "psx",
+        ];
+        let progress = |label: &str, pct: Option<u32>| eprintln!("[install] {label} {pct:?}");
+        for id in FAMILIES {
+            let sys = ufm_emu::table::system_by_id(id).unwrap_or_else(|| panic!("{id} in table"));
+            let (env, layout) = probe_env();
+            let chosen = match decide(sys, &env, None) {
+                Decision::Sheet { preselect } => preselect,
+                Decision::PlayNow { option_id } => option_id,
+            };
+            assert_eq!(
+                chosen,
+                sys.default_option.clone().unwrap_or_default(),
+                "{id}: the decision must land on the curated default"
+            );
+            let opt = sys.option(&chosen).unwrap().clone();
+            let req = ufm_emu::requirement_for(id);
+            let gated = req.map(|r| r.gate_play).unwrap_or(false)
+                && !bios_satisfied(req.unwrap(), &bios_system_root(layout.as_ref()));
+            let (_, layout2) = ensure_option(&opt, &progress)
+                .unwrap_or_else(|e| panic!("{id}: core install failed: {e}"));
+            let (env2, _) = probe_env();
+            let st = state_of(sys, &opt, &env2, layout2.as_ref());
+            if gated {
+                assert_eq!(st, OptState::NeedsBios, "{id}: must gate on the missing BIOS");
+                eprintln!("FAMILY {id}: core fetched; GATE OK (NeedsBios — no launch by design)");
+            } else {
+                assert_eq!(st, OptState::Ready, "{id}: must read Ready after install");
+                let (argv, cwd) = launch_argv(
+                    &opt,
+                    layout2.as_ref(),
+                    &default_view_root(),
+                    "/tmp/fable-accept-rom",
+                )
+                .unwrap_or_else(|e| panic!("{id}: argv expansion failed: {e}"));
+                eprintln!("FAMILY {id}: READY argv={argv:?} cwd={cwd:?}");
+            }
+        }
+    }
+
+    /// v1.1 BIOS gate proof: on this (BIOS-less) box, gated systems
+    /// read NeedsBios through the sheet wire with the Add row
+    /// populated — the refusal IS the feature (§6).
+    #[test]
+    #[ignore]
+    fn bios_gate_acceptance() {
+        if std::env::var("FABLE_EMU_ACCEPT").is_err() {
+            return;
+        }
+        for id in ["psx", "saturn", "channelf", "atarilynx", "odyssey2"] {
+            let sys = ufm_emu::table::system_by_id(id).unwrap();
+            let req = ufm_emu::requirement_for(id).unwrap();
+            let (env, layout) = probe_env();
+            let root = bios_system_root(layout.as_ref());
+            let def = sys.default().unwrap();
+            let st = state_of(sys, def, &env, layout.as_ref());
+            if bios_satisfied(req, &root) {
+                eprintln!("BIOS {id}: files present on this box — state {st:?}");
+                continue;
+            }
+            let wire = bios_gate_wire(sys, def, layout.as_ref(), st);
+            let wire = wire.unwrap_or_else(|| panic!("{id}: sheet must carry the BIOS row"));
+            assert!(wire.blocking || st.needs_install(), "{id}: row blocks or install precedes");
+            eprintln!("BIOS {id}: state={st:?} missing={:?}", wire.files);
+        }
+    }
+
+    /// v1.1 Add-flow proof (pure fs, temp dirs): right names file
+    /// under canonical names, wrong names are refused, sets flip
+    /// satisfied only when complete.
+    #[test]
+    #[ignore]
+    fn bios_add_acceptance() {
+        let base = std::env::temp_dir().join(format!("fable-bios-accept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("system");
+        let src = base.join("picked");
+        std::fs::create_dir_all(&src).unwrap();
+        let dummy = |name: &str, bytes: usize| -> PathBuf {
+            let p = src.join(name);
+            std::fs::write(&p, vec![7u8; bytes]).unwrap();
+            p
+        };
+        // PlayStation: an uppercase regional file files canonically;
+        // a stranger is refused with a reason.
+        let out = add_bios_files(
+            "psx",
+            &[dummy("SCPH5501.BIN", 2048), dummy("holiday.jpg", 512)],
+            &root,
+        )
+        .unwrap();
+        assert_eq!(out.filed.len(), 1);
+        assert_eq!(out.filed[0].filed_as, "scph5501.bin");
+        assert_eq!(out.rejected.len(), 1);
+        assert!(out.system.satisfied);
+        assert!(root.join("scph5501.bin").is_file());
+        // Channel F: two of three isn't satisfied; the third completes it.
+        let out = add_bios_files(
+            "channelf",
+            &[dummy("sl31253.bin", 1024), dummy("sl31254.bin", 1024)],
+            &root,
+        )
+        .unwrap();
+        assert!(!out.system.satisfied);
+        assert_eq!(out.system.sets[0].missing, vec!["sl90025.bin".to_string()]);
+        let out = add_bios_files("channelf", &[dummy("sl90025.bin", 1024)], &root).unwrap();
+        assert!(out.system.satisfied);
+        // Dreamcast: the pair files into the dc/ corner.
+        let out = add_bios_files(
+            "dreamcast",
+            &[dummy("dc_boot.bin", 1024), dummy("dc_flash.bin", 1024)],
+            &root,
+        )
+        .unwrap();
+        assert!(out.system.satisfied);
+        assert!(root.join("dc/dc_boot.bin").is_file());
+        // Amiga CD32: a Kickstart keeps its own (versioned) name.
+        let out = add_bios_files("amigacd32", &[dummy("kick40060.CD32", 1024)], &root).unwrap();
+        assert!(out.system.satisfied);
+        assert_eq!(out.filed[0].filed_as, "kick40060.CD32");
+        let _ = std::fs::remove_dir_all(&base);
+        eprintln!("BIOS ADD: all filing rules hold");
     }
 
     #[test]

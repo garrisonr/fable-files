@@ -320,55 +320,159 @@ pub(crate) struct VolumeBadge {
     pub last_seen: Option<String>,
 }
 
-/// Resolve an item's absolute path to its volume. Live mounts win
-/// (longest mount-point prefix); failing that, the remembered mount
-/// history of every known volume (again longest prefix) marks the
-/// item offline. None = the path is on no known volume (cloud /
+/// Resolve an item's absolute path to its volume: ONE contest
+/// across live mounts AND remembered mount history — the longest
+/// claim wins, and a live claim beats a history claim of the same
+/// length. None = the path is on no known volume (cloud /
 /// network locations, paths never indexed from a real volume).
-pub(crate) fn volume_badge_for_path(
-    mounted: &[MountedVolume],
-    volumes: &[ufm_catalog::VolumeRecord],
+///
+/// The two-stage version this replaced asked live mounts FIRST and
+/// only consulted history when no live mount claimed the path —
+/// but "/" is always a live mount and claims every absolute path,
+/// so an unplugged drive's items badged ONLINE wearing the
+/// internal volume's identity, and the history stage never ran.
+/// (Emulation v1.1 probe: the same "/" catch-all shape the v1
+/// checkpoint flagged; `emu::home_volume` already carries this
+/// one-contest discipline for the same reason.)
+pub(crate) fn volume_badge_for_path<'a>(
+    mounted: &'a [MountedVolume],
+    volumes: &'a [ufm_catalog::VolumeRecord],
     path: &str,
 ) -> Option<VolumeBadge> {
-    let mut best: Option<&MountedVolume> = None;
+    enum Claim<'a> {
+        Live(&'a MountedVolume),
+        History(&'a ufm_catalog::VolumeRecord),
+    }
+    let mut best: Option<(usize, Claim<'a>)> = None;
+    let mut consider = |len: usize, claim: Claim<'a>| {
+        let better = match &best {
+            None => true,
+            Some((bl, bc)) => {
+                len > *bl
+                    || (len == *bl
+                        && matches!(claim, Claim::Live(_))
+                        && matches!(bc, Claim::History(_)))
+            }
+        };
+        if better {
+            best = Some((len, claim));
+        }
+    };
     for v in mounted {
-        if path_under(path, &v.path)
-            && best.is_none_or(|b| v.path.len() > b.path.len())
-        {
-            best = Some(v);
+        if path_under(path, &v.path) {
+            consider(v.path.len(), Claim::Live(v));
         }
     }
-    if let Some(v) = best {
-        let record = v
-            .uuid
-            .as_ref()
-            .and_then(|u| volumes.iter().find(|r| &r.fs_uuid == u));
-        return Some(VolumeBadge {
-            label: record
-                .and_then(|r| r.label.clone())
-                .unwrap_or_else(|| v.name.clone()),
-            offline: false,
-            last_seen: record.map(|r| r.last_seen.clone()),
-        });
-    }
-    let mut best: Option<(&ufm_catalog::VolumeRecord, usize)> = None;
     for rec in volumes {
         for m in &rec.mount_history {
-            if path_under(path, &m.path)
-                && best.is_none_or(|(_, len)| m.path.len() > len)
-            {
-                best = Some((rec, m.path.len()));
+            if path_under(path, &m.path) {
+                consider(m.path.len(), Claim::History(rec));
             }
         }
     }
-    best.map(|(rec, _)| VolumeBadge {
-        label: rec
-            .label
-            .clone()
-            .unwrap_or_else(|| "Unnamed drive".to_string()),
-        offline: true,
-        last_seen: Some(rec.last_seen.clone()),
-    })
+    match best?.1 {
+        Claim::Live(v) => {
+            let record = v
+                .uuid
+                .as_ref()
+                .and_then(|u| volumes.iter().find(|r| &r.fs_uuid == u));
+            Some(VolumeBadge {
+                label: record
+                    .and_then(|r| r.label.clone())
+                    .unwrap_or_else(|| v.name.clone()),
+                offline: false,
+                last_seen: record.map(|r| r.last_seen.clone()),
+            })
+        }
+        Claim::History(rec) => Some(VolumeBadge {
+            label: rec
+                .label
+                .clone()
+                .unwrap_or_else(|| "Unnamed drive".to_string()),
+            offline: true,
+            last_seen: Some(rec.last_seen.clone()),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod badge_tests {
+    use super::*;
+
+    fn vol(path: &str, name: &str, uuid: Option<&str>) -> MountedVolume {
+        MountedVolume {
+            name: name.to_string(),
+            path: path.to_string(),
+            removable: true,
+            uuid: uuid.map(|s| s.to_string()),
+            label: None,
+        }
+    }
+
+    fn record(uuid: &str, label: &str, mounts: &[&str]) -> ufm_catalog::VolumeRecord {
+        ufm_catalog::VolumeRecord {
+            fs_uuid: uuid.to_string(),
+            label: Some(label.to_string()),
+            first_seen: "2026-01-01T00:00:00Z".to_string(),
+            last_seen: "2026-10-01T00:00:00Z".to_string(),
+            last_indexed: None,
+            mount_history: mounts
+                .iter()
+                .map(|p| ufm_catalog::MountSighting {
+                    path: p.to_string(),
+                    first_seen: "2026-01-01T00:00:00Z".to_string(),
+                    last_seen: "2026-10-01T00:00:00Z".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn unplugged_drive_items_badge_offline_with_their_own_name() {
+        // The v1.1 probe case: Desk SSD unplugged, only "/" live.
+        // Its files must NOT ride the root catch-all into an
+        // online badge — the history claim is longer and wins.
+        let mounted = vec![vol("/", "Internal", Some("root-uuid"))];
+        let volumes = vec![
+            record("root-uuid", "Internal", &["/"]),
+            record("desk-uuid", "Desk SSD", &["/media/richard/Desk SSD"]),
+        ];
+        let badge = volume_badge_for_path(
+            &mounted,
+            &volumes,
+            "/media/richard/Desk SSD/ROMS/game.nes",
+        )
+        .expect("badge");
+        assert!(badge.offline, "unplugged drive's file must badge offline");
+        assert_eq!(badge.label, "Desk SSD");
+        // A genuinely internal file still badges online.
+        let badge = volume_badge_for_path(&mounted, &volumes, "/home/richard/game.nes")
+            .expect("badge");
+        assert!(!badge.offline);
+    }
+
+    #[test]
+    fn plugged_drive_items_badge_online_by_live_claim() {
+        let mounted = vec![
+            vol("/", "Internal", Some("root-uuid")),
+            vol("/media/richard/Desk SSD", "Desk SSD", Some("desk-uuid")),
+        ];
+        let volumes = vec![record("desk-uuid", "Desk SSD", &["/media/richard/Desk SSD"])];
+        let badge = volume_badge_for_path(
+            &mounted,
+            &volumes,
+            "/media/richard/Desk SSD/ROMS/game.nes",
+        )
+        .expect("badge");
+        assert!(!badge.offline);
+        assert_eq!(badge.label, "Desk SSD");
+    }
+
+    #[test]
+    fn unclaimed_paths_get_no_badge() {
+        let mounted = vec![vol("/", "Internal", None)];
+        assert!(volume_badge_for_path(&mounted, &[], "relative/path.nes").is_none());
+    }
 }
 
 /// "Oct 9, 2026" for badge/error copy; falls back to the raw date

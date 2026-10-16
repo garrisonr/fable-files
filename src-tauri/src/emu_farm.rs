@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
-use ufm_emu::{DesiredLink, FarmCopy, FarmGame, FarmOp};
+use ufm_emu::{DesiredLink, FarmCopy, FarmGame, FarmOp, M3uOp};
 
 use crate::commands::{Cmd, CommandError};
 use crate::emu::{
@@ -50,6 +50,12 @@ pub struct KeeperReport {
     pub blocked: Vec<String>,
     /// Playlist files written (names only).
     pub playlists: Vec<String>,
+    /// Multi-file game sets represented as folders (§5.3).
+    pub sets: usize,
+    /// Multi-disc playlist (.m3u) files written this pass.
+    pub m3us_written: usize,
+    /// Multi-disc playlist (.m3u) files removed this pass.
+    pub m3us_removed: usize,
     /// Distinct volumes the view's games currently live on.
     pub drives: usize,
     pub error: Option<String>,
@@ -99,12 +105,152 @@ fn compute_games(
                 copies: Vec::new(),
             });
         entry.copies.push(FarmCopy {
-            path: pk,
+            path: pk.clone(),
             present,
             rank,
+            // Multi-file set membership (§5.3): only present copies
+            // get scanned — an absent copy's folder shape can't be
+            // read, and the farm only represents what can open.
+            set_files: if present {
+                scan_set_files(std::path::Path::new(&pk))
+            } else {
+                Vec::new()
+            },
         });
     }
     Ok((by_identity.into_values().collect(), managed))
+}
+
+/// Launch-file extensions that can head a multi-file set.
+const SET_LAUNCH_EXTS: [&str; 4] = ["cue", "gdi", "ccd", "m3u"];
+/// Extensions that mark a same-stem sibling as a set member.
+const SET_DATA_EXTS: [&str; 7] = ["bin", "iso", "img", "sub", "wav", "mp3", "flac"];
+
+fn lower_ext(path: &Path) -> String {
+    path.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+fn read_head(path: &Path, cap: usize) -> Option<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(cap as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// The member files of the set a launch file heads (amendment
+/// §5.3), read from the launch file itself wherever it declares
+/// its members:
+///
+/// - `.cue`: its `FILE "…"` lines.
+/// - `.gdi`: each track line's quoted file name.
+/// - `.ccd`: same-stem `.img` / `.sub` siblings.
+/// - `.m3u`: the files it lists.
+///
+/// …with a same-stem sibling sweep (data extensions) as the
+/// fallback when a sheet declares nothing readable. Members must
+/// sit BESIDE the launch file (flat sets — the universal shape);
+/// a reference into a subfolder declines set treatment (the game
+/// keeps its plain link, exactly as v1 left it). Returns the
+/// member paths INCLUDING the launch file when ≥2 files belong,
+/// else an empty vec (a single-file game).
+fn scan_set_files(launch: &Path) -> Vec<String> {
+    let ext = lower_ext(launch);
+    if !SET_LAUNCH_EXTS.contains(&ext.as_str()) {
+        return Vec::new();
+    }
+    let Some(dir) = launch.parent() else {
+        return Vec::new();
+    };
+    let mut members: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    members.insert(launch.to_path_buf());
+    match ext.as_str() {
+        "cue" | "m3u" => {
+            if let Some(text) = read_head(launch, 512 * 1024) {
+                for line in text.lines() {
+                    let line = line.trim();
+                    let name = if ext == "cue" {
+                        let lower = line.to_lowercase();
+                        if !lower.starts_with("file ") {
+                            continue;
+                        }
+                        match (line.find('"'), line.rfind('"')) {
+                            (Some(a), Some(b)) if b > a => line[a + 1..b].to_string(),
+                            _ => continue,
+                        }
+                    } else {
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        line.to_string()
+                    };
+                    // Flat sets only: a subfolder reference means
+                    // the set's shape isn't the farm's folder shape.
+                    if name.contains('/') || name.contains('\\') {
+                        return Vec::new();
+                    }
+                    let candidate = dir.join(&name);
+                    if candidate.is_file() {
+                        members.insert(candidate);
+                    }
+                }
+            }
+        }
+        "gdi" => {
+            if let Some(text) = read_head(launch, 64 * 1024) {
+                for line in text.lines().skip(1) {
+                    let line = line.trim();
+                    let name = match (line.find('"'), line.rfind('"')) {
+                        (Some(a), Some(b)) if b > a => line[a + 1..b].to_string(),
+                        _ => continue,
+                    };
+                    if name.contains('/') || name.contains('\\') {
+                        return Vec::new();
+                    }
+                    let candidate = dir.join(&name);
+                    if candidate.is_file() {
+                        members.insert(candidate);
+                    }
+                }
+            }
+        }
+        _ => {} // "ccd": the sibling sweep below is its rule.
+    }
+    if members.len() < 2 {
+        // Fallback: same-stem data siblings (ccd triples land here
+        // too: .ccd + .img + .sub share a stem).
+        let stem = launch
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if !stem.is_empty() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    let same_stem = p
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_lowercase() == stem)
+                        .unwrap_or(false);
+                    if same_stem && SET_DATA_EXTS.contains(&lower_ext(&p).as_str()) && p.is_file()
+                    {
+                        members.insert(p);
+                    }
+                }
+            }
+        }
+    }
+    if members.len() < 2 {
+        return Vec::new();
+    }
+    members
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// The desired link set + the mounts the targets live on.
@@ -125,8 +271,10 @@ fn compute_desired(
 }
 
 /// Read the farm's actual symlinks in the managed system folders:
-/// (rel, target) pairs. Real files are invisible here by design —
-/// the keeper never touches what it didn't plant.
+/// (rel, target) pairs — top-level links AND the links inside set
+/// folders (§5.3; one level down, the folder's children). Real
+/// files are invisible here by design — the keeper never touches
+/// what it didn't plant.
 fn read_actual(root: &Path, managed: &BTreeSet<String>) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for system in managed {
@@ -139,18 +287,95 @@ fn read_actual(root: &Path, managed: &BTreeSet<String>) -> Vec<(String, String)>
             let Ok(md) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
-            if !md.file_type().is_symlink() {
-                continue;
-            }
-            if let Ok(target) = std::fs::read_link(&path) {
-                out.push((
-                    format!("{}/{}", system, e.file_name().to_string_lossy()),
-                    target.to_string_lossy().into_owned(),
-                ));
+            if md.file_type().is_symlink() {
+                if let Ok(target) = std::fs::read_link(&path) {
+                    out.push((
+                        format!("{}/{}", system, e.file_name().to_string_lossy()),
+                        target.to_string_lossy().into_owned(),
+                    ));
+                }
+            } else if md.is_dir() {
+                // A set folder: its member links live one level in.
+                let folder = e.file_name().to_string_lossy().into_owned();
+                if let Ok(children) = std::fs::read_dir(&path) {
+                    for c in children.flatten() {
+                        let cpath = c.path();
+                        let Ok(cmd) = std::fs::symlink_metadata(&cpath) else {
+                            continue;
+                        };
+                        if cmd.file_type().is_symlink() {
+                            if let Ok(target) = std::fs::read_link(&cpath) {
+                                out.push((
+                                    format!(
+                                        "{}/{}/{}",
+                                        system,
+                                        folder,
+                                        c.file_name().to_string_lossy()
+                                    ),
+                                    target.to_string_lossy().into_owned(),
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
     out
+}
+
+/// The marker line every Fable-written .m3u carries — the keeper
+/// manages only files that carry it, and never overwrites a file
+/// that doesn't (a man's own playlist of the same name stays his).
+pub const M3U_MARKER: &str = "# Fable Files — kept in step with your library";
+
+/// The farm's actual Fable-managed .m3u files: (rel, disc lines).
+fn read_actual_m3us(root: &Path, managed: &BTreeSet<String>) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    for system in managed {
+        let dir = root.join(system);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.to_lowercase().ends_with(".m3u") {
+                continue;
+            }
+            let path = e.path();
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if !text.contains(M3U_MARKER) {
+                continue;
+            }
+            let lines: Vec<String> = text
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.to_string())
+                .collect();
+            out.push((format!("{system}/{name}"), lines));
+        }
+    }
+    out
+}
+
+/// Remove now-empty set folders in the managed system dirs (a set
+/// whose links all retired leaves its folder shell behind).
+/// `remove_dir` only succeeds on empty dirs, so a folder holding
+/// anything real is untouchable by construction.
+fn cleanup_empty_set_folders(root: &Path, managed: &BTreeSet<String>) {
+    for system in managed {
+        let dir = root.join(system);
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    let _ = std::fs::remove_dir(e.path());
+                }
+            }
+        }
+    }
 }
 
 /// Can this directory hold symlinks at all? (The view root must
@@ -208,6 +433,9 @@ pub fn run_keeper_with_mounts(
     report.identities = games.len();
     report.links = desired.len();
     report.drives = drives;
+    // Multi-disc groups (§5.3): computed once, used by both the
+    // farm's .m3u files and the RetroArch playlist entries.
+    let desired_m3us = ufm_emu::desired_m3us(&games);
 
     if settings.view_enabled {
         let root = settings.view_root_path();
@@ -219,10 +447,36 @@ pub fn run_keeper_with_mounts(
                     if std::fs::read_to_string(&readme).ok().as_deref() != Some(README_TEXT) {
                         let _ = std::fs::write(&readme, README_TEXT);
                     }
+                    // Sets among the desired links (folders with
+                    // member links inside).
+                    {
+                        let mut folders = BTreeSet::new();
+                        for l in &desired {
+                            let mut parts = l.rel.splitn(3, '/');
+                            if let (Some(s), Some(f), Some(_)) =
+                                (parts.next(), parts.next(), parts.next())
+                            {
+                                folders.insert(format!("{s}/{f}"));
+                            }
+                        }
+                        report.sets = folders.len();
+                    }
                     let actual = read_actual(&root, &managed);
-                    for op in ufm_emu::farm_delta(&desired, &actual) {
+                    // Application order matters around sets: removes
+                    // first (a stale plain link vacates the name a
+                    // set folder needs, and vice versa), then
+                    // repoints, then creates. Any case the ordering
+                    // can't settle in one pass heals on the next —
+                    // every pass recomputes the full delta.
+                    let ops = ufm_emu::farm_delta(&desired, &actual);
+                    let ordered = ops.iter().filter(|o| matches!(o, FarmOp::Remove { .. }))
+                        .chain(ops.iter().filter(|o| matches!(o, FarmOp::Repoint { .. })))
+                        .chain(ops.iter().filter(|o| matches!(o, FarmOp::Create { .. })));
+                    cleanup_empty_set_folders(&root, &managed);
+                    for op in ordered {
                         match op {
                             FarmOp::Create { rel, target } => {
+                                let rel = rel.clone();
                                 let path = root.join(&rel);
                                 if let Some(parent) = path.parent() {
                                     let _ = std::fs::create_dir_all(parent);
@@ -231,24 +485,65 @@ pub fn run_keeper_with_mounts(
                                     // Something real sits there —
                                     // never overwrite a user's file.
                                     report.blocked.push(rel);
-                                } else if std::os::unix::fs::symlink(&target, &path).is_ok() {
+                                } else if std::os::unix::fs::symlink(target, &path).is_ok() {
                                     report.created += 1;
                                 } else {
                                     report.blocked.push(rel);
                                 }
                             }
                             FarmOp::Repoint { rel, target } => {
-                                let path = root.join(&rel);
+                                let path = root.join(rel);
                                 let _ = std::fs::remove_file(&path);
-                                if std::os::unix::fs::symlink(&target, &path).is_ok() {
+                                if std::os::unix::fs::symlink(target, &path).is_ok() {
                                     report.repointed += 1;
                                 } else {
-                                    report.blocked.push(rel);
+                                    report.blocked.push(rel.clone());
                                 }
                             }
                             FarmOp::Remove { rel } => {
-                                if std::fs::remove_file(root.join(&rel)).is_ok() {
+                                if std::fs::remove_file(root.join(rel)).is_ok() {
                                     report.removed += 1;
+                                }
+                            }
+                        }
+                    }
+                    cleanup_empty_set_folders(&root, &managed);
+
+                    // --- multi-disc playlists (§5.3) ---------------
+                    let actual_m3us = read_actual_m3us(&root, &managed);
+                    let managed_m3u_rels: BTreeSet<&str> =
+                        actual_m3us.iter().map(|(rel, _)| rel.as_str()).collect();
+                    for op in ufm_emu::m3u_delta(&desired_m3us, &actual_m3us) {
+                        match op {
+                            M3uOp::Write { rel, lines } => {
+                                let path = root.join(&rel);
+                                if path.exists() && !managed_m3u_rels.contains(rel.as_str()) {
+                                    // A file Fable didn't write
+                                    // holds the name — never
+                                    // overwrite what's his.
+                                    report.blocked.push(rel);
+                                    continue;
+                                }
+                                let mut text = String::from("#EXTM3U\n");
+                                text.push_str(M3U_MARKER);
+                                text.push('\n');
+                                for line in &lines {
+                                    text.push_str(line);
+                                    text.push('\n');
+                                }
+                                let tmp = path.with_extension("m3u.part");
+                                if std::fs::write(&tmp, &text).is_ok()
+                                    && std::fs::rename(&tmp, &path).is_ok()
+                                {
+                                    report.m3us_written += 1;
+                                } else {
+                                    let _ = std::fs::remove_file(&tmp);
+                                    report.blocked.push(rel);
+                                }
+                            }
+                            M3uOp::Remove { rel } => {
+                                if std::fs::remove_file(root.join(&rel)).is_ok() {
+                                    report.m3us_removed += 1;
                                 }
                             }
                         }
@@ -276,10 +571,23 @@ pub fn run_keeper_with_mounts(
                 .iter()
                 .map(|g| (g.identity.clone(), g.title.clone()))
                 .collect();
-            // identity -> its desired target (best present copy).
-            let targets: BTreeMap<String, String> = desired
+            // identity -> its launch target: the best present
+            // copy's own path (for a set, its launch file — the
+            // real cue, never a farm path).
+            let targets: BTreeMap<String, String> = games
                 .iter()
-                .map(|l| (l.identity.clone(), l.target.clone()))
+                .filter_map(|g| {
+                    g.copies
+                        .iter()
+                        .filter(|c| c.present)
+                        .min_by(|a, b| a.rank.cmp(&b.rank).then_with(|| a.path.cmp(&b.path)))
+                        .map(|c| (g.identity.clone(), c.path.clone()))
+                })
+                .collect();
+            // identity -> its multi-disc group, for this pass.
+            let group_of: BTreeMap<&str, &ufm_emu::DesiredM3u> = desired_m3us
+                .iter()
+                .flat_map(|m| m.identities.iter().map(move |i| (i.as_str(), m)))
                 .collect();
             for system in &managed {
                 let Some(sys) = ufm_emu::table::system_by_id(system) else {
@@ -306,11 +614,31 @@ pub fn run_keeper_with_mounts(
                     },
                     None => (String::new(), String::new()),
                 };
-                let entries: Vec<ufm_emu::PlaylistEntry> = games
-                    .iter()
-                    .filter(|g| &g.system == system)
-                    .filter_map(|g| {
-                        targets.get(&g.identity).map(|t| ufm_emu::PlaylistEntry {
+                // Entries in shelf order. A multi-disc group
+                // collapses to ONE entry pointing at the farm's
+                // .m3u — the handle RetroArch swaps discs through
+                // (§3(d): the .m3u is an alias, and the one place a
+                // playlist carries a farm path); single games keep
+                // their real paths, as always.
+                let mut entries: Vec<ufm_emu::PlaylistEntry> = Vec::new();
+                let mut emitted_groups: BTreeSet<&str> = BTreeSet::new();
+                for g in games.iter().filter(|g| &g.system == system) {
+                    if let Some(m) = group_of.get(g.identity.as_str()) {
+                        if emitted_groups.insert(m.rel.as_str()) {
+                            entries.push(ufm_emu::PlaylistEntry {
+                                path: root
+                                    .join(&m.rel)
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                label: m.title.clone(),
+                                core_path: core_path.clone(),
+                                core_name: core_name.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                    if let Some(t) = targets.get(&g.identity) {
+                        entries.push(ufm_emu::PlaylistEntry {
                             path: t.clone(),
                             label: titles
                                 .get(&g.identity)
@@ -318,9 +646,9 @@ pub fn run_keeper_with_mounts(
                                 .unwrap_or_else(|| g.title.clone()),
                             core_path: core_path.clone(),
                             core_name: core_name.clone(),
-                        })
-                    })
-                    .collect();
+                        });
+                    }
+                }
                 if entries.is_empty() {
                     continue;
                 }
@@ -416,6 +744,9 @@ pub struct ViewStateWire {
 pub struct EmuPrefsWire {
     pub systems: Vec<PrefsSystemWire>,
     pub view: ViewStateWire,
+    /// The System files (BIOS) card: every requirement system's
+    /// state, whether he owns games for it or not (§6).
+    pub bios: Vec<crate::emu::BiosSystemWire>,
 }
 
 fn view_state(state: &AppState, settings: &EmuSettings, report: KeeperReport) -> ViewStateWire {
@@ -479,7 +810,7 @@ pub async fn emu_prefs(app: tauri::AppHandle) -> Cmd<EmuPrefsWire> {
                     .options
                     .iter()
                     .map(|o| {
-                        let st = state_of(o, &env, layout.as_ref());
+                        let st = state_of(sys, o, &env, layout.as_ref());
                         PrefsOptionWire {
                             id: o.id.clone(),
                             label: o.label.clone(),
@@ -499,6 +830,7 @@ pub async fn emu_prefs(app: tauri::AppHandle) -> Cmd<EmuPrefsWire> {
         Ok(EmuPrefsWire {
             systems,
             view: view_state(&state, &settings, report),
+            bios: crate::emu::bios_state_wires(layout.as_ref()),
         })
     })
     .await
@@ -572,4 +904,99 @@ pub async fn emu_rebuild_view(app: tauri::AppHandle) -> Cmd<ViewStateWire> {
     })
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("rebuild task failed: {e}"))))?
+}
+
+#[cfg(test)]
+mod set_scan_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fable-set-scan-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn cue_declares_its_members() {
+        let dir = scratch("cue");
+        std::fs::write(dir.join("Game.bin"), b"x").unwrap();
+        let cue = dir.join("Game.cue");
+        std::fs::write(&cue, "FILE \"Game.bin\" BINARY\n  TRACK 01 MODE2/2352\n").unwrap();
+        let members = scan_set_files(&cue);
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().any(|m| m.ends_with("Game.cue")));
+        assert!(members.iter().any(|m| m.ends_with("Game.bin")));
+        // A bin referenced but absent isn't invented.
+        let cue2 = dir.join("Ghost.cue");
+        std::fs::write(dir.join("Ghost.bin"), b"x").unwrap();
+        std::fs::write(
+            &cue2,
+            "FILE \"Ghost.bin\" BINARY\nFILE \"Missing.bin\" BINARY\n",
+        )
+        .unwrap();
+        assert_eq!(scan_set_files(&cue2).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn subfolder_references_decline_set_treatment() {
+        let dir = scratch("sub");
+        std::fs::create_dir_all(dir.join("tracks")).unwrap();
+        std::fs::write(dir.join("tracks/t01.bin"), b"x").unwrap();
+        let cue = dir.join("Game.cue");
+        std::fs::write(&cue, "FILE \"tracks/t01.bin\" BINARY\n").unwrap();
+        assert!(scan_set_files(&cue).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ccd_triples_come_from_the_sibling_sweep() {
+        let dir = scratch("ccd");
+        for name in ["Game.ccd", "Game.img", "Game.sub", "Other.img"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let members = scan_set_files(&dir.join("Game.ccd"));
+        assert_eq!(members.len(), 3);
+        // A lone cue with no members and no siblings stays single.
+        let lone = dir.join("Lone.cue");
+        std::fs::write(&lone, "REM nothing here\n").unwrap();
+        assert!(scan_set_files(&lone).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gdi_and_m3u_declarations_read() {
+        let dir = scratch("gdi");
+        std::fs::write(dir.join("track01.bin"), b"x").unwrap();
+        std::fs::write(dir.join("track03.bin"), b"x").unwrap();
+        let gdi = dir.join("Game.gdi");
+        std::fs::write(
+            &gdi,
+            "2\n1 0 4 \"track01.bin\" 0\n3 45000 4 \"track03.bin\" 0\n",
+        )
+        .unwrap();
+        assert_eq!(scan_set_files(&gdi).len(), 3);
+        let m3u = dir.join("Saga.m3u");
+        std::fs::write(dir.join("Saga (Disc 1).cue"), b"x").unwrap();
+        std::fs::write(dir.join("Saga (Disc 2).cue"), b"x").unwrap();
+        std::fs::write(&m3u, "#EXTM3U\nSaga (Disc 1).cue\nSaga (Disc 2).cue\n").unwrap();
+        assert_eq!(scan_set_files(&m3u).len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cartridges_are_never_sets() {
+        let dir = scratch("cart");
+        let rom = dir.join("Game.gb");
+        std::fs::write(&rom, b"x").unwrap();
+        std::fs::write(dir.join("Game.bin"), b"x").unwrap();
+        assert!(scan_set_files(&rom).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
