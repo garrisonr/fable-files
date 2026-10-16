@@ -3776,6 +3776,25 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 }
 .rh-health:hover { color: var(--ufm-text); }
 
+/* ---- Needs-ID shelf (Phase 2): grouped dark list ---- */
+.rh-needsid { padding: 4px 20px 24px; max-width: 62rem; }
+.rh-needsid-intro { color: var(--ufm-text-muted); margin: 0 0 10px; }
+.rh-needsid-run { margin-bottom: 18px; }
+.rh-needsid-group { margin-bottom: 14px; }
+.rh-needsid-group-title {
+  margin: 0 0 4px; font-size: 0.95rem; font-weight: 650;
+}
+.rh-needsid-row {
+  display: flex; align-items: baseline; gap: 12px;
+  padding: 3px 0; font-size: 0.88rem;
+}
+.rh-needsid-name { font-weight: 550; overflow-wrap: anywhere; }
+.rh-needsid-reason { color: var(--ufm-text-muted); flex: none; }
+.rh-needsid-path {
+  color: var(--ufm-text-muted); font-size: 0.8rem;
+  margin-left: auto; text-align: right; overflow-wrap: anywhere;
+}
+
 /* ---- Shelf ---- */
 .rh-shelf { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .rh-shelf-head {

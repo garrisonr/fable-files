@@ -107,6 +107,13 @@ pub fn packages_for(family: Family, logical: &str) -> Option<&'static [&'static 
         (Family::Arch, "bsdtar") => &["libarchive"],
         (Family::Fedora, "bsdtar") => &["bsdtar"],
         (Family::Suse, "bsdtar") => &["bsdtar"],
+        // 7-Zip (binary: 7z) — ROM identification reads member
+        // CRCs/sizes out of 7z/rar archives (bsdtar is the fallback
+        // when 7z is absent, so a missing 7z degrades, never blocks).
+        (Family::Debian, "7z") => &["p7zip-full"],
+        (Family::Arch, "7z") => &["p7zip"],
+        (Family::Fedora, "7z") => &["p7zip", "p7zip-plugins"],
+        (Family::Suse, "7z") => &["p7zip"],
         // ImageMagick (binary: magick).
         (_, "magick") => &["imagemagick"],
         (_, "xorriso") => &["xorriso"],

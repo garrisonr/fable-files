@@ -1,8 +1,9 @@
 # Grizzette tokens (tokens.toml)
-# Semantic roles, not raw decoration. Colors are #RRGGBB. Every text role was
-# verified ≥ 4.5:1 against its background by ufm-themes' contrast check (see
-# the grizzette_passes_contrast test). The vivid #FB4E00 stays available as
-# accent_dim for large art where contrast rules don't apply.
+# Semantic roles, not raw decoration. Colors are #RRGGBB. Every role is
+# verified against the full pair matrix by ufm-themes' contrast gate
+# (cargo test: every_shipped_theme_is_contrast_clean). The vivid #FB4E00
+# stays available as accent_dim for large art where contrast rules don't
+# apply (the gate's one named exemption).
 
 surface = "#FFDDB5"          # peachy cream paper
 surface_elevated = "#FFE9D2"
@@ -11,14 +12,14 @@ text = "#6B3816"             # chocolate ink
 text_muted = "#8A5A2E"
 border = "#D9B98C"
 selection = "#CAE7FC"        # icy blue
-focus_ring = "#2BA3C7"       # bondi blue
+focus_ring = "#1C6980"       # deep bondi (bright Bondi #2BA3C7 was 2.27:1 on peach)
 accent = "#A83500"           # accessible orange-red (contrast-fixed)
 accent_text = "#FFFFFF"
 accent_dim = "#FB4E00"       # vivid accent for large art / highlights
-success = "#2E7D32"
-warning = "#B26A00"
+success = "#296E2C"          # deepened for the gate (#2E7D32 was 3.97:1 on surface)
+warning = "#8C5300"          # deepened for the gate (#B26A00 was 3.28:1 on surface)
 error = "#B3261E"
-info = "#2BA3C7"
+info = "#1C6980"             # deep bondi, same value as focus_ring
 density = "comfortable"      # compact | comfortable | spacious
 
 [typography]

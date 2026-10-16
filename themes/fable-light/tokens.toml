@@ -1,7 +1,7 @@
 # Fable Light tokens (tokens.toml)
 # Warm paper theme. Semantic roles, not raw decoration. Colors are #RRGGBB.
-# Every text pair verified >= 4.5:1 (WCAG AA) by scripts/contrast_check.py
-# (see the design notes in the UI subagent report of 2026-10-12).
+# Verified against the full pair matrix by ufm-themes' contrast gate
+# (cargo test: every_shipped_theme_is_contrast_clean).
 
 surface = "#FAF4E8"          # parchment chrome
 surface_elevated = "#FFFDF7" # toolbar / status bar

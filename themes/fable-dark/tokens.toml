@@ -1,7 +1,7 @@
 # Fable Dark tokens (tokens.toml)
 # True-dark neutral theme. Semantic roles, not raw decoration. Colors are
-# #RRGGBB. Every text pair verified >= 4.5:1 (WCAG AA) by
-# scripts/contrast_check.py (see the UI subagent report of 2026-10-12).
+# #RRGGBB. Verified against the full pair matrix by ufm-themes' contrast
+# gate (cargo test: every_shipped_theme_is_contrast_clean).
 
 surface = "#17171A"          # near-black neutral chrome
 surface_elevated = "#202025" # toolbar / status bar

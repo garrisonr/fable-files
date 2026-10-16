@@ -19,6 +19,7 @@ import {
   type Item,
   type RomGameState,
   type RomHomeGame,
+  type RomNeedsIdEntry,
   type RomSmartList,
 } from "./api";
 import {
@@ -77,6 +78,7 @@ type ShelfRef =
   | { kind: "favorites" }
   | { kind: "recent" }
   | { kind: "missing" }
+  | { kind: "needsid" }
   | { kind: "system"; name: string }
   | { kind: "hardware"; name: string }
   | { kind: "list"; id: string }
@@ -262,6 +264,9 @@ export class RomHome {
   private gamesByKey = new Map<string, RoomGame>();
   private systems: RoomSystem[] = [];
   private counts = { total: 0, missingMedia: 0 };
+  /** Needs-ID shelf contents (Phase 2): unidentified candidates in
+   * ROM territory, pre-grouped by parsed filename on the backend. */
+  private needsEntries: RomNeedsIdEntry[] = [];
   private collections: CollectionInfo[] = [];
   private smartLists: RomSmartList[] = [];
   private trailersEnabled = false;
@@ -510,14 +515,17 @@ export class RomHome {
 
   private async loadAll(): Promise<void> {
     const seq = ++this.loadSeq;
-    const [counts, datGames, collections, smartLists, settings] = await Promise.all([
-      api.romHomeCounts().catch(() => null),
-      api.romHomeGames(null).catch(() => []),
-      api.listCollections().catch(() => []),
-      api.romHomeSmartLists().catch(() => []),
-      api.getRomMediaSettings().catch(() => null),
-    ]);
+    const [counts, datGames, collections, smartLists, settings, needs] =
+      await Promise.all([
+        api.romHomeCounts().catch(() => null),
+        api.romHomeGames(null).catch(() => []),
+        api.listCollections().catch(() => []),
+        api.romHomeSmartLists().catch(() => []),
+        api.getRomMediaSettings().catch(() => null),
+        api.romHomeNeedsId().catch(() => null),
+      ]);
     if (seq !== this.loadSeq) return;
+    if (needs) this.needsEntries = needs;
     if (counts) {
       this.counts = { total: counts.total, missingMedia: counts.missingMedia };
     }
@@ -764,6 +772,14 @@ export class RomHome {
         "🖼",
         "Missing Media",
         this.counts.missingMedia > 0 ? String(this.counts.missingMedia) : "",
+      ),
+    );
+    lib.appendChild(
+      this.shelfRow(
+        { kind: "needsid" },
+        "🔍",
+        "Needs Identification",
+        this.needsEntries.length > 0 ? String(this.needsEntries.length) : "",
       ),
     );
     rail.appendChild(lib);
@@ -1027,6 +1043,9 @@ export class RomHome {
         return this.games.filter((g) => g.state.lastPlayed !== null);
       case "missing":
         return this.games.filter((g) => g.source === "dat" && !g.media.has("boxart"));
+      case "needsid":
+        // Not a game shelf — renderShelf paints the grouped list.
+        return [];
       case "system":
         return this.games.filter(
           (g) =>
@@ -1189,6 +1208,12 @@ export class RomHome {
       }
     }
 
+    // Needs-ID shelf: the grouped dark list, not game tiles.
+    if (this.shelf.kind === "needsid") {
+      scroll.appendChild(this.needsIdView());
+      return;
+    }
+
     const games = this.visibleGames();
     if (games.length === 0) {
       scroll.appendChild(this.emptyState());
@@ -1198,6 +1223,85 @@ export class RomHome {
     else this.renderList(scroll, games);
     if (keepScroll) this.restoreScroll();
     this.attachKeys(scroll);
+  }
+
+  /** The Needs-ID shelf body (Dickles Q3 ✓, 2026-10-16): files no
+   * DAT claims, grouped under their parsed filename — regional
+   * twins and tagged copies gather under one heading instead of a
+   * flat 16k-row swamp. Each row says why it's dark, in plain
+   * words, and where it lives. */
+  private needsIdView(): HTMLElement {
+    const wrap = el("div", "rh-needsid");
+    wrap.appendChild(
+      el(
+        "p",
+        "rh-needsid-intro",
+        "These files live in ROM territory, but no DAT set claims them — hacks, fan translations, bad dumps, homebrew, and sets Fable can't read yet. Identifying again is cheap: files already scanned are skipped by size and date.",
+      ),
+    );
+    const run = el(
+      "button",
+      "pill-btn primary rh-needsid-run",
+      "Identify ROMs",
+    ) as HTMLButtonElement;
+    run.addEventListener("click", () => {
+      run.disabled = true;
+      run.textContent = "Identifying…";
+      void api
+        .identifyRoms()
+        .catch(() => undefined)
+        .finally(() => void this.softRefresh());
+    });
+    wrap.appendChild(run);
+    if (this.needsEntries.length === 0) {
+      const done = el("div", "rh-empty");
+      done.append(
+        el("div", "rh-empty-emoji", "🎉"),
+        el("h3", "", "Everything's identified"),
+        el(
+          "p",
+          "",
+          "Every candidate in ROM territory matched a DAT. New files land here until the next identification pass claims them.",
+        ),
+      );
+      wrap.appendChild(done);
+      return wrap;
+    }
+    const groups = new Map<string, RomNeedsIdEntry[]>();
+    for (const e of this.needsEntries) {
+      const arr = groups.get(e.group);
+      if (arr) arr.push(e);
+      else groups.set(e.group, [e]);
+    }
+    for (const [group, entries] of [...groups.entries()].sort((a, b) =>
+      a[0].localeCompare(b[0]),
+    )) {
+      const g = el("div", "rh-needsid-group");
+      g.appendChild(
+        el(
+          "h3",
+          "rh-needsid-group-title",
+          entries.length > 1 ? `${group} · ${entries.length} files` : group,
+        ),
+      );
+      for (const e of entries) {
+        const row = el("div", "rh-needsid-row");
+        row.append(
+          el("span", "rh-needsid-name", e.item.name),
+          el("span", "rh-needsid-reason", e.reason),
+        );
+        const pk = e.item.provider_key ?? "";
+        const folder = pk.includes("/")
+          ? pk.slice(0, pk.lastIndexOf("/"))
+          : "";
+        if (folder) {
+          row.appendChild(el("span", "rh-needsid-path", folder));
+        }
+        g.appendChild(row);
+      }
+      wrap.appendChild(g);
+    }
+    return wrap;
   }
 
   private placeholderNote(rs: RoomSystem): HTMLElement {
@@ -1301,6 +1405,13 @@ export class RomHome {
         title = "Missing Media";
         sub = `${this.counts.missingMedia.toLocaleString()} games missing box art — fetch them right here`;
         missingForFetch = this.counts.missingMedia;
+        break;
+      case "needsid":
+        title = "Needs Identification";
+        sub =
+          this.needsEntries.length > 0
+            ? `${this.needsEntries.length.toLocaleString()} files no DAT claims — grouped by name`
+            : "Every file in ROM territory is identified";
         break;
       case "system": {
         const rs = this.systems.find((s) => s.name === ref.name);
@@ -1446,6 +1557,11 @@ export class RomHome {
   private renderChipsBar(): void {
     const bar = this.chipsBar;
     bar.innerHTML = "";
+    // Filters judge games; the Needs-ID shelf has none to judge.
+    if (this.shelf.kind === "needsid") {
+      bar.hidden = true;
+      return;
+    }
     const f = this.filters;
     const chips: { label: string; clear: () => void }[] = [];
     const pushGroup = (values: string[], group: keyof RoomFilters, label: (v: string) => string) => {

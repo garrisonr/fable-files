@@ -47,9 +47,20 @@ Colors are `#RRGGBB` strings. Roles (spec §24):
 
 ## Contrast rule
 
-Every text pair (`text`/`surface`, `text_muted`/`surface`, `accent_text`/`accent`,
-`text`/`content_canvas`) must reach **4.5:1** (WCAG AA). `theme_contrast_report`
-names failing pairs and *suggests* a safe color — it never rewrites the
+The gate is `check_contrast` in `crates/ufm-themes`, enforced by the
+`every_shipped_theme_is_contrast_clean` cargo test over **every**
+`themes/*/` package — it rides the standard ship gates, and a theme
+added to the folder is covered automatically. The matrix is 20 pairs.
+Text-grade pairs must reach **4.5:1** (WCAG AA): `text` and `text_muted`
+on `surface`, `surface_elevated`, and `content_canvas`; `text` on
+`selection`; `accent_text` on `accent`; `accent` on `surface` and
+`content_canvas`; and the four status roles (`success`/`warning`/
+`error`/`info`) on `surface` and `content_canvas`. `focus_ring` is a
+non-text indicator and must reach **3:1** (WCAG 1.4.11) on `surface`,
+`surface_elevated`, and `content_canvas`. The one exempt token is
+`accent_dim` (large art / highlights only), recorded as a named
+constant in the checker with its reason. `theme_contrast_report` names
+failing pairs and *suggests* a safe color — it never rewrites the
 designer's choice silently. The theme editor shows the report live with
 undo/compare/duplicate/reset.
 

@@ -1,61 +1,17 @@
 #!/usr/bin/env python3
-"""WCAG 2.x contrast check for Fable Files theme packages.
+"""SUPERSEDED — this script no longer checks anything. Do not rely on it.
 
-Checks the four mandated text pairs from docs/THEME_FORMAT.md:
-  text/surface, text_muted/surface, accent_text/accent, text/content_canvas
-against 4.5:1 (WCAG AA). Usage:
-  python3 scripts/contrast_check.py themes/fable-light themes/fable-dark
+It verified four contrast pairs for two themes, once, by hand. The gate
+is now the Rust suite in crates/ufm-themes: check_contrast runs a
+20-pair matrix (text/muted on every surface, status roles, accent,
+focus_ring at the 1.4.11 non-text bar) against EVERY themes/*/ package
+in the standard cargo gate — see the test
+`every_shipped_theme_is_contrast_clean`. Design-checks P1, 2026-10-16.
+
+Kept as a pointer so stale references (old theme headers, old reports)
+land somewhere honest instead of on a checker that silently under-checks.
 """
-import re
 import sys
 
-
-def rel_luminance(hex_color: str) -> float:
-    hex_color = hex_color.strip().lstrip("#")
-    r, g, b = (int(hex_color[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
-
-    def lin(c: float) -> float:
-        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
-
-    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
-
-
-def ratio(fg: str, bg: str) -> float:
-    l1, l2 = rel_luminance(fg), rel_luminance(bg)
-    lighter, darker = max(l1, l2), min(l1, l2)
-    return (lighter + 0.05) / (darker + 0.05)
-
-
-def load_tokens(path: str) -> dict:
-    tokens: dict = {}
-    with open(path) as f:
-        for line in f:
-            m = re.match(r'^\s*([a-z_]+)\s*=\s*"#([0-9A-Fa-f]{6})"', line)
-            if m:
-                tokens[m.group(1)] = "#" + m.group(2)
-    return tokens
-
-
-PAIRS = [
-    ("text", "surface"),
-    ("text_muted", "surface"),
-    ("accent_text", "accent"),
-    ("text", "content_canvas"),
-]
-
-THRESHOLD = 4.5
-failed = False
-
-for theme_dir in sys.argv[1:]:
-    tokens = load_tokens(f"{theme_dir}/tokens.toml")
-    print(f"== {theme_dir}")
-    for fg, bg in PAIRS:
-        r = ratio(tokens[fg], tokens[bg])
-        ok = r >= THRESHOLD
-        failed = failed or not ok
-        print(
-            f"  {fg:12s}/{bg:15s} {tokens[fg]} on {tokens[bg]}  "
-            f"{r:5.2f}:1  {'PASS' if ok else 'FAIL'}"
-        )
-
-sys.exit(1 if failed else 0)
+print(__doc__.strip(), file=sys.stderr)
+sys.exit(1)

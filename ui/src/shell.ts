@@ -14,7 +14,7 @@ import {
   type LocationSummary,
   type ThemeInfo,
 } from "./api";
-import { FileView, dragState, showItemMenu, type FileViewHooks } from "./fileview";
+import { FileView, dragState, showItemMenu, romSystemNameForKey, type FileViewHooks } from "./fileview";
 import { ColumnsView } from "./columns";
 import { GalleryView } from "./gallery";
 import { AboutDialog } from "./about";
@@ -309,18 +309,20 @@ export class Shell {
       onOpen: (item) => this.openItem(item),
       onOpenInNewTab: (item) => void this.openItemInNewTab(item),
       onOpenInRomHome: (item) => {
-        const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
-        const systems = loadRomSystems().filter(
-          (s) => s.extensions.includes(ext) && !isRomPlaceholder(s),
-        );
-        systems.sort(
-          (a, b) =>
-            Number(romSystemKey(b) !== null) -
-            Number(romSystemKey(a) !== null),
-        );
-        this.enterRomHome(
-          systems[0] ? { kind: "system", name: systems[0].name } : undefined,
-        );
+        // Identity-first (Phase 2): the door exists only for
+        // identified games, and it opens THEIR system — resolved
+        // from the catalog identity, never an extension guess.
+        void api
+          .romIdentityMap([item.id])
+          .then((hits) => {
+            const name = hits[0]
+              ? romSystemNameForKey(hits[0].platform)
+              : null;
+            this.enterRomHome(
+              name ? { kind: "system", name } : undefined,
+            );
+          })
+          .catch(() => this.enterRomHome(undefined));
       },
       onOpenRomFolder: (systemName) =>
         this.enterRomHome({ kind: "system", name: systemName }),

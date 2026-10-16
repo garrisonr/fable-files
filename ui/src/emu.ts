@@ -605,6 +605,21 @@ export class EmuSection {
         this.body.appendChild(this.overrideRow(ov));
       }
     }
+    // ---- ROM collection reset (Dickles, 2026-10-16): the clean
+    // slate for a big new drive. The confirmation in resetCard()
+    // states exactly what clears and what survives BEFORE he
+    // commits — no surprises.
+    const rh = el("h3", "prefs-section", "ROM collection");
+    rh.style.marginTop = "1.4rem";
+    this.body.appendChild(rh);
+    this.body.appendChild(
+      el(
+        "p",
+        "prefs-note",
+        "Identification is what turns files into the shelves in ROM Home. Start it over when you want a clean slate — a fresh drive, a reorganized library, a identification pass you don't trust.",
+      ),
+    );
+    this.body.appendChild(this.resetCard());
   }
 
   /** v2.1: the fleet prep pass in one quiet line — apparent
@@ -728,6 +743,92 @@ export class EmuSection {
       row.appendChild(actions);
       card.appendChild(row);
     }
+    return card;
+  }
+
+  /** The reset door, two-step by design: the first click swaps in
+   * the honest accounting (what clears, what survives); only the
+   * second click — on the card that SAYS it — does the deed. */
+  private resetCard(): HTMLElement {
+    const card = el("div", "emu-view-card");
+    const paint = (stage: "ask" | "confirm" | "done", note?: string) => {
+      card.innerHTML = "";
+      if (stage === "ask") {
+        card.appendChild(
+          el(
+            "p",
+            "emu-view-state",
+            "Reset removes every ROM identification and all fetched ROM media links from the catalog. ROM Home's shelves empty until you run Identify ROMs again.",
+          ),
+        );
+        const btn = el(
+          "button",
+          "emu-btn",
+          "Reset ROM collection…",
+        ) as HTMLButtonElement;
+        btn.addEventListener("click", () => paint("confirm"));
+        const actions = el("div", "emu-view-actions");
+        actions.appendChild(btn);
+        card.appendChild(actions);
+      } else if (stage === "confirm") {
+        card.appendChild(
+          el(
+            "p",
+            "emu-view-state",
+            "What clears: every game's identification, and the fetched box art, videos, and manuals linked to them. What survives: your ratings, favorites, and play history — they're kept by file path and re-attach when games are identified again. Your game files are never touched.",
+          ),
+        );
+        card.appendChild(
+          el(
+            "p",
+            "emu-view-state",
+            "Reset the ROM collection now?",
+          ),
+        );
+        const yes = el(
+          "button",
+          "emu-btn",
+          "Yes — reset it",
+        ) as HTMLButtonElement;
+        const no = el("button", "emu-btn", "Keep it") as HTMLButtonElement;
+        no.addEventListener("click", () => paint("ask"));
+        yes.addEventListener("click", () => {
+          yes.disabled = true;
+          no.disabled = true;
+          yes.textContent = "Resetting…";
+          void (async () => {
+            try {
+              const stats = await api.romResetCollection();
+              Toast.success(
+                `Collection reset — ${stats.identitiesRemoved.toLocaleString()} identifications and ${stats.mediaRemoved.toLocaleString()} media links removed.`,
+              );
+              paint(
+                "done",
+                "The shelves are empty. Open ROM Home and run Identify ROMs to rebuild — your ratings, favorites, and history will re-attach as games are recognized.",
+              );
+            } catch (err) {
+              Toast.error(`Reset didn't happen: ${errText(err)}`);
+              paint("ask");
+            }
+          })();
+        });
+        const actions = el("div", "emu-view-actions");
+        actions.append(yes, no);
+        card.appendChild(actions);
+      } else {
+        card.appendChild(el("p", "emu-view-state", note ?? "Done."));
+        const again = el(
+          "button",
+          "emu-btn",
+          "Reset again",
+        ) as HTMLButtonElement;
+        again.addEventListener("click", () => paint("confirm"));
+        const actions = el("div", "emu-view-actions");
+        actions.appendChild(again);
+        card.appendChild(actions);
+      }
+    };
+    paint("ask");
     return card;
   }
 

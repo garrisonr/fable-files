@@ -8193,11 +8193,17 @@ fn rom_dataset(
 }
 
 /// Which DAT project a system key's rows came from (evidence label).
+/// The CD systems Phase 2 learned to identify (Neo Geo CD, Amiga
+/// CD32, PC-FX) are Redump; "jaguar" merges No-Intro cart rows with
+/// Redump's Jaguar CD rows under one key — the label names Redump,
+/// the project this build's jaguar identifications come from.
 fn rom_source_label(sys: &str) -> &'static str {
     match sys {
         "arcade" | "neogeo" => "mame",
-        "3do" | "dreamcast" | "gamecube" | "psx" | "ps2" | "ps3" | "saturn" | "segacd"
-        | "wii" | "xbox" | "xbox360" => "redump",
+        "3do" | "amigacd32" | "dreamcast" | "gamecube" | "jaguar" | "neogeocd" | "pcfx"
+        | "psx" | "ps2" | "ps3" | "saturn" | "segacd" | "wii" | "xbox" | "xbox360" => {
+            "redump"
+        }
         _ => "no-intro",
     }
 }
@@ -8256,6 +8262,12 @@ fn run_rom_identify(
     state: &AppState,
 ) -> Cmd<RomIdentifyStats> {
     let started = std::time::Instant::now();
+    // Archive identification shells to 7z (bsdtar fallback). Ensure
+    // both once per pass, best effort: a declined/absent tool only
+    // degrades archive reading (romdat falls back, then yields no
+    // match) — it must never block identifying everything else.
+    let _ = crate::deps::ensure_tool("7z", "7z");
+    let _ = crate::deps::ensure_tool("bsdtar", "bsdtar");
     let ds = rom_dataset(app, state)?;
     let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
         .map_err(CommandError::from)?;
@@ -8312,10 +8324,31 @@ fn run_rom_identify(
         }
         stats.hashed += 1;
         let path = std::path::PathBuf::from(&pk);
-        let identified = ufm_media::romdat::identify_file(&ds, &path);
+        // identify_file_all: archives can hold several games (one
+        // per disc-set variant packed inside — TruRip's regional
+        // editions). The row carries the BEST variant as the item's
+        // identity; every variant is preserved in the evidence for
+        // the Phase 3 grouping layer.
+        let identified = ufm_media::romdat::identify_file_all(&ds, &path);
         let (title, platform, sha1, evidence) = match identified {
-            Ok(Some(id)) => {
+            Ok(ids) if !ids.is_empty() => {
                 stats.matched += 1;
+                let id = &ids[0];
+                let variants: Vec<serde_json::Value> = ids
+                    .iter()
+                    .map(|v| {
+                        serde_json::json!({
+                            "sys": v.sys,
+                            "also": v.also,
+                            "datName": v.dat_name,
+                            "crc": v.crc,
+                            "md5": v.md5_hex(),
+                            "sha1": v.sha1_hex(),
+                            "container": v.container,
+                            "member": v.member,
+                        })
+                    })
+                    .collect();
                 let ev = serde_json::json!({
                     "matched": true,
                     "crc": id.crc,
@@ -8325,6 +8358,8 @@ fn run_rom_identify(
                     "source": rom_source_label(&id.sys),
                     "container": id.container,
                     "also": id.also,
+                    "member": id.member,
+                    "variants": variants,
                 });
                 (
                     Some(id.dat_name.clone()),
@@ -8333,7 +8368,7 @@ fn run_rom_identify(
                     ev,
                 )
             }
-            Ok(None) => {
+            Ok(_) => {
                 let ev = serde_json::json!({
                     "matched": false,
                     "size": size,
@@ -8445,6 +8480,168 @@ pub async fn rom_collection_items(
         }
     }
     Ok(out)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomIdentityHit {
+    pub item_id: String,
+    pub platform: String,
+}
+
+/// Identified platforms for a batch of items — the Files banner and
+/// the "Open in ROM Home" door consult IDENTITIES first (Phase 2):
+/// a folder may only be claimed for a system its identified games
+/// actually belong to. Unidentified items are simply absent.
+#[tauri::command]
+pub async fn rom_identity_map(
+    state: State<'_, AppState>,
+    item_ids: Vec<String>,
+) -> Cmd<Vec<RomIdentityHit>> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let rows = catalog
+        .rom_platforms_for_items(&item_ids)
+        .map_err(CommandError::from)?;
+    Ok(rows
+        .into_iter()
+        .map(|(item_id, platform)| RomIdentityHit { item_id, platform })
+        .collect())
+}
+
+/// Is this path in ROM territory? Either its folder already holds an
+/// identified game (data-driven), or some path segment names a ROM
+/// collection outright. Keeps the Needs-ID shelf honest: PC-game
+/// data files and documentation trees that merely share an
+/// extension with a ROM format never qualify on their own.
+fn rom_context_path(
+    provider_key: &str,
+    identified_folders: &std::collections::HashSet<String>,
+) -> bool {
+    if let Some((parent, _)) = provider_key.rsplit_once('/') {
+        if identified_folders.contains(parent) {
+            return true;
+        }
+    }
+    provider_key.split('/').any(|seg| {
+        matches!(
+            seg.to_ascii_lowercase().as_str(),
+            "roms" | "rom" | "games" | "game"
+        )
+    })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomNeedsIdEntry {
+    pub item: Item,
+    /// Shelf group: the filename with its tag groups stripped
+    /// (romdat::parsed_base_title) — Dickles Q3: grouped, not flat.
+    pub group: String,
+    /// Why this file is dark, in plain words.
+    pub reason: String,
+    /// True when an identification pass has already scanned (and
+    /// failed to match) this file; false when it was never scanned.
+    pub scanned: bool,
+}
+
+/// The ROM Home "Needs identification" shelf: ROM candidates in ROM
+/// territory that no DAT claims — grouped by parsed filename in the
+/// UI. Scoped hard (see rom_context_path): the raw matched-nothing
+/// bucket is ~75% non-ROM noise and is NOT what this returns.
+#[tauri::command]
+pub async fn rom_home_needs_id(
+    state: State<'_, AppState>,
+) -> Cmd<Vec<RomNeedsIdEntry>> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let exts: Vec<String> = ufm_media::romdat::candidate_extensions()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let rows = catalog
+        .rom_needs_id_candidates(&exts)
+        .map_err(CommandError::from)?;
+    let identified_folders = catalog
+        .rom_identified_folders()
+        .map_err(CommandError::from)?;
+    let mut out = Vec::new();
+    for (item, has_row) in rows {
+        let Some(pk) = item.provider_key.clone() else {
+            continue;
+        };
+        if !rom_context_path(&pk, &identified_folders) {
+            continue;
+        }
+        let name = item.name.clone();
+        let remapped = remap_session_items(state.inner(), vec![item]);
+        let Some(it) = remapped.into_iter().next() else {
+            continue;
+        };
+        let stem = std::path::Path::new(&name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&name)
+            .to_string();
+        let group = {
+            let g = ufm_media::romdat::parsed_base_title(&stem);
+            if g.is_empty() {
+                stem.clone()
+            } else {
+                g
+            }
+        };
+        let ext = std::path::Path::new(&name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let reason = if !has_row {
+            "Not scanned yet"
+        } else if matches!(ext.as_str(), "7z" | "rar" | "zip") {
+            "Scanned — no known game inside"
+        } else if matches!(ext.as_str(), "cue" | "ccd" | "chd" | "gdi" | "mdf" | "cdi") {
+            "Scanned — disc set not matched"
+        } else {
+            "Scanned — no DAT match"
+        }
+        .to_string();
+        out.push(RomNeedsIdEntry {
+            item: it,
+            group,
+            reason,
+            scanned: has_row,
+        });
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomResetStats {
+    pub identities_removed: u64,
+    pub media_removed: u64,
+}
+
+/// Reset the ROM collection (Dickles, 2026-10-16): wipe every ROM
+/// identity and cached ROM-media row so the next identification
+/// pass starts clean — the on-ramp for a big new games drive.
+/// Personal state (ratings, favorites, play history) is keyed by
+/// file path in rom_game_state and is NOT touched; the UI's
+/// confirmation copy says exactly this before the user commits.
+#[tauri::command]
+pub async fn rom_reset_collection(
+    state: State<'_, AppState>,
+) -> Cmd<RomResetStats> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let (identities_removed, media_removed) = catalog
+        .reset_rom_collection()
+        .map_err(CommandError::from)?;
+    Ok(RomResetStats {
+        identities_removed,
+        media_removed,
+    })
 }
 
 // ---------------------------------------------------------------------------

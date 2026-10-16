@@ -704,6 +704,13 @@ export const api = {
   identifyRoms: () => invoke<RomIdentifyStats>("identify_roms"),
   romCollectionItems: (system: string, scope: RomScope) =>
     invoke<RomHit[]>("rom_collection_items", { system, scope }),
+  // ROM identification Phase 2: identities are the banner's and the
+  // context-menu door's truth source; the Needs-ID shelf's entries;
+  // and the collection reset (Preferences → ROMs).
+  romIdentityMap: (itemIds: string[]) =>
+    invoke<RomIdentityHit[]>("rom_identity_map", { itemIds }),
+  romHomeNeedsId: () => invoke<RomNeedsIdEntry[]>("rom_home_needs_id"),
+  romResetCollection: () => invoke<RomResetStats>("rom_reset_collection"),
   // ROM media enrichment: settings + keyring secrets (presence only
   // ever comes back), validation, the download job, the report.
   getRomMediaSettings: () =>
@@ -1786,6 +1793,27 @@ export interface RomHit {
   item: Item;
   datName: string;
   system: string;
+}
+
+/** One item's identified platform (dataset key, e.g. "neogeocd"). */
+export interface RomIdentityHit {
+  itemId: string;
+  platform: string;
+}
+
+/** ROM Home Needs-ID shelf: an unidentified ROM candidate, grouped
+ * by its parsed filename (tag groups stripped). */
+export interface RomNeedsIdEntry {
+  item: Item;
+  group: string;
+  reason: string;
+  scanned: boolean;
+}
+
+/** What a ROM collection reset actually removed. */
+export interface RomResetStats {
+  identitiesRemoved: number;
+  mediaRemoved: number;
 }
 
 /** ROM Home: one game's media presence for one type (inspector chips). */

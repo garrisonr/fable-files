@@ -7,6 +7,17 @@
 //! filename is a known set whose contained ROM CRCs are all present).
 //! Extensions merely nominate candidates; the DAT decides.
 //!
+//! Containers and disc sets (2026-10-16, ROM Identification Phase 2):
+//! 7z/rar archives get the zip treatment — members are enumerated with
+//! their stored CRCs (7z's technical listing; bsdtar as fallback) and
+//! matched without decompression — plus one layer zip never needed:
+//! a cue/ccd set inside the archive (or loose on disk, anchored by its
+//! .cue/.ccd/.gdi) identifies by hashing the cue's data-track SPAN of
+//! the disc image, because Redump DATs carry per-track rows, so a
+//! whole-image hash can never match. One archive can yield several
+//! identifications (TruRip packs regional variants side by side);
+//! `identify_file_all` returns them all, best variant first.
+//!
 //! Identification is cheap by construction:
 //!   1. extension → plausible systems (table below),
 //!   2. magic gates reject wrong formats before any hashing
@@ -386,7 +397,7 @@ pub fn systems_for_extension(ext: &str) -> &'static [&'static str] {
         "gdi" | "cdi" => &["dreamcast"],
         "gen" | "md" => &["genesis"],
         "gg" => &["gamegear"],
-        "img" => &["psx", "saturn", "segacd"],
+        "img" => &["psx", "saturn", "segacd", "neogeocd"],
         "int" => &["intellivision"],
         "iso" => &[
             "psx", "ps2", "saturn", "segacd", "dreamcast", "psp", "gamecube", "wii", "xbox",
@@ -423,16 +434,22 @@ pub fn systems_for_extension(ext: &str) -> &'static [&'static str] {
 }
 
 /// Every extension that can nominate a file for identification
-/// (the union of `systems_for_extension` keys, plus "zip").
+/// (the union of `systems_for_extension` keys, plus the container and
+/// disc-set anchors: "zip", "7z", "rar", "cue", "ccd", "chd", "gdi").
+/// "md" is deliberately NOT here: it nominates Genesis in
+/// `systems_for_extension`, but on a real disk nearly every .md is a
+/// Markdown document — nomination wrote thousands of junk identities
+/// (audit §5). A loose .md can still be identified when a caller asks
+/// about that file directly; it is never scanned for.
 pub fn candidate_extensions() -> Vec<&'static str> {
     vec![
-        "32x", "3ds", "a26", "a52", "a78", "adf", "atr", "atx", "bin", "cdi", "chf", "cia", "ciso",
-        "col", "cpr", "crt", "cso", "cv", "d64", "dms", "dsk", "fig", "gb", "gba", "gbc", "gc",
-        "gcm", "gdi", "gen", "gg", "img", "int", "iso", "j64", "jag", "lha", "lnx", "md",
-        "mdf", "mx1", "mx2", "n64", "nds", "neo", "nes", "ngc", "ngp", "pbp", "pce", "pkg",
-        "prg", "rom", "rpx", "sfc", "sg", "sgb", "smc", "smd", "sms", "sna", "swc", "szx", "t64",
-        "tap", "tgc", "tzx", "unh", "v64", "vb", "vboy", "vec", "vpk", "wad", "wbfs", "ws", "wsc",
-        "wua", "wux", "xbe", "xex", "xfd", "xiso", "z64", "z80", "zip",
+        "32x", "3ds", "7z", "a26", "a52", "a78", "adf", "atr", "atx", "bin", "ccd", "cdi", "chd",
+        "chf", "cia", "ciso", "col", "cpr", "crt", "cso", "cue", "cv", "d64", "dms", "dsk", "fig",
+        "gb", "gba", "gbc", "gc", "gcm", "gdi", "gen", "gg", "img", "int", "iso", "j64", "jag",
+        "lha", "lnx", "mdf", "mx1", "mx2", "n64", "nds", "neo", "nes", "ngc", "ngp", "pbp", "pce",
+        "pkg", "prg", "rar", "rom", "rpx", "sfc", "sg", "sgb", "smc", "smd", "sms", "sna", "swc",
+        "szx", "t64", "tap", "tgc", "tzx", "unh", "v64", "vb", "vboy", "vec", "vpk", "wad", "wbfs",
+        "ws", "wsc", "wua", "wux", "xbe", "xex", "xfd", "xiso", "z64", "z80", "zip",
     ]
 }
 
@@ -559,7 +576,7 @@ impl HashSink {
 fn hash_file(path: &Path, t: Transform) -> std::io::Result<(u32, [u8; 16], [u8; 20], u64)> {
     let mut f = std::fs::File::open(path)?;
     let mut sink = HashSink::new();
-    let mut skip = match t {
+    let skip = match t {
         Transform::Skip(n) => n,
         Transform::Smd => 512,
         _ => 0,
@@ -597,7 +614,6 @@ fn hash_file(path: &Path, t: Transform) -> std::io::Result<(u32, [u8; 16], [u8; 
             }
             to_skip -= n;
         }
-        skip = 0;
         loop {
             let mut filled = 0usize;
             while filled < block.len() {
@@ -761,6 +777,11 @@ pub struct Identification {
     pub container: &'static str,
     /// The identified file's own size on disk.
     pub file_size: u64,
+    /// For container/disc identifications: the member that IS the
+    /// game — an archive member path ("Game (World)/Game.img") or,
+    /// for a loose cue/ccd set, the disc image's path beside the
+    /// anchor. None for plain files and set matches.
+    pub member: Option<String>,
 }
 
 fn hex_of(bytes: &[u8]) -> String {
@@ -820,6 +841,7 @@ fn identify_set(
                 sha1: [0; 20],
                 container: "set",
                 file_size,
+                member: None,
             });
         }
     }
@@ -829,9 +851,20 @@ fn identify_set(
 /// Identify one file. Err = the file could not be read at all;
 /// Ok(None) = read fine, no DAT match (not a known ROM).
 pub fn identify_file(ds: &RomDataset, path: &Path) -> Result<Option<Identification>, String> {
+    Ok(identify_file_all(ds, path)?.into_iter().next())
+}
+
+/// Identify one file, returning EVERY identification it yields.
+/// Loose files and zips yield at most one (established behavior);
+/// 7z/rar archives can yield several — one per disc-set variant
+/// packed inside (TruRip's regional variants), best variant first.
+pub fn identify_file_all(
+    ds: &RomDataset,
+    path: &Path,
+) -> Result<Vec<Identification>, String> {
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
     if !meta.is_file() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let file_size = meta.len();
     let ext = path
@@ -840,11 +873,26 @@ pub fn identify_file(ds: &RomDataset, path: &Path) -> Result<Option<Identificati
         .unwrap_or("")
         .to_lowercase();
 
-    if ext == "zip" {
-        return identify_zip(ds, path, file_size);
+    match ext.as_str() {
+        "zip" => Ok(identify_zip(ds, path, file_size)?.into_iter().collect()),
+        "7z" | "rar" => identify_archive(ds, path, file_size, &ext),
+        "cue" => Ok(identify_cue_anchor(ds, path, file_size)?.into_iter().collect()),
+        "ccd" => Ok(identify_ccd_anchor(ds, path, file_size)?.into_iter().collect()),
+        "gdi" => Ok(identify_gdi_anchor(ds, path, file_size)?.into_iter().collect()),
+        // CHDs are nominated (so they surface as unidentified and can
+        // be counted) but track slicing out of a CHD is not attempted.
+        "chd" => Ok(Vec::new()),
+        _ => Ok(identify_loose(ds, path, file_size, &ext)?.into_iter().collect()),
     }
+}
 
-    let sys_keys = systems_for_extension(&ext);
+fn identify_loose(
+    ds: &RomDataset,
+    path: &Path,
+    file_size: u64,
+    ext: &str,
+) -> Result<Option<Identification>, String> {
+    let sys_keys = systems_for_extension(ext);
     if sys_keys.is_empty() {
         return Ok(None);
     }
@@ -936,7 +984,61 @@ fn resolve_hits(
         sha1,
         container,
         file_size,
+        member: None,
     }
+}
+
+/// Contained-ROM matching over a member list: the first entry whose
+/// stored CRC+size hits a DAT row (entry extensions nominate their
+/// own systems; an entry without a known extension is tried against
+/// all cartridge systems). Shared by zip and 7z/rar identification.
+fn contained_hit(
+    ds: &RomDataset,
+    entries: &[ZipEntry],
+    container: &'static str,
+    file_size: u64,
+) -> Option<Identification> {
+    let cart: Vec<u8> = cartridge_systems()
+        .iter()
+        .filter_map(|k| ds.sys_index(k))
+        .collect();
+    for entry in entries {
+        if entry.name.ends_with('/') || entry.size == 0 {
+            continue;
+        }
+        let eext = entry
+            .name
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_lowercase();
+        let mut syses: Vec<u8> = systems_for_extension(&eext)
+            .iter()
+            .filter_map(|k| ds.sys_index(k))
+            .collect();
+        if syses.is_empty() {
+            syses = cart.clone();
+        }
+        let hits = ds.lookup(entry.crc, entry.size, None, None, &syses);
+        if !hits.is_empty() {
+            // A zipped .nes entry: its stored CRC is of the headered
+            // file, and the DAT carries headered rows too — a raw hit
+            // is expected. (Headerless-content matching inside
+            // containers would need decompression; not attempted.)
+            let pref: Vec<&str> = systems_for_extension(&eext).to_vec();
+            return Some(resolve_hits(
+                ds,
+                hits,
+                &pref,
+                entry.crc,
+                [0; 16],
+                [0; 20],
+                container,
+                file_size,
+            ));
+        }
+    }
+    None
 }
 
 fn identify_zip(
@@ -958,50 +1060,718 @@ fn identify_zip(
             return Ok(Some(id));
         }
     }
-    // Contained-ROM matching: any entry whose stored CRC+size hits a
-    // DAT row (entry extensions nominate their own systems; an entry
-    // without a known extension is tried against all cartridge systems).
-    let cart: Vec<u8> = cartridge_systems()
-        .iter()
-        .filter_map(|k| ds.sys_index(k))
-        .collect();
-    for entry in &entries {
-        if entry.name.ends_with('/') || entry.size == 0 {
+    Ok(contained_hit(ds, &entries, "zip", file_size))
+}
+
+// ---------------------------------------------------------------------------
+// Archives (7z / rar) and CD sets (cue / ccd / gdi)
+// ---------------------------------------------------------------------------
+
+use std::process::{Command, Stdio};
+
+/// Parse `7z l -slt` output: member blocks after the dashed
+/// separator, each a set of "Key = Value" lines. Directory rows are
+/// dropped. A member whose format carries no stored CRC gets crc 0
+/// (it simply never wins a stored-CRC match).
+fn parse_7z_listing(text: &str) -> Vec<ZipEntry> {
+    let text = text.replace("\r\n", "\n");
+    let Some(sep) = text.find("\n----------") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for block in text[sep..].split("\n\n") {
+        let mut path: Option<String> = None;
+        let mut size: u64 = 0;
+        let mut crc: u32 = 0;
+        let mut is_dir = false;
+        for line in block.lines() {
+            let Some((key, value)) = line.split_once(" = ") else {
+                continue;
+            };
+            let value = value.trim();
+            match key.trim() {
+                "Path" => path = Some(value.to_string()),
+                "Size" => size = value.parse().unwrap_or(0),
+                "CRC" => {
+                    crc = u32::from_str_radix(value, 16).unwrap_or(0);
+                }
+                "Folder" => is_dir = value == "+",
+                "Attributes" => {
+                    if value.starts_with('D') {
+                        is_dir = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(name) = path {
+            if !is_dir && !name.ends_with('/') {
+                out.push(ZipEntry { name, crc, size });
+            }
+        }
+    }
+    out
+}
+
+/// bsdtar fallback member list (names + sizes; CRCs unknown = 0).
+/// Mirrors the archive browser's parsing in commands.rs.
+fn bsdtar_members(path: &Path) -> Option<Vec<ZipEntry>> {
+    let names_out = Command::new("bsdtar")
+        .arg("-tf")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !names_out.status.success() {
+        return None;
+    }
+    let mut sizes: HashMap<String, u64> = HashMap::new();
+    if let Ok(vout) = Command::new("bsdtar").arg("-tvf").arg(path).output() {
+        for line in String::from_utf8_lossy(&vout.stdout).lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 9 {
+                if let Ok(size) = fields[4].parse::<u64>() {
+                    sizes.insert(fields[8..].join(" "), size);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for line in String::from_utf8_lossy(&names_out.stdout).lines() {
+        let p = line.trim_end_matches('\r');
+        if p.is_empty() || p.ends_with('/') {
             continue;
         }
-        let eext = entry
-            .name
-            .rsplit('.')
-            .next()
-            .unwrap_or("")
-            .to_lowercase();
-        let mut syses: Vec<u8> = systems_for_extension(&eext)
-            .iter()
-            .filter_map(|k| ds.sys_index(k))
-            .collect();
-        if syses.is_empty() {
-            syses = cart.clone();
+        out.push(ZipEntry {
+            size: sizes.get(p).copied().unwrap_or(0),
+            name: p.to_string(),
+            crc: 0,
+        });
+    }
+    Some(out)
+}
+
+/// Member list of a 7z/rar archive: 7z's technical listing first
+/// (stored CRCs make set/contained matching decompression-free);
+/// bsdtar when 7z is unavailable or cannot read the archive.
+fn archive_members(path: &Path) -> Option<Vec<ZipEntry>> {
+    if let Ok(out) = Command::new("7z")
+        .arg("l")
+        .arg("-slt")
+        .arg("--")
+        .arg(path)
+        .output()
+    {
+        if out.status.success() {
+            let entries = parse_7z_listing(&String::from_utf8_lossy(&out.stdout));
+            if !entries.is_empty() {
+                return Some(entries);
+            }
         }
-        let hits = ds.lookup(entry.crc, entry.size, None, None, &syses);
-        if !hits.is_empty() {
-            // A zipped .nes entry: its stored CRC is of the headered
-            // file, and the DAT carries headered rows too — a raw hit
-            // is expected. (Headerless-content matching inside zips
-            // would need decompression; not attempted.)
-            let pref: Vec<&str> = systems_for_extension(&eext).to_vec();
-            return Ok(Some(resolve_hits(
-                ds,
-                hits,
-                &pref,
-                entry.crc,
-                [0; 16],
-                [0; 20],
-                "zip",
-                file_size,
-            )));
+    }
+    bsdtar_members(path)
+}
+
+/// Stream one archive member to stdout (7z, falling back to bsdtar).
+fn spawn_member_stream(archive: &Path, member: &str) -> std::io::Result<std::process::Child> {
+    match Command::new("7z")
+        .args(["e", "-so", "--"])
+        .arg(archive)
+        .arg(member)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => Ok(c),
+        Err(_) => Command::new("bsdtar")
+            .arg("-xOf")
+            .arg(archive)
+            .arg(member)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn(),
+    }
+}
+
+/// Read up to `cap` bytes of one member (cue sheets are small).
+fn read_member_bytes(archive: &Path, member: &str, cap: usize) -> Option<Vec<u8>> {
+    let mut child = spawn_member_stream(archive, member).ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    while buf.len() < cap {
+        match stdout.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let take = n.min(cap - buf.len());
+                buf.extend_from_slice(&chunk[..take]);
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Some(buf)
+}
+
+/// Hash exactly [start, start+len) of a byte stream; returns the
+/// hashes plus how many bytes were actually hashed (a short stream
+/// simply cannot match — callers compare against `len`).
+fn hash_span_reader<R: Read>(
+    mut reader: R,
+    start: u64,
+    len: u64,
+) -> std::io::Result<(u32, [u8; 16], [u8; 20], u64)> {
+    let mut sink = HashSink::new();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut to_skip = start;
+    while to_skip > 0 {
+        let want = (to_skip as usize).min(buf.len());
+        let n = reader.read(&mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        to_skip -= n as u64;
+    }
+    let mut hashed = 0u64;
+    while hashed < len {
+        let want = ((len - hashed) as usize).min(buf.len());
+        let n = reader.read(&mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        sink.push(&buf[..n]);
+        hashed += n as u64;
+    }
+    let (crc, md5, sha1, _) = sink.finish();
+    Ok((crc, md5, sha1, hashed))
+}
+
+fn hash_file_span(
+    path: &Path,
+    start: u64,
+    len: u64,
+) -> std::io::Result<(u32, [u8; 16], [u8; 20], u64)> {
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(start))?;
+    hash_span_reader(f, 0, len)
+}
+
+fn hash_member_span(
+    archive: &Path,
+    member: &str,
+    start: u64,
+    len: u64,
+) -> std::io::Result<(u32, [u8; 16], [u8; 20], u64)> {
+    let mut child = spawn_member_stream(archive, member)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdout"))?;
+    let r = hash_span_reader(stdout, start, len);
+    let _ = child.kill();
+    let _ = child.wait();
+    r
+}
+
+// -- cue sheets --------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct CueTrack {
+    data: bool,
+    sector_size: u64,
+    index01: u64,
+    points: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct CueSheet {
+    file_name: String,
+    tracks: Vec<CueTrack>,
+}
+
+/// "04:05:69" (mm:ss:ff at 75 frames/s) → sector number.
+fn parse_msf(s: &str) -> Option<u64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let m: u64 = parts[0].trim().parse().ok()?;
+    let sec: u64 = parts[1].trim().parse().ok()?;
+    let f: u64 = parts[2].trim().parse().ok()?;
+    Some((m * 60 + sec) * 75 + f)
+}
+
+/// Parse a cue sheet into its FILE blocks and track maps. Lenient by
+/// design: Redump/CloneCD rips are regular, and anything unparsable
+/// just yields no spans to try.
+fn parse_cue(text: &str) -> Vec<CueSheet> {
+    let mut sheets: Vec<CueSheet> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("FILE ") {
+            let rest = rest.trim();
+            let name = if let Some(q) = rest.strip_prefix('"') {
+                q.split('"').next().unwrap_or("").to_string()
+            } else {
+                rest.split_whitespace().next().unwrap_or("").to_string()
+            };
+            sheets.push(CueSheet {
+                file_name: name,
+                tracks: Vec::new(),
+            });
+        } else if line.starts_with("TRACK ") {
+            let mode = line.split_whitespace().nth(2).unwrap_or("").to_string();
+            let sector_size = mode
+                .rsplit('/')
+                .next()
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(2352);
+            if let Some(sheet) = sheets.last_mut() {
+                sheet.tracks.push(CueTrack {
+                    data: !mode.eq_ignore_ascii_case("AUDIO"),
+                    sector_size,
+                    index01: 0,
+                    points: Vec::new(),
+                });
+            }
+        } else if line.starts_with("INDEX ") {
+            let mut parts = line.split_whitespace();
+            let _ = parts.next();
+            let which = parts.next().unwrap_or("");
+            let msf = parts.next().unwrap_or("");
+            if let Some(sec) = parse_msf(msf) {
+                if let Some(track) = sheets.last_mut().and_then(|s| s.tracks.last_mut()) {
+                    track.points.push(sec);
+                    if which == "01" {
+                        track.index01 = sec;
+                    }
+                }
+            }
+        }
+    }
+    for sheet in &mut sheets {
+        for t in &mut sheet.tracks {
+            t.points.sort_unstable();
+            if t.index01 == 0 {
+                t.index01 = t.points.first().copied().unwrap_or(0);
+            }
+        }
+    }
+    sheets
+}
+
+/// CD-system preference for span lookups: disc systems first (in a
+/// sane order), then every other dataset system — the size gate has
+/// already decided a span is worth hashing, and side hashes arbitrate.
+fn cd_pref(ds: &RomDataset) -> (Vec<&str>, Vec<u8>, Vec<u8>) {
+    const CD_KEYS: &[&str] = &[
+        "neogeocd", "psx", "saturn", "segacd", "dreamcast", "amigacd32", "cdi", "pcfx", "3do",
+        "jaguar", "tg16",
+    ];
+    let mut pref: Vec<&str> = Vec::new();
+    let mut cd_syses: Vec<u8> = Vec::new();
+    for k in CD_KEYS {
+        if let Some(idx) = ds.sys_index(k) {
+            pref.push(k);
+            cd_syses.push(idx);
+        }
+    }
+    for (k, _) in ds.systems() {
+        if !pref.contains(&k.as_str()) {
+            pref.push(k.as_str());
+        }
+    }
+    let all: Vec<u8> = (0..ds.systems().len()).map(|i| i as u8).collect();
+    (pref, cd_syses, all)
+}
+
+/// Hash one whole span (a full track file, a whole image) and look
+/// it up, CD systems preferred.
+fn identify_whole_span<F>(
+    ds: &RomDataset,
+    len: u64,
+    container: &'static str,
+    member: Option<String>,
+    file_size: u64,
+    hash_span: &F,
+) -> Option<Identification>
+where
+    F: Fn(u64, u64) -> std::io::Result<(u32, [u8; 16], [u8; 20], u64)>,
+{
+    let (pref, cd_syses, all) = cd_pref(ds);
+    if !cd_syses.iter().any(|&s| ds.size_known(s, len)) {
+        return None;
+    }
+    let (crc, md5, sha1, actual) = hash_span(0, len).ok()?;
+    if actual != len {
+        return None;
+    }
+    let hits = ds.lookup(crc, len, Some(&md5), Some(&sha1), &all);
+    if hits.is_empty() {
+        return None;
+    }
+    let mut id = resolve_hits(ds, hits, &pref, crc, md5, sha1, container, file_size);
+    id.member = member;
+    Some(id)
+}
+
+/// Identify a disc image from its cue sheet: for each data track,
+/// the span runs from its INDEX 01 to the next index point in the
+/// file (the following track's INDEX 00 — pregap included — is the
+/// Redump per-track model, proven on TruRip) or to the image's end.
+fn identify_cd_spans<F>(
+    ds: &RomDataset,
+    sheet: &CueSheet,
+    image_len: u64,
+    container: &'static str,
+    member: Option<String>,
+    file_size: u64,
+    hash_span: &F,
+) -> Option<Identification>
+where
+    F: Fn(u64, u64) -> std::io::Result<(u32, [u8; 16], [u8; 20], u64)>,
+{
+    let (pref, cd_syses, all) = cd_pref(ds);
+    let mut all_points: Vec<u64> = sheet
+        .tracks
+        .iter()
+        .flat_map(|t| t.points.iter().copied())
+        .collect();
+    all_points.sort_unstable();
+    all_points.dedup();
+    for track in &sheet.tracks {
+        if !track.data {
+            continue;
+        }
+        let ss = track.sector_size.max(1);
+        let start = track.index01;
+        let end_sector = all_points.iter().copied().filter(|&p| p > start).min();
+        let start_b = start.saturating_mul(ss);
+        let end_b = match end_sector {
+            Some(e) => (e.saturating_mul(ss)).min(image_len),
+            None => image_len,
+        };
+        if end_b <= start_b {
+            continue;
+        }
+        let len = end_b - start_b;
+        if !cd_syses.iter().any(|&s| ds.size_known(s, len)) {
+            continue;
+        }
+        let Ok((crc, md5, sha1, actual)) = hash_span(start_b, len) else {
+            continue;
+        };
+        if actual != len {
+            continue;
+        }
+        let hits = ds.lookup(crc, len, Some(&md5), Some(&sha1), &all);
+        if hits.is_empty() {
+            continue;
+        }
+        let mut id = resolve_hits(ds, hits, &pref, crc, md5, sha1, container, file_size);
+        id.member = member.clone();
+        return Some(id);
+    }
+    None
+}
+
+// -- loose disc-set anchors ----------------------------------------------------
+
+fn identify_cue_anchor(
+    ds: &RomDataset,
+    path: &Path,
+    file_size: u64,
+) -> Result<Option<Identification>, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&bytes);
+    let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    for sheet in parse_cue(&text) {
+        let img = dir.join(&sheet.file_name);
+        let Ok(meta) = std::fs::metadata(&img) else {
+            continue;
+        };
+        let img_len = meta.len();
+        let img_disp = img.to_string_lossy().into_owned();
+        let id = identify_cd_spans(
+            ds,
+            &sheet,
+            img_len,
+            "cd",
+            Some(img_disp),
+            file_size,
+            &|s, l| hash_file_span(&img, s, l),
+        );
+        if id.is_some() {
+            return Ok(id);
         }
     }
     Ok(None)
+}
+
+fn identify_ccd_anchor(
+    ds: &RomDataset,
+    path: &Path,
+    file_size: u64,
+) -> Result<Option<Identification>, String> {
+    // A same-stem .cue beside the .ccd describes the same set.
+    let cue = path.with_extension("cue");
+    if cue.exists() {
+        if let Some(id) = identify_cue_anchor(ds, &cue, file_size)? {
+            return Ok(Some(id));
+        }
+    }
+    // Otherwise a same-stem image whose whole length is one track.
+    for ext in ["img", "bin"] {
+        let img = path.with_extension(ext);
+        let Ok(meta) = std::fs::metadata(&img) else {
+            continue;
+        };
+        let len = meta.len();
+        let img_disp = img.to_string_lossy().into_owned();
+        let id = identify_whole_span(ds, len, "cd", Some(img_disp), file_size, &|s, l| {
+            hash_file_span(&img, s, l)
+        });
+        if id.is_some() {
+            return Ok(id);
+        }
+    }
+    Ok(None)
+}
+
+fn identify_gdi_anchor(
+    ds: &RomDataset,
+    path: &Path,
+    file_size: u64,
+) -> Result<Option<Identification>, String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&bytes);
+    let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    for line in text.lines() {
+        let line = line.trim();
+        // 1 0 4 2352 "track01.bin" 0 — track, lba, type, sector size.
+        let Some(q1) = line.find('"') else { continue };
+        let Some(q2) = line[q1 + 1..].find('"') else {
+            continue;
+        };
+        let name = &line[q1 + 1..q1 + 1 + q2];
+        let fields: Vec<&str> = line[..q1].split_whitespace().collect();
+        if fields.len() < 4 || fields[2] != "4" {
+            continue; // data tracks only
+        }
+        let img = dir.join(name);
+        let Ok(meta) = std::fs::metadata(&img) else {
+            continue;
+        };
+        let len = meta.len();
+        let img_disp = img.to_string_lossy().into_owned();
+        let id = identify_whole_span(ds, len, "cd", Some(img_disp), file_size, &|s, l| {
+            hash_file_span(&img, s, l)
+        });
+        if id.is_some() {
+            return Ok(id);
+        }
+    }
+    Ok(None)
+}
+
+// -- archives ------------------------------------------------------------------
+
+/// Variant preference among an archive's identifications: a clean
+/// release beats a patched/hack variant; World/USA beats Europe
+/// beats Japan beats the rest (mirrors the grouping defaults).
+fn variant_rank(dat_name: &str) -> (u8, u8) {
+    let l = dat_name.to_lowercase();
+    let patched = if l.contains("patched") || l.contains("hack") {
+        1
+    } else {
+        0
+    };
+    let region = if l.contains("(world") || l.contains("(usa") {
+        0
+    } else if l.contains("(europe") {
+        1
+    } else if l.contains("(japan") {
+        2
+    } else {
+        3
+    };
+    (patched, region)
+}
+
+/// Identify a 7z/rar archive: MAME-style set match by stem, then
+/// every cue/ccd disc set packed inside (one identification per
+/// variant folder), then — when no disc set matched — the zip-style
+/// contained-ROM match. Results are sorted best-variant-first.
+fn identify_archive(
+    ds: &RomDataset,
+    path: &Path,
+    file_size: u64,
+    ext: &str,
+) -> Result<Vec<Identification>, String> {
+    let Some(members) = archive_members(path) else {
+        return Ok(Vec::new());
+    };
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if !stem.is_empty() {
+        if let Some(id) = identify_set(ds, &stem, &members, file_size) {
+            return Ok(vec![id]);
+        }
+    }
+    let container: &'static str = if ext == "7z" { "7z" } else { "rar" };
+    let parent_of = |name: &str| -> String {
+        name.rsplit_once('/')
+            .map(|(d, _)| d.to_string())
+            .unwrap_or_default()
+    };
+    let cue_dirs: HashSet<String> = members
+        .iter()
+        .filter(|m| m.name.to_lowercase().ends_with(".cue"))
+        .map(|m| parent_of(&m.name))
+        .collect();
+    let mut ids: Vec<Identification> = Vec::new();
+    for m in members.iter().filter(|m| {
+        let l = m.name.to_lowercase();
+        l.ends_with(".cue") || l.ends_with(".ccd")
+    }) {
+        let lower = m.name.to_lowercase();
+        let folder = parent_of(&m.name);
+        if lower.ends_with(".ccd") && cue_dirs.contains(&folder) {
+            continue; // the sibling .cue describes this set
+        }
+        if lower.ends_with(".cue") {
+            let Some(bytes) = read_member_bytes(path, &m.name, 2 * 1024 * 1024) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            for sheet in parse_cue(&text) {
+                let want_base = sheet
+                    .file_name
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&sheet.file_name)
+                    .to_lowercase();
+                let Some(img_member) = members.iter().find(|e| {
+                    parent_of(&e.name) == folder
+                        && e.name
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("")
+                            .eq_ignore_ascii_case(&want_base)
+                }) else {
+                    continue;
+                };
+                let img_len = img_member.size;
+                let img_name = img_member.name.clone();
+                if let Some(id) = identify_cd_spans(
+                    ds,
+                    &sheet,
+                    img_len,
+                    container,
+                    Some(img_name.clone()),
+                    file_size,
+                    &|s, l| hash_member_span(path, &img_name, s, l),
+                ) {
+                    ids.push(id);
+                }
+            }
+        } else {
+            // .ccd without a .cue: whole-image attempt on the
+            // same-stem image member in the same folder.
+            let stem_base = m
+                .name
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .rsplit_once('.')
+                .map(|(s, _)| s.to_lowercase())
+                .unwrap_or_default();
+            for cand_ext in ["img", "bin"] {
+                let target = format!("{stem_base}.{cand_ext}");
+                let Some(img_member) = members.iter().find(|e| {
+                    parent_of(&e.name) == folder
+                        && e.name
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("")
+                            .eq_ignore_ascii_case(&target)
+                }) else {
+                    continue;
+                };
+                let img_len = img_member.size;
+                let img_name = img_member.name.clone();
+                if let Some(id) = identify_whole_span(
+                    ds,
+                    img_len,
+                    container,
+                    Some(img_name.clone()),
+                    file_size,
+                    &|s, l| hash_member_span(path, &img_name, s, l),
+                ) {
+                    ids.push(id);
+                    break;
+                }
+            }
+        }
+    }
+    // One identification per (system, content, member) — a set whose
+    // .ccd and .cue both resolve must not double-count.
+    let mut seen: HashSet<(String, u32, String)> = HashSet::new();
+    ids.retain(|id| {
+        seen.insert((
+            id.sys.clone(),
+            id.crc,
+            id.member.clone().unwrap_or_default(),
+        ))
+    });
+    if ids.is_empty() {
+        if let Some(id) = contained_hit(ds, &members, container, file_size) {
+            ids.push(id);
+        }
+    }
+    ids.sort_by(|a, b| {
+        variant_rank(&a.dat_name)
+            .cmp(&variant_rank(&b.dat_name))
+            .then_with(|| a.dat_name.cmp(&b.dat_name))
+    });
+    Ok(ids)
+}
+
+// -- name parsing (Needs-ID grouping now, variant grouping later) --------------
+
+/// The display base title of a ROM file/DAT name with its tag groups
+/// removed: "(USA) [p1][!]"-style parenthesized and bracketed groups
+/// are variant metadata, not title. ", The" inversions are undone.
+/// Pure and shared: the Needs-ID shelf groups by this today; the
+/// variant grouper builds its keys from it next.
+pub fn parsed_base_title(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut depth_paren = 0i32;
+    let mut depth_brack = 0i32;
+    for ch in raw.chars() {
+        match ch {
+            '(' => depth_paren += 1,
+            ')' => depth_paren = (depth_paren - 1).max(0),
+            '[' => depth_brack += 1,
+            ']' => depth_brack = (depth_brack - 1).max(0),
+            _ => {
+                if depth_paren == 0 && depth_brack == 0 {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    let mut s = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    s = s.trim_matches(|c| c == ' ' || c == '-' || c == ',').to_string();
+    let lower = s.to_lowercase();
+    if let Some(prefix) = lower.strip_suffix(", the") {
+        let keep = &s[..prefix.len()];
+        s = format!("The {keep}");
+    }
+    s
 }
 
 #[cfg(test)]
@@ -1194,6 +1964,166 @@ mod tests {
         let md_path = dir.join("notes.md");
         std::fs::write(&md_path, &payload).unwrap();
         assert!(identify_file(&ds, &md_path).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One-system, one-row dataset: (sys_key, row crc, row size, name).
+    fn one_row_dataset(sys_key: &str, crc: u32, size: u64, name: &str) -> RomDataset {
+        let mut sys_blob: Vec<u8> = Vec::new();
+        sys_blob.push(sys_key.len() as u8);
+        sys_blob.extend_from_slice(sys_key.as_bytes());
+        sys_blob.push(4u8);
+        sys_blob.extend_from_slice(b"TEST");
+        let mut names: Vec<u8> = Vec::new();
+        names.extend_from_slice(name.as_bytes());
+        names.push(0);
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"FABLEDAT");
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(sys_blob.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&sys_blob);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&NONE32.to_le_bytes());
+        out.extend_from_slice(&NONE32.to_le_bytes());
+        out.push(0);
+        out.push(0);
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&names);
+        RomDataset::load(out).unwrap()
+    }
+
+    fn crc_of(payload: &[u8]) -> u32 {
+        let mut h = crc32fast::Hasher::new();
+        h.update(payload);
+        h.finalize()
+    }
+
+    #[test]
+    fn nomination_includes_archives_and_disc_anchors_but_not_md() {
+        let exts = candidate_extensions();
+        for e in ["7z", "rar", "cue", "ccd", "chd", "gdi", "zip", "nes"] {
+            assert!(exts.contains(&e), "missing {e}");
+        }
+        assert!(!exts.contains(&"md"), ".md must never be scanned for");
+        // img nominates Neo Geo CD now (audit D3).
+        assert!(systems_for_extension("img").contains(&"neogeocd"));
+    }
+
+    #[test]
+    fn seven_z_listing_parses_members_and_skips_dirs() {
+        let sample = "7-Zip 23.01\n\nListing archive: /x/Game.7z\n\n--\nPath = /x/Game.7z\nType = 7z\n\n----------\nPath = Game (World)\nSize = 0\nAttributes = DI\nCRC = \n\nPath = Game (World)/Game.cue\nSize = 11605\nAttributes = I\nCRC = DE0F3FE7\n\nPath = Game (World)/Game.img\nSize = 1000\nAttributes = I\nCRC = 37F64C30\n";
+        let entries = parse_7z_listing(sample);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "Game (World)/Game.cue");
+        assert_eq!(entries[0].crc, 0xDE0F3FE7);
+        assert_eq!(entries[1].size, 1000);
+        assert_eq!(entries[1].crc, 0x37F64C30);
+    }
+
+    #[test]
+    fn cue_span_math_matches_the_trurip_proof() {
+        // The audit's proven case: Track 01's span ends at Track 02's
+        // INDEX 00 (04:05:69 = 18,444 sectors × 2352 = 43,380,288 B).
+        let cue = "FILE \"3 Count Bout.img\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 00 04:05:69\n    INDEX 01 04:08:69\n";
+        let sheets = parse_cue(cue);
+        assert_eq!(sheets.len(), 1);
+        let sheet = &sheets[0];
+        assert_eq!(sheet.file_name, "3 Count Bout.img");
+        assert_eq!(sheet.tracks.len(), 2);
+        assert!(sheet.tracks[0].data);
+        assert!(!sheet.tracks[1].data);
+        assert_eq!(sheet.tracks[0].index01, 0);
+        assert_eq!(sheet.tracks[1].points, vec![18444, 18669]);
+        assert_eq!(18444 * 2352, 43_380_288);
+        assert_eq!(parse_msf("04:05:69"), Some(18444));
+    }
+
+    #[test]
+    fn parsed_base_title_strips_tags_and_undoes_inversion() {
+        assert_eq!(parsed_base_title("Klax (USA) [p1][!]"), "Klax");
+        assert_eq!(
+            parsed_base_title("King of Fighters '97, The (Japan) (En,Ja)"),
+            "The King of Fighters '97"
+        );
+        assert_eq!(parsed_base_title("3 Count Bout"), "3 Count Bout");
+        assert_eq!(parsed_base_title("Game (Disc 1)"), "Game");
+    }
+
+    #[test]
+    fn loose_cd_set_identifies_by_track_span() {
+        // Payload = exactly 10 sectors; the cue's Track 02 INDEX 00
+        // sits at sector 10, so Track 01's span IS the payload. The
+        // image carries trailing audio bytes that must not matter.
+        let payload: Vec<u8> = (0..2352 * 10).map(|i| (i % 251) as u8).collect();
+        let ds = one_row_dataset("neogeocd", crc_of(&payload), payload.len() as u64, "Span Game (World)");
+        let dir = std::env::temp_dir().join(format!("ufm-cd-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut img = payload.clone();
+        img.extend_from_slice(&[7u8; 2352 * 4]);
+        std::fs::write(dir.join("game.img"), &img).unwrap();
+        std::fs::write(
+            dir.join("game.cue"),
+            "FILE \"game.img\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 00 00:00:10\n    INDEX 01 00:00:12\n",
+        )
+        .unwrap();
+        let ids = identify_file_all(&ds, &dir.join("game.cue")).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].sys, "neogeocd");
+        assert_eq!(ids[0].dat_name, "Span Game (World)");
+        assert_eq!(ids[0].container, "cd");
+        assert!(ids[0].member.as_deref().unwrap().ends_with("game.img"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn seven_z_archive_identifies_cd_variant_inside() {
+        // The TruRip shape in miniature: a variant folder holding a
+        // cue set, packed in a real .7z (skipped when 7z is absent).
+        if Command::new("7z").arg("--help").output().is_err() {
+            return;
+        }
+        let payload: Vec<u8> = (0..2352 * 10).map(|i| (i % 241) as u8).collect();
+        let ds = one_row_dataset("neogeocd", crc_of(&payload), payload.len() as u64, "Packed Game (World) (En,Ja)");
+        let dir = std::env::temp_dir().join(format!("ufm-7z-test-{}", std::process::id()));
+        let stage = dir.join("Packed Game (World)");
+        std::fs::create_dir_all(&stage).unwrap();
+        let mut img = payload.clone();
+        img.extend_from_slice(&[3u8; 2352 * 2]);
+        std::fs::write(stage.join("Packed Game.img"), &img).unwrap();
+        std::fs::write(
+            stage.join("Packed Game.cue"),
+            "FILE \"Packed Game.img\" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n  TRACK 02 AUDIO\n    INDEX 00 00:00:10\n    INDEX 01 00:00:12\n",
+        )
+        .unwrap();
+        let arch = dir.join("Packed Game.7z");
+        let status = Command::new("7z")
+            .arg("a")
+            .arg(&arch)
+            .arg("Packed Game (World)")
+            .current_dir(&dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let ids = identify_file_all(&ds, &arch).unwrap();
+        assert_eq!(ids.len(), 1, "ids: {ids:?}");
+        assert_eq!(ids[0].sys, "neogeocd");
+        assert_eq!(ids[0].container, "7z");
+        assert_eq!(
+            ids[0].member.as_deref(),
+            Some("Packed Game (World)/Packed Game.img")
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

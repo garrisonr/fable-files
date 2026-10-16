@@ -1570,6 +1570,188 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Platforms of identified ROMs for a set of items — the Files
+    /// banner's truth source (identities first; extension guesses
+    /// only as fallback). Returns (item_id, platform) for the items
+    /// that HAVE a ROM identification; unidentified items are absent.
+    pub fn rom_platforms_for_items(
+        &self,
+        item_ids: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        if item_ids.is_empty() {
+            return Ok(out);
+        }
+        // Chunked IN lists keep statement counts low for big folders.
+        for chunk in item_ids.chunks(400) {
+            let placeholders: Vec<String> =
+                (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT item_id, platform FROM media_identities
+                 WHERE media_kind = 'rom' AND platform IS NOT NULL
+                   AND item_id IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let values: Vec<rusqlite::types::Value> = chunk
+                .iter()
+                .map(|s| rusqlite::types::Value::Text(s.clone()))
+                .collect();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for row in rows {
+                out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Unidentified ROM candidates for the ROM Home Needs-ID shelf:
+    /// items named like a candidate extension that either have no ROM
+    /// identity row at all or a title-less (matched:false) one.
+    /// Extension filtering mirrors `rule_candidates`. Returns
+    /// (item, has_identity_row). ROM-context scoping (which folders
+    /// count as ROM territory) is the caller's job — it needs path
+    /// evidence, applied in commands.rs with `rom_identified_folders`.
+    pub fn rom_needs_id_candidates(
+        &self,
+        extensions: &[String],
+    ) -> Result<Vec<(ufm_vfs::Item, bool)>> {
+        if extensions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let likes: Vec<String> = extensions
+            .iter()
+            .map(|e| format!("%.{}", e.to_lowercase()))
+            .collect();
+        let like_clause = likes
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("lower(i.name) LIKE ?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let sql = format!(
+            "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes,
+                    i.modified, i.provider_key,
+                    CASE WHEN mi.item_id IS NULL THEN 0 ELSE 1 END
+             FROM items AS i
+             LEFT JOIN media_identities AS mi
+               ON mi.item_id = i.id AND mi.media_kind = 'rom'
+             WHERE ({like_clause})
+               AND (mi.item_id IS NULL OR mi.title IS NULL)
+             ORDER BY i.name COLLATE NOCASE"
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let values: Vec<rusqlite::types::Value> = likes
+            .iter()
+            .map(|s| rusqlite::types::Value::Text(s.clone()))
+            .collect();
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, location_id, name, kind_s, size_bytes, modified_s, provider_key, has_row) =
+                row.map_err(|e| UfmError::Database(e.to_string()))?;
+            let parse_id = |s: &str, what: &str| {
+                uuid::Uuid::parse_str(s)
+                    .map_err(|e| UfmError::Database(format!("bad {what} id {s:?}: {e}")))
+            };
+            let labels = match &provider_key {
+                Some(pk) => self.labels_for_path(pk).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            out.push((
+                ufm_vfs::Item {
+                    id: ufm_core::ItemId(parse_id(&id, "item")?),
+                    location: ufm_core::LocationId(parse_id(&location_id, "location")?),
+                    name,
+                    kind: parse_kind(&kind_s),
+                    size_bytes: size_bytes.map(|s| s as u64),
+                    modified: modified_s.and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&chrono::Utc))
+                    }),
+                    provider_key,
+                    labels,
+                    starred: false,
+                },
+                has_row != 0,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Parent folders (provider_key directory parts) holding at least
+    /// one identified ROM — the data-driven half of the Needs-ID
+    /// shelf's ROM-context scope: an unmatched file sitting beside
+    /// identified games is in ROM territory whatever its path says.
+    pub fn rom_identified_folders(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT i.provider_key FROM items AS i
+                 JOIN media_identities AS mi ON mi.item_id = i.id
+                 WHERE mi.media_kind = 'rom' AND mi.title IS NOT NULL
+                   AND i.provider_key IS NOT NULL",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            let pk = row.map_err(|e| UfmError::Database(e.to_string()))?;
+            if let Some(pos) = pk.rfind('/') {
+                out.insert(pk[..pos].to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reset the ROM collection: delete every ROM identity and every
+    /// cached ROM media row, so the next identification pass starts
+    /// from a blank slate (Dickles, 2026-10-16 — the on-ramp for a
+    /// big new games drive). Personal state (`rom_game_state`:
+    /// ratings, favorites, play history) is deliberately NOT touched:
+    /// it is keyed by file path and re-attaches when items
+    /// re-identify. Returns (identities removed, media rows removed).
+    pub fn reset_rom_collection(&self) -> Result<(u64, u64)> {
+        let identities = self
+            .conn
+            .execute(
+                "DELETE FROM media_identities WHERE media_kind = 'rom'",
+                [],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let media = self
+            .conn
+            .execute("DELETE FROM rom_media", [])
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok((identities as u64, media as u64))
+    }
+
     /// Cache a probed media duration for a path (0.0 = probed, unreadable).
     pub fn set_duration(&self, provider_key: &str, secs: f64) -> Result<()> {
         self.conn

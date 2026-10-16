@@ -10,7 +10,12 @@ import { ContextMenu, type MenuItem } from "./contextmenu";
 import { OpenWithDialog } from "./openwith";
 import { labelColor, loadLabelDefs } from "./labels";
 import { isVideoName } from "./video";
-import { loadRomSystems, romSystemKey, isRomPlaceholder } from "./roms";
+import {
+  loadRomSystems,
+  romSystemKey,
+  isRomPlaceholder,
+  ROM_SYSTEM_KEYS,
+} from "./roms";
 import { isAudioName } from "./music";
 
 export interface FileViewHooks {
@@ -151,6 +156,17 @@ function isMediaName(name: string): boolean {
   ].includes(ext);
 }
 
+/** Display name for a DAT dataset key ("neogeocd" → "Neo Geo CD"):
+ * the user's own system list first, the built-in key table after.
+ * Used to name a system from an IDENTIFICATION (Phase 2) — never
+ * from an extension guess. */
+export function romSystemNameForKey(key: string): string | null {
+  const sys = loadRomSystems().find((s) => romSystemKey(s) === key);
+  if (sys) return sys.name;
+  const entry = Object.entries(ROM_SYSTEM_KEYS).find(([, k]) => k === key);
+  return entry ? entry[0] : null;
+}
+
 export function romSystemForItem(item: Item): string | null {
   if (item.kind === "folder") return null;
   const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
@@ -224,11 +240,18 @@ export async function showItemMenu(
       label: "Open in New Tab",
       action: () => hooks.onOpenInNewTab!(item),
     });
-  if (hooks.onOpenInRomHome && romSystemForItem(item))
-    items.push({
-      label: "Open in ROM Home",
-      action: () => hooks.onOpenInRomHome!(item),
-    });
+  // The ROM Home door opens only for a game Fable has IDENTIFIED
+  // (Phase 2): an extension match alone never claims a system.
+  if (hooks.onOpenInRomHome) {
+    const hits = await api.romIdentityMap([item.id]).catch(
+      () => [] as { itemId: string; platform: string }[],
+    );
+    if (hits.length > 0)
+      items.push({
+        label: "Open in ROM Home",
+        action: () => hooks.onOpenInRomHome!(item),
+      });
+  }
   items.push({ label: "Open With...", action: () => openWith(item) });
   if (isArchiveItem(item) && hooks.onExtractArchive) {
     items.push({
@@ -614,6 +637,10 @@ export class FileView {
   private ctxMenu = new ContextMenu();
   /** ROM banner dismissals, per directory (session only). */
   private romBannerDismissed = new Set<string>();
+  /** Identified platforms per directory (Phase 2): dirId →
+   * itemId → dataset key. The banner reads ONLY this. */
+  private romIdByDir = new Map<string, Map<string, string>>();
+  private romIdFetching = new Set<string>();
   private openWithDialog = new OpenWithDialog();
 
   constructor(
@@ -801,16 +828,55 @@ export class FileView {
 
   /** ROM Home reverse door: a folder that is mostly one
    * system's games offers the room — slim, and dismissible per
-   * folder so it never becomes a nag. */
+   * folder so it never becomes a nag. Phase 2: the claim comes
+   * from IDENTIFICATIONS only (≥60% of the folder's identified
+   * files, ≥3 identified) — an extension pattern can look like
+   * anything (TruRip's .7z discs claimed "Arcade" under the old
+   * rule while holding zero identified games), so a folder with
+   * no identified games gets no banner at all. */
   private maybeRomBanner(tab: Tab): void {
     if (!this.hooks.onOpenRomFolder) return;
     const files = tab.items.filter((i) => i.kind !== "folder");
     if (files.length < 4) return;
-    const counts = new Map<string, number>();
-    for (const f of files) {
-      const s = romSystemForItem(f);
-      if (s) counts.set(s, (counts.get(s) ?? 0) + 1);
+    const dir = currentDir(tab);
+    if (this.romBannerDismissed.has(dir.dirId)) return;
+    const known = this.romIdByDir.get(dir.dirId);
+    if (!known) {
+      if (this.romIdFetching.has(dir.dirId)) return;
+      this.romIdFetching.add(dir.dirId);
+      void api
+        .romIdentityMap(files.map((f) => f.id))
+        .then((hits) => {
+          this.romIdByDir.set(
+            dir.dirId,
+            new Map(hits.map((h) => [h.itemId, h.platform])),
+          );
+        })
+        .catch(() => this.romIdByDir.set(dir.dirId, new Map()))
+        .finally(() => {
+          this.romIdFetching.delete(dir.dirId);
+          // Paint once the truth is in — if this tab still shows
+          // this folder and no banner is already up.
+          if (
+            this.tab() === tab &&
+            currentDir(tab).dirId === dir.dirId &&
+            !this.scroller.querySelector(".rom-folder-banner")
+          ) {
+            this.maybeRomBanner(tab);
+          }
+        });
+      return;
     }
+    const counts = new Map<string, number>();
+    let identified = 0;
+    for (const f of files) {
+      const p = known.get(f.id);
+      if (p) {
+        counts.set(p, (counts.get(p) ?? 0) + 1);
+        identified += 1;
+      }
+    }
+    if (identified < 3) return;
     let best: string | null = null;
     let bestN = 0;
     for (const [s, n] of counts) {
@@ -819,17 +885,16 @@ export class FileView {
         bestN = n;
       }
     }
-    if (!best || bestN / files.length < 0.6) return;
-    const dir = currentDir(tab);
-    if (this.romBannerDismissed.has(dir.dirId)) return;
+    if (!best || bestN / identified < 0.6) return;
+    const system = romSystemNameForKey(best);
+    if (!system) return;
     const banner = document.createElement("div");
     banner.className = "rom-folder-banner";
     const text = document.createElement("span");
-    text.textContent = `\uD83C\uDFAE This folder is mostly ${best} games.`;
+    text.textContent = `\uD83C\uDFAE This folder is mostly ${system} games.`;
     const open = document.createElement("button");
     open.className = "pill-btn rom-banner-open";
     open.textContent = "Open in ROM Home";
-    const system = best;
     open.addEventListener("click", () =>
       this.hooks.onOpenRomFolder!(system),
     );
