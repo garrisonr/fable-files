@@ -121,7 +121,7 @@ named, with whose call it is).
 | Distro Gauntlet (top-20 distros + Flathub verification) | Missing — separate queue item | Per-distro themes exist; the gauntlet itself is queued campaign work, not a Phase 6 promise kept or broken here. |
 | Packaging: AppImage canonical | Implemented | The ship pipeline's install form (this build); Flathub storefront = release work outside this repo tree — Partial overall |
 | Report a Bug + Request a Feature in-app | Implemented | shell.ts + about.ts surfaces |
-| No-dependency-errors law (apps self-install what they need) | Partial | The PDF path degrades with a plain-language note when poppler is absent rather than installing it. Named gap against the standing law. |
+| No-dependency-errors law (apps self-install what they need) | Implemented (2026-10-15, Distro Gauntlet G1) | deps.rs ensures at every user-invoked door: Poppler at the PDF doors (Quick Look preview + text, the reader — session-latched so one declined prompt is respected; background thumbnails still degrade quietly by design), zip at Compress, GVfs daemons+backends at Connect to Server (before any mount attempt), the GStreamer plugin set at the player's playback-setup door (Fedora/openSUSE full sets ride in via an explicit, in-words RPM Fusion/Packman offer per Dickles' Q4 verdict), the uninstaller speaks dpkg/apt + pacman + rpm/dnf/zypper, and the clipboard ensures wl-clipboard on Wayland sessions / xclip on X11 sessions. |
 | Rust only; one icon family; GPL-3.0 | Implemented | Workspace is Rust + the Tauri web UI (the family's established shape); license in repo |
 
 ### The baseline audits' headline verdicts, re-scored

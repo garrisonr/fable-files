@@ -285,6 +285,12 @@ pub async fn open_pdf(path: String) -> Result<PdfOpenView, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let p = Path::new(&path);
         let size = stat_pdf(p)?;
+        // Gauntlet G1: the reader is a user-invoked door, so
+        // Poppler is ENSURED here (session-latched — one
+        // declined prompt is respected for the session) instead
+        // of the book opening onto a missing-tools note. The
+        // receipt outranks the decoder's note when both speak.
+        let receipt = crate::deps::ensure_tool_session("pdfinfo", "poppler").err();
         let doc = ufm_preview::pdf::open_pdf_document(p, size);
         let page_count = doc.page_count.unwrap_or(0) as usize;
         let start_page = entry
@@ -297,7 +303,7 @@ pub async fn open_pdf(path: String) -> Result<PdfOpenView, String> {
             author: doc.author,
             page_count,
             encrypted: doc.encrypted,
-            note: doc.note,
+            note: crate::commands::prefer_setup_receipt(doc.note, receipt),
             outline: doc.outline,
             start_page,
             zoom_mode: entry
@@ -333,6 +339,11 @@ pub async fn read_pdf_page(
         use base64::Engine;
         let p = Path::new(&path);
         let size = stat_pdf(p)?;
+        // Belt and braces (Gauntlet G1): open_pdf ensures
+        // Poppler first in every real flow; if a page is ever
+        // requested cold, the session-latched ensure runs here
+        // too — free when the tools are already in place.
+        let _ = crate::deps::ensure_tool_session("pdfinfo", "poppler");
         let bucket = page_width_bucket(width_px.max(320));
         let cache_dir = pdf_cache_dir();
         let digest = format!("{:x}", md5::compute(file_uri(p).as_bytes()));

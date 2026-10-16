@@ -945,6 +945,19 @@ export const api = {
     invoke<{ state: string; position: number; duration: number }>("cast_status", { device }),
   castBackends: () => invoke<string[]>("cast_backends"),
   castSetup: () => invoke<string[]>("cast_setup"),
+  // Playback setup (Gauntlet G1): the GStreamer plugin set's
+  // state, and the door's one install action. `repoName` is
+  // "RPM Fusion" / "Packman" on the families whose full codec
+  // set lives in a third-party source.
+  playbackSetupStatus: () =>
+    invoke<{ pluginsPresent: boolean; repoName: string | null; repoEnabled: boolean }>(
+      "playback_setup_status",
+    ),
+  playbackSetupInstall: (withRepo: boolean) =>
+    invoke<{ pluginsPresent: boolean; repoName: string | null; repoEnabled: boolean }>(
+      "playback_setup_install",
+      { withRepo },
+    ),
   listInstalledApps: () =>
     invoke<Array<{ name: string; id: string; source: string; desktop_path: string }>>("list_installed_apps"),
   findAppLeftovers: (appId: string, appName: string) =>

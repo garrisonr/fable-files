@@ -693,6 +693,8 @@ pub fn run() {
             commands::cast_scan,
             commands::cast_backends,
             commands::cast_setup,
+            commands::playback_setup_status,
+            commands::playback_setup_install,
             commands::cast_play,
             commands::cast_stop,
             commands::cast_pause,

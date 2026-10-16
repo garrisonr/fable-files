@@ -836,6 +836,15 @@ pub async fn net_connect(
         domain: domain.filter(|d| !d.trim().is_empty()),
         anonymous,
     };
+    // Gauntlet G1: GVfs presence is checked HERE, at the
+    // Connect door — the daemons plus this scheme's backend are
+    // ensured in context (deps.rs), in plain language, BEFORE
+    // any mount attempt can fail cryptically inside GIO.
+    let gvfs_scheme = parsed.scheme.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::deps::ensure_gvfs(&gvfs_scheme))
+        .await
+        .map_err(|e| CommandError::from(UfmError::Internal(format!("connect setup task: {e}"))))?
+        .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
     let connect_uri = parsed.uri.clone();
     let mount = tauri::async_runtime::spawn_blocking(move || {
         crate::network::mount(&connect_uri, &creds)
@@ -5095,12 +5104,22 @@ pub async fn preview_text(
     // Round 7.2: ods/odp join via the same ODF content.xml mechanism.
     if ["docx", "odt", "ods", "odp", "epub", "pdf"].contains(&ext.as_str()) {
         let doc_path = path.clone();
+        let is_pdf = ext == "pdf";
         let extracted = tauri::async_runtime::spawn_blocking(move || {
-            extract_document_text(&doc_path)
+            // Gauntlet G1: PDF text rides on pdftotext — ensure
+            // Poppler at this user-invoked door first (session-
+            // latched), so a missing-tools failure becomes a
+            // setup, not a silent "no readable text".
+            let receipt = if is_pdf {
+                crate::deps::ensure_tool_session("pdfinfo", "poppler").err()
+            } else {
+                None
+            };
+            (extract_document_text(&doc_path), receipt)
         })
         .await;
         match extracted {
-            Ok(Ok(text)) if !text.trim().is_empty() => {
+            Ok((Ok(text), _)) if !text.trim().is_empty() => {
                 let mut lines: Vec<String> = Vec::new();
                 let mut truncated = false;
                 for raw in text.lines() {
@@ -5125,6 +5144,17 @@ pub async fn preview_text(
                     lines.push(l);
                 }
                 return Ok(PreviewTextResult { lines, truncated });
+            }
+            Ok((_, receipt)) => {
+                return Ok(PreviewTextResult {
+                    lines: vec![receipt.unwrap_or_else(|| {
+                        format!(
+                            "No readable text could be extracted from this .{} file.",
+                            ext
+                        )
+                    })],
+                    truncated: false,
+                });
             }
             _ => {
                 return Ok(PreviewTextResult {
@@ -5264,6 +5294,22 @@ pub async fn preview_document(
         .map_err(|e| CommandError::from(UfmError::Internal(e)))
 }
 
+/// When a door's tool setup didn't go through, the setup
+/// receipt outranks the decoder's own "tools aren't installed"
+/// note — the receipt says why, and what the user can do. Any
+/// other decoder note (encrypted, unreadable) keeps its place.
+/// (Gauntlet G1.)
+pub(crate) fn prefer_setup_receipt(
+    note: Option<String>,
+    receipt: Option<String>,
+) -> Option<String> {
+    match (note, receipt) {
+        (Some(n), Some(r)) if n.contains("aren't installed") => Some(r),
+        (None, Some(r)) => Some(r),
+        (n, _) => n,
+    }
+}
+
 fn build_document_preview(
     path: &std::path::Path,
     ext: &str,
@@ -5311,6 +5357,18 @@ fn build_document_preview(
 
     match ext {
         "pdf" => {
+            // Gauntlet G1: Quick Look's document preview is a
+            // user-invoked door, so Poppler is ENSURED here —
+            // session-latched, so one declined prompt is
+            // respected rather than re-asked on every preview —
+            // and the decode below then re-runs with the tools
+            // in place. The card still always paints: when setup
+            // didn't go through, the receipt replaces the
+            // decoder's missing-tools note, because the receipt
+            // is the actionable truth. (Grid thumbnails stay
+            // background and keep degrading quietly, by design.)
+            let receipt =
+                crate::deps::ensure_tool_session("pdfinfo", "poppler").err();
             // A fresh cached page makes the render unnecessary; the
             // metadata + text pass is the cheap remainder.
             let p = if cached_image.is_some() {
@@ -5339,7 +5397,7 @@ fn build_document_preview(
                 image,
                 lines,
                 truncated,
-                note: p.note,
+                note: prefer_setup_receipt(p.note, receipt),
             })
         }
         _ => {
@@ -6670,6 +6728,10 @@ pub async fn compress_items(state: State<'_, AppState>, items: Vec<ItemId>) -> C
             .iter()
             .filter_map(|p| p.file_name().and_then(|x| x.to_str()).map(|x| x.to_string()))
             .collect();
+        // Gauntlet G1: `zip` is near-universal but not guaranteed
+        // (minimal installs lack it) — Compress is the door, so
+        // the tool is ensured at the door like every other.
+        crate::deps::ensure_tool("zip", "zip")?;
         let out = std::process::Command::new("zip")
             .arg("-r")
             .arg("-q")
@@ -6771,13 +6833,55 @@ fn file_uri_to_path(u: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Write file paths to the Wayland clipboard (wl-copy). Cut uses the
+/// Which clipboard world this session lives in (Gauntlet G1).
+/// The session type the login session reports wins; the
+/// display variables are the fallback — a session may lack the
+/// type but a graphical one always has one of the displays.
+/// Before G1 the clipboard only spoke wl-copy/wl-paste, so on
+/// X11 sessions (Mint and MX default to them) file copy/paste
+/// simply failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardBackend {
+    Wayland,
+    X11,
+}
+
+fn clipboard_backend() -> Result<ClipboardBackend, String> {
+    match std::env::var("XDG_SESSION_TYPE").as_deref() {
+        Ok("wayland") => return Ok(ClipboardBackend::Wayland),
+        Ok("x11") => return Ok(ClipboardBackend::X11),
+        _ => {}
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        Ok(ClipboardBackend::Wayland)
+    } else if std::env::var_os("DISPLAY").is_some() {
+        Ok(ClipboardBackend::X11)
+    } else {
+        Err("Fable can't reach a clipboard here — this session doesn't report a Wayland or X11 display.".to_string())
+    }
+}
+
+/// Write file paths to the session clipboard. Cut uses the
 /// GNOME nautilus format so Nautilus honors the move; copy uses
-/// text/uri-list, which everything reads.
+/// text/uri-list, which everything reads. The helper is the
+/// session's own (wl-copy on Wayland, xclip on X11 — the
+/// nautilus format is native to both worlds) and is ensured at
+/// this door, never assumed.
 #[tauri::command]
 pub async fn clipboard_write(paths: Vec<String>, cut: bool) -> Cmd<()> {
     tauri::async_runtime::spawn_blocking(move || {
         use std::io::{Read, Write};
+        let backend = clipboard_backend()?;
+        let tool = match backend {
+            ClipboardBackend::Wayland => {
+                crate::deps::ensure_tool("wl-copy", "wl-clipboard")?;
+                "wl-copy"
+            }
+            ClipboardBackend::X11 => {
+                crate::deps::ensure_tool("xclip", "xclip")?;
+                "xclip"
+            }
+        };
         let (mime, data) = if cut {
             let mut d = String::from("cut\n");
             for p in &paths {
@@ -6798,29 +6902,37 @@ pub async fn clipboard_write(paths: Vec<String>, cut: bool) -> Cmd<()> {
         // libwayland/libffi can make wl-copy fail to start or to reach
         // the compositor, and the old code swallowed the exit status,
         // so the failure surfaced only as "[object Object]".
-        let mut child = std::process::Command::new("wl-copy")
-            .arg("--type")
-            .arg(mime)
+        let mut cmd = std::process::Command::new(tool);
+        match backend {
+            ClipboardBackend::Wayland => {
+                cmd.arg("--type").arg(mime);
+            }
+            ClipboardBackend::X11 => {
+                cmd.args(["-selection", "clipboard", "-t", mime, "-i"]);
+            }
+        }
+        let mut child = cmd
             .env_remove("LD_LIBRARY_PATH")
             .stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| format!("could not start wl-copy: {e}"))?;
+            .map_err(|e| format!("could not start {tool}: {e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(data.as_bytes())
-                .map_err(|e| format!("wl-copy write: {e}"))?;
+                .map_err(|e| format!("{tool} write: {e}"))?;
         }
-        // wl-copy forks a server and the parent exits promptly; a
-        // nonzero exit is a REAL failure and must reach the user.
-        let status = child.wait().map_err(|e| format!("wl-copy wait: {e}"))?;
+        // Both helpers fork a clipboard owner and the parent exits
+        // promptly; a nonzero exit is a REAL failure and must reach
+        // the user.
+        let status = child.wait().map_err(|e| format!("{tool} wait: {e}"))?;
         if !status.success() {
             let mut err_text = String::new();
             if let Some(mut stderr) = child.stderr.take() {
                 let _ = stderr.read_to_string(&mut err_text);
             }
             return Err(format!(
-                "wl-copy exited {status}: {}",
+                "{tool} exited {status}: {}",
                 err_text.trim()
             ));
         }
@@ -6837,18 +6949,33 @@ pub struct ClipboardData {
     pub cut: bool,
 }
 
-/// Read file paths from the Wayland clipboard (wl-paste).
+/// Read file paths from the session clipboard (wl-paste on
+/// Wayland, xclip on X11 — ensured at the door, like the write).
 #[tauri::command]
 pub async fn clipboard_read() -> Cmd<ClipboardData> {
     tauri::async_runtime::spawn_blocking(move || {
+        let backend = clipboard_backend()?;
+        let tool = match backend {
+            ClipboardBackend::Wayland => {
+                crate::deps::ensure_tool("wl-paste", "wl-clipboard")?;
+                "wl-paste"
+            }
+            ClipboardBackend::X11 => {
+                crate::deps::ensure_tool("xclip", "xclip")?;
+                "xclip"
+            }
+        };
         let read_type = |mime: &str| -> Option<String> {
-            let out = std::process::Command::new("wl-paste")
-                .arg("--type")
-                .arg(mime)
-                .arg("--no-newline")
-                .env_remove("LD_LIBRARY_PATH")
-                .output()
-                .ok()?;
+            let mut cmd = std::process::Command::new(tool);
+            match backend {
+                ClipboardBackend::Wayland => {
+                    cmd.arg("--type").arg(mime).arg("--no-newline");
+                }
+                ClipboardBackend::X11 => {
+                    cmd.args(["-selection", "clipboard", "-t", mime, "-o"]);
+                }
+            }
+            let out = cmd.env_remove("LD_LIBRARY_PATH").output().ok()?;
             if out.status.success() {
                 Some(String::from_utf8_lossy(&out.stdout).to_string())
             } else {
@@ -10906,6 +11033,84 @@ pub async fn cast_setup() -> Cmd<Vec<String>> {
     .map_err(|e| CommandError::from(UfmError::Internal(e)))
 }
 
+/// Playback setup state (Gauntlet G1): is the host GStreamer
+/// plugin set on this system, and — on the families whose full
+/// codec set lives in a third-party source (Fedora/RPM Fusion,
+/// openSUSE/Packman) — what is that source called, and is it
+/// enabled yet? The player's setup strip renders from this;
+/// probing is file checks only, cheap enough for a door.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackSetupStatus {
+    pub plugins_present: bool,
+    /// "RPM Fusion" / "Packman" on the families that have one.
+    pub repo_name: Option<String>,
+    pub repo_enabled: bool,
+}
+
+fn playback_setup_status_now() -> PlaybackSetupStatus {
+    let fam = crate::deps::distro_family();
+    let repo = crate::deps::third_party_repo(fam);
+    PlaybackSetupStatus {
+        plugins_present: crate::deps::gst_plugins_present(),
+        repo_name: repo.map(|r| r.name.to_string()),
+        repo_enabled: repo.map(|_| crate::deps::repo_enabled(fam)).unwrap_or(false),
+    }
+}
+
+#[tauri::command]
+pub async fn playback_setup_status() -> Cmd<PlaybackSetupStatus> {
+    tauri::async_runtime::spawn_blocking(playback_setup_status_now)
+        .await
+        .map_err(|e| CommandError::from(UfmError::Internal(format!("playback status task: {e}"))))
+}
+
+/// The playback-setup door's one action, clicked BY the user on
+/// the player's setup strip (never automatic): install the
+/// GStreamer plugin set. With `with_repo` — a separate, explicit
+/// click after the strip explained the source in words — the
+/// family's third-party codec source is enabled first (the
+/// pkexec prompt is the admin OK) and the FULL media set goes
+/// in, ffmpeg included, so conversions light up from the same
+/// consent. Returns the fresh status either way; an install
+/// that didn't go through is the calm error (the receipt).
+#[tauri::command]
+pub async fn playback_setup_install(with_repo: bool) -> Cmd<PlaybackSetupStatus> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let fam = crate::deps::distro_family();
+        let repo = crate::deps::third_party_repo(fam);
+        if with_repo {
+            if let Some(r) = repo {
+                if !crate::deps::repo_enabled(fam) {
+                    crate::deps::enable_third_party_repo(fam).map_err(|e| {
+                        format!(
+                            "Fable couldn't add the {} source: {e}. Nothing was installed, and you can try again from the same button.",
+                            r.name
+                        )
+                    })?;
+                }
+            }
+        }
+        let full = repo.is_some() && (with_repo || crate::deps::repo_enabled(fam));
+        let pkgs = if full {
+            crate::deps::media_full_packages(fam)
+        } else {
+            crate::deps::packages_for(fam, "gst-plugins")
+                .map(|p| p.to_vec())
+                .ok_or_else(|| {
+                    "Fable doesn't know the playback packages for this system, so it can't set them up automatically."
+                        .to_string()
+                })?
+        };
+        crate::deps::install_packages(&pkgs)
+            .map_err(|e| format!("Fable couldn't set up playback on this system: {e}. Nothing else is affected, and you can try again from the same button."))?;
+        Ok::<PlaybackSetupStatus, String>(playback_setup_status_now())
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("playback setup task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
 /// Start playback of a media URL on a cast device.
 #[tauri::command]
 pub async fn cast_play(
@@ -11733,8 +11938,11 @@ pub async fn find_app_leftovers(app_id: String, app_name: String) -> Cmd<Vec<Lef
     .map_err(|e| CommandError::from(UfmError::Internal(e)))
 }
 
-/// Uninstall an app (flatpak remove, or pkexec pacman -Rns for
-/// system apps) and optionally trash the selected leftovers.
+/// Uninstall an app (flatpak remove, a local-launcher delete,
+/// or the family's own package removal for system apps —
+/// Gauntlet G1 de-pacman'd this: owner query + removal speak
+/// dpkg/apt, pacman, or rpm/dnf/zypper per deps.rs) and
+/// optionally trash the selected leftovers.
 #[tauri::command]
 pub async fn uninstall_app(
     app: InstalledAppIn,
@@ -11763,33 +11971,13 @@ pub async fn uninstall_app(
                 notes.push("removed the local launcher".into());
             }
             _ => {
-                // System app: find the owning pacman package.
-                let out = std::process::Command::new("pacman")
-                    .args(["-Qo", &app.desktop_path])
-                    .output()
-                    .map_err(|e| format!("pacman: {e}"))?;
-                let text = String::from_utf8_lossy(&out.stdout).to_string();
-                // "path is owned by pkg 1.2-3"
-                let pkg = text
-                    .split(" is owned by ")
-                    .nth(1)
-                    .and_then(|t| t.split_whitespace().next())
-                    .ok_or("could not find the owning package")?
-                    .to_string();
-                let out = std::process::Command::new("pkexec")
-                    .args(["pacman", "-Rns", "--noconfirm", &pkg])
-                    .output()
-                    .map_err(|e| format!("pkexec: {e}"))?;
-                if !out.status.success() {
-                    return Err(format!(
-                        "uninstall failed: {}",
-                        String::from_utf8_lossy(&out.stderr)
-                            .lines()
-                            .last()
-                            .unwrap_or("")
-                            .trim()
-                    ));
-                }
+                // System app: find the owning package and remove
+                // it the family's way (deps.rs — this branch used
+                // to shell pacman unconditionally, so it errored
+                // on every apt/dnf/zypper system).
+                let pkg = crate::deps::app_owner_query(&app.desktop_path)?
+                    .ok_or("could not find the owning package")?;
+                crate::deps::remove_app_package(&pkg)?;
                 notes.push(format!("removed package {pkg}"));
             }
         }

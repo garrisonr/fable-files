@@ -129,6 +129,16 @@ export class VideoPlayer {
    * loading, so position polls are ignored until the initial
    * seek (to the local position) has had time to land. */
   private castSeekAt = 0;
+  /** Gauntlet G1 — playback setup strip: appears when the host
+   * GStreamer plugin set is missing (checked once per player:
+   * at standalone-open, or at the first playback failure for
+   * inline players — never on scroll). Non-modal by design:
+   * nothing prompts until HE clicks the strip's button, and
+   * the pkexec prompt that follows belongs to that click. */
+  private setupStrip: HTMLDivElement | null = null;
+  private setupChecked = false;
+  private setupBusy = false;
+  private setupRepoName: string | null = null;
 
   /** The file this player is showing (hosts snapshot it before a
    * re-render tears the player down — fix batch item 1). */
@@ -355,6 +365,13 @@ export class VideoPlayer {
     this.castBadge.append(this.castBadgeText, badgeStop);
     this.el.appendChild(this.castBadge);
 
+    // Playback setup strip (Gauntlet G1): created hidden — the
+    // setup check decides whether it ever appears.
+    this.setupStrip = document.createElement("div");
+    this.setupStrip.className = "vp-setup";
+    this.setupStrip.hidden = true;
+    this.el.appendChild(this.setupStrip);
+
     // Playback wiring.
     this.video.addEventListener("play", () => {
       this.playBtn.textContent = "⏸";
@@ -426,6 +443,102 @@ export class VideoPlayer {
     this.el.addEventListener("keydown", (e) => this.onKey(e));
     this.el.tabIndex = 0;
     this.showControls(true);
+    // A pop-out player is a door the user deliberately opened,
+    // so its playback-setup check runs up front. Inline (Quick
+    // Look) players check at the first playback failure
+    // instead (see enterFallback) — never on scroll.
+    if (opts.standalone) void this.checkPlaybackSetup();
+  }
+
+  /** One-shot playback-setup check (Gauntlet G1): if the host
+   * GStreamer set is missing, offer the setup on the strip —
+   * in context, in words, with the install behind a button
+   * HE clicks. Audio players skip it (no picture pipeline). */
+  private async checkPlaybackSetup(): Promise<void> {
+    if (this.setupChecked || this.destroyed) return;
+    this.setupChecked = true;
+    if (isAudioName(this.path)) return;
+    try {
+      const st = await api.playbackSetupStatus();
+      if (this.destroyed || st.pluginsPresent) return;
+      this.setupRepoName = st.repoName;
+      this.renderSetupStrip(
+        "This system is missing the pieces that let Fable play video.",
+        "Set up playback",
+        false,
+      );
+    } catch {
+      // A failed status probe is not a playback error — the
+      // player itself will say what it has to say.
+    }
+  }
+
+  private renderSetupStrip(text: string, btnLabel: string, withRepo: boolean): void {
+    const strip = this.setupStrip;
+    if (!strip) return;
+    strip.replaceChildren();
+    const span = document.createElement("span");
+    span.className = "vp-setup-text";
+    span.textContent = text;
+    const btn = document.createElement("button");
+    btn.className = "vp-setup-btn";
+    btn.textContent = btnLabel;
+    btn.addEventListener("click", () => void this.runSetupInstall(withRepo, btn));
+    strip.append(span, btn);
+    strip.hidden = false;
+  }
+
+  private async runSetupInstall(withRepo: boolean, btn: HTMLButtonElement): Promise<void> {
+    if (this.setupBusy) return;
+    this.setupBusy = true;
+    btn.disabled = true;
+    btn.textContent = "Setting up…";
+    try {
+      const st = await api.playbackSetupInstall(withRepo);
+      this.setupBusy = false;
+      if (this.destroyed) return;
+      if (st.pluginsPresent) {
+        this.renderSetupDone();
+      } else if (st.repoName && !st.repoEnabled) {
+        // The stock set went in and playback is STILL
+        // incomplete: on this family the rest lives in the
+        // third-party source. Name it, in words, and let the
+        // second click be the consent (Q4).
+        this.setupRepoName = st.repoName;
+        this.renderSetupStrip(
+          `The full playback set on this system lives in the ${st.repoName} source, which isn't enabled yet. Fable can add it — the system will ask for your password.`,
+          `Add ${st.repoName} and finish setup`,
+          true,
+        );
+      } else {
+        this.renderSetupStrip(
+          "Playback setup finished, but the pieces still aren't landing on this system.",
+          "Try again",
+          withRepo,
+        );
+      }
+    } catch (e) {
+      this.setupBusy = false;
+      if (this.destroyed) return;
+      // The backend's calm sentence is the receipt; the button
+      // beside it stays the retry.
+      this.renderSetupStrip(String(e), "Try again", withRepo);
+    }
+  }
+
+  private renderSetupDone(): void {
+    const strip = this.setupStrip;
+    if (!strip) return;
+    strip.replaceChildren();
+    const span = document.createElement("span");
+    span.className = "vp-setup-text";
+    span.textContent =
+      "Playback is set up — if this video already gave up, reopen it and it will play.";
+    strip.appendChild(span);
+    strip.hidden = false;
+    window.setTimeout(() => {
+      if (!this.destroyed && this.setupStrip) this.setupStrip.hidden = true;
+    }, 6000);
   }
 
   private onKey(e: KeyboardEvent): void {
@@ -744,6 +857,11 @@ export class VideoPlayer {
     }
     this.checkFrame();
     if (this.frameSeen) return;
+    // A first playback failure is also the inline player's
+    // playback-setup moment (Gauntlet G1): if the host plugin
+    // set is what's missing, the strip offers the fix while
+    // the transcode fallback spins up either way.
+    void this.checkPlaybackSetup();
     void this.startTranscode(this.video.currentTime || 0);
   }
 
