@@ -17,6 +17,7 @@ pub mod mediares;
 pub mod musiccomplete;
 pub mod opensubs;
 pub mod rommedia;
+pub mod romorg;
 pub mod emu;
 pub mod emu_esde;
 pub mod emu_farm;
@@ -656,6 +657,8 @@ pub fn run() {
             commands::mediares_confirm,
             commands::mediares_plan_organize,
             commands::mediares_start_organize,
+            commands::rom_plan_organize,
+            commands::rom_start_organize,
             commands::mediacomplete_get_settings,
             commands::mediacomplete_save_settings,
             commands::mediacomplete_get_status,

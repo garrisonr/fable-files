@@ -832,6 +832,12 @@ export const api = {
     invoke<MediaresOrganizePlan>("mediares_plan_organize", { req }),
   mediaresStartOrganize: (req: MediaresScanRequest) =>
     invoke<JobStart>("mediares_start_organize", { req }),
+  // ROM Organize (Organize parity, 2026-10-16): same plan/start
+  // shape as the media-server organize; the plan is the preview.
+  romPlanOrganize: (req: MediaresScanRequest) =>
+    invoke<RomOrganizePlan>("rom_plan_organize", { req }),
+  romStartOrganize: (req: MediaresScanRequest) =>
+    invoke<JobStart>("rom_start_organize", { req }),
   // Media Completion: artwork + OpenSubtitles subtitles + the
   // background scheduler. Secrets go in one-way (only presence and
   // validation results come back); runs are the morning reports.
@@ -1755,6 +1761,12 @@ export interface MediaresConfirmRequest {
 export interface MediaresOrganizePlan {
   actions: Array<{ src: string; dst: string; rel: string }>;
   excluded: Array<{ path: string; reason: string }>;
+}
+
+export interface RomOrganizePlan {
+  actions: Array<{ src: string; dst: string; rel: string }>;
+  excluded: Array<{ path: string; reason: string }>;
+  truncated: boolean;
 }
 
 export interface RomMediaCandidate {

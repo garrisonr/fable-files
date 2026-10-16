@@ -29,6 +29,7 @@ import { showPluginRunDialog } from "./plugins";
 import { SearchView, fmtDay } from "./search";
 import { RomHome } from "./romhome";
 import { MediaResDialog } from "./mediares";
+import { RomOrganizeDialog } from "./romorg";
 import { MusicCompleteDialog } from "./musiccomplete";
 import { PropertiesDialog } from "./properties";
 import { AuditorPanel } from "./auditor";
@@ -237,6 +238,7 @@ export class Shell {
   private labelManager = new LabelManager();
   private searchOpenWith = new OpenWithDialog();
   private mediaRename = new MediaResDialog();
+  private romOrganize = new RomOrganizeDialog();
   private musicComplete = new MusicCompleteDialog();
   private musicPlayer = new MusicPlayer();
   private labelList!: HTMLElement;
@@ -2914,6 +2916,34 @@ export class Shell {
     this.dupDialog.open(path);
   }
 
+  /** Media-server Organize on the folder being browsed (hamburger →
+   * Organize): the Resolve dialog scoped to this folder, whose
+   * Preview Organize step files resolved movies/episodes into the
+   * server layout as a journaled job. */
+  private async openMediaOrganizeHere(): Promise<void> {
+    const path = (await this.currentDirPath()) || (await this.homePath());
+    if (!path) {
+      Toast.error("Open a folder first, then organize its movies and shows.");
+      return;
+    }
+    void this.mediaRename.openFolder(path, () => {
+      this.refreshActiveDir();
+      if (this.searchView.active) this.searchView.refresh();
+    });
+  }
+
+  /** ROM Organize on the folder being browsed (hamburger →
+   * Organize): identified games filed by system + DAT title, as a
+   * journaled job, after a full preview. */
+  private async openRomOrganizeHere(): Promise<void> {
+    const path = (await this.currentDirPath()) || (await this.homePath());
+    if (!path) {
+      Toast.error("Open a folder first, then organize its games.");
+      return;
+    }
+    void this.romOrganize.openFolder(path, () => this.refreshActiveDir());
+  }
+
   /** Music Completion on the folder being browsed (hamburger →
    * Organize). */
   private async openMusicHere(): Promise<void> {
@@ -4590,6 +4620,14 @@ export class Shell {
           {
             label: "Complete Music Tags & Lyrics\u2026",
             action: () => void this.openMusicHere(),
+          },
+          {
+            label: "Organize Movies & TV\u2026",
+            action: () => void this.openMediaOrganizeHere(),
+          },
+          {
+            label: "Organize Video Games\u2026",
+            action: () => void this.openRomOrganizeHere(),
           },
           {
             label: "Manage Labels\u2026",

@@ -14075,6 +14075,168 @@ pub async fn mediares_start_organize(
 }
 
 // ---------------------------------------------------------------------------
+// ROM Organize commands (Organize parity, Dickles 2026-10-16):
+// plan/preview + job start for filing identified games by platform +
+// DAT title. The plan lives in crate::romorg (stored identities only);
+// the job builder mirrors build_organize_job minus the Media
+// Completion fetch steps — games fetch their artwork through the ROM
+// media pipeline, not at their new home.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn rom_plan_organize(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    req: MediaresScanRequest,
+) -> Cmd<crate::romorg::RomOrganizePlan> {
+    let ds = rom_dataset(&app, &state)?;
+    let systems: Vec<(String, String)> = ds.systems().to_vec();
+    let catalog_path = state.catalog_path.clone();
+    let plan = tauri::async_runtime::spawn_blocking(move || {
+        let catalog = ufm_catalog::Catalog::open(&catalog_path)
+            .map_err(|e| format!("catalog open failed: {e}"))?;
+        crate::romorg::plan_rom_organize(&catalog, Path::new(&req.root), &req.paths, &systems)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("plan task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(plan)
+}
+
+/// Build the ROM Organize job from a plan: one Mkdir chain per
+/// platform folder + one Move per file, every Move an outcome step
+/// (the undo feed) — build_organize_job's shape, nothing more.
+fn build_rom_organize_job(
+    state: &AppState,
+    root: &Path,
+    plan: &crate::romorg::RomOrganizePlan,
+) -> Cmd<ufm_jobs::Job> {
+    let location = location_for_path(state, root);
+    let mut planner = PathPlanner {
+        job: ufm_jobs::Job::new(
+            format!(
+                "Organize {} game{} by system",
+                plan.actions.len(),
+                if plan.actions.len() == 1 { "" } else { "s" }
+            ),
+            ufm_jobs::JobPreview::default(),
+        ),
+        seq: 0,
+        location,
+    };
+    // abs dir -> step id that creates it (None = already on disk)
+    let mut dir_steps: std::collections::HashMap<PathBuf, Option<String>> =
+        std::collections::HashMap::new();
+    dir_steps.insert(root.to_path_buf(), None);
+    for action in &plan.actions {
+        let src = PathBuf::from(&action.src);
+        let dst = PathBuf::from(&action.dst);
+        let dst_parent = dst
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| root.to_path_buf());
+        // Ensure the destination chain exists as steps.
+        let mut dep: Option<String> = None;
+        if let Ok(rel_parent) = dst_parent.strip_prefix(root) {
+            let mut cur = root.to_path_buf();
+            for comp in rel_parent.components() {
+                cur = cur.join(comp.as_os_str());
+                if let Some(existing) = dir_steps.get(&cur) {
+                    if existing.is_some() {
+                        dep = existing.clone();
+                    }
+                    continue;
+                }
+                if cur.is_dir() {
+                    dir_steps.insert(cur.clone(), None);
+                } else {
+                    let parent_dep = dep.clone();
+                    let id = planner.add_mkdir(
+                        cur.parent().unwrap_or(root),
+                        &comp.as_os_str().to_string_lossy(),
+                        parent_dep,
+                    );
+                    dir_steps.insert(cur.clone(), Some(id.clone()));
+                    dep = Some(id);
+                }
+            }
+        }
+        let new_name = dst
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let size = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+        planner.job.preview.files_affected += 1;
+        planner.job.preview.bytes_to_move += size;
+        if same_device(&src, &dst_parent) {
+            planner.add_step(
+                format!("organize {}", src.display()),
+                ufm_jobs::StepOp::Move {
+                    src: job_item(
+                        ItemId::new(),
+                        location,
+                        &src,
+                        ItemKind::File,
+                        Some(size),
+                    ),
+                    dst_parent: job_item(
+                        ItemId::new(),
+                        location,
+                        &dst_parent,
+                        ItemKind::Folder,
+                        None,
+                    ),
+                    new_name,
+                },
+                dep.into_iter().collect(),
+                true,
+                None,
+            );
+        } else {
+            let (_, _, del) =
+                planner.add_move_file(&src, &dst_parent, &new_name, size, dep);
+            if let Some(s) = planner.job.steps.get_mut(&del) {
+                s.outcome = true;
+                s.outcome_path = Some(action.dst.clone());
+            }
+        }
+    }
+    Ok(planner.job)
+}
+
+#[tauri::command]
+pub async fn rom_start_organize(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    req: MediaresScanRequest,
+) -> Cmd<JobStart> {
+    let ds = rom_dataset(&app, &state)?;
+    let systems: Vec<(String, String)> = ds.systems().to_vec();
+    let catalog_path = state.catalog_path.clone();
+    let root = PathBuf::from(&req.root);
+    let root_for_plan = root.clone();
+    let plan = tauri::async_runtime::spawn_blocking(move || {
+        let catalog = ufm_catalog::Catalog::open(&catalog_path)
+            .map_err(|e| format!("catalog open failed: {e}"))?;
+        crate::romorg::plan_rom_organize(&catalog, &root_for_plan, &req.paths, &systems)
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("plan task failed: {e}")))
+    })?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    if plan.actions.is_empty() {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "nothing to organize — every file was excluded (see the preview)".into(),
+        )));
+    }
+    let job = build_rom_organize_job(&state, &root, &plan)?;
+    start_job(app, &state, job)
+}
+
+// ---------------------------------------------------------------------------
 // Media Completion commands (Dickles, 2026-10-15): artwork and
 // subtitle settings + fetches, the OpenSubtitles account block, and
 // the background scheduler (agent control, runs, undo, pending).

@@ -15,6 +15,7 @@ pub mod lrc;
 pub mod musicid;
 pub mod oshash;
 pub mod romdat;
+pub mod romorg;
 pub mod videoid;
 
 // ---------------------------------------------------------------------------

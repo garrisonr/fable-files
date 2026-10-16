@@ -144,6 +144,22 @@ export class MediaResDialog {
     }
   }
 
+  /** Organize-menu door (Organize parity, 2026-10-16): the same
+   * dialog scoped to the folder being browsed — root and only input
+   * are the folder itself; the scan expands it. Lands the user on
+   * the scan, one click from Preview Organize; unresolved files are
+   * offered resolve-first here, never guessed. */
+  async openFolder(path: string, onDone: () => void): Promise<void> {
+    this.onDone = onDone;
+    this.el.hidden = false;
+    this.titleEl.textContent = "Resolve for Media Servers";
+    this.bodyEl.innerHTML = "";
+    this.bodyEl.appendChild(el("p", "prefs-note", "Reading names…"));
+    this.footEl.innerHTML = "";
+    this.req = { root: path, paths: [path] };
+    await this.rescan();
+  }
+
   private close(): void {
     this.el.hidden = true;
   }
