@@ -26,7 +26,9 @@ interface JobRow {
   pct: HTMLSpanElement;
   cancel: HTMLButtonElement;
   pause?: HTMLButtonElement;
+  copy?: HTMLButtonElement;
   paused: boolean;
+  failed: boolean;
 }
 
 /** The backend `job-progress` payload (commands.rs emit_job_progress). */
@@ -51,6 +53,19 @@ export class JobsPanel {
   readonly el: HTMLDivElement;
   private rows = new Map<string, JobRow>();
   private list: HTMLDivElement;
+  /** Freeze fix (2026-10-16): terminal emits seen for jobs that had
+   * no row at emit time, jobId → error (null = clean finish). The
+   * backend spawns the executor BEFORE start_* returns, so a fast
+   * job (a one-file trash completes in ~160 ms) can emit its
+   * terminal event before trackJob() ever runs — without this set,
+   * trackJob then created a row at 0% that nothing would ever
+   * remove: the eternal "WORKING… 0%" zombie Dickles hit twice. */
+  private terminalSeen = new Map<string, string | null>();
+  /** Job ids whose completion continuation already fired — the
+   * emit path and the reconcile path must never fire it twice. */
+  private continuationsFired = new Set<string>();
+  /** Backstop reconcile timer (see reconcileRows). */
+  private reconcileTimer: number | null = null;
   /** Fired when a job completes successfully (shell refreshes). */
   onJobDone: ((output: string) => void) | null = null;
   /** Fired when a job fails. */
@@ -116,10 +131,21 @@ export class JobsPanel {
 
   /** Register a transfer job (inc-2): a row with pause/resume (⏸/▶)
    * and cancel (✕) wired to the job commands. Rows are keyed
-   * `job:<id>` so they can never collide with transcode/burn ids. */
+   * `job:<id>` so they can never collide with transcode/burn ids.
+   *
+   * Freeze fix (2026-10-16): the executor starts before start_*
+   * returns, so the job may ALREADY be terminal here. A job in
+   * terminalSeen gets no row (its continuation fires instead), and
+   * every fresh row is immediately reconciled against list_jobs —
+   * plus the periodic backstop in reconcileRows — so a lost or
+   * early emit can never wedge the panel at 0% again. */
   trackJob(jobId: string, label: string): void {
     const key = `job:${jobId}`;
     if (this.rows.has(key)) return;
+    if (this.terminalSeen.has(jobId)) {
+      this.fireTransferDone(jobId, this.terminalSeen.get(jobId) ?? null);
+      return;
+    }
     this.show();
     const row = this.makeRow(key, label, true);
     row.pause?.addEventListener("click", () => {
@@ -129,6 +155,83 @@ export class JobsPanel {
     row.cancel.addEventListener("click", () => {
       void api.cancelJob(jobId).catch(() => undefined);
     });
+    this.ensureReconcileTimer();
+    void this.reconcileRows();
+  }
+
+  /** Fire the shell's per-job continuation exactly once. */
+  private fireTransferDone(jobId: string, error: string | null): void {
+    if (this.continuationsFired.has(jobId)) return;
+    this.continuationsFired.add(jobId);
+    if (this.onTransferDone) this.onTransferDone(jobId, error);
+  }
+
+  /** While any transfer rows are on screen, re-read backend truth
+   * every few seconds: terminal rows are retired (or shown failed),
+   * live rows repaint from the summary. Events stay the primary
+   * channel; this is the backstop that makes a missed emit a
+   * seconds-long delay instead of a permanent phantom. */
+  private ensureReconcileTimer(): void {
+    if (this.reconcileTimer !== null) return;
+    this.reconcileTimer = window.setInterval(() => {
+      void this.reconcileRows();
+    }, 4000);
+  }
+
+  private async reconcileRows(): Promise<void> {
+    const keys = [...this.rows.keys()].filter((k) => k.startsWith("job:"));
+    if (keys.length === 0) {
+      if (this.reconcileTimer !== null) {
+        window.clearInterval(this.reconcileTimer);
+        this.reconcileTimer = null;
+      }
+      return;
+    }
+    let jobs: JobSummary[];
+    try {
+      jobs = await api.listJobs();
+    } catch {
+      return; // backend unreachable this pass; rows stay as they are
+    }
+    const byId = new Map(jobs.map((j) => [j.job_id, j]));
+    for (const key of keys) {
+      const row = this.rows.get(key);
+      if (!row || row.failed) continue;
+      const jobId = key.slice(4);
+      const j = byId.get(jobId);
+      if (!j) {
+        // The backend no longer holds the job at all — it finished
+        // and was reaped; retire the row rather than strand it.
+        this.retireRow(key);
+        this.fireTransferDone(jobId, null);
+        continue;
+      }
+      if (TERMINAL_STATES.has(j.state)) {
+        // The summary carries no error text (that lives only in the
+        // progress payload): a failed job still reports as failed —
+        // never dress it up as a success for the shell's undo logic.
+        const err = j.state === "failed" ? "The job failed." : null;
+        this.terminalSeen.set(jobId, err);
+        this.retireRow(key);
+        this.fireTransferDone(jobId, err);
+        continue;
+      }
+      const pct =
+        j.bytes_total > 0
+          ? (j.bytes_done / j.bytes_total) * 100
+          : j.steps_total > 0
+            ? (j.steps_done / j.steps_total) * 100
+            : 0;
+      this.paintRow(row, pct, j.state, JobsPanel.progressDetail(j));
+    }
+  }
+
+  private retireRow(key: string): void {
+    const row = this.rows.get(key);
+    if (!row) return;
+    this.rows.delete(key);
+    row.root.remove();
+    if (this.rows.size === 0) this.el.hidden = true;
   }
 
   /** Surface an already-running job (UI round double-submit guard):
@@ -212,7 +315,7 @@ export class JobsPanel {
       root.append(name, detail, track, pct, cancel);
     }
     this.list.appendChild(root);
-    const row: JobRow = { root, name, detail, bar, pct, cancel, pause, paused: false };
+    const row: JobRow = { root, name, detail, bar, pct, cancel, pause, paused: false, failed: false };
     this.rows.set(id, row);
     return row;
   }
@@ -276,12 +379,15 @@ export class JobsPanel {
 
   private onJobProgress(p: JobProgress): void {
     const key = `job:${p.job_id}`;
+    // Freeze fix: remember EVERY terminal emit, tracked or not —
+    // trackJob consults this when the executor outruns the invoke.
+    if (p.done) this.terminalSeen.set(p.job_id, p.error);
     let row = this.rows.get(key);
     if (!row) {
       if (p.done) {
         // Terminal emit for a job we never tracked (e.g. it finished
         // before hydration): still deliver the completion.
-        if (this.onTransferDone) this.onTransferDone(p.job_id, p.error);
+        this.fireTransferDone(p.job_id, p.error);
         return;
       }
       this.trackJob(p.job_id, p.title);
@@ -302,10 +408,51 @@ export class JobsPanel {
       this.paintRow(row, pct, p.state, JobsPanel.progressDetail(p));
       return;
     }
-    this.rows.delete(key);
-    row.root.remove();
-    if (this.rows.size === 0) this.el.hidden = true;
-    if (this.onTransferDone) this.onTransferDone(p.job_id, p.error);
+    this.fireTransferDone(p.job_id, p.error);
+    if (p.error) {
+      // A failed job keeps a compact row — the error text, a Copy
+      // button (the copy-button law) and a dismiss ✕ — instead of
+      // vanishing and leaving the failure to a transient toast.
+      this.failRow(row, p.error);
+      return;
+    }
+    this.retireRow(key);
+  }
+
+  /** Convert a live row into its failed end-state (kept until the
+   * user dismisses it). The ✕ becomes Dismiss; pause goes away. */
+  private failRow(row: JobRow, error: string): void {
+    row.failed = true;
+    row.root.classList.add("job-failed");
+    row.bar.style.width = "100%";
+    row.pct.textContent = "Failed";
+    row.detail.textContent = error;
+    row.detail.hidden = false;
+    row.root.title = error;
+    if (row.pause) row.pause.hidden = true;
+    row.cancel.title = "Dismiss";
+    if (!row.copy) {
+      const copy = document.createElement("button");
+      copy.className = "icon-btn job-copy";
+      copy.textContent = "Copy";
+      copy.title = "Copy the error text";
+      copy.addEventListener("click", () => {
+        void navigator.clipboard?.writeText(error).catch(() => undefined);
+      });
+      row.root.appendChild(copy);
+      row.copy = copy;
+    }
+    // The ✕ becomes Dismiss: swap in a clone (drops the cancel
+    // listener — the job is already terminal) wired to retire.
+    const dismiss = row.cancel.cloneNode(true) as HTMLButtonElement;
+    dismiss.title = "Dismiss";
+    row.cancel.replaceWith(dismiss);
+    row.cancel = dismiss;
+    dismiss.addEventListener("click", () => {
+      for (const [k, r] of this.rows) {
+        if (r === row) this.retireRow(k);
+      }
+    });
   }
 
   private onProgress(p: {

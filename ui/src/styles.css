@@ -2410,7 +2410,13 @@ body[data-layout="tv"] .cell-icon {
 
 /* ——— Phase 2: Collections sidebar + search-hit stars ——— */
 .side-star { color: var(--ufm-accent); font-size: 0.8rem; flex: none; }
-.side-glyph { font-size: 0.8rem; flex: none; }
+.side-glyph { font-size: 0.8rem; flex: none; display: inline-flex; align-items: center; }
+/* Mono section icons (2026-10-16): inline SVG, currentColor — the
+   glyph takes the sidebar's own ink in every theme. */
+.side-glyph svg { width: 1rem; height: 1rem; display: block; }
+.side-item:has(.side-glyph) { align-items: center; }
+.rom-door-glyph { display: inline-flex; align-items: center; }
+.rom-door-glyph svg { width: 1.05rem; height: 1.05rem; display: block; }
 .side-count {
   margin-left: auto; color: var(--ufm-text-muted); font-size: 0.75rem;
   font-variant-numeric: tabular-nums; flex: none;
@@ -2793,36 +2799,44 @@ tr.row[style*="--label-color"] {
 .term-body { flex: 1; min-height: 0; padding: 4px 6px; }
 .term-body .xterm { height: 100%; }
 
-/* ——— jobs dock ——— */
-/* Docked at the bottom of the main column, directly above the
-   status bar (UI round, Dickles' screenshot: the old floating
-   panel covered the indexing readout). In-flow chrome: it takes
-   layout space, pushes the viewport up, and can never occlude the
-   status bar. Cards spend WIDTH (a row, growing to a cap, then
-   scrolling sideways) instead of stacking height; the card itself
-   keeps its name + truth-line detail + progress grid. */
+/* ——— jobs panel ——— */
+/* Freeze/icons ship (Dickles, 2026-10-16): the in-flow full-width
+   dock read as a GARGANTUAN slab eating the window. The panel is a
+   compact floating card again — bottom-right above the status bar,
+   capped width, slim stacked rows with the same truth-line detail:
+   very apparent, not obnoxious. It floats (never pushes the
+   viewport around) and stays clear of the status bar readout. */
 .jobs-panel {
-  flex: 0 0 auto;
-  max-height: 40vh;
+  position: fixed;
+  right: 0.9rem;
+  bottom: 2.6rem;
+  z-index: 60;
+  width: min(21rem, calc(100vw - 2rem));
+  max-height: 46vh;
   overflow-y: auto;
-  background: color-mix(in srgb, var(--ufm-surface) 78%, transparent);
+  background: color-mix(in srgb, var(--ufm-surface) 84%, transparent);
   backdrop-filter: blur(18px) saturate(150%);
-  border-top: 1px solid var(--ufm-border);
-  padding: 0.5rem 0.75rem 0.6rem;
+  border: 1px solid var(--ufm-border);
+  border-radius: 14px;
+  box-shadow: 0 16px 44px rgb(0 0 0 / 0.30), 0 3px 10px rgb(0 0 0 / 0.18);
+  padding: 0.55rem 0.7rem 0.65rem;
   color: var(--ufm-text);
 }
 .jobs-panel[hidden] { display: none; }
-.jobs-head { font-size: 0.75rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ufm-text-muted); margin-bottom: 0.4rem; }
-.jobs-list { display: flex; flex-direction: row; flex-wrap: nowrap; gap: 0.75rem; overflow-x: auto; padding-bottom: 0.2rem; }
-.jobs-list .job-row { flex: 1 1 18rem; min-width: 16rem; max-width: 28rem; }
-.job-row { display: grid; grid-template-columns: 1fr auto auto; gap: 0.25rem 0.5rem; align-items: center; }
+.jobs-head { font-size: 0.6875rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: var(--ufm-text-muted); margin-bottom: 0.35rem; }
+.jobs-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.job-row { display: grid; grid-template-columns: 1fr auto auto; gap: 0.2rem 0.5rem; align-items: center; }
 .job-row-xfer { grid-template-columns: 1fr auto auto auto; }
 .job-name { font-size: 0.8125rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; grid-column: 1 / -1; }
-.job-track { height: 6px; border-radius: 3px; background: color-mix(in srgb, var(--ufm-text) 14%, transparent); overflow: hidden; }
-.job-bar { height: 100%; width: 0%; background: var(--ufm-accent); border-radius: 3px; transition: width 200ms ease; }
+.job-track { height: 4px; border-radius: 2px; background: color-mix(in srgb, var(--ufm-text) 14%, transparent); overflow: hidden; }
+.job-bar { height: 100%; width: 0%; background: var(--ufm-accent); border-radius: 2px; transition: width 200ms ease; }
 .job-pct { font-size: 0.75rem; font-variant-numeric: tabular-nums; color: var(--ufm-text-muted); }
 .job-detail { font-size: 0.75rem; color: var(--ufm-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; grid-column: 1 / -1; font-variant-numeric: tabular-nums; }
 .job-detail[hidden] { display: none; }
+.job-row.job-failed .job-name { color: var(--ufm-danger, #c0392b); }
+.job-row.job-failed .job-bar { background: var(--ufm-danger, #c0392b); }
+.job-row.job-failed .job-detail { white-space: normal; overflow-wrap: anywhere; }
+.job-copy { font-size: 0.7rem; padding: 0.15rem 0.45rem; }
 .job-row.job-flash { animation: job-flash-pulse 1.6s ease-out; border-radius: 8px; }
 @keyframes job-flash-pulse { 0%, 55% { background: color-mix(in srgb, var(--ufm-accent) 20%, transparent); } 100% { background: transparent; } }
 @media (prefers-reduced-motion: reduce) { .job-row.job-flash { animation: none; } }

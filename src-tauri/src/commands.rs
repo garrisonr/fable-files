@@ -4443,6 +4443,17 @@ pub async fn start_indexing(
         let progress_app = app.clone();
         let indexed = tauri::async_runtime::spawn_blocking(move || {
             let mut indexer = ufm_search::Indexer::open(&catalog_path, &checkpoint_path)?;
+            // Freeze fix (2026-10-16): the emit into the WebView is
+            // coalesced to at most one per 400 ms. The callback itself
+            // still updates index_state on every call (index_status
+            // polls read the truth), but each emit crosses the glib
+            // main-context channel and wakes the renderer — during the
+            // 59k-dir Home walk the un-coalesced stream was part of
+            // the saturation that froze the window. The completion
+            // path below emits the final state unconditionally.
+            let last_emit = std::sync::Arc::new(std::sync::Mutex::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            ));
             indexer.set_progress_callback(Box::new(move |stats| {
                 // Single-lock site: only index_state, never nested — the
                 // canonical lock order is respected.
@@ -4459,6 +4470,13 @@ pub async fn start_indexing(
                     }
                     index.clone()
                 };
+                {
+                    let mut last = last_emit.lock().unwrap();
+                    if last.elapsed() < std::time::Duration::from_millis(400) {
+                        return;
+                    }
+                    *last = std::time::Instant::now();
+                }
                 let _ = progress_app.emit("index-progress", &payload);
             }));
             indexer.index_root(&root, &location_rec)

@@ -79,6 +79,17 @@ const CHECKPOINT_VERSION: u32 = 2;
 /// Checkpoint cadence: persist after this many newly-completed directories.
 const CHECKPOINT_EVERY_DIRS: u64 = 25;
 
+/// Minimum wall-clock gap between non-final checkpoint writes
+/// (freeze fix, 2026-10-16). The cadence above fires every 25
+/// completed dirs, but each write re-serializes the ENTIRE
+/// completed-dirs set — on Dickles' Home walk (59,309 dirs) that was
+/// ~2,372 ever-larger pretty-JSON serializations (quadratic total
+/// work, the perf-proven hot spot that saturated the app while
+/// indexing: `Vec::from_iter` + free churn in this crate). Writes are
+/// now time-throttled and compact; a crash loses at most this many
+/// seconds of dir completions, and the resume re-walk is idempotent.
+const CHECKPOINT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Progress reports during [`Indexer::index_root`]: invoked with cumulative
 /// stats on checkpoint cadence. Must be cheap — it runs on the indexing thread.
 pub type ProgressCallback = Box<dyn Fn(IndexStats) + Send + 'static>;
@@ -105,6 +116,9 @@ pub struct Indexer {
     files_updated: u64,
     files_removed: u64,
     progress: Option<ProgressCallback>,
+    /// When the last non-final checkpoint actually hit disk (freeze
+    /// fix: cadence writes inside the throttle window are skipped).
+    last_checkpoint_write: Option<std::time::Instant>,
 }
 
 impl Indexer {
@@ -123,6 +137,7 @@ impl Indexer {
             files_updated: 0,
             files_removed: 0,
             progress: None,
+            last_checkpoint_write: None,
         };
         me.load_checkpoint()?;
         Ok(me)
@@ -392,7 +407,23 @@ impl Indexer {
 
     /// Atomic checkpoint write: serialize → `<path>.tmp` + fsync → rename.
     /// Readers only ever see the previous complete checkpoint or the new one.
-    fn write_checkpoint(&self, run_complete: bool) -> Result<()> {
+    ///
+    /// Freeze fix (2026-10-16): non-final writes are throttled to one
+    /// per [`CHECKPOINT_MIN_INTERVAL`] and the JSON is compact. The
+    /// old shape — full collect + sort + PRETTY serialization of the
+    /// whole completed-dirs set every 25 dirs — was quadratic in the
+    /// size of the walk and burned a full core for the entire pass
+    /// (59k dirs → a 6.3 MB document re-serialized ~2,400 times),
+    /// starving the UI that shares the process. The final write
+    /// (run_complete) always lands.
+    fn write_checkpoint(&mut self, run_complete: bool) -> Result<()> {
+        if !run_complete {
+            if let Some(last) = self.last_checkpoint_write {
+                if last.elapsed() < CHECKPOINT_MIN_INTERVAL {
+                    return Ok(());
+                }
+            }
+        }
         let mut dirs: Vec<String> = self.completed_dirs.iter().cloned().collect();
         dirs.sort();
         let ck = Checkpoint {
@@ -402,8 +433,9 @@ impl Indexer {
             bytes_done: self.bytes_done,
             run_complete,
         };
-        let json = serde_json::to_string_pretty(&ck)
+        let json = serde_json::to_string(&ck)
             .map_err(|e| UfmError::Database(format!("serialize checkpoint: {e}")))?;
+        self.last_checkpoint_write = Some(std::time::Instant::now());
         let tmp = self.checkpoint_path.with_extension("tmp");
         if let Some(parent) = tmp.parent() {
             if !parent.as_os_str().is_empty() {
@@ -678,5 +710,38 @@ mod tests {
 
         std::fs::remove_dir_all(&work).ok();
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Freeze fix (2026-10-16): cadence checkpoint writes inside the
+    /// throttle window must NOT touch disk — the pre-fix shape
+    /// re-serialized the entire completed-dirs set every 25 dirs
+    /// (quadratic; the indexing-freeze hot spot). The final write
+    /// always lands, and the on-disk format is compact JSON.
+    #[test]
+    fn checkpoint_writes_are_time_throttled_and_compact() {
+        let work = scratch_dir("throttle");
+        let catalog_path = work.join("catalog.db");
+        let checkpoint_path = work.join("checkpoint.json");
+        let mut ix = Indexer::open(&catalog_path, &checkpoint_path).unwrap();
+        ix.completed_dirs.insert("/a".to_string());
+        ix.completed_dirs.insert("/b".to_string());
+        ix.write_checkpoint(false).unwrap();
+        let first = std::fs::read_to_string(&checkpoint_path).unwrap();
+        assert!(first.contains("\"/a\"") && first.contains("\"/b\""));
+        assert!(
+            !first.contains('\n'),
+            "checkpoint must be compact JSON, got pretty output"
+        );
+        // Inside the throttle window: a cadence write is skipped whole.
+        ix.completed_dirs.insert("/c".to_string());
+        ix.write_checkpoint(false).unwrap();
+        let second = std::fs::read_to_string(&checkpoint_path).unwrap();
+        assert_eq!(first, second, "throttled write must not touch disk");
+        // The final write always lands, throttle or not.
+        ix.write_checkpoint(true).unwrap();
+        let third = std::fs::read_to_string(&checkpoint_path).unwrap();
+        assert!(third.contains("\"/c\""));
+        assert!(third.contains("\"run_complete\":true"));
+        std::fs::remove_dir_all(&work).ok();
     }
 }

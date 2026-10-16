@@ -38,6 +38,7 @@ import { loadLabelDefs, migrateLabelAssignments, saveLabelDefs } from "./labels"
 import { loadRomSystems, saveRomSystems, romsEnabled, romScopeOf, romSystemKey, isRomPlaceholder, setRomsEnabled, romDivisions, loadRomGrouping, saveRomGrouping, loadOpenDivisions, saveOpenDivisions, romIconSlug, loadRomIconSet, saveRomIconSet, type RomSystem, type OwnedHardware } from "./roms";
 import { ROM_FLAT_ICONS } from "./romicons_flat";
 import { MusicPlayer } from "./music";
+import { sectionGlyph, SECTION_ICON_SVG } from "./sectionicons";
 import { isPlayableName, isVideoName } from "./video";
 import { OpenWithDialog } from "./openwith";
 import type { ArchiveEntry } from "./api";
@@ -109,6 +110,72 @@ interface SmartFolder {
   type: string | null;
   /** Rule-based folder (Round 5.5): evaluated live by the backend. */
   rule?: { extensions: string[]; minDurationSecs?: number | null };
+}
+
+/** Sidebar icon for a smart folder, by its rule's media kind
+ * (sections/README.md mapping; mono adaptive set). Extension sets
+ * mirror the seeded rule folders; name and search-type are
+ * fallbacks; anything unrecognized wears the plain folder. */
+function smartFolderIcon(sf: SmartFolder): string {
+  const exts = new Set(
+    (sf.rule?.extensions ?? []).map((e) => e.toLowerCase()),
+  );
+  const has = (...xs: string[]) => xs.some((x) => exts.has(x));
+  if (has("m4b")) return "audiobooks";
+  if (has("mkv", "mp4", "avi", "mov", "m4v", "webm", "mpg", "mpeg", "wmv"))
+    return "movies";
+  if (has("mp3", "aac", "flac", "ogg", "oga", "opus", "wav", "m4a", "aif", "aiff"))
+    return "music";
+  if (has("xls", "xlsx", "ods", "csv")) return "spreadsheets";
+  if (has("jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif", "heic"))
+    return "pictures";
+  if (has("epub", "mobi", "azw3")) return "books";
+  if (exts.size === 1 && exts.has("pdf")) return "books";
+  if (has("doc", "docx", "odt", "pdf", "rtf", "ppt", "pptx", "txt", "md"))
+    return "documents";
+  switch ((sf.type ?? "").toLowerCase()) {
+    case "audio":
+      return "music";
+    case "video":
+      return "movies";
+    case "image":
+      return "pictures";
+    case "document":
+      return "documents";
+  }
+  const n = sf.name.toLowerCase();
+  if (n.includes("audiobook")) return "audiobooks";
+  if (n.includes("spreadsheet") || n.includes("sheet")) return "spreadsheets";
+  if (n.includes("movie") || n.includes("film") || n.includes("video"))
+    return "movies";
+  if (n.includes("music") || n.includes("song")) return "music";
+  if (n.includes("photo") || n.includes("picture") || n.includes("image"))
+    return "pictures";
+  if (n.includes("book")) return "books";
+  if (n.includes("doc")) return "documents";
+  return "folder";
+}
+
+/** Sidebar icon for a built-in favorite door, by door name. */
+function favoriteIcon(name: string): string {
+  switch (name) {
+    case "Home":
+      return "home";
+    case "Documents":
+      return "documents";
+    case "Downloads":
+      return "downloads";
+    case "Videos":
+      return "videos";
+    case "Pictures":
+      return "pictures";
+    case "Music":
+      return "music";
+    case "Trash":
+      return "trash";
+    default:
+      return "folder";
+  }
 }
 
 export class Shell {
@@ -989,9 +1056,7 @@ export class Shell {
     auditorHead.textContent = "File Auditor";
     const auditorRow = document.createElement("button");
     auditorRow.className = "side-item";
-    const auditorGlyph = document.createElement("span");
-    auditorGlyph.className = "side-glyph";
-    auditorGlyph.textContent = "🧾";
+    const auditorGlyph = sectionGlyph("auditor");
     const auditorLabel = document.createElement("span");
     auditorLabel.textContent = "Review findings";
     const auditorBadge = document.createElement("span");
@@ -1018,7 +1083,7 @@ export class Shell {
     romsHead.setAttribute("aria-label", "Open ROM Home");
     const romsGlyph = document.createElement("span");
     romsGlyph.className = "rom-door-glyph";
-    romsGlyph.textContent = "\uD83C\uDFAE";
+    romsGlyph.innerHTML = `<svg viewBox="0 0 48 48" aria-hidden="true">${SECTION_ICON_SVG.roms}</svg>`;
     const romsHeadText = document.createElement("span");
     romsHeadText.className = "rom-door-label";
     romsHeadText.textContent = "ROMs";
@@ -3294,7 +3359,9 @@ export class Shell {
       const target = pair.target!;
       const b = document.createElement("button");
       b.className = "side-item";
-      b.textContent = name;
+      const favLabel = document.createElement("span");
+      favLabel.textContent = name;
+      b.append(sectionGlyph(favoriteIcon(name)), favLabel);
       b.title = target.display;
       {
         // Drag to rearrange the sidebar (persisted order).
@@ -3531,7 +3598,9 @@ export class Shell {
       this.favoritePathSet.add(normFavPath(fav.path));
       const b = document.createElement("button");
       b.className = "side-item";
-      b.textContent = fav.name;
+      const pinLabel = document.createElement("span");
+      pinLabel.textContent = fav.name;
+      b.append(sectionGlyph("folder"), pinLabel);
       b.title = fav.path;
       b.addEventListener("click", () => {
         this.navigateTo({
@@ -3817,12 +3886,9 @@ export class Shell {
     {
       const b = document.createElement("button");
       b.className = "side-item";
-      const star = document.createElement("span");
-      star.className = "side-star";
-      star.textContent = "★";
       const label = document.createElement("span");
       label.textContent = "Starred";
-      b.append(star, label);
+      b.append(sectionGlyph("starred"), label);
       b.addEventListener("click", () => this.openStarred());
       this.collectionList.appendChild(b);
     }
@@ -3841,9 +3907,7 @@ export class Shell {
     for (const c of manual) {
       const b = document.createElement("button");
       b.className = "side-item";
-      const glyph = document.createElement("span");
-      glyph.className = "side-glyph";
-      glyph.textContent = "🗂";
+      const glyph = sectionGlyph("folder");
       const label = document.createElement("span");
       label.textContent = c.name;
       b.append(glyph, label);
@@ -3917,7 +3981,9 @@ export class Shell {
     for (const sf of folders) {
       const b = document.createElement("button");
       b.className = "side-item";
-      b.textContent = `☆ ${sf.name}`;
+      const sfLabel = document.createElement("span");
+      sfLabel.textContent = sf.name;
+      b.append(sectionGlyph(smartFolderIcon(sf)), sfLabel);
       b.title = sf.query || sf.type || "";
       b.addEventListener("click", () => {
         // The path bar names the view while it is up (Round 7.1);
