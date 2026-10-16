@@ -799,6 +799,9 @@ export const api = {
   emuBiosAdd: (systemId: string) =>
     invoke<EmuBiosAddResult>("emu_bios_add", { systemId }),
   emuPrefs: () => invoke<EmuPrefs>("emu_prefs"),
+  emuFleetBadge: () => invoke<EmuFleetBadge>("emu_fleet_badge"),
+  emuApplyUpdate: (key: string) => invoke<void>("emu_apply_update", { key }),
+  emuApplyAllUpdates: () => invoke<string[]>("emu_apply_all_updates"),
   emuSetChoice: (platform: string, optionId: string) =>
     invoke<void>("emu_set_choice", { platform, optionId }),
   emuSetView: (enabled: boolean, root: string | null) =>
@@ -2001,6 +2004,37 @@ export interface EmuPrefs {
   bios: EmuBiosSystem[];
   esde: EsDeState;
   overrides: EmuOverride[];
+  prep: EmuPrepState;
+  updates: EmuUpdatesState;
+}
+
+/** Emulation v2.1: the fleet prep pass's state (Preferences → ROMs). */
+export interface EmuPrepState {
+  running: boolean;
+  /** Unix seconds of the last completed pass (0 = never). */
+  lastRun: number;
+  total: number;
+  ready: number;
+  failed: { label: string; error: string }[];
+}
+
+/** Emulation v2.1: one waiting emulator update. */
+export interface EmuUpdateItem {
+  key: string;
+  label: string;
+  detail: string;
+}
+
+/** Emulation v2.1: the last update check's findings. */
+export interface EmuUpdatesState {
+  checkedAt: number;
+  items: EmuUpdateItem[];
+}
+
+/** Emulation v2.1: the ROMs-door pill's data. */
+export interface EmuFleetBadge {
+  updates: number;
+  prepping: boolean;
 }
 
 /** Emulation: install progress event payload. */
@@ -2015,6 +2049,12 @@ export function onEmuInstallProgress(
   return listen<EmuInstallProgress>("emu-install-progress", (e) =>
     cb(e.payload),
   );
+}
+
+/** Emulation v2.1: prep progress / update findings changed —
+ * the ROMs-door pill refreshes off this. */
+export function onEmuFleetChanged(cb: () => void): Promise<UnlistenFn> {
+  return listen("emu-fleet-changed", () => cb());
 }
 
 /** A Smart List: a saved filter whose rule renders as a sentence. */

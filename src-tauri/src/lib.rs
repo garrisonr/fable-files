@@ -20,6 +20,7 @@ pub mod rommedia;
 pub mod emu;
 pub mod emu_esde;
 pub mod emu_farm;
+pub mod emu_prep;
 pub mod plugins;
 pub mod reader;
 pub mod templates;
@@ -87,6 +88,9 @@ pub struct AppState {
     /// come and go) and a single-flight guard for keeper passes.
     pub emu_mounts_seen: Mutex<Vec<String>>,
     pub emu_keeper_running: std::sync::atomic::AtomicBool,
+    /// Emulation v2.1: single-flight guard for the fleet prep
+    /// pass + update check chain (emu_prep).
+    pub emu_prep_running: std::sync::atomic::AtomicBool,
     pub previews: PreviewRegistry,
     pub themes_dir: PathBuf,
     pub active_theme: Mutex<String>,
@@ -251,6 +255,7 @@ impl AppState {
             rom_identify_running: std::sync::atomic::AtomicBool::new(false),
             emu_mounts_seen: Mutex::new(Vec::new()),
             emu_keeper_running: std::sync::atomic::AtomicBool::new(false),
+            emu_prep_running: std::sync::atomic::AtomicBool::new(false),
         };
 
         seed_themes(&themes_dir)?;
@@ -507,6 +512,11 @@ pub fn run() {
             // + RetroArch playlists) against the volumes Library
             // Memory sees mounted right now.
             emu_farm::spawn_keeper(app.handle().clone());
+            // Emulation v2.1: keep the fleet (his systems'
+            // default emulators) ready in the background, then
+            // the daily update check — serialized, checkpointed,
+            // never blocking the window.
+            emu_prep::spawn_prep_and_check(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -630,6 +640,9 @@ pub fn run() {
             emu_esde::emu_esde_install,
             emu_esde::emu_esde_open,
             emu_farm::emu_prefs,
+            emu_prep::emu_fleet_badge,
+            emu_prep::emu_apply_update,
+            emu_prep::emu_apply_all_updates,
             emu_farm::emu_set_choice,
             emu_farm::emu_set_view,
             emu_farm::emu_rebuild_view,

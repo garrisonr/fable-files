@@ -769,6 +769,13 @@ pub struct EmuPrefsWire {
     /// Sandbox drive-access grants Fable applied with his
     /// consent (v2, §4.4) — visible here, removable here.
     pub overrides: Vec<OverrideWire>,
+    /// Emulation v2.1: the fleet prep pass's state (fleet ready?
+    /// still preparing? anything fail?).
+    pub prep: crate::emu_prep::PrepWire,
+    /// Emulation v2.1: the last update check's findings — the
+    /// "Emulator updates" card renders this; applying is a
+    /// separate click, never automatic.
+    pub updates: crate::emu_prep::UpdatesWire,
 }
 
 /// One recorded sandbox grant, for the Preferences list.
@@ -889,6 +896,8 @@ pub async fn emu_prefs(app: tauri::AppHandle) -> Cmd<EmuPrefsWire> {
             bios: crate::emu::bios_state_wires(layout.as_ref(), &settings),
             esde: crate::emu_esde::esde_state(&state.data_base),
             overrides: override_wires(&settings),
+            prep: crate::emu_prep::prep_wire(&state, &settings),
+            updates: crate::emu_prep::updates_wire(&settings),
         })
     })
     .await

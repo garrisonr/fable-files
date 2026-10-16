@@ -5,6 +5,7 @@
  * (scroll-snap + scrollIntoView), flicks carry native momentum.
  */
 import { api, formatBytes, formatDate, type Item } from "./api";
+import { fileTypeGlyph } from "./sectionicons";
 import { sortedItems, type Tab } from "./tabs";
 import { ContextMenu } from "./contextmenu";
 import { OpenWithDialog } from "./openwith";
@@ -100,7 +101,11 @@ export class GalleryView {
     } else {
       const icon = document.createElement("div");
       icon.className = "gallery-bigicon";
-      icon.textContent = item.kind === "folder" ? "📁" : "📄";
+      // Icon set v2: document families wear their own glyph
+      // (16px-proofed shapes); everything else keeps the emoji.
+      const glyph = item.kind === "folder" ? null : fileTypeGlyph(item.name);
+      if (glyph) icon.appendChild(glyph);
+      else icon.textContent = item.kind === "folder" ? "📁" : "📄";
       this.stage.appendChild(icon);
     }
     const caption = document.createElement("div");
@@ -134,7 +139,9 @@ export class GalleryView {
       } else {
         const icon = document.createElement("span");
         icon.className = "gallery-cell-icon";
-        icon.textContent = item.kind === "folder" ? "📁" : "📄";
+        const glyph = item.kind === "folder" ? null : fileTypeGlyph(item.name);
+        if (glyph) icon.appendChild(glyph);
+        else icon.textContent = item.kind === "folder" ? "📁" : "📄";
         cell.appendChild(icon);
       }
       const label = document.createElement("span");

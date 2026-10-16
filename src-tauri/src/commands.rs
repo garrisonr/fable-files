@@ -8239,6 +8239,9 @@ pub async fn identify_roms(
             // unified view (alias farm + playlists) reconciles.
             if r.is_ok() {
                 crate::emu_farm::spawn_keeper(app.clone());
+                // v2.1: new systems may have joined the library
+                // — the fleet prep pass tops itself up.
+                crate::emu_prep::spawn_prep(app.clone());
             }
             r
         }

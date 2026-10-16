@@ -63,6 +63,93 @@ pub struct EmuSettings {
     pub esde_version: String,
     #[serde(default)]
     pub esde_sha256: String,
+    /// Emulation v2.1: the fleet-prep record — what the background
+    /// prep pass has done, per item, so a restarted pass re-probes
+    /// and skips what's already Ready instead of starting over.
+    #[serde(default)]
+    pub prep: PrepState,
+    /// Emulation v2.1: the last update check's findings (the
+    /// Preferences card + door badge render this record; checks
+    /// never auto-apply).
+    #[serde(default)]
+    pub updates: UpdateState,
+    /// Emulation v2.1: per-core buildbot baselines — the zip facts
+    /// (length + Last-Modified) recorded when a core was fetched,
+    /// compared against a HEAD at check time.
+    #[serde(default)]
+    pub core_records: BTreeMap<String, CoreRecord>,
+    /// Emulation v2.1: per-AppImage baselines for the GitHub
+    /// channel — the release asset Fable installed, so a newer
+    /// asset name (or a different published digest) reads as an
+    /// update rather than a mystery.
+    #[serde(default)]
+    pub app_records: BTreeMap<String, AppImageRecord>,
+}
+
+/// The prep pass's memory (v2.1): when it last completed, and the
+/// last known state of each fleet item it has touched.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PrepState {
+    /// Unix seconds of the last completed pass (0 = never).
+    pub last_run: i64,
+    /// Fleet item key -> last recorded outcome.
+    pub items: BTreeMap<String, PrepItemState>,
+}
+
+/// One fleet item's recorded prep outcome.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PrepItemState {
+    /// "ready" | "failed".
+    pub state: String,
+    /// Unix seconds of the outcome.
+    pub at: i64,
+    /// The failure, in the words the installer produced (ready
+    /// items carry an empty string, unserialized).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub error: String,
+}
+
+/// The last update check's record (v2.1).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UpdateState {
+    /// Unix seconds of the check (0 = never checked).
+    pub checked_at: i64,
+    pub items: Vec<UpdateItem>,
+}
+
+/// One available emulator update, as the card lists it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateItem {
+    /// Apply key: "core:<core_file>" | "flatpak:<app_id>" |
+    /// "appimage:<file_name>" | "esde".
+    pub key: String,
+    /// Human label ("RetroArch", "Mesen core", "ES-DE").
+    pub label: String,
+    /// One plain line about what's waiting.
+    pub detail: String,
+}
+
+/// Buildbot facts recorded when Fable fetched a core (v2.1).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CoreRecord {
+    pub len: u64,
+    pub modified: String,
+    pub at: i64,
+}
+
+/// What Fable installed through the GitHub AppImage channel
+/// (v2.1): the release asset's name carries its version.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AppImageRecord {
+    pub asset: String,
+    pub sha256: String,
+    pub at: i64,
 }
 
 /// One recorded sandbox grant: this flatpak app may read this
@@ -83,6 +170,10 @@ impl Default for EmuSettings {
             overrides: Vec::new(),
             esde_version: String::new(),
             esde_sha256: String::new(),
+            prep: PrepState::default(),
+            updates: UpdateState::default(),
+            core_records: BTreeMap::new(),
+            app_records: BTreeMap::new(),
         }
     }
 }
@@ -930,6 +1021,38 @@ pub fn ensure_retroarch(progress: &Progress) -> Result<RaLayout, String> {
     })
 }
 
+/// Update one user flatpak in place (v2.1 update apply — only
+/// ever run because he pressed the button on the updates card).
+pub fn flatpak_update(app_id: &str) -> Result<(), String> {
+    run_long(
+        "flatpak",
+        &["update", "--user", "-y", "--noninteractive", app_id],
+        Duration::from_secs(1800),
+    )
+    .map_err(|e| format!("Fable couldn't update {app_id}: {e}"))
+}
+
+/// User flatpak app ids with an update waiting on the remote
+/// (v2.1 update check). Empty when nothing is newer — and also
+/// when flatpak itself can't answer, which a background check
+/// treats as "nothing to report", never an error surface.
+pub fn flatpak_pending_updates() -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if let Some(text) = run_stdout(
+        "flatpak",
+        &["remote-ls", "--user", "--updates", "--columns=application"],
+        Duration::from_secs(60),
+    ) {
+        for line in text.lines() {
+            let id = line.trim();
+            if !id.is_empty() {
+                out.insert(id.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Fetch one core from the libretro buildbot into the flavor's
 /// user cores dir. Idempotent; resumable by simply calling again.
 pub fn fetch_core(
@@ -941,6 +1064,43 @@ pub fn fetch_core(
     if dest.is_file() {
         return Ok(dest);
     }
+    download_core(layout, core_file, progress)
+}
+
+/// Fetch the buildbot's current core build, REPLACING the one on
+/// disk (v2.1 update apply). The download stages through the same
+/// `.part` discipline, so a failed refresh leaves the old core in
+/// place rather than stranding the system.
+pub fn refetch_core(
+    layout: &RaLayout,
+    core_file: &str,
+    progress: &Progress,
+) -> Result<PathBuf, String> {
+    download_core(layout, core_file, progress)
+}
+
+/// The buildbot's current facts about a core zip — what an update
+/// check compares the recorded fetch against. None when the
+/// buildbot can't be reached; checks stay silent then.
+pub fn core_remote_facts(core_file: &str) -> Option<(u64, String)> {
+    let url = format!(
+        "https://buildbot.libretro.com/nightly/linux/x86_64/latest/{core_file}.zip"
+    );
+    let resp = ureq::head(&url).call().ok()?;
+    let len = resp
+        .header("Content-Length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let modified = resp.header("Last-Modified").unwrap_or_default().to_string();
+    Some((len, modified))
+}
+
+fn download_core(
+    layout: &RaLayout,
+    core_file: &str,
+    progress: &Progress,
+) -> Result<PathBuf, String> {
+    let dest = layout.cores_dir.join(core_file);
     let url = format!(
         "https://buildbot.libretro.com/nightly/linux/x86_64/latest/{core_file}.zip"
     );

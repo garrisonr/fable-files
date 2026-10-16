@@ -2006,6 +2006,11 @@ body[data-layout="tv"] .cell-icon {
   font-size: 96px;
   line-height: 1;
 }
+.gallery-bigicon .file-type-glyph svg { width: 96px; height: 96px; display: block; }
+.gallery-cell-icon .file-type-glyph svg { width: 40px; height: 40px; display: inline-block; vertical-align: middle; }
+.file-type-glyph { color: var(--ufm-text-muted); }
+.emu-prep-line { margin-top: 0.6rem; }
+.emu-prep-fail { color: var(--ufm-danger); }
 
 .gallery-caption {
   display: flex;
@@ -4037,6 +4042,8 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 .rom-door-label { flex: 1; }
 .rom-door-count { color: var(--ufm-text-muted); font-variant-numeric: tabular-nums; letter-spacing: 0; }
 .rom-door-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ufm-danger); flex: none; }
+.rom-door-pill { font-size: 0.625rem; font-weight: 600; padding: 0.1rem 0.45rem; border-radius: 999px; background: var(--ufm-surface-2, rgba(127,127,127,0.18)); color: var(--ufm-text-muted); flex: none; white-space: nowrap; }
+.rom-door-pill.has-updates { background: color-mix(in srgb, var(--ufm-accent) 22%, transparent); color: var(--ufm-accent); }
 .rom-folder-banner {
   grid-column: 1 / -1;
   display: flex; align-items: center; gap: 10px;

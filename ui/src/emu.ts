@@ -534,6 +534,9 @@ export class EmuSection {
     for (const sys of this.prefs.systems) {
       this.body.appendChild(this.systemRow(sys));
     }
+    // ---- Fleet prep line (v2.1): what's ready, what's still
+    // preparing, what failed — under the rows it describes.
+    this.body.appendChild(this.prepLine());
     // ---- System files (BIOS) card (§6)
     const bh = el("h3", "prefs-section", "System files");
     bh.style.marginTop = "1.4rem";
@@ -562,6 +565,18 @@ export class EmuSection {
     const viewHost = el("div", "emu-view-host");
     viewHost.appendChild(this.viewCard(this.prefs.view));
     this.body.appendChild(viewHost);
+    // ---- Emulator updates card (v2.1)
+    const uh = el("h3", "prefs-section", "Emulator updates");
+    uh.style.marginTop = "1.4rem";
+    this.body.appendChild(uh);
+    this.body.appendChild(
+      el(
+        "p",
+        "prefs-note",
+        "Fable checks once a day whether RetroArch, its cores, your emulators, or ES-DE have something newer — and then waits. Nothing updates itself; every update below is yours to start.",
+      ),
+    );
+    this.body.appendChild(this.updatesCard());
     // ---- ES-DE companion card (v2)
     const eh = el("h3", "prefs-section", "ES-DE companion");
     eh.style.marginTop = "1.4rem";
@@ -590,6 +605,130 @@ export class EmuSection {
         this.body.appendChild(this.overrideRow(ov));
       }
     }
+  }
+
+  /** v2.1: the fleet prep pass in one quiet line — apparent
+   * while it works, reassuring once done, honest about failures. */
+  private prepLine(): HTMLElement {
+    const prep = this.prefs!.prep;
+    const wrap = el("div", "emu-prep-line");
+    if (prep.total > 0) {
+      if (prep.running) {
+        wrap.appendChild(
+          el(
+            "p",
+            "prefs-note",
+            `Preparing your emulators… ${prep.ready} of ${prep.total} ready — Play keeps working meanwhile.`,
+          ),
+        );
+      } else if (prep.ready === prep.total) {
+        wrap.appendChild(
+          el(
+            "p",
+            "prefs-note",
+            "Your emulators are ready — Fable installs them ahead of time and keeps them current in the background, so Play never waits on a download.",
+          ),
+        );
+      } else {
+        wrap.appendChild(
+          el(
+            "p",
+            "prefs-note",
+            `Emulators: ${prep.ready} of ${prep.total} ready — the rest prepare in the background.`,
+          ),
+        );
+      }
+    }
+    for (const f of prep.failed) {
+      wrap.appendChild(
+        el(
+          "p",
+          "prefs-note emu-prep-fail",
+          `Couldn't prepare ${f.label}: ${f.error}`,
+        ),
+      );
+    }
+    return wrap;
+  }
+
+  /** v2.1: the daily check's findings. Applying is always his
+   * click — per row, or the whole list at once. */
+  private updatesCard(): HTMLElement {
+    const updates = this.prefs!.updates;
+    const card = el("div", "emu-view-card");
+    if (updates.items.length === 0) {
+      card.appendChild(
+        el(
+          "p",
+          "emu-view-state",
+          updates.checkedAt > 0
+            ? `Everything's current — last checked ${new Date(
+                updates.checkedAt * 1000,
+              ).toLocaleString()}.`
+            : "No check yet — Fable looks once a day, quietly, and reports here.",
+        ),
+      );
+      return card;
+    }
+    const applyAll = el(
+      "button",
+      "emu-btn",
+      `Update all (${updates.items.length})`,
+    ) as HTMLButtonElement;
+    const headActions = el("div", "emu-view-actions");
+    headActions.appendChild(applyAll);
+    card.appendChild(headActions);
+    applyAll.addEventListener("click", () => {
+      applyAll.disabled = true;
+      applyAll.textContent = "Updating…";
+      void (async () => {
+        try {
+          const failures = await api.emuApplyAllUpdates();
+          this.prefs = await api.emuPrefs();
+          if (failures.length === 0) {
+            Toast.success("Emulators are up to date.");
+          } else {
+            Toast.error(
+              `Some updates didn't apply — they're still listed below. (${failures[0]})`,
+            );
+          }
+          this.render();
+        } catch (err) {
+          applyAll.disabled = false;
+          applyAll.textContent = "Update all";
+          Toast.error(`Updates didn't apply: ${errText(err)}`);
+        }
+      })();
+    });
+    for (const item of updates.items) {
+      const row = el("div", "emu-sys-row");
+      const head = el("div", "emu-sys-head");
+      head.appendChild(el("strong", "", item.label));
+      row.appendChild(head);
+      row.appendChild(el("p", "emu-sys-verdict", item.detail));
+      const actions = el("div", "emu-bios-actions");
+      const btn = el("button", "emu-btn", "Update") as HTMLButtonElement;
+      btn.addEventListener("click", () => {
+        btn.disabled = true;
+        btn.textContent = "Updating…";
+        void (async () => {
+          try {
+            await api.emuApplyUpdate(item.key);
+            this.prefs = await api.emuPrefs();
+            Toast.success(`${item.label} is up to date.`);
+            this.render();
+          } catch (err) {
+            btn.disabled = false;
+            btn.textContent = "Update";
+            Toast.error(`${item.label} didn't update: ${errText(err)}`);
+          }
+        })();
+      });
+      actions.appendChild(btn);
+      row.appendChild(actions);
+      card.appendChild(row);
+    }
+    return card;
   }
 
   private esdeCard(): HTMLElement {

@@ -7,6 +7,7 @@
 import {
   api,
   formatBytes,
+  onEmuFleetChanged,
   type Item,
   type JobOutcome,
   type JobStart,
@@ -250,6 +251,9 @@ export class Shell {
   /** ROM Home door tallies (2026-10-15). */
   private romsDoorCount: HTMLElement | null = null;
   private romsDoorDot: HTMLElement | null = null;
+  /** v2.1: fleet pill beside the missing-media dot — emulator
+   * updates waiting, or the prep pass at work. */
+  private romsFleetPill: HTMLElement | null = null;
   private romsList!: HTMLElement;
   /** Chevron spans of the collapsible sidebar sections (Round 7.2:
    * kept so boot can re-apply durable collapse prefs to the DOM). */
@@ -1093,13 +1097,20 @@ export class Shell {
     romsDot.className = "rom-door-dot";
     romsDot.title = "Some games are missing media";
     romsDot.hidden = true;
+    const romsPill = document.createElement("span");
+    romsPill.className = "rom-door-pill";
+    romsPill.hidden = true;
     const romsChev = document.createElement("span");
     romsChev.className = "side-chev";
     romsChev.hidden = true;
-    romsHead.append(romsGlyph, romsHeadText, romsCount, romsDot, romsChev);
+    romsHead.append(romsGlyph, romsHeadText, romsCount, romsDot, romsPill, romsChev);
     this.romsChevEl = romsChev;
     this.romsDoorCount = romsCount;
     this.romsDoorDot = romsDot;
+    this.romsFleetPill = romsPill;
+    // v2.1: the pill follows the fleet (prep progress + update
+    // findings) live, not just when the door's counts refresh.
+    void onEmuFleetChanged(() => void this.refreshRomDoor()).catch(() => {});
     romsHead.title = "ROM Home — right-click to add a system";
     romsHead.addEventListener("contextmenu", (e) => {
       e.preventDefault();
@@ -4728,6 +4739,25 @@ export class Shell {
         counts.total > 0 ? counts.total.toLocaleString() : "";
     }
     if (this.romsDoorDot) this.romsDoorDot.hidden = counts.missingMedia === 0;
+    // v2.1 fleet pill: updates waiting outrank the quieter
+    // "preparing" state; neither shows when the fleet is settled.
+    if (this.romsFleetPill) {
+      const badge = await api.emuFleetBadge().catch(() => null);
+      const pill = this.romsFleetPill;
+      if (badge && badge.updates > 0) {
+        pill.hidden = false;
+        pill.textContent = `${badge.updates} update${badge.updates === 1 ? "" : "s"}`;
+        pill.title = "Emulator updates are waiting — Preferences → ROMs";
+        pill.classList.add("has-updates");
+      } else if (badge && badge.prepping) {
+        pill.hidden = false;
+        pill.textContent = "Preparing…";
+        pill.title = "Fable is preparing your emulators";
+        pill.classList.remove("has-updates");
+      } else {
+        pill.hidden = true;
+      }
+    }
     if (this.romsHead) {
       this.romsHead.title =
         counts.total > 0
