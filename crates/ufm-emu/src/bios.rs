@@ -15,11 +15,11 @@
 //! copied, and a size-checked re-read after filing — the glue
 //! performs the copy; the facts stay checkable here.
 //!
-//! Presence home (v1.1): the detected RetroArch flavor's `system`
-//! directory — every v1.1 gated default is a libretro core, so
-//! that is where launches look. The gate applies to libretro-core
-//! options only; a standalone keeps its own home and its own rules
-//! (the standalone wave, v2, brings its folders with it).
+//! Presence homes: libretro cores look in the detected
+//! RetroArch flavor's `system` directory; the v2 standalones keep
+//! their own (DuckStation's and PCSX2's config homes, RPCS3's
+//! `dev_flash`). The glue names the home per option; the
+//! requirement facts stay here.
 
 use serde::{Deserialize, Serialize};
 
@@ -399,6 +399,43 @@ pub static BIOS_REQUIREMENTS: &[BiosRequirement] = &[
         sets: &[any("Super System Card", &["syscard3.pce"])],
         note: "Only CD games need the System Card — HuCard games play without it.",
     },
+    // v2: the standalone wave brought its own system-file homes.
+    // PS2 BIOS dumps are named by console model (scph39001.bin …)
+    // — a glob set, verified by name; PCSX2 checks the file's
+    // contents far harder than Fable can (and should).
+    BiosRequirement {
+        system: "ps2",
+        title: "PlayStation 2",
+        need: BiosNeed::Required,
+        gate_play: true,
+        sets: &[BiosSet {
+            what: "PlayStation 2 BIOS",
+            names: &[],
+            glob: Some(("scph", ".bin")),
+            all: false,
+            subdir: "",
+        }],
+        note: "One BIOS file from a PlayStation 2 you own — a file named like scph39001.bin.",
+    },
+    // PS3 system software isn't a loose file the emulators read:
+    // RPCS3 installs Sony's PS3UPDAT.PUP into its own dev_flash.
+    // Presence = the installed firmware payload (the .sprx files
+    // under dev_flash/sys/external). The Add flow hands the PUP
+    // to RPCS3's own installer — Fable never unpacks it.
+    BiosRequirement {
+        system: "ps3",
+        title: "PlayStation 3",
+        need: BiosNeed::Required,
+        gate_play: true,
+        sets: &[BiosSet {
+            what: "PlayStation 3 firmware",
+            names: &[],
+            glob: Some(("", ".sprx")),
+            all: false,
+            subdir: "dev_flash/sys/external",
+        }],
+        note: "Sony's own PS3 system software, installed from the PS3UPDAT.PUP update file. Add it here and Fable hands it to RPCS3, which installs it — nothing is downloaded.",
+    },
 ];
 
 /// The requirement for one table system id, when it has one.
@@ -453,6 +490,22 @@ mod tests {
     }
 
     #[test]
+    fn v2_ps2_ps3_sets_match_their_shapes() {
+        let ps2 = requirement_for("ps2").unwrap();
+        let set = &ps2.sets[0];
+        assert!(set.satisfied_by(&listing(&["scph39001.bin"])));
+        assert!(set.satisfied_by(&listing(&["SCPH-70004.BIN"])));
+        assert!(!set.satisfied_by(&listing(&["scph5501.bin.txt"])));
+        assert!(!set.satisfied_by(&listing(&["bios.bin"])));
+        // PS3 presence = installed firmware payload, not the PUP.
+        let ps3 = requirement_for("ps3").unwrap();
+        let set = &ps3.sets[0];
+        assert_eq!(set.subdir, "dev_flash/sys/external");
+        assert!(set.satisfied_by(&listing(&["liblv2.sprx"])));
+        assert!(!set.satisfied_by(&listing(&["PS3UPDAT.PUP"])));
+    }
+
+    #[test]
     fn picks_file_under_the_canonical_name() {
         let req = requirement_for("atarilynx").unwrap();
         assert_eq!(
@@ -492,6 +545,9 @@ mod tests {
             "neogeocd",
             "3do",
             "amigacd32",
+            // v2: the standalone wave's gated rows.
+            "ps2",
+            "ps3",
         ] {
             let req = requirement_for(id).unwrap_or_else(|| panic!("{id} requirement"));
             assert!(req.gate_play, "{id} must gate play");

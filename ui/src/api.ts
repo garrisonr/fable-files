@@ -776,6 +776,23 @@ export const api = {
       optionId,
       remember,
     }),
+  emuGrantAccessAndPlay: (
+    providerKey: string,
+    platform: string,
+    optionId: string,
+    remember: boolean,
+  ) =>
+    invoke<EmuPlayOutcome>("emu_grant_access_and_play", {
+      providerKey,
+      platform,
+      optionId,
+      remember,
+    }),
+  emuRemoveOverride: (appId: string, filesystem: string) =>
+    invoke<void>("emu_remove_override", { appId, filesystem }),
+  emuEsdeState: () => invoke<EsDeState>("emu_esde_state"),
+  emuEsdeInstall: () => invoke<EsDeState>("emu_esde_install"),
+  emuEsdeOpen: () => invoke<void>("emu_esde_open"),
   emuOpenEmulator: (platform: string) =>
     invoke<void>("emu_open_emulator", { platform }),
   emuBiosState: () => invoke<EmuBiosSystem[]>("emu_bios_state"),
@@ -1876,7 +1893,29 @@ export type EmuPlayOutcome =
       playedProviderKey: string;
     }
   | { kind: "sheet"; sheet: EmuSheet }
+  | {
+      kind: "access-needed";
+      optionId: string;
+      appId: string;
+      appLabel: string;
+      filesystem: string;
+      message: string;
+    }
   | { kind: "unavailable"; message: string };
+
+/** Emulation: the ES-DE companion's state (the door, v2). */
+export interface EsDeState {
+  installed: boolean;
+  version: string | null;
+  path: string;
+}
+
+/** Emulation: one recorded sandbox drive-access grant. */
+export interface EmuOverride {
+  appId: string;
+  appLabel: string;
+  filesystem: string;
+}
 
 /** Emulation: one row of Preferences → ROMs → Emulators. */
 export interface EmuPrefsOption {
@@ -1960,6 +1999,8 @@ export interface EmuPrefs {
   systems: EmuPrefsSystem[];
   view: EmuViewState;
   bios: EmuBiosSystem[];
+  esde: EsDeState;
+  overrides: EmuOverride[];
 }
 
 /** Emulation: install progress event payload. */

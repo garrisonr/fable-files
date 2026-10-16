@@ -1961,7 +1961,14 @@ export class RomHome {
         Toast.info(outcome.message);
         return;
       }
-      const result = await showEmuSheet(outcome.sheet, {
+      // "access-needed" (the saved emulator's sandbox can't see
+      // this drive) also lands on the sheet — its primary becomes
+      // the one-tap consent there.
+      const sheetData =
+        outcome.kind === "sheet"
+          ? outcome.sheet
+          : await api.emuSheet(pk, g.platform);
+      const result = await showEmuSheet(sheetData, {
         onOpenEmulator: (platform) => {
           void api.emuOpenEmulator(platform).catch((err) => {
             Toast.error(`Could not open the emulator: ${errText(err)}`);
@@ -1998,6 +2005,16 @@ export class RomHome {
     }
   }
 
+  /** The ES-DE door: open the companion front-end on the same
+   * library (installs it first when it isn't here — the backend
+   * owns that road). */
+  private openEsde(): void {
+    Toast.info("Opening ES-DE… (first time? Fable sets it up first)");
+    void api.emuEsdeOpen().catch((err) => {
+      Toast.error(`Could not open ES-DE: ${errText(err)}`);
+    });
+  }
+
   private applySheetResult(
     g: RoomGame,
     result: EmuSheetResult,
@@ -2005,6 +2022,8 @@ export class RomHome {
   ): void {
     if (result.action === "launched") {
       this.afterEmuLaunch(g, result.outcome);
+    } else if (result.action === "es-de") {
+      this.openEsde();
     } else if (result.action === "os-default") {
       // Declining is free of consequence: Play does what it did
       // before emulation existed (from Play: launched + noted;
@@ -2234,6 +2253,10 @@ export class RomHome {
         },
       },
       { label: "", separator: true, action: () => undefined },
+      {
+        label: "Open in ES-DE",
+        action: () => this.openEsde(),
+      },
       {
         label: "Add a ROM folder…",
         action: () => this.hooks.onAddRomFolder(),

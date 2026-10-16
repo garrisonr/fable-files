@@ -187,6 +187,17 @@ pub fn packages_for(family: Family, logical: &str) -> Option<&'static [&'static 
         (Family::Arch, "gvfs") => &["gvfs"],
         (Family::Fedora, "gvfs") => &["gvfs", "gvfs-fuse"],
         (Family::Suse, "gvfs") => &["gvfs", "gvfs-backends", "gvfs-fuse"],
+        // Emulation v2: MAME standalone (the arcade family's deep
+        // bench) — one package name across the families.
+        (_, "mame") => &["mame"],
+        // Emulation v2: AppImages (ES-DE, RPCS3) need FUSE 2 to
+        // run at all (amendment §4.3). Debian's noble-era name is
+        // libfuse2t64 (the t64 transition); the others keep the
+        // classic names.
+        (Family::Debian, "libfuse2") => &["libfuse2t64"],
+        (Family::Arch, "libfuse2") => &["fuse2"],
+        (Family::Fedora, "libfuse2") => &["fuse-libs"],
+        (Family::Suse, "libfuse2") => &["libfuse2"],
         _ => return None,
     })
 }
@@ -875,6 +886,9 @@ mod tests {
                 // helpers, the GStreamer playback set, GVfs.
                 "poppler", "zip", "wl-clipboard", "xclip", "gst-plugins",
                 "gvfs",
+                // Emulation v2 additions: MAME standalone and the
+                // AppImage FUSE runtime.
+                "mame", "libfuse2",
             ] {
                 assert!(
                     packages_for(fam, logical).is_some(),

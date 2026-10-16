@@ -18,6 +18,7 @@ pub mod musiccomplete;
 pub mod opensubs;
 pub mod rommedia;
 pub mod emu;
+pub mod emu_esde;
 pub mod emu_farm;
 pub mod plugins;
 pub mod reader;
@@ -620,9 +621,14 @@ pub fn run() {
             emu::emu_play,
             emu::emu_sheet,
             emu::emu_install_and_play,
+            emu::emu_grant_access_and_play,
+            emu::emu_remove_override,
             emu::emu_open_emulator,
             emu::emu_bios_state,
             emu::emu_bios_add,
+            emu_esde::emu_esde_state,
+            emu_esde::emu_esde_install,
+            emu_esde::emu_esde_open,
             emu_farm::emu_prefs,
             emu_farm::emu_set_choice,
             emu_farm::emu_set_view,

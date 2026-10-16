@@ -75,9 +75,20 @@ fn mount_rank(
 
 /// Group the shelf query into farm games + the systems the keeper
 /// manages (any system with at least one catalog game).
+///
+/// THE VIEW IS NEVER A SOURCE (v2 fix, proven by ES-DE): the
+/// catalog also holds rows for the farm's own files (the indexer
+/// walks the home tree the farm lives in). A farm row is the
+/// mirror's reflection, not a copy — and because it sits on the
+/// internal disk it OUTRANKS the real copies on removable
+/// drives, so an unfiltered keeper pointed one link per such
+/// game at the link's own location (1,047 self-loops on the
+/// man's box, ELOOP for every outside reader). Rows under the
+/// view root never become copies here.
 fn compute_games(
     catalog: &ufm_catalog::Catalog,
     mounted: &[crate::commands::MountedVolume],
+    view_root: &Path,
 ) -> Result<(Vec<FarmGame>, BTreeSet<String>), String> {
     let volumes = catalog.volumes().unwrap_or_default();
     let rows = catalog.rom_home_games(None).map_err(|e| e.to_string())?;
@@ -92,6 +103,9 @@ fn compute_games(
         let Some(pk) = row.item.provider_key.clone() else {
             continue;
         };
+        if Path::new(&pk).starts_with(view_root) {
+            continue;
+        }
         let (present, rank) = match mount_rank(&pk, mounted, &volumes) {
             Some((rank, _)) => (true, rank),
             None => (false, u32::MAX),
@@ -257,9 +271,10 @@ fn scan_set_files(launch: &Path) -> Vec<String> {
 fn compute_desired(
     catalog: &ufm_catalog::Catalog,
     mounted: &[crate::commands::MountedVolume],
+    view_root: &Path,
 ) -> Result<(Vec<FarmGame>, Vec<DesiredLink>, BTreeSet<String>, usize), String> {
     let volumes = catalog.volumes().unwrap_or_default();
-    let (games, managed) = compute_games(catalog, mounted)?;
+    let (games, managed) = compute_games(catalog, mounted, view_root)?;
     let desired = ufm_emu::desired_links(&games);
     let mut mounts: BTreeSet<String> = BTreeSet::new();
     for link in &desired {
@@ -423,7 +438,9 @@ pub fn run_keeper_with_mounts(
         }
     };
     let mounted = mounted.to_vec();
-    let (games, desired, managed, drives) = match compute_desired(&catalog, &mounted) {
+    let view_root = settings.view_root_path();
+    let (games, desired, managed, drives) =
+        match compute_desired(&catalog, &mounted, &view_root) {
         Ok(v) => v,
         Err(e) => {
             report.error = Some(e);
@@ -747,6 +764,45 @@ pub struct EmuPrefsWire {
     /// The System files (BIOS) card: every requirement system's
     /// state, whether he owns games for it or not (§6).
     pub bios: Vec<crate::emu::BiosSystemWire>,
+    /// The ES-DE companion card (v2): installed? which version?
+    pub esde: crate::emu_esde::EsDeStateWire,
+    /// Sandbox drive-access grants Fable applied with his
+    /// consent (v2, §4.4) — visible here, removable here.
+    pub overrides: Vec<OverrideWire>,
+}
+
+/// One recorded sandbox grant, for the Preferences list.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverrideWire {
+    pub app_id: String,
+    /// The emulator's friendly name when the table knows the app.
+    pub app_label: String,
+    pub filesystem: String,
+}
+
+/// Resolve the recorded grants to display rows (friendly names
+/// come from the table — the app id is the durable record).
+pub fn override_wires(settings: &EmuSettings) -> Vec<OverrideWire> {
+    settings
+        .overrides
+        .iter()
+        .map(|o| {
+            let label = ufm_emu::systems_table()
+                .iter()
+                .flat_map(|s| s.options.iter())
+                .find(|opt| {
+                    matches!(&opt.install, ufm_emu::InstallSpec::Flatpak { app_id } if app_id == &o.app_id)
+                })
+                .map(|opt| opt.label.clone())
+                .unwrap_or_else(|| o.app_id.clone());
+            OverrideWire {
+                app_id: o.app_id.clone(),
+                app_label: label,
+                filesystem: o.filesystem.clone(),
+            }
+        })
+        .collect()
 }
 
 fn view_state(state: &AppState, settings: &EmuSettings, report: KeeperReport) -> ViewStateWire {
@@ -756,7 +812,7 @@ fn view_state(state: &AppState, settings: &EmuSettings, report: KeeperReport) ->
         match catalog {
             Some(cat) => {
                 let mounted = crate::commands::current_filesystems();
-                compute_games(&cat, &mounted)
+                compute_games(&cat, &mounted, &root)
                     .map(|(_, managed)| read_actual(&root, &managed).len())
                     .unwrap_or(0)
             }
@@ -830,7 +886,9 @@ pub async fn emu_prefs(app: tauri::AppHandle) -> Cmd<EmuPrefsWire> {
         Ok(EmuPrefsWire {
             systems,
             view: view_state(&state, &settings, report),
-            bios: crate::emu::bios_state_wires(layout.as_ref()),
+            bios: crate::emu::bios_state_wires(layout.as_ref(), &settings),
+            esde: crate::emu_esde::esde_state(&state.data_base),
+            overrides: override_wires(&settings),
         })
     })
     .await

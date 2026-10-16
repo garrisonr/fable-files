@@ -50,6 +50,28 @@ pub struct EmuSettings {
     /// Unified-view root. Empty = ~/ROMs (ES-DE's default, so the
     /// future ES-DE door needs zero path configuration).
     pub view_root: String,
+    /// Sandbox drive-access grants Fable applied with the man's
+    /// consent (amendment §4.4, v2) — visible and removable in
+    /// Preferences → ROMs.
+    #[serde(default)]
+    pub overrides: Vec<SandboxOverride>,
+    /// The ES-DE companion Fable installed (v2): its version +
+    /// the sha256 the publisher published for the exact file, so
+    /// later launches can tell the installed AppImage is still
+    /// the one Fable fetched.
+    #[serde(default)]
+    pub esde_version: String,
+    #[serde(default)]
+    pub esde_sha256: String,
+}
+
+/// One recorded sandbox grant: this flatpak app may read this
+/// filesystem root (`flatpak override --user --filesystem=…`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SandboxOverride {
+    pub app_id: String,
+    pub filesystem: String,
 }
 
 impl Default for EmuSettings {
@@ -58,6 +80,9 @@ impl Default for EmuSettings {
             choices: BTreeMap::new(),
             view_enabled: true,
             view_root: String::new(),
+            overrides: Vec::new(),
+            esde_version: String::new(),
+            esde_sha256: String::new(),
         }
     }
 }
@@ -169,7 +194,7 @@ const SYSTEM_CORE_DIRS: [&str; 3] = [
     "/usr/lib64/libretro",
 ];
 
-fn run_stdout(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
+pub fn run_stdout(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let mut child = Command::new(cmd)
         .args(args)
         .stdin(Stdio::null())
@@ -198,13 +223,50 @@ fn run_stdout(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
 }
 
 fn flatpak_has_app(app_id: &str) -> bool {
+    flatpak_app_ids().contains(app_id)
+}
+
+/// Every installed flatpak app id, one list call (v2: probing a
+/// dozen options must not shell out per option).
+fn flatpak_app_ids() -> BTreeSet<String> {
     run_stdout(
         "flatpak",
         &["list", "--app", "--columns=application"],
         Duration::from_secs(20),
     )
-    .map(|s| s.lines().any(|l| l.trim() == app_id))
-    .unwrap_or(false)
+    .map(|s| s.lines().map(|l| l.trim().to_string()).collect())
+    .unwrap_or_default()
+}
+
+/// Fable's managed AppImage home (the same ~/Applications the app
+/// itself ships into).
+pub fn applications_dir() -> PathBuf {
+    home_dir().join("Applications")
+}
+
+/// The managed AppImage for a file name, when it is really there.
+pub fn managed_appimage(file_name: &str) -> Option<PathBuf> {
+    let p = applications_dir().join(file_name);
+    if p.is_file() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Does this option's install channel already have its artifact
+/// on the machine? (Flatpak app installed / managed AppImage
+/// present.) Presence is what turns an install spec from a
+/// promise into a launchable thing.
+fn channel_present(opt: &EmuOption, flatpak_apps: &BTreeSet<String>) -> bool {
+    match &opt.install {
+        ufm_emu::InstallSpec::Flatpak { app_id } => flatpak_apps.contains(app_id),
+        ufm_emu::InstallSpec::AppImage { file_name, .. }
+        | ufm_emu::InstallSpec::GitHubAppImage { file_name, .. } => {
+            managed_appimage(file_name).is_some()
+        }
+        _ => false,
+    }
 }
 
 fn flatpak_available() -> bool {
@@ -254,15 +316,22 @@ pub fn probe_env() -> (EnvProbe, Option<RaLayout>) {
         }
     }
 
-    // Standalone presence: probe each curated option's binaries.
+    // Standalone presence: each curated option's own binaries on
+    // PATH, or (v2) the artifact of the channel Fable installs —
+    // an installed flatpak app or a managed AppImage answers for
+    // emulators whose binaries don't live on PATH at all.
+    let flatpak_apps = flatpak_app_ids();
     let mut standalones: BTreeSet<String> = BTreeSet::new();
     for sys in ufm_emu::systems_table() {
         for opt in &sys.options {
-            if opt.kind == OptionKind::Standalone
-                && opt
-                    .probe_bins
-                    .iter()
-                    .any(|b| crate::deps::tool_present(b))
+            if opt.kind != OptionKind::Standalone {
+                continue;
+            }
+            if opt
+                .probe_bins
+                .iter()
+                .any(|b| crate::deps::tool_present(b))
+                || channel_present(opt, &flatpak_apps)
             {
                 standalones.insert(opt.id.clone());
             }
@@ -314,6 +383,63 @@ pub fn bios_system_root(layout: Option<&RaLayout>) -> PathBuf {
     }
 }
 
+/// Where DuckStation keeps its system files: the flatpak app's
+/// config home when the flatpak is how it's installed (Fable's
+/// channel), else the native config home.
+pub fn duckstation_bios_dir() -> PathBuf {
+    let home = home_dir();
+    if flatpak_has_app("org.duckstation.DuckStation")
+        || !crate::deps::tool_present("duckstation")
+    {
+        home.join(".var/app/org.duckstation.DuckStation/config/duckstation/bios")
+    } else {
+        home.join(".config/duckstation/bios")
+    }
+}
+
+/// Where PCSX2 keeps its BIOS files (flatpak config home, else
+/// the native one — same shape rule as DuckStation).
+pub fn pcsx2_bios_dir() -> PathBuf {
+    let home = home_dir();
+    if flatpak_has_app("net.pcsx2.PCSX2") || !crate::deps::tool_present("pcsx2") {
+        home.join(".var/app/net.pcsx2.PCSX2/config/PCSX2/bios")
+    } else {
+        home.join(".config/PCSX2/bios")
+    }
+}
+
+/// RPCS3's config home. Its requirement sets carry the
+/// `dev_flash/sys/external` subdir — the firmware payload lives
+/// there once RPCS3 has installed a PUP.
+pub fn rpcs3_config_dir() -> PathBuf {
+    home_dir().join(".config/rpcs3")
+}
+
+/// The system-file home for a STANDALONE option, when Fable
+/// knows it (v2). Standalones keep their own folders — the gate
+/// checks the folder the emulator itself will look in.
+pub fn standalone_bios_root(sys_id: &str, opt: &EmuOption) -> Option<PathBuf> {
+    match (sys_id, opt.id.as_str()) {
+        ("psx", "duckstation-standalone") => Some(duckstation_bios_dir()),
+        ("ps2", "pcsx2-standalone") => Some(pcsx2_bios_dir()),
+        ("ps3", "rpcs3-standalone") => Some(rpcs3_config_dir()),
+        _ => None,
+    }
+}
+
+/// The home a requirement's presence is judged against for one
+/// option: cores → the RetroArch system dir; known standalones →
+/// their own folder; anything else → the RetroArch home (the
+/// v1.1 behavior the card always had).
+fn bios_root_for(sys: &SystemEntry, opt: &EmuOption, layout: Option<&RaLayout>) -> PathBuf {
+    if opt.kind == OptionKind::Standalone {
+        if let Some(root) = standalone_bios_root(&sys.id, opt) {
+            return root;
+        }
+    }
+    bios_system_root(layout)
+}
+
 fn dir_listing(dir: &Path) -> Vec<String> {
     std::fs::read_dir(dir)
         .map(|entries| {
@@ -339,16 +465,18 @@ pub fn bios_satisfied(req: &ufm_emu::BiosRequirement, system_root: &Path) -> boo
 
 /// One option's state here, BIOS included.
 ///
-/// Layering rules (v1.1): the requirement table decides gating —
-/// a gating requirement unsatisfied in the system dir makes a
-/// libretro-core option `NeedsBios`, layered UNDER any install
-/// need (install first, then the sheet explains the file — never
-/// a launch into a black screen). Non-gating requirements
-/// (optional / recommended / only-some-games) inform through the
-/// card and the sheet but never change the state. Standalones
-/// keep their own homes and are never gated by the RetroArch
-/// system dir. Mined systems without a requirement keep the
-/// legacy per-option list check.
+/// Layering rules: the requirement table decides gating — a
+/// gating requirement unsatisfied in the option's system-file
+/// home makes it `NeedsBios`, layered UNDER any install need
+/// (install first, then the sheet explains the file — never a
+/// launch into a black screen). Homes (v2): cores look in the
+/// RetroArch system dir; the standalone wave's emulators look in
+/// their own folders (DuckStation's / PCSX2's config homes,
+/// RPCS3's dev_flash) — a standalone is never gated by the
+/// RetroArch dir. Non-gating requirements (optional /
+/// recommended / only-some-games) inform through the card and
+/// the sheet but never change the state. Mined systems without
+/// a requirement keep the legacy per-option list check.
 pub fn state_of(
     sys: &SystemEntry,
     opt: &EmuOption,
@@ -356,22 +484,45 @@ pub fn state_of(
     layout: Option<&RaLayout>,
 ) -> OptState {
     let base = option_state(opt, env);
-    if opt.kind != OptionKind::LibretroCore {
-        return base;
-    }
-    match ufm_emu::requirement_for(&sys.id) {
-        Some(req) if req.gate_play => {
-            if base.needs_install() {
+    match opt.kind {
+        OptionKind::LibretroCore => match ufm_emu::requirement_for(&sys.id) {
+            Some(req) if req.gate_play => {
+                if base.needs_install() {
+                    return base;
+                }
+                if bios_satisfied(req, &bios_system_root(layout)) {
+                    base
+                } else {
+                    OptState::NeedsBios
+                }
+            }
+            Some(_) => base,
+            None => with_bios(base, opt, bios_present(opt, layout)),
+        },
+        OptionKind::Standalone => {
+            // Only an installed-and-ready standalone can be gated
+            // (install needs and manual-only states pass through —
+            // the BIOS conversation starts once the emulator is
+            // actually here, mirroring the cores' layering).
+            if base != OptState::Ready {
                 return base;
             }
-            if bios_satisfied(req, &bios_system_root(layout)) {
+            let Some(req) = ufm_emu::requirement_for(&sys.id) else {
+                return base;
+            };
+            if !req.gate_play {
+                return base;
+            }
+            let Some(root) = standalone_bios_root(&sys.id, opt) else {
+                return base;
+            };
+            if bios_satisfied(req, &root) {
                 base
             } else {
                 OptState::NeedsBios
             }
         }
-        Some(_) => base,
-        None => with_bios(base, opt, bios_present(opt, layout)),
+        OptionKind::OsDefault | OptionKind::EsDeDoor => base,
     }
 }
 
@@ -396,14 +547,16 @@ fn bios_gate_wire(
     layout: Option<&RaLayout>,
     state: OptState,
 ) -> Option<BiosGateWire> {
-    if opt.kind != OptionKind::LibretroCore {
+    if opt.kind != OptionKind::LibretroCore && opt.kind != OptionKind::Standalone {
         return None;
     }
     let req = ufm_emu::requirement_for(&sys.id)?;
     if !req.gate_play && req.need != ufm_emu::BiosNeed::Recommended {
         return None;
     }
-    let root = bios_system_root(layout);
+    // The option's own home decides what's missing — a
+    // standalone's row talks about ITS folder, not RetroArch's.
+    let root = bios_root_for(sys, opt, layout);
     let missing = bios_missing_sets(req, &root);
     if missing.is_empty() {
         return None;
@@ -453,7 +606,7 @@ pub struct BiosSystemWire {
     pub note: String,
 }
 
-fn home_relative(path: &Path) -> String {
+pub fn home_relative(path: &Path) -> String {
     let home = home_dir();
     match path.strip_prefix(&home) {
         Ok(rest) => format!("~/{}", rest.display()),
@@ -488,14 +641,67 @@ pub fn bios_system_wire(req: &ufm_emu::BiosRequirement, system_root: &Path) -> B
     }
 }
 
+/// The home the System-files card judges one requirement
+/// against: the home of the system's EFFECTIVE option (his saved
+/// choice, else the curated default) — so the card answers the
+/// question Play will ask. When his PlayStation choice is
+/// DuckStation, the card reads DuckStation's folder; when it's a
+/// Beetle core, RetroArch's system dir.
+fn card_bios_root(
+    req: &ufm_emu::BiosRequirement,
+    layout: Option<&RaLayout>,
+    settings: &EmuSettings,
+) -> PathBuf {
+    let Some(sys) = ufm_emu::table::system_by_id(req.system) else {
+        return bios_system_root(layout);
+    };
+    let saved = settings
+        .choices
+        .iter()
+        .find(|(platform, _)| esde_id(platform) == req.system)
+        .map(|(_, id)| id.as_str());
+    let opt = saved
+        .and_then(|id| sys.option(id))
+        .or_else(|| sys.default());
+    match opt {
+        Some(opt) => bios_root_for(sys, opt, layout),
+        None => bios_system_root(layout),
+    }
+}
+
 /// The whole card: every requirement system, games or not
 /// (amendment §6 — state display is cheap; the flow is the feature).
-pub fn bios_state_wires(layout: Option<&RaLayout>) -> Vec<BiosSystemWire> {
-    let root = bios_system_root(layout);
+pub fn bios_state_wires(
+    layout: Option<&RaLayout>,
+    settings: &EmuSettings,
+) -> Vec<BiosSystemWire> {
     ufm_emu::BIOS_REQUIREMENTS
         .iter()
-        .map(|req| bios_system_wire(req, &root))
+        .map(|req| bios_system_wire(req, &card_bios_root(req, layout, settings)))
         .collect()
+}
+
+/// Every home the Add flow files a system's files into: the
+/// effective option's home FIRST (the card judges that one),
+/// plus the RetroArch system dir when it differs — PS1/PS2 games
+/// can be played from either side of the fence, and a 4 MB file
+/// filed in both homes means whichever emulator he picks later
+/// just works (v2). PS3 is the exception: its Add flow is the
+/// PUP hand-off in `emu_bios_add`, never a file copy.
+pub fn bios_add_roots(
+    system_id: &str,
+    layout: Option<&RaLayout>,
+    settings: &EmuSettings,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(req) = ufm_emu::requirement_for(system_id) {
+        roots.push(card_bios_root(req, layout, settings));
+    }
+    let ra_root = bios_system_root(layout);
+    if !roots.contains(&ra_root) {
+        roots.push(ra_root);
+    }
+    roots
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -649,6 +855,43 @@ fn run_long(cmd: &str, args: &[&str], timeout: Duration) -> Result<(), String> {
     }
 }
 
+/// Make sure the USER flatpak installation can see Flathub.
+///
+/// A --user install resolves refs from USER remotes only, and a
+/// box whose flathub is registered system-wide (this one) can't
+/// serve user installs ("No remote refs found"). Register the
+/// same remote for the user first — idempotent, no password,
+/// entirely per-user. v1 learned this for RetroArch; v2's whole
+/// flatpak wave needs it, so it lives here now.
+pub fn ensure_user_flathub() -> Result<(), String> {
+    let user_has_flathub = run_stdout(
+        "flatpak",
+        &["remote-list", "--user", "--columns=name"],
+        Duration::from_secs(20),
+    )
+    .map(|s| s.lines().any(|l| l.trim() == "flathub"))
+    .unwrap_or(false);
+    if user_has_flathub {
+        return Ok(());
+    }
+    run_long(
+        "flatpak",
+        &[
+            "remote-add",
+            "--user",
+            "--if-not-exists",
+            "flathub",
+            "https://dl.flathub.org/repo/flathub.flatpakrepo",
+        ],
+        Duration::from_secs(120),
+    )
+    .map_err(|e| {
+        format!(
+            "Fable couldn't set up Flathub for installs: {e}. Nothing else is affected — try again from the same place."
+        )
+    })
+}
+
 /// Make sure RetroArch exists; returns its layout. Flatpak first
 /// (amendment §4.1), apt via deps.rs as the fallback.
 pub fn ensure_retroarch(progress: &Progress) -> Result<RaLayout, String> {
@@ -658,36 +901,7 @@ pub fn ensure_retroarch(progress: &Progress) -> Result<RaLayout, String> {
     }
     if env.flatpak_available {
         progress("Installing RetroArch…", None);
-        // A --user install resolves refs from USER remotes only,
-        // and this box's flathub is registered system-wide — a
-        // user install can't see it ("No remote refs found").
-        // Register the same remote for the user first; still no
-        // password, still entirely per-user.
-        let user_has_flathub = run_stdout(
-            "flatpak",
-            &["remote-list", "--user", "--columns=name"],
-            Duration::from_secs(20),
-        )
-        .map(|s| s.lines().any(|l| l.trim() == "flathub"))
-        .unwrap_or(false);
-        if !user_has_flathub {
-            run_long(
-                "flatpak",
-                &[
-                    "remote-add",
-                    "--user",
-                    "--if-not-exists",
-                    "flathub",
-                    "https://dl.flathub.org/repo/flathub.flatpakrepo",
-                ],
-                Duration::from_secs(120),
-            )
-            .map_err(|e| {
-                format!(
-                    "Fable couldn't install RetroArch: {e}. Nothing else is affected — try again from the same place."
-                )
-            })?;
-        }
+        ensure_user_flathub()?;
         run_long(
             "flatpak",
             &[
@@ -771,6 +985,234 @@ pub fn fetch_core(
     Ok(dest)
 }
 
+// ---------------------------------------------------------------------------
+// AppImages (v2) — the official-download channel. RPCS3 and ES-DE
+// arrive as managed files in ~/Applications, verified against
+// the sha256 the publisher's own channel publishes wherever one
+// exists, and proved runnable (FUSE) before anyone calls them
+// installed.
+// ---------------------------------------------------------------------------
+
+/// sha256 of a file, lowercase hex.
+pub fn sha256_file(path: &Path) -> Option<String> {
+    use sha2::Digest;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut h = sha2::Sha256::new();
+    std::io::copy(&mut f, &mut h).ok()?;
+    Some(format!("{:x}", h.finalize()))
+}
+
+/// Stream a URL to a file with progress. Written to a `.part`
+/// sibling by the caller; this just moves the bytes.
+fn download_to(url: &str, dest: &Path, label: &str, progress: &Progress) -> Result<u64, String> {
+    use std::io::Write;
+    let resp = ureq::get(url)
+        .call()
+        .map_err(|e| format!("Fable couldn't reach the download: {e}"))?;
+    let total: u64 = resp
+        .header("Content-Length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut reader = resp.into_reader();
+    let mut out = std::fs::File::create(dest)
+        .map_err(|e| format!("couldn't create the download file: {e}"))?;
+    let mut buf = [0u8; 256 * 1024];
+    let mut written: u64 = 0;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("the download stopped: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&buf[..n])
+            .map_err(|e| format!("couldn't save the download: {e}"))?;
+        written += n as u64;
+        if written > 2 * 1024 * 1024 * 1024 {
+            let _ = std::fs::remove_file(dest);
+            return Err("the download grew implausibly large; stopped".to_string());
+        }
+        if total > 0 {
+            let pct = ((written * 100) / total).min(100) as u32;
+            progress(label, Some(pct));
+        }
+    }
+    out.flush().map_err(|e| format!("couldn't save the download: {e}"))?;
+    Ok(written)
+}
+
+/// A comparable version key from an asset name: the first four
+/// digit groups ("rpcs3-v0.0.37-18146-…" → (0, 0, 37, 18146)).
+/// RPCS3's release LIST order is not version order (an old build
+/// can sit on top), so the newest asset is picked by name.
+pub fn appimage_version_key(name: &str) -> (u64, u64, u64, u64) {
+    let mut groups = name
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u64>().ok());
+    (
+        groups.next().unwrap_or(0),
+        groups.next().unwrap_or(0),
+        groups.next().unwrap_or(0),
+        groups.next().unwrap_or(0),
+    )
+}
+
+/// Resolve a GitHub-releases AppImage: the newest asset whose
+/// name ends with `asset_suffix`, plus the sha256 digest the
+/// releases API publishes for it (when it publishes one).
+pub fn resolve_github_appimage(
+    repo: &str,
+    asset_suffix: &str,
+) -> Result<(String, Option<String>, String), String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=10");
+    let body = ureq::get(&url)
+        .set("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| format!("Fable couldn't check for the latest release: {e}"))?
+        .into_string()
+        .map_err(|e| format!("the release list couldn't be read: {e}"))?;
+    let releases: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("the release list was unreadable: {e}"))?;
+    let mut best: Option<((u64, u64, u64, u64), String, Option<String>, String)> = None;
+    for release in releases.as_array().cloned().unwrap_or_default() {
+        for asset in release["assets"].as_array().cloned().unwrap_or_default() {
+            let name = asset["name"].as_str().unwrap_or_default();
+            if !name.ends_with(asset_suffix) {
+                continue;
+            }
+            let Some(dl) = asset["browser_download_url"].as_str() else {
+                continue;
+            };
+            let digest = asset["digest"]
+                .as_str()
+                .and_then(|d| d.strip_prefix("sha256:"))
+                .map(|d| d.to_string());
+            let cand = (
+                appimage_version_key(name),
+                dl.to_string(),
+                digest,
+                name.to_string(),
+            );
+            if best.as_ref().map(|b| cand.0 > b.0).unwrap_or(true) {
+                best = Some(cand);
+            }
+        }
+    }
+    best.map(|(_, dl, digest, name)| (dl, digest, name))
+        .ok_or_else(|| "no suitable download was found in the latest releases".to_string())
+}
+
+/// Is FUSE 2 (the runtime every AppImage needs) on this system?
+pub fn libfuse2_present() -> bool {
+    for p in [
+        "/usr/lib/x86_64-linux-gnu/libfuse.so.2",
+        "/lib/x86_64-linux-gnu/libfuse.so.2",
+        "/usr/lib/libfuse.so.2",
+        "/usr/lib64/libfuse.so.2",
+    ] {
+        if Path::new(p).exists() {
+            return true;
+        }
+    }
+    run_stdout("ldconfig", &["-p"], Duration::from_secs(15))
+        .map(|s| s.contains("libfuse.so.2"))
+        .unwrap_or(false)
+}
+
+/// Prove an AppImage can start on this system — the AppImage
+/// runtime answers `--appimage-version` itself, no display
+/// needed. When FUSE is the problem, set it up (dependency law)
+/// and prove again.
+pub fn ensure_appimage_runnable(path: &Path, label: &str) -> Result<(), String> {
+    let probe = |p: &Path| -> bool {
+        run_stdout(
+            &p.to_string_lossy(),
+            &["--appimage-version"],
+            Duration::from_secs(25),
+        )
+        .is_some()
+    };
+    if probe(path) {
+        return Ok(());
+    }
+    crate::deps::ensure_with_check("libfuse2", &libfuse2_present).map_err(|e| {
+        format!("{label} downloaded fine, but this system is missing the library AppImages need: {e}")
+    })?;
+    if probe(path) {
+        return Ok(());
+    }
+    Err(format!(
+        "{label} downloaded fine, but it couldn't start on this system — nothing else is affected, and you can try again from the same place."
+    ))
+}
+
+/// Download an AppImage into ~/Applications under its stable
+/// managed name: hash-verified when the channel published a
+/// hash, then proved runnable. Idempotent — a present file that
+/// matches the published hash is already installed.
+pub fn install_appimage(
+    url: &str,
+    expected_sha256: Option<&str>,
+    file_name: &str,
+    label: &str,
+    progress: &Progress,
+) -> Result<PathBuf, String> {
+    let dir = applications_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("couldn't open ~/Applications: {e}"))?;
+    let dest = dir.join(file_name);
+    if dest.is_file() {
+        match expected_sha256 {
+            Some(want) if sha256_file(&dest).as_deref() == Some(want) => {
+                ensure_appimage_runnable(&dest, label)?;
+                return Ok(dest);
+            }
+            None => {
+                ensure_appimage_runnable(&dest, label)?;
+                return Ok(dest);
+            }
+            _ => {}
+        }
+    }
+    progress(&format!("Downloading {label}…"), Some(0));
+    let part = dir.join(format!(".{file_name}.part"));
+    download_to(url, &part, &format!("Downloading {label}…"), progress)?;
+    if let Some(want) = expected_sha256 {
+        progress("Verifying the download…", None);
+        match sha256_file(&part) {
+            Some(got) if got == want => {}
+            _ => {
+                let _ = std::fs::remove_file(&part);
+                return Err(format!(
+                    "{label}'s download didn't match the checksum its makers published, so Fable removed it. Nothing was installed."
+                ));
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755));
+    }
+    std::fs::rename(&part, &dest).map_err(|e| format!("couldn't file {label}: {e}"))?;
+    progress("Checking it runs…", None);
+    ensure_appimage_runnable(&dest, label)?;
+    Ok(dest)
+}
+
+/// Post-install verification for standalones (v2): the install
+/// only counts when a fresh probe reads the option Ready —
+/// BIOS-free, since `option_state` doesn't know about gates.
+fn verify_option_ready(opt: &EmuOption, env: &EnvProbe) -> Result<(), String> {
+    if option_state(opt, env) != OptState::Ready {
+        return Err(
+            "The setup finished, but the emulator still isn't ready — nothing else is affected, and you can try again from the same place."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Install whatever an option needs, in dependency order, then
 /// verify the install itself reads Ready. The sheet's "Install &
 /// Play" is this function followed by the BIOS gate and a launch.
@@ -805,19 +1247,49 @@ pub fn ensure_option(
         OptionKind::Standalone => match &opt.install {
             ufm_emu::InstallSpec::Flatpak { app_id } => {
                 progress(&format!("Installing {}…", opt.label), None);
+                ensure_user_flathub()?;
                 run_long(
                     "flatpak",
                     &["install", "--user", "-y", "--noninteractive", "flathub", app_id],
                     Duration::from_secs(1800),
                 )
                 .map_err(|e| format!("Fable couldn't install {}: {e}", opt.label))?;
-                Ok(probe_env())
+                let (env, layout) = probe_env();
+                verify_option_ready(opt, &env)?;
+                Ok((env, layout))
             }
             ufm_emu::InstallSpec::AptLogical { logical } => {
                 progress(&format!("Installing {}…", opt.label), None);
                 let bin = opt.probe_bins.first().cloned().unwrap_or_default();
                 crate::deps::ensure_tool(&bin, logical)?;
-                Ok(probe_env())
+                let (env, layout) = probe_env();
+                verify_option_ready(opt, &env)?;
+                Ok((env, layout))
+            }
+            ufm_emu::InstallSpec::AppImage { url, file_name } => {
+                install_appimage(url, None, file_name, &opt.label, progress)?;
+                let (env, layout) = probe_env();
+                verify_option_ready(opt, &env)?;
+                Ok((env, layout))
+            }
+            ufm_emu::InstallSpec::GitHubAppImage {
+                repo,
+                asset_suffix,
+                file_name,
+            } => {
+                progress(&format!("Checking for the latest {}…", opt.label), None);
+                let (url, digest, _asset_name) = resolve_github_appimage(repo, asset_suffix)
+                    .map_err(|e| format!("Fable couldn't install {}: {e}", opt.label))?;
+                install_appimage(
+                    &url,
+                    digest.as_deref(),
+                    file_name,
+                    &opt.label,
+                    progress,
+                )?;
+                let (env, layout) = probe_env();
+                verify_option_ready(opt, &env)?;
+                Ok((env, layout))
             }
             _ => Err(opt.install_note.clone().unwrap_or_else(|| {
                 "Fable can't install this one yet.".to_string()
@@ -848,6 +1320,33 @@ fn emulator_tokens(template: &str) -> Vec<String> {
     out
 }
 
+/// The command line that runs a standalone option HERE, as one
+/// string for template substitution (multi-word is fine — the
+/// expander tokenizes). Resolution order (v2): the channel
+/// Fable manages wins — a managed AppImage by path; an installed
+/// flatpak app by `flatpak run`; then the option's own binaries
+/// on PATH (how hand-installed emulators are found).
+pub fn standalone_command(opt: &EmuOption) -> Option<String> {
+    match &opt.install {
+        ufm_emu::InstallSpec::AppImage { file_name, .. }
+        | ufm_emu::InstallSpec::GitHubAppImage { file_name, .. } => {
+            if let Some(p) = managed_appimage(file_name) {
+                return Some(p.to_string_lossy().into_owned());
+            }
+        }
+        ufm_emu::InstallSpec::Flatpak { app_id } => {
+            if flatpak_has_app(app_id) {
+                return Some(format!("flatpak run {app_id}"));
+            }
+        }
+        _ => {}
+    }
+    opt.probe_bins
+        .iter()
+        .find(|b| crate::deps::tool_present(b))
+        .cloned()
+}
+
 /// Build the launch argv for an option + game path.
 pub fn launch_argv(
     opt: &EmuOption,
@@ -859,6 +1358,15 @@ pub fn launch_argv(
     if let Some(l) = layout {
         emulators.insert("EMULATOR_RETROARCH".to_string(), l.command.join(" "));
     }
+    // The option's resolved standalone command (v2 channels
+    // included) answers every %EMULATOR_…% token in its template.
+    if opt.kind == OptionKind::Standalone {
+        if let Some(cmd) = standalone_command(opt) {
+            for token in emulator_tokens(&opt.template) {
+                emulators.insert(token, cmd.clone());
+            }
+        }
+    }
     // Standalone find-rules: a probed binary answers its own
     // %EMULATOR_<NAME>% token in the option's template (the token's
     // suffix IS the binary's name — MESEN ↔ mesen, FS-UAE ↔
@@ -869,6 +1377,12 @@ pub fn launch_argv(
             continue;
         }
         for token in emulator_tokens(&opt.template) {
+            // A channel-resolved command (flatpak / AppImage) has
+            // already answered this token — it stays (the BIOS
+            // home is judged against that same channel).
+            if emulators.contains_key(&token) {
+                continue;
+            }
             let suffix = token.strip_prefix("EMULATOR_").unwrap_or("");
             if suffix.eq_ignore_ascii_case(bin)
                 || bin.to_lowercase().starts_with(&suffix.to_lowercase())
@@ -991,6 +1505,20 @@ pub enum EmuPlayOutcome {
     },
     Sheet {
         sheet: SheetWire,
+    },
+    /// v2 (§4.4): the emulator is installed and the system files
+    /// are fine, but its flatpak sandbox can't see the drive this
+    /// game lives on. The sheet asks once — Allow access & Play —
+    /// and `emu_grant_access_and_play` applies the scoped grant.
+    AccessNeeded {
+        option_id: String,
+        /// The flatpak app the grant would go to.
+        app_id: String,
+        /// The option's friendly name ("DuckStation").
+        app_label: String,
+        /// The volume root the grant would open (nothing wider).
+        filesystem: String,
+        message: String,
     },
     Unavailable {
         message: String,
@@ -1117,16 +1645,23 @@ pub fn home_volume(
 /// The best present copy of a group: ranked exactly like the farm
 /// (internal first, then fixed volumes, then removable), so Play
 /// and the view always agree about which copy is "the" copy.
+/// Rows inside the unified view are the mirror's reflection, not
+/// copies (the view is never a source — see emu_farm), and are
+/// skipped even when the pressed row is one of them.
 pub fn best_present_copy<'a>(
     group: &'a GameGroup,
     mounted: &[crate::commands::MountedVolume],
     volumes: &[ufm_catalog::VolumeRecord],
+    view_root: &Path,
 ) -> Option<&'a ufm_catalog::RomHomeGame> {
     group
         .rows
         .iter()
         .filter_map(|r| {
             let pk = r.item.provider_key.as_ref()?;
+            if Path::new(pk.as_str()).starts_with(view_root) {
+                return None;
+            }
             let home = home_volume(pk, mounted, volumes)?;
             home.live.then(|| (home.rank, pk.clone(), r))
         })
@@ -1224,7 +1759,10 @@ fn play_prelude_with_catalog(
     // against a missing file.
     let mounted = crate::commands::current_filesystems();
     let volumes = catalog.volumes().unwrap_or_default();
-    let Some(launch_row) = best_present_copy(&group, &mounted, &volumes).cloned() else {
+    let settings = load_settings(&state.data_base);
+    let Some(launch_row) =
+        best_present_copy(&group, &mounted, &volumes, &settings.view_root_path()).cloned()
+    else {
         // Name the drive that owns the pressed copy, the way the
         // room itself phrases it.
         let message = match home_volume(provider_key, &mounted, &volumes) {
@@ -1237,7 +1775,6 @@ fn play_prelude_with_catalog(
         return Err(unavailable(message));
     };
     let (env, layout) = probe_env();
-    let settings = load_settings(&state.data_base);
     Ok(PlayPrelude {
         sys,
         group,
@@ -1246,6 +1783,232 @@ fn play_prelude_with_catalog(
         layout,
         settings,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox drive access (amendment §4.4, v2). A flatpak emulator
+// can only read what its sandbox allows. Coverage is decided
+// DECLARATIVELY — the app's own metadata filesystems plus the
+// user's overrides, against the game's real path — never by
+// trial launches. When a launch would be blind, the sheet asks
+// once; consent applies one scoped grant for the game's home
+// volume and records it where he can see and revoke it
+// (Preferences → ROMs).
+// ---------------------------------------------------------------------------
+
+/// Every `filesystems=` entry in a flatpak metadata / override
+/// dump (`filesystems=host;home;` style INI lines).
+fn parse_filesystems_line(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if let Some(v) = line.trim().strip_prefix("filesystems=") {
+            for e in v.split(';') {
+                let e = e.trim();
+                if !e.is_empty() {
+                    out.push(e.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The grants an app effectively has: its shipped metadata plus
+/// the user's overrides.
+fn flatpak_filesystem_grants(app_id: &str) -> Vec<String> {
+    let mut grants = Vec::new();
+    if let Some(meta) = run_stdout(
+        "flatpak",
+        &["info", "--show-metadata", app_id],
+        Duration::from_secs(20),
+    ) {
+        grants.extend(parse_filesystems_line(&meta));
+    }
+    if let Some(ovr) = run_stdout(
+        "flatpak",
+        &["override", "--user", "--show", app_id],
+        Duration::from_secs(20),
+    ) {
+        grants.extend(parse_filesystems_line(&ovr));
+    }
+    grants
+}
+
+/// Do these grants cover this path? Grant spellings: `host`
+/// (everything), `home` (the home tree), absolute paths, `~/…`
+/// paths; `:ro`/`:rw`/`:create` mode suffixes don't change
+/// coverage.
+pub fn grant_covers(grants: &[String], path: &Path) -> bool {
+    let home = home_dir();
+    for g in grants {
+        let e = g.trim();
+        let base = match e.rsplit_once(':') {
+            Some((head, mode)) if matches!(mode, "ro" | "rw" | "create") => head,
+            _ => e,
+        };
+        match base {
+            "host" => return true,
+            "home" => {
+                if path.starts_with(&home) {
+                    return true;
+                }
+            }
+            _ if base.starts_with('/') => {
+                if path.starts_with(Path::new(base)) {
+                    return true;
+                }
+            }
+            _ if base.starts_with("~/") => {
+                if path.starts_with(home.join(&base[2..])) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Can this flatpak app actually read this file where it sits?
+pub fn sandbox_can_see(app_id: &str, path: &Path) -> bool {
+    grant_covers(&flatpak_filesystem_grants(app_id), path)
+}
+
+/// The §4.4 grant: open exactly this filesystem root to the app.
+pub fn apply_sandbox_override(app_id: &str, filesystem: &str) -> Result<(), String> {
+    run_long(
+        "flatpak",
+        &[
+            "override",
+            "--user",
+            &format!("--filesystem={filesystem}"),
+            app_id,
+        ],
+        Duration::from_secs(60),
+    )
+    .map_err(|e| format!("Fable couldn't open the drive to the emulator: {e}"))
+}
+
+/// Take a grant back (`flatpak override --nofilesystem=…`).
+pub fn remove_sandbox_override(app_id: &str, filesystem: &str) -> Result<(), String> {
+    run_long(
+        "flatpak",
+        &[
+            "override",
+            "--user",
+            &format!("--nofilesystem={filesystem}"),
+            app_id,
+        ],
+        Duration::from_secs(60),
+    )
+    .map_err(|e| format!("Fable couldn't take back the drive access: {e}"))
+}
+
+/// Record a grant in the settings (Preferences shows + revokes
+/// from the same list — the record and the machine never drift:
+/// recording happens only after the override landed).
+pub fn record_override(base: &Path, app_id: &str, filesystem: &str) -> Result<(), String> {
+    let mut settings = load_settings(base);
+    if !settings
+        .overrides
+        .iter()
+        .any(|o| o.app_id == app_id && o.filesystem == filesystem)
+    {
+        settings.overrides.push(SandboxOverride {
+            app_id: app_id.to_string(),
+            filesystem: filesystem.to_string(),
+        });
+        save_settings(base, &settings)?;
+    }
+    Ok(())
+}
+
+pub fn forget_override(base: &Path, app_id: &str, filesystem: &str) -> Result<(), String> {
+    let mut settings = load_settings(base);
+    settings
+        .overrides
+        .retain(|o| !(o.app_id == app_id && o.filesystem == filesystem));
+    save_settings(base, &settings)
+}
+
+/// The access gap for one launch, when there is one: (app id,
+/// the filesystem root a grant would open, the volume's name for
+/// the sentence). The root is the game's home VOLUME's root —
+/// one grant per drive, scoped to that drive — or, for a game
+/// on the internal disk outside the sandbox's reach, the game's
+/// own folder.
+fn access_gap(
+    state: &AppState,
+    opt: &EmuOption,
+    rom_path: &str,
+) -> Option<(String, String, String)> {
+    let ufm_emu::InstallSpec::Flatpak { app_id } = &opt.install else {
+        return None;
+    };
+    if sandbox_can_see(app_id, Path::new(rom_path)) {
+        return None;
+    }
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path).ok();
+    let volumes = catalog
+        .as_ref()
+        .and_then(|c| c.volumes().ok())
+        .unwrap_or_default();
+    let mounted = crate::commands::current_filesystems();
+    let parent = Path::new(rom_path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/".to_string());
+    let (filesystem, word) = match home_volume(rom_path, &mounted, &volumes) {
+        Some(h) if h.live && h.root != "/" => {
+            let word = h.record_label.clone().unwrap_or_else(|| h.root.clone());
+            (h.root.clone(), word)
+        }
+        Some(h) => (
+            parent,
+            h.record_label.unwrap_or_else(|| "this computer".to_string()),
+        ),
+        None => (parent, "this computer".to_string()),
+    };
+    Some((app_id.clone(), filesystem, word))
+}
+
+/// The shared launch tail (§4.4 check, then launch + note). Used
+/// by Play, Install & Play, and Allow access & Play, so every
+/// road to a launch crosses the same sandbox gate.
+fn finish_launch(
+    state: &AppState,
+    prelude: &PlayPrelude,
+    opt: &EmuOption,
+    layout: Option<&RaLayout>,
+    option_id: &str,
+) -> EmuPlayOutcome {
+    let rom_path = prelude
+        .launch_row
+        .item
+        .provider_key
+        .clone()
+        .unwrap_or_default();
+    if let Some((app_id, filesystem, word)) = access_gap(state, opt, &rom_path) {
+        return EmuPlayOutcome::AccessNeeded {
+            option_id: option_id.to_string(),
+            app_id,
+            app_label: opt.label.clone(),
+            filesystem,
+            message: format!(
+                "{} is installed, but its sandbox can't see the drive this game is on ({word}). Fable can open just that drive to {} — nothing else changes, and you can take it back any time in Preferences → ROMs.",
+                opt.label, opt.label
+            ),
+        };
+    }
+    let view_root = prelude.settings.view_root_path();
+    match launch_and_note(state, opt, layout, &view_root, &rom_path) {
+        Ok(game_state) => EmuPlayOutcome::Launched {
+            state: game_state,
+            option_id: option_id.to_string(),
+            played_provider_key: rom_path,
+        },
+        Err(e) => EmuPlayOutcome::Unavailable { message: e.message },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,22 +2050,7 @@ pub async fn emu_play(
                             );
                             return EmuPlayOutcome::Sheet { sheet };
                         }
-                        let rom_path = p
-                            .launch_row
-                            .item
-                            .provider_key
-                            .clone()
-                            .unwrap_or_default();
-                        let view_root = p.settings.view_root_path();
-                        match launch_and_note(state, &opt, p.layout.as_ref(), &view_root, &rom_path)
-                        {
-                            Ok(game_state) => EmuPlayOutcome::Launched {
-                                state: game_state,
-                                option_id,
-                                played_provider_key: rom_path,
-                            },
-                            Err(e) => EmuPlayOutcome::Unavailable { message: e.message },
-                        }
+                        finish_launch(state, &p, &opt, p.layout.as_ref(), &option_id)
                     }
                     Decision::Sheet { preselect } => {
                         let sheet = sheet_wire(
@@ -1432,24 +2180,85 @@ pub async fn emu_install_and_play(
             );
             return EmuPlayOutcome::Sheet { sheet };
         }
+        finish_launch(state, &prelude, &opt, layout.as_ref(), &option_id)
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("install task failed: {e}"))))
+}
+
+/// The §4.4 consent, accepted: apply the scoped grant for the
+/// game's drive, record it, and launch in the same sitting.
+#[tauri::command]
+pub async fn emu_grant_access_and_play(
+    app: tauri::AppHandle,
+    provider_key: String,
+    platform: String,
+    option_id: String,
+    remember: bool,
+) -> Cmd<EmuPlayOutcome> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = app.state::<AppState>();
+        let state: &AppState = &guard;
+        let prelude = match play_prelude(state, &platform, &provider_key) {
+            Ok(p) => p,
+            Err(o) => return o,
+        };
+        let Some(opt) = prelude.sys.option(&option_id).cloned() else {
+            return EmuPlayOutcome::Unavailable {
+                message: "That emulator isn't on the list for this system.".to_string(),
+            };
+        };
         let rom_path = prelude
             .launch_row
             .item
             .provider_key
             .clone()
             .unwrap_or_default();
-        let view_root = prelude.settings.view_root_path();
-        match launch_and_note(state, &opt, layout.as_ref(), &view_root, &rom_path) {
-            Ok(game_state) => EmuPlayOutcome::Launched {
-                state: game_state,
-                option_id,
-                played_provider_key: rom_path,
+        if let Some((app_id, filesystem, _word)) = access_gap(state, &opt, &rom_path) {
+            if let Err(e) = apply_sandbox_override(&app_id, &filesystem) {
+                return EmuPlayOutcome::Unavailable { message: e };
+            }
+            if let Err(e) = record_override(&state.data_base, &app_id, &filesystem) {
+                return EmuPlayOutcome::Unavailable { message: e };
+            }
+        }
+        if remember {
+            let mut settings = load_settings(&state.data_base);
+            settings.choices.insert(platform.clone(), option_id.clone());
+            let _ = save_settings(&state.data_base, &settings);
+        }
+        match finish_launch(state, &prelude, &opt, prelude.layout.as_ref(), &option_id) {
+            // The grant landed but the sandbox still can't see
+            // the game — say so plainly instead of looping the
+            // consent sheet.
+            EmuPlayOutcome::AccessNeeded { .. } => EmuPlayOutcome::Unavailable {
+                message: "Fable opened the drive, but the emulator still can't see the game — nothing else is affected, and the access you allowed is listed in Preferences → ROMs if you'd like to take it back."
+                    .to_string(),
             },
-            Err(e) => EmuPlayOutcome::Unavailable { message: e.message },
+            other => other,
         }
     })
     .await
-    .map_err(|e| CommandError::from(UfmError::Internal(format!("install task failed: {e}"))))
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("access task failed: {e}"))))
+}
+
+/// Preferences → ROMs: take back one recorded drive-access grant.
+#[tauri::command]
+pub async fn emu_remove_override(
+    app: tauri::AppHandle,
+    app_id: String,
+    filesystem: String,
+) -> Cmd<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = app.state::<AppState>();
+        let state: &AppState = &guard;
+        remove_sandbox_override(&app_id, &filesystem)
+            .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+        forget_override(&state.data_base, &app_id, &filesystem)
+            .map_err(|e| CommandError::from(UfmError::Internal(e)))
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("override task failed: {e}"))))?
 }
 
 /// Preferences → ROMs → System files: every requirement system's
@@ -1458,9 +2267,11 @@ pub async fn emu_install_and_play(
 #[tauri::command]
 pub async fn emu_bios_state(app: tauri::AppHandle) -> Cmd<Vec<BiosSystemWire>> {
     tauri::async_runtime::spawn_blocking(move || {
-        let _ = &app;
+        let guard = app.state::<AppState>();
+        let state: &AppState = &guard;
         let (_, layout) = probe_env();
-        Ok(bios_state_wires(layout.as_ref()))
+        let settings = load_settings(&state.data_base);
+        Ok(bios_state_wires(layout.as_ref(), &settings))
     })
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("bios state task failed: {e}"))))?
@@ -1479,21 +2290,32 @@ pub async fn emu_bios_state(app: tauri::AppHandle) -> Cmd<Vec<BiosSystemWire>> {
 /// trusted side of that line.
 #[tauri::command]
 pub async fn emu_bios_add(app: tauri::AppHandle, system_id: String) -> Cmd<BiosAddWire> {
+    let app2 = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         use tauri_plugin_dialog::DialogExt;
+        let guard = app.state::<AppState>();
+        let state: &AppState = &guard;
         let req = ufm_emu::requirement_for(&system_id).ok_or_else(|| {
             CommandError::from(UfmError::NotFound(format!(
                 "no system files tracked for {system_id}"
             )))
         })?;
+        let (_, layout) = probe_env();
+        let settings = load_settings(&state.data_base);
+        // PS3 system software is a hand-off, not a file copy (v2).
+        if system_id == "ps3" {
+            return ps3_firmware_add(&app, &app2, req, layout.as_ref());
+        }
         let picked = app
             .dialog()
             .file()
             .set_title(format!("Choose the {} system file", req.title))
             .add_filter("System files", &["bin", "img", "rom", "pce", "zip", "dat"])
             .blocking_pick_files();
-        let (_, layout) = probe_env();
-        let root = bios_system_root(layout.as_ref());
+        // The card judges the effective option's home; the Add
+        // flow files there first, then mirrors into the other
+        // home (RetroArch's system dir) when it differs.
+        let root = card_bios_root(req, layout.as_ref(), &settings);
         match picked {
             None => Ok(BiosAddWire {
                 cancelled: true,
@@ -1506,13 +2328,157 @@ pub async fn emu_bios_add(app: tauri::AppHandle, system_id: String) -> Cmd<BiosA
                     .into_iter()
                     .filter_map(|f| f.into_path().ok())
                     .collect();
-                add_bios_files(&system_id, &paths, &root)
-                    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+                let mut wire = add_bios_files(&system_id, &paths, &root)
+                    .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+                for extra in bios_add_roots(&system_id, layout.as_ref(), &settings) {
+                    if extra != root {
+                        let _ = add_bios_files(&system_id, &paths, &extra);
+                    }
+                }
+                // Judge the result against the card's home, fresh.
+                wire.system = bios_system_wire(req, &root);
+                Ok(wire)
             }
         }
     })
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("bios add task failed: {e}"))))?
+}
+
+/// The PS3 Add flow (v2): his PS3UPDAT.PUP is handed to RPCS3's
+/// own firmware installer — Fable never unpacks Sony's update
+/// file itself. RPCS3 is installed first (through the same
+/// machinery as Play) when it isn't here yet.
+fn ps3_firmware_add(
+    app: &tauri::AppHandle,
+    progress_app: &tauri::AppHandle,
+    req: &ufm_emu::BiosRequirement,
+    layout: Option<&RaLayout>,
+) -> Cmd<BiosAddWire> {
+    use tauri_plugin_dialog::DialogExt;
+    let _ = layout;
+    let root = rpcs3_config_dir();
+    let picked = app
+        .dialog()
+        .file()
+        .set_title("Choose the PS3 system software update (PS3UPDAT.PUP)")
+        .add_filter("PS3 update file", &["PUP", "pup"])
+        .blocking_pick_file();
+    let Some(file) = picked else {
+        return Ok(BiosAddWire {
+            cancelled: true,
+            system: bios_system_wire(req, &root),
+            filed: Vec::new(),
+            rejected: Vec::new(),
+        });
+    };
+    let path = file
+        .into_path()
+        .map_err(|e| CommandError::from(UfmError::Internal(format!("picked file: {e}"))))?;
+    let picked_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let reject = |reason: String| BiosAddWire {
+        cancelled: false,
+        system: bios_system_wire(req, &root),
+        filed: Vec::new(),
+        rejected: vec![BiosRejectedWire {
+            picked: picked_name.clone(),
+            reason,
+        }],
+    };
+    if !picked_name.eq_ignore_ascii_case("PS3UPDAT.PUP") {
+        return Ok(reject(
+            "That isn't Sony's PS3 update file — it has to be named PS3UPDAT.PUP.".to_string(),
+        ));
+    }
+    let sys = ufm_emu::table::system_by_id("ps3")
+        .ok_or_else(|| CommandError::from(UfmError::NotFound("ps3 system".into())))?;
+    let opt = sys
+        .option("rpcs3-standalone")
+        .cloned()
+        .ok_or_else(|| CommandError::from(UfmError::NotFound("rpcs3 option".into())))?;
+    let (env, _) = probe_env();
+    if option_state(&opt, &env) != OptState::Ready {
+        let progress = |label: &str, pct: Option<u32>| {
+            let _ = progress_app.emit(
+                "emu-install-progress",
+                serde_json::json!({ "label": label, "pct": pct }),
+            );
+        };
+        ensure_option(&opt, &progress)
+            .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    }
+    let Some(cmdline) = standalone_command(&opt) else {
+        return Ok(reject(
+            "RPCS3 isn't available, so the firmware can't be installed yet.".to_string(),
+        ));
+    };
+    let mut argv: Vec<String> = ufm_emu::expand::tokenize(&cmdline);
+    argv.push("--installfw".to_string());
+    argv.push(path.to_string_lossy().into_owned());
+    // RPCS3 installs firmware inside its own UI process — it
+    // may show progress, finish and exit, or land in its main
+    // window. So: spawn it, then watch the dev_flash payload
+    // for the landing instead of waiting on an exit code that
+    // may never be the signal. (Proven on this build: a bad
+    // path leaves RPCS3 sitting in a dialog, happily alive.)
+    let spawned = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(reject(format!(
+                "RPCS3 couldn't start to install the firmware: {e}"
+            )))
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(150);
+    loop {
+        if bios_satisfied(req, &root) {
+            return Ok(BiosAddWire {
+                cancelled: false,
+                system: bios_system_wire(req, &root),
+                filed: vec![BiosFiledWire {
+                    picked: picked_name,
+                    filed_as: "PS3 system software (installed by RPCS3)".to_string(),
+                }],
+                rejected: Vec::new(),
+            });
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return Ok(reject(
+                    "RPCS3 ran, but the firmware didn't land — the file has to be Sony's official PS3UPDAT.PUP."
+                        .to_string(),
+                ))
+            }
+            Ok(None) => {
+                if Instant::now() > deadline {
+                    // Still working over there (or waiting on
+                    // its own dialog) — leave it running: killing
+                    // a firmware install mid-flight would be the
+                    // one truly bad outcome.
+                    return Ok(reject(
+                        "RPCS3 is still holding the file — if its window is open, let it finish there. This card flips to Ready on its own once the firmware lands."
+                            .to_string(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(_) => {
+                return Ok(reject(
+                    "Fable lost track of RPCS3 while it worked — check its window; this card flips to Ready once the firmware lands."
+                        .to_string(),
+                ))
+            }
+        }
+    }
 }
 
 /// Open the chosen emulator with no game (the sheet footer's
@@ -1559,16 +2525,21 @@ pub async fn emu_open_emulator(app: tauri::AppHandle, platform: String) -> Cmd<(
                     })
             }
             OptionKind::Standalone => {
-                let bin = chosen
-                    .probe_bins
-                    .iter()
-                    .find(|b| crate::deps::tool_present(b))
-                    .ok_or_else(|| {
-                        CommandError::from(UfmError::NotFound(
-                            "that emulator isn't installed".into(),
-                        ))
-                    })?;
-                spawn_launch(&[bin.clone()], None)
+                // v2: the resolved channel command (flatpak run /
+                // managed AppImage / PATH binary), tokenized the
+                // same way launches are.
+                let cmdline = standalone_command(chosen).ok_or_else(|| {
+                    CommandError::from(UfmError::NotFound(
+                        "that emulator isn't installed".into(),
+                    ))
+                })?;
+                let argv = ufm_emu::expand::tokenize(&cmdline);
+                if argv.is_empty() {
+                    return Err(CommandError::from(UfmError::NotFound(
+                        "that emulator isn't installed".into(),
+                    )));
+                }
+                spawn_launch(&argv, None)
                     .map_err(|e| CommandError::from(UfmError::Internal(e)))
             }
             _ => Err(CommandError::from(UfmError::InvalidInput(
@@ -1585,6 +2556,55 @@ pub async fn emu_open_emulator(app: tauri::AppHandle, platform: String) -> Cmd<(
 // real cold-start path — probe, decide, install, launch — plus the
 // keeper against the real catalog. See BUILD-CHECKPOINT.md.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_keys_pick_the_newest_rpcs3_asset() {
+        assert!(
+            appimage_version_key("rpcs3-v0.0.37-18146-ffeb16fe_linux64.AppImage")
+                > appimage_version_key("rpcs3-v0.0.18-12817-fff0c96b_linux64.AppImage")
+        );
+        assert!(
+            appimage_version_key("rpcs3-v0.0.38-18434-3c747b37_linux64.AppImage")
+                > appimage_version_key("rpcs3-v0.0.37-18146-ffeb16fe_linux64.AppImage")
+        );
+    }
+
+    #[test]
+    fn filesystem_lines_parse_flatpaks_ini_shape() {
+        let meta = "[Application]\nname=org.example.App\n[Context]\nfilesystems=home;/media;xdg-run/pipewire-0;\nsockets=wayland;\n";
+        let grants = parse_filesystems_line(meta);
+        assert_eq!(grants, vec!["home", "/media", "xdg-run/pipewire-0"]);
+        assert!(parse_filesystems_line("[Context]\nsockets=wayland;\n").is_empty());
+    }
+
+    #[test]
+    fn grant_coverage_follows_flatpaks_rules() {
+        let home = home_dir();
+        let rom = home.join("Games/psx/game.cue");
+        assert!(grant_covers(&["host".into()], &rom));
+        assert!(grant_covers(&["home".into()], &rom));
+        assert!(grant_covers(&["home:ro".into()], &rom));
+        assert!(!grant_covers(&["home".into()], Path::new("/media/Desk SSD/roms/x.nes")));
+        assert!(grant_covers(
+            &["/media/Desk SSD".into()],
+            Path::new("/media/Desk SSD/roms/x.nes")
+        ));
+        // A grant for one drive doesn't leak onto another.
+        assert!(!grant_covers(
+            &["/media/Desk SSD".into()],
+            Path::new("/media/Other/roms/x.nes")
+        ));
+        assert!(grant_covers(
+            &["~/Games".into()],
+            &home.join("Games/psx/game.cue")
+        ));
+        assert!(!grant_covers(&[], &rom));
+    }
+}
 
 #[cfg(test)]
 mod acceptance {
@@ -1777,6 +2797,32 @@ mod acceptance {
         let report = crate::emu_farm::run_keeper(Path::new(&catalog), Path::new(&data));
         eprintln!("KEEPER: {report:#?}");
         assert!(report.error.is_none());
+        // The view is never a source (v2): after a pass, NO farm
+        // link may point inside the view root — the self-loop
+        // class ES-DE's scan exposed (1,047 links on this box
+        // before the fix). Every link must resolve to a real file.
+        let settings = load_settings(Path::new(&data));
+        let root = settings.view_root_path();
+        let mut bad = 0;
+        for system in ["nes", "snes"] {
+            let dir = root.join(system);
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if std::fs::symlink_metadata(&p)
+                        .map(|m| m.file_type().is_symlink())
+                        .unwrap_or(false)
+                    {
+                        let target = std::fs::read_link(&p).unwrap_or_default();
+                        if target.starts_with(&root) || !p.exists() {
+                            bad += 1;
+                            eprintln!("MIRROR/DANGLING: {} -> {}", p.display(), target.display());
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(bad, 0, "no farm link may point at the view itself or dangle");
     }
 
     #[test]
@@ -1820,5 +2866,285 @@ mod acceptance {
             }
         }
         assert_eq!(dangling, 0, "links must never dangle after an unplug reconcile");
+    }
+
+    /// v2 BIOS gate for standalones: on a box with NO dumped
+    /// system files anywhere, the three gated standalone defaults
+    /// read NeedsBios against their OWN homes (never the
+    /// RetroArch dir), an ungated standalone stays Ready, and the
+    /// sheet's BIOS row exists for the gated rows.
+    #[test]
+    #[ignore]
+    fn standalone_bios_gate_acceptance() {
+        if std::env::var("FABLE_EMU_ACCEPT").is_err() {
+            return;
+        }
+        let (env, layout) = probe_env();
+        for (system, option_id) in [
+            ("psx", "duckstation-standalone"),
+            ("ps2", "pcsx2-standalone"),
+            ("ps3", "rpcs3-standalone"),
+        ] {
+            let sys = ufm_emu::table::system_by_id(system).unwrap();
+            let opt = sys.option(option_id).unwrap();
+            let req = ufm_emu::requirement_for(system).unwrap();
+            let root = standalone_bios_root(system, opt).expect("known home");
+            if bios_satisfied(req, &root) {
+                eprintln!("BIOS {system}: files present in {} — gate open", root.display());
+                continue;
+            }
+            let st = state_of(sys, opt, &env, layout.as_ref());
+            assert_eq!(
+                st,
+                OptState::NeedsBios,
+                "{system}: installed standalone with no system files must gate"
+            );
+            let wire = bios_gate_wire(sys, opt, layout.as_ref(), st)
+                .unwrap_or_else(|| panic!("{system}: sheet must carry the BIOS row"));
+            assert!(wire.blocking, "{system}: BIOS row blocks");
+            eprintln!("BIOS {system}: NeedsBios via {} — {:?}", root.display(), wire.files);
+        }
+        // An ungated standalone default never gates.
+        let sys = ufm_emu::table::system_by_id("gc").unwrap();
+        let opt = sys.option("dolphin-standalone").unwrap();
+        assert_eq!(
+            state_of(sys, opt, &env, layout.as_ref()),
+            OptState::Ready,
+            "gc: Dolphin has no system-file requirement"
+        );
+        eprintln!("BIOS standalone gate: layering holds");
+    }
+
+    /// v2 standalone wave: each default installs through FABLE's
+    /// own `ensure_option` (the same call the sheet's Install &
+    /// Play makes), reads Ready on a fresh probe, and expands a
+    /// launch argv whose program + flags are real. Spawn-alive
+    /// proofs are the separate test below (they need his desktop
+    /// session env exported for the test binary).
+    #[test]
+    #[ignore]
+    fn standalone_wave_acceptance() {
+        if std::env::var("FABLE_EMU_ACCEPT").is_err() {
+            return;
+        }
+        let progress = |label: &str, pct: Option<u32>| {
+            eprintln!("INSTALL: {label} {:?}", pct);
+        };
+        let cases: &[(&str, &str, &str)] = &[
+            ("psx", "duckstation-standalone", "/tmp/fable-standin-psx.cue"),
+            ("gc", "dolphin-standalone", "/tmp/fable-standin-gc.iso"),
+            ("wii", "dolphin-standalone", "/tmp/fable-standin-wii.iso"),
+            ("ps2", "pcsx2-standalone", "/tmp/fable-standin-ps2.iso"),
+            ("ps3", "rpcs3-standalone", "/tmp/fable-standin-ps3.iso"),
+            ("psp", "ppsspp-standalone", "/tmp/fable-standin-psp.iso"),
+            ("n3ds", "azahar-standalone", "/tmp/fable-standin-3ds.3ds"),
+        ];
+        for (system, option_id, standin) in cases {
+            let sys = ufm_emu::table::system_by_id(system).unwrap();
+            let opt = sys.option(option_id).unwrap().clone();
+            ensure_option(&opt, &progress)
+                .unwrap_or_else(|e| panic!("{system}: Fable-path install failed: {e}"));
+            let (env, layout) = probe_env();
+            assert_eq!(
+                option_state(&opt, &env),
+                OptState::Ready,
+                "{system}: option must read Ready after install"
+            );
+            let (argv, _cwd) = launch_argv(&opt, layout.as_ref(), Path::new("/tmp"), standin)
+                .unwrap_or_else(|e| panic!("{system}: argv: {e}"));
+            eprintln!("WAVE {system}: ready; argv = {argv:?}");
+            assert!(!argv.is_empty());
+            assert!(
+                !argv.iter().any(|a| a.contains("%EMULATOR_")),
+                "{system}: template fully resolved"
+            );
+        }
+    }
+
+    /// v2 spawn-alive proofs: launch each installed standalone
+    /// BARE (its own UI, no game), require it alive after a
+    /// settle window, then kill it by handle. Proves the artifact
+    /// Fable installed actually runs on this machine. RPCS3's
+    /// template carries --no-gui + a ROM, so its bare proof is
+    /// the AppImage itself (no template args).
+    #[test]
+    #[ignore]
+    fn standalone_spawn_acceptance() {
+        if std::env::var("FABLE_EMU_ACCEPT").is_err() {
+            return;
+        }
+        let cases: &[(&str, &str)] = &[
+            ("psx", "duckstation-standalone"),
+            ("gc", "dolphin-standalone"),
+            ("ps2", "pcsx2-standalone"),
+            ("ps3", "rpcs3-standalone"),
+            ("psp", "ppsspp-standalone"),
+            ("n3ds", "azahar-standalone"),
+        ];
+        for (system, option_id) in cases {
+            let sys = ufm_emu::table::system_by_id(system).unwrap();
+            let opt = sys.option(option_id).unwrap().clone();
+            let cmdline = standalone_command(&opt)
+                .unwrap_or_else(|| panic!("{system}: no resolved command"));
+            let argv = ufm_emu::expand::tokenize(&cmdline);
+            eprintln!("SPAWN {system}: {argv:?}");
+            let mut child = Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap_or_else(|e| panic!("{system}: spawn failed: {e}"));
+            std::thread::sleep(Duration::from_millis(3500));
+            let alive = matches!(child.try_wait(), Ok(None));
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(alive, "{system}: emulator exited within the settle window");
+            eprintln!("SPAWN {system}: alive after 3.5s, killed by handle");
+        }
+    }
+
+    /// v2 §4.4 proof against a REAL external-volume game path
+    /// (FABLE_EMU_EXT_ROM): the declarative check's answer, then —
+    /// when the sandbox genuinely can't see it — the full consent
+    /// machinery (grant → can see → read inside the sandbox →
+    /// revoke) exercised through the same fns the commands call.
+    #[test]
+    #[ignore]
+    fn sandbox_override_acceptance() {
+        if std::env::var("FABLE_EMU_ACCEPT").is_err() {
+            return;
+        }
+        let rom = std::env::var("FABLE_EMU_EXT_ROM").expect("FABLE_EMU_EXT_ROM");
+        let app_id = "org.duckstation.DuckStation";
+        let grants = flatpak_filesystem_grants(app_id);
+        eprintln!("SANDBOX {app_id} grants: {grants:?}");
+        let before = sandbox_can_see(app_id, Path::new(&rom));
+        eprintln!("SANDBOX can-see({rom}) before = {before}");
+        if before {
+            eprintln!("SANDBOX: shipped permissions already cover it — flow not needed here");
+            return;
+        }
+        // The game's home volume root is what a consent grants.
+        let catalog_path = std::env::var("FABLE_EMU_CATALOG").expect("FABLE_EMU_CATALOG");
+        let catalog = ufm_catalog::Catalog::open(Path::new(&catalog_path)).unwrap();
+        let volumes = catalog.volumes().unwrap_or_default();
+        let mounted = crate::commands::current_filesystems();
+        let home = home_volume(&rom, &mounted, &volumes).expect("home volume");
+        assert!(home.live, "the external volume must be mounted for this proof");
+        apply_sandbox_override(app_id, &home.root).expect("apply override");
+        let after = sandbox_can_see(app_id, Path::new(&rom));
+        eprintln!("SANDBOX can-see after grant({}) = {after}", home.root);
+        assert!(after, "the grant must flip the declarative check");
+        // And the sandbox really can read the file now.
+        let out = run_stdout(
+            "flatpak",
+            &[
+                "run",
+                "--command=stat",
+                app_id,
+                "-c",
+                "%s",
+                &rom,
+            ],
+            Duration::from_secs(30),
+        );
+        eprintln!("SANDBOX in-sandbox stat: {out:?}");
+        assert!(out.is_some(), "stat inside the sandbox must succeed");
+        // Clean up after ourselves: revoke, machine as found.
+        remove_sandbox_override(app_id, &home.root).expect("revoke override");
+        assert!(!sandbox_can_see(app_id, Path::new(&rom)));
+        eprintln!("SANDBOX: grant + read + revoke all proven");
+    }
+
+    /// v2 ES-DE door proof: install through the door's own path,
+    /// point it at the farm + media tree in its OWN settings
+    /// file, launch it, and read back what IT wrote (log lines
+    /// naming the systems it populated). Killed by handle after.
+    #[test]
+    #[ignore]
+    fn esde_door_acceptance() {
+        if std::env::var("FABLE_EMU_ACCEPT").is_err() {
+            return;
+        }
+        let data = std::env::var("FABLE_EMU_DATA").expect("FABLE_EMU_DATA");
+        let base = Path::new(&data);
+        let progress = |label: &str, pct: Option<u32>| {
+            eprintln!("ESDE: {label} {:?}", pct);
+        };
+        let state = crate::emu_esde::install_esde(base, &progress).expect("install via Fable path");
+        eprintln!("ESDE state after install: {state:?}");
+        assert!(state.installed);
+        // First run generates ES-DE's own home; then Fable's two
+        // entries land in ES-DE's own file.
+        let argv = crate::emu_esde::esde_command().expect("esde command");
+        let settings = load_settings(base);
+        let view_root = settings.view_root_path();
+        let media_root = crate::rommedia::load_settings(base).root_path();
+        if !crate::emu_esde::esde_settings_path().is_file() {
+            let mut init = Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("init spawn");
+            let deadline = Instant::now() + Duration::from_secs(40);
+            while !crate::emu_esde::esde_settings_path().is_file()
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(400));
+            }
+            let _ = init.kill();
+            let _ = init.wait();
+        }
+        let wrote = crate::emu_esde::write_esde_settings(&view_root, &media_root)
+            .expect("write settings");
+        assert!(wrote, "ES-DE's settings file must exist after its first run");
+        let text = std::fs::read_to_string(crate::emu_esde::esde_settings_path()).unwrap();
+        assert!(
+            text.contains("MediaDirectory"),
+            "Fable's media tree must be in ES-DE's settings"
+        );
+        eprintln!("ESDE settings carry MediaDirectory -> {}", media_root.display());
+        // The real launch: alive after settle, and its log must
+        // show the farm's systems populating.
+        let mut child = Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("launch spawn");
+        std::thread::sleep(Duration::from_millis(12000));
+        let alive = matches!(child.try_wait(), Ok(None));
+        let log_path = crate::emu_esde::esde_home().join("logs").join("es_log.txt");
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        // ES-DE's own census: "loaded N systems" + "Total game
+        // count: M" — the farm's games, counted by ES-DE itself.
+        let census: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains("systems") || l.contains("Total game count"))
+            .collect();
+        for h in &census {
+            eprintln!("ESDE LOG: {h}");
+        }
+        let total: u64 = log
+            .lines()
+            .find_map(|l| l.split("Total game count:").nth(1))
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or(0);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(alive, "ES-DE must stay up");
+        assert!(
+            total > 0,
+            "ES-DE's log must count the farm's games (got {total})"
+        );
+        assert!(
+            !log.contains("Too many levels of symbolic links"),
+            "the farm must never hand ES-DE a loop"
+        );
+        eprintln!("ESDE: door proof complete — ES-DE counted {total} games");
     }
 }

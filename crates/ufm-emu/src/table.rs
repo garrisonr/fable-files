@@ -37,6 +37,16 @@ pub enum InstallSpec {
     AptLogical { logical: String },
     /// An official AppImage dropped into ~/Applications.
     AppImage { url: String, file_name: String },
+    /// An official AppImage whose download the glue resolves at
+    /// install time from the publisher's GitHub releases (v2 —
+    /// RPCS3's continuous channel: asset names carry versions, so
+    /// no URL can be pinned; the releases API also publishes a
+    /// sha256 digest per asset, which the glue verifies).
+    GitHubAppImage {
+        repo: String,
+        asset_suffix: String,
+        file_name: String,
+    },
     /// Fable does not install this (in this version). If the user
     /// already has it, Fable detects and uses it.
     None,
@@ -270,6 +280,78 @@ fn standalone(
             "Fable doesn't install this one yet — if it's already on this PC, Fable will happily use it."
                 .to_string(),
         ),
+    }
+}
+
+/// v2: a standalone emulator Fable installs itself as a Flatpak
+/// (the dependency law's preferred channel — user install, no
+/// password). Default-able: the standalone wave made these the
+/// systems' best path.
+fn flatpak_sa(
+    id: &str,
+    label: &str,
+    app_id: &str,
+    template: &str,
+    probe_bins: &[&str],
+    verdict: &str,
+) -> EmuOption {
+    EmuOption {
+        id: id.to_string(),
+        label: label.to_string(),
+        kind: OptionKind::Standalone,
+        template: template.to_string(),
+        core_file: None,
+        core_name: None,
+        install: InstallSpec::Flatpak {
+            app_id: app_id.to_string(),
+        },
+        bios: Vec::new(),
+        verdict: verdict.to_string(),
+        class: OptClass::DefaultAble,
+        probe_bins: probe_bins.iter().map(|s| s.to_string()).collect(),
+        install_note: None,
+    }
+}
+
+/// v2: a BIOS-gated flatpak standalone (DuckStation, PCSX2) — the
+/// option advertises the requirement's file list like the gated
+/// cores do; the glue enforces the gate against the emulator's
+/// own BIOS home.
+fn flatpak_sa_req(
+    id: &str,
+    label: &str,
+    app_id: &str,
+    template: &str,
+    probe_bins: &[&str],
+    verdict: &str,
+    requirement_system: &str,
+) -> EmuOption {
+    let mut opt = flatpak_sa(id, label, app_id, template, probe_bins, verdict);
+    if let Some(req) = crate::bios::requirement_for(requirement_system) {
+        opt.bios = req.all_names();
+    }
+    opt
+}
+
+/// v2: MAME as its own app, installed through the distro package
+/// map (deps logical `mame`) — the arcade family's deep bench and
+/// the best-effort driver for Astrocade / CD-i.
+fn mame_sa(template: &str, verdict: &str) -> EmuOption {
+    EmuOption {
+        id: "mame-standalone".to_string(),
+        label: "MAME (standalone)".to_string(),
+        kind: OptionKind::Standalone,
+        template: template.to_string(),
+        core_file: None,
+        core_name: None,
+        install: InstallSpec::AptLogical {
+            logical: "mame".to_string(),
+        },
+        bios: Vec::new(),
+        verdict: verdict.to_string(),
+        class: OptClass::DefaultAble,
+        probe_bins: vec!["mame".to_string()],
+        install_note: None,
     }
 }
 
@@ -746,11 +828,8 @@ fn arcade_options(system: &str) -> Vec<EmuOption> {
             "MAME itself as a core — the deep bench for sets FinalBurn doesn't carry.",
             system,
         ),
-        standalone(
-            "mame-standalone",
-            "MAME (standalone)",
+        mame_sa(
             "mame -rompath %GAMEDIR% %BASENAME%",
-            &["mame"],
             "MAME as its own app — Fable points it at the set's own folder.",
         ),
     ]
@@ -1177,17 +1256,30 @@ fn override_atarijaguar(entry: &mut SystemEntry) {
 }
 
 fn override_psx(entry: &mut SystemEntry) {
+    // v2 (amendment §3): DuckStation is the PlayStation default —
+    // PGXP-sharpened 3D, per-game settings, the community's pick.
+    // The Beetle cores stay as RetroArch alternates; both paths
+    // want his own PS1 BIOS (the BIOS card's psx row).
     curate(
         entry,
         "PlayStation",
         "Sony - PlayStation",
         vec![
+            flatpak_sa_req(
+                "duckstation-standalone",
+                "DuckStation",
+                "org.duckstation.DuckStation",
+                "%EMULATOR_DUCKSTATION% -batch %ROM%",
+                &["duckstation", "DuckStation"],
+                "The community's favorite PlayStation app — PGXP-sharpened 3D, per-game settings, superb compatibility.",
+                "psx",
+            ),
             ra_core_req(
                 "ra-beetle-psx-hw",
                 "RetroArch · Beetle PSX HW",
                 "mednafen_psx_hw_libretro.so",
                 "Beetle PSX HW",
-                "The strong PlayStation core — sharp 3D and deep compatibility. (The DuckStation app joins in a later round.)",
+                "The strong PlayStation core — sharp 3D and deep compatibility, inside RetroArch.",
                 "psx",
             ),
             ra_core_req(
@@ -1198,16 +1290,258 @@ fn override_psx(entry: &mut SystemEntry) {
                 "The software-only Beetle — the patient, exact one.",
                 "psx",
             ),
-            standalone(
-                "duckstation-standalone",
-                "DuckStation (standalone)",
-                "%EMULATOR_DUCKSTATION% %ROM%",
-                &["duckstation", "DuckStation"],
-                "The community's favorite PlayStation app — Fable installs it in the standalone round; if it's already here, Fable can drive it.",
+        ],
+        "duckstation-standalone",
+    );
+}
+
+fn override_gc(entry: &mut SystemEntry) {
+    curate(
+        entry,
+        "GameCube",
+        "Nintendo - GameCube",
+        vec![
+            flatpak_sa(
+                "dolphin-standalone",
+                "Dolphin",
+                "org.DolphinEmu.dolphin-emu",
+                "%EMULATOR_DOLPHIN% -b -e %ROM%",
+                &["dolphin-emu", "dolphin"],
+                "The GameCube and Wii emulator — nothing else comes close. Most GameCube games run full speed at their original resolution on this PC.",
+            ),
+            ra_core(
+                "ra-dolphin",
+                "RetroArch · Dolphin",
+                "dolphin_libretro.so",
+                "Dolphin",
+                "The Dolphin core — handy inside RetroArch, a step behind the app itself.",
             ),
         ],
-        "ra-beetle-psx-hw",
+        "dolphin-standalone",
     );
+}
+
+fn override_wii(entry: &mut SystemEntry) {
+    curate(
+        entry,
+        "Wii",
+        "Nintendo - Wii",
+        vec![
+            flatpak_sa(
+                "dolphin-standalone",
+                "Dolphin",
+                "org.DolphinEmu.dolphin-emu",
+                "%EMULATOR_DOLPHIN% -b -e %ROM%",
+                &["dolphin-emu", "dolphin"],
+                "The GameCube and Wii emulator. Wii games vary — light ones sing; motion-heavy and demanding titles will test this PC.",
+            ),
+            ra_core(
+                "ra-dolphin",
+                "RetroArch · Dolphin",
+                "dolphin_libretro.so",
+                "Dolphin",
+                "The Dolphin core — handy inside RetroArch, a step behind the app itself.",
+            ),
+        ],
+        "dolphin-standalone",
+    );
+}
+
+fn override_ps2(entry: &mut SystemEntry) {
+    curate(
+        entry,
+        "PlayStation 2",
+        "Sony - PlayStation 2",
+        vec![
+            flatpak_sa_req(
+                "pcsx2-standalone",
+                "PCSX2",
+                "net.pcsx2.PCSX2",
+                "%EMULATOR_PCSX2% -batch %ROM%",
+                &["pcsx2", "PCSX2"],
+                "The PlayStation 2 emulator. Many games run well at their original resolution on this PC; the demanding tail will chug.",
+                "ps2",
+            ),
+            classed(
+                ra_core_req(
+                    "ra-lrps2",
+                    "RetroArch · LRPS2",
+                    "pcsx2_libretro.so",
+                    "LRPS2",
+                    "PCSX2's core form — younger than the app and still catching up; best effort.",
+                    "ps2",
+                ),
+                OptClass::BestEffort,
+            ),
+        ],
+        "pcsx2-standalone",
+    );
+}
+
+fn override_ps3(entry: &mut SystemEntry) {
+    curate(
+        entry,
+        "PlayStation 3",
+        "Sony - PlayStation 3",
+        vec![EmuOption {
+            id: "rpcs3-standalone".to_string(),
+            label: "RPCS3".to_string(),
+            kind: OptionKind::Standalone,
+            template: "%EMULATOR_RPCS3% --no-gui %ROM%".to_string(),
+            core_file: None,
+            core_name: None,
+            install: InstallSpec::GitHubAppImage {
+                repo: "RPCS3/rpcs3-binaries-linux".to_string(),
+                asset_suffix: "_linux64.AppImage".to_string(),
+                file_name: "RPCS3.AppImage".to_string(),
+            },
+            bios: crate::bios::requirement_for("ps3")
+                .map(|r| r.all_names())
+                .unwrap_or_default(),
+            verdict: "The PlayStation 3 emulator, straight from its makers. On this PC it's light and 2D games only — big 3D titles need a stronger machine."
+                .to_string(),
+            class: OptClass::DefaultAble,
+            probe_bins: vec!["rpcs3".to_string()],
+            install_note: None,
+        }],
+        "rpcs3-standalone",
+    );
+}
+
+fn override_psp(entry: &mut SystemEntry) {
+    curate(
+        entry,
+        "PlayStation Portable",
+        "Sony - PlayStation Portable",
+        vec![
+            flatpak_sa(
+                "ppsspp-standalone",
+                "PPSSPP",
+                "org.ppsspp.PPSSPP",
+                "%EMULATOR_PPSSPP% %ROM%",
+                &["ppsspp", "PPSSPP"],
+                "Superb PSP emulation — sharp, fast, and happy on this PC.",
+            ),
+            ra_core(
+                "ra-ppsspp",
+                "RetroArch · PPSSPP",
+                "ppsspp_libretro.so",
+                "PPSSPP",
+                "The same PPSSPP inside RetroArch.",
+            ),
+        ],
+        "ppsspp-standalone",
+    );
+}
+
+fn override_n3ds(entry: &mut SystemEntry) {
+    curate(
+        entry,
+        "Nintendo 3DS",
+        "Nintendo - 3DS",
+        vec![flatpak_sa(
+            "azahar-standalone",
+            "Azahar",
+            "org.azahar_emu.Azahar",
+            "%EMULATOR_AZAHAR% %ROM%",
+            &["azahar"],
+            "The maintained 3DS emulator (Citra's successor). Keep expectations modest on this PC — and some games ask for system files from a real 3DS.",
+        )],
+        "azahar-standalone",
+    );
+}
+
+fn override_astrocde(entry: &mut SystemEntry) {
+    // Amendment §3: Bally Astrocade — MAME standalone, best
+    // effort. Astrocade emulation is preliminary everywhere.
+    curate(
+        entry,
+        "Bally Astrocade",
+        "Bally - Astrocade",
+        vec![classed(
+            mame_sa(
+                "%EMULATOR_MAME% -rompath %GAMEDIR% astrocde -cart %ROM%",
+                "MAME's Astrocade driver — best effort; Astrocade emulation is preliminary everywhere.",
+            ),
+            OptClass::BestEffort,
+        )],
+        "mame-standalone",
+    );
+}
+
+fn override_cdimono1(entry: &mut SystemEntry) {
+    // Amendment §3: Philips CD-i — SAME CDI, best effort, labeled.
+    curate(
+        entry,
+        "Philips CD-i",
+        "Philips - CD-i",
+        vec![
+            classed(
+                ra_core(
+                    "ra-same-cdi",
+                    "RetroArch · SAME CDI",
+                    "same_cdi_libretro.so",
+                    "SAME CDI",
+                    "The CD-i specialist core — experimental, and the best there is. Many titles play; some won't. It also wants the CD-i system ROMs in place.",
+                ),
+                OptClass::BestEffort,
+            ),
+            classed(
+                mame_sa(
+                    "%EMULATOR_MAME% -rompath %GAMEDIR% cdimono1 -cdrom %ROM%",
+                    "MAME's CD-i driver — best effort, the deep bench.",
+                ),
+                OptClass::BestEffort,
+            ),
+        ],
+        "ra-same-cdi",
+    );
+}
+
+fn override_xbox(entry: &mut SystemEntry) {
+    // Amendment §3: xemu in the sheet, never a silent default —
+    // it cannot start without the files dumped from an Xbox he
+    // owns, which Fable can't fetch or model, so the row is
+    // best-effort honesty with an install Fable CAN do.
+    entry.short_name = "Xbox".to_string();
+    entry.options = vec![classed(
+        flatpak_sa(
+            "xemu-standalone",
+            "xemu",
+            "app.xemu.xemu",
+            "%EMULATOR_XEMU% -dvd_path %ROM%",
+            &["xemu"],
+            "Real Xbox emulation — but xemu can't start without files dumped from an Xbox you own (its boot ROMs and hard-disk image), which Fable can't fetch. Once you've set xemu up, Fable can drive it.",
+        ),
+        OptClass::BestEffort,
+    )];
+    entry.default_option = None;
+    entry.overridden = true;
+}
+
+fn override_switch(entry: &mut SystemEntry) {
+    // Amendment §3, forever: Switch emulation is manual-only.
+    // Fable never installs a Switch emulator; if he installs one
+    // himself (Eden is the living one), Fable happily drives it.
+    entry.short_name = "Switch".to_string();
+    entry.options = vec![
+        standalone(
+            "eden-standalone",
+            "Eden (standalone)",
+            "%EMULATOR_EDEN% %ROM%",
+            &["eden"],
+            "The living Switch emulator — manual only, forever: Fable never installs Switch emulators, and it needs your own Switch's keys and firmware.",
+        ),
+        standalone(
+            "ryujinx-standalone",
+            "Ryujinx (standalone)",
+            "%EMULATOR_RYUJINX% %ROM%",
+            &["ryujinx"],
+            "Ryujinx — discontinued upstream, kept here for anyone who still has it installed.",
+        ),
+    ];
+    entry.default_option = None;
+    entry.overridden = true;
 }
 
 /// The amendment's designed honesty state for systems with no
@@ -1268,6 +1602,17 @@ fn build_table() -> Vec<SystemEntry> {
             "channelf" => override_channelf(entry),
             "atarijaguar" => override_atarijaguar(entry),
             "psx" => override_psx(entry),
+            // v2 standalone wave (amendment §7).
+            "gc" => override_gc(entry),
+            "wii" => override_wii(entry),
+            "ps2" => override_ps2(entry),
+            "ps3" => override_ps3(entry),
+            "psp" => override_psp(entry),
+            "n3ds" => override_n3ds(entry),
+            "astrocde" => override_astrocde(entry),
+            "cdimono1" => override_cdimono1(entry),
+            "xbox" => override_xbox(entry),
+            "switch" => override_switch(entry),
             // Designed not-yet states (amendment §3).
             "ps4" | "psvita" | "xbox360" | "supracan" | "gamecom" => mark_not_yet(entry),
             _ => {}
@@ -1374,7 +1719,6 @@ mod tests {
             ("amigacd32", "ra-puae", "puae_libretro.so"),
             ("channelf", "ra-freechaf", "freechaf_libretro.so"),
             ("atarijaguar", "ra-virtualjaguar", "virtualjaguar_libretro.so"),
-            ("psx", "ra-beetle-psx-hw", "mednafen_psx_hw_libretro.so"),
         ];
         for (system, want_id, want_core) in cases {
             let sys = system_by_id(system).unwrap_or_else(|| panic!("{system} in table"));
@@ -1394,11 +1738,153 @@ mod tests {
         // Jaguar is the amendment's best-effort row.
         let jag = system_by_id("atarijaguar").unwrap();
         assert_eq!(jag.default().unwrap().class, OptClass::BestEffort);
-        // PSX: DuckStation rides along manual-only in v1.1 (v2 installs it).
+    }
+
+    #[test]
+    fn v2_standalone_wave_carries_real_install_specs() {
+        // (system, default option id, install channel) — the six
+        // standalone-wave systems + PSX's new default (amendment
+        // §7 v2 / §3). Every default is Fable-installable through
+        // the ask-once machinery; flatpaks carry the verified
+        // Flathub IDs, RPCS3 the AppImage channel (its Flathub
+        // build nags — RESEARCH).
+        let cases: &[(&str, &str, InstallSpec)] = &[
+            (
+                "psx",
+                "duckstation-standalone",
+                InstallSpec::Flatpak {
+                    app_id: "org.duckstation.DuckStation".to_string(),
+                },
+            ),
+            (
+                "gc",
+                "dolphin-standalone",
+                InstallSpec::Flatpak {
+                    app_id: "org.DolphinEmu.dolphin-emu".to_string(),
+                },
+            ),
+            (
+                "wii",
+                "dolphin-standalone",
+                InstallSpec::Flatpak {
+                    app_id: "org.DolphinEmu.dolphin-emu".to_string(),
+                },
+            ),
+            (
+                "ps2",
+                "pcsx2-standalone",
+                InstallSpec::Flatpak {
+                    app_id: "net.pcsx2.PCSX2".to_string(),
+                },
+            ),
+            (
+                "ps3",
+                "rpcs3-standalone",
+                InstallSpec::GitHubAppImage {
+                    repo: "RPCS3/rpcs3-binaries-linux".to_string(),
+                    asset_suffix: "_linux64.AppImage".to_string(),
+                    file_name: "RPCS3.AppImage".to_string(),
+                },
+            ),
+            (
+                "psp",
+                "ppsspp-standalone",
+                InstallSpec::Flatpak {
+                    app_id: "org.ppsspp.PPSSPP".to_string(),
+                },
+            ),
+            (
+                "n3ds",
+                "azahar-standalone",
+                InstallSpec::Flatpak {
+                    app_id: "org.azahar_emu.Azahar".to_string(),
+                },
+            ),
+        ];
+        for (system, want_id, want_install) in cases {
+            let sys = system_by_id(system).unwrap_or_else(|| panic!("{system} in table"));
+            assert!(sys.overridden, "{system} overridden");
+            assert_eq!(
+                sys.default_option.as_deref(),
+                Some(*want_id),
+                "{system} default option"
+            );
+            let def = sys.default().unwrap();
+            assert_eq!(def.class, OptClass::DefaultAble, "{system} default class");
+            assert_eq!(def.kind, OptionKind::Standalone, "{system} default kind");
+            assert_eq!(&def.install, want_install, "{system} install channel");
+            assert!(!def.verdict.is_empty(), "{system} verdict");
+            assert!(!sys.short_name.is_empty(), "{system} short name");
+        }
+        // The BIOS-gated three carry the requirement's file list,
+        // like the gated cores do.
+        for system in ["psx", "ps2", "ps3"] {
+            let def = system_by_id(system).unwrap().default().unwrap();
+            assert!(!def.bios.is_empty(), "{system} default carries a BIOS list");
+        }
         let psx = system_by_id("psx").unwrap();
-        let duck = psx.option("duckstation-standalone").unwrap();
-        assert_eq!(duck.class, OptClass::ManualOnly);
-        assert_eq!(duck.install, InstallSpec::None);
+        assert!(psx
+            .default()
+            .unwrap()
+            .bios
+            .iter()
+            .any(|b| b == "scph5501.bin"));
+        // PS2's alternate is the honest best-effort core.
+        let ps2 = system_by_id("ps2").unwrap();
+        let lrps2 = ps2.option("ra-lrps2").unwrap();
+        assert_eq!(lrps2.class, OptClass::BestEffort);
+        assert_eq!(
+            lrps2.core_file.as_deref(),
+            Some("pcsx2_libretro.so")
+        );
+    }
+
+    #[test]
+    fn v2_best_effort_rows_and_manual_switch() {
+        // Astrocade + CD-i ride best-effort (amendment §3).
+        for (system, want_id) in [("astrocde", "mame-standalone"), ("cdimono1", "ra-same-cdi")] {
+            let sys = system_by_id(system).unwrap_or_else(|| panic!("{system} in table"));
+            assert!(sys.overridden, "{system} overridden");
+            assert_eq!(sys.default_option.as_deref(), Some(want_id), "{system} default");
+            assert_eq!(
+                sys.default().unwrap().class,
+                OptClass::BestEffort,
+                "{system} default class"
+            );
+        }
+        // MAME standalone is installable everywhere it appears.
+        for system in ["arcade", "neogeo", "astrocde", "cdimono1"] {
+            let sys = system_by_id(system).unwrap();
+            let mame = sys.option("mame-standalone").unwrap();
+            assert_eq!(
+                mame.install,
+                InstallSpec::AptLogical {
+                    logical: "mame".to_string()
+                },
+                "{system} mame install"
+            );
+        }
+        // xemu sits in the sheet (installable, best effort) with no
+        // silent default.
+        let xbox = system_by_id("xbox").unwrap();
+        assert!(xbox.default_option.is_none());
+        let xemu = xbox.option("xemu-standalone").unwrap();
+        assert_eq!(xemu.class, OptClass::BestEffort);
+        assert_eq!(
+            xemu.install,
+            InstallSpec::Flatpak {
+                app_id: "app.xemu.xemu".to_string()
+            }
+        );
+        // Switch: manual-only forever — Eden + Ryujinx rows, no
+        // install spec on either.
+        let switch = system_by_id("switch").unwrap();
+        assert!(switch.default_option.is_none());
+        for id in ["eden-standalone", "ryujinx-standalone"] {
+            let opt = switch.option(id).unwrap();
+            assert_eq!(opt.class, OptClass::ManualOnly, "{id} class");
+            assert_eq!(opt.install, InstallSpec::None, "{id} install");
+        }
     }
 
     #[test]

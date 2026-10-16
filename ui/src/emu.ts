@@ -29,6 +29,7 @@ export type EmuSheetResult =
       outcome: Extract<EmuPlayOutcome, { kind: "launched" }>;
     }
   | { action: "os-default" }
+  | { action: "es-de" }
   | { action: "dismissed" };
 
 export interface EmuSheetHooks {
@@ -140,6 +141,9 @@ export function showEmuSheet(
         radio.addEventListener("change", () => {
           if (radio.checked) {
             selected = opt.id;
+            // A pending sandbox consent belongs to the option
+            // that hit the wall; picking another retires it.
+            pendingAccess = null;
             refresh();
           }
         });
@@ -162,6 +166,29 @@ export function showEmuSheet(
     ) as HTMLButtonElement;
     biosRow.append(biosText, biosAdd);
     dialog.appendChild(biosRow);
+
+    // ---- the sandbox-access row (§4.4, v2): an installed
+    // flatpak emulator can't see the drive this game is on. The
+    // primary button becomes the consent ("Allow access &
+    // Play"); the row carries the explanation the backend
+    // composed.
+    const accessRow = el("div", "emu-bios-row");
+    accessRow.hidden = true;
+    const accessText = el("p", "emu-bios-text", "");
+    accessRow.appendChild(accessText);
+    dialog.appendChild(accessRow);
+    let pendingAccess: Extract<
+      EmuPlayOutcome,
+      { kind: "access-needed" }
+    > | null = null;
+    function renderAccessRow(): void {
+      if (!pendingAccess) {
+        accessRow.hidden = true;
+        return;
+      }
+      accessRow.hidden = false;
+      accessText.textContent = pendingAccess.message;
+    }
     function renderBiosRow(): void {
       const bios = selectedOpt()?.bios ?? null;
       if (!bios) {
@@ -240,6 +267,15 @@ export function showEmuSheet(
       ) as HTMLButtonElement;
       osRow.addEventListener("click", () => finish({ action: "os-default" }));
       dialog.appendChild(osRow);
+      // The ES-DE door (§6): the companion front-end reads the
+      // same library through the unified view.
+      const esdeRow = el(
+        "button",
+        "emu-os-row",
+        "Open in ES-DE",
+      ) as HTMLButtonElement;
+      esdeRow.addEventListener("click", () => finish({ action: "es-de" }));
+      dialog.appendChild(esdeRow);
       const remRow = el("label", "emu-remember");
       rememberBox = document.createElement("input");
       rememberBox.type = "checkbox";
@@ -296,17 +332,32 @@ export function showEmuSheet(
 
     function refresh(): void {
       const opt = selectedOpt();
-      primary.textContent = primaryLabel(opt);
-      primary.disabled = !primaryEnabled(opt);
+      if (pendingAccess) {
+        primary.textContent = "Allow access & Play";
+        primary.disabled = false;
+      } else {
+        primary.textContent = primaryLabel(opt);
+        primary.disabled = !primaryEnabled(opt);
+      }
       for (const [id, note] of noteByOption) note.hidden = id !== selected;
       renderBiosRow();
+      renderAccessRow();
     }
 
     let busy = false;
     primary.addEventListener("click", () => {
       if (busy) return;
+      if (pendingAccess) {
+        runFlow(true);
+        return;
+      }
       const opt = selectedOpt();
       if (!primaryEnabled(opt)) return;
+      runFlow(false);
+    });
+
+    function runFlow(grant: boolean): void {
+      const opt = selectedOpt();
       busy = true;
       for (const r of radios) r.disabled = true;
       primary.disabled = true;
@@ -330,20 +381,44 @@ export function showEmuSheet(
           // progress is garnish; the install proceeds regardless
         }
         try {
-          const outcome = await api.emuInstallAndPlay(
-            sheet.providerKey,
-            sheet.platform,
-            opt.id,
-            remember,
-          );
+          const outcome =
+            grant && pendingAccess
+              ? await api.emuGrantAccessAndPlay(
+                  sheet.providerKey,
+                  sheet.platform,
+                  pendingAccess.optionId,
+                  remember,
+                )
+              : await api.emuInstallAndPlay(
+                  sheet.providerKey,
+                  sheet.platform,
+                  opt.id,
+                  remember,
+                );
           if (outcome.kind === "launched") {
             finish({ action: "launched", outcome });
+          } else if (outcome.kind === "access-needed") {
+            // Installed fine — but the sandbox can't see the
+            // game's drive. The sheet asks once, in place: the
+            // access row explains, the primary becomes the
+            // consent.
+            busy = false;
+            progress.hidden = true;
+            pendingAccess = outcome;
+            for (const r of radios) r.disabled = false;
+            receipt.hidden = false;
+            receipt.textContent =
+              "One more thing before this can play — this emulator lives in a sandbox:";
+            refresh();
+            notNow.disabled = false;
+            accessRow.scrollIntoView({ block: "nearest" });
           } else if (outcome.kind === "sheet") {
             // Installed fine — but a system file is still missing.
             // The backend handed back a fresh sheet whose BIOS row
             // carries the Add flow; swap it in and say so plainly.
             busy = false;
             progress.hidden = true;
+            pendingAccess = null;
             activeSheet = outcome.sheet;
             if (activeSheet.options.some((o) => o.id === outcome.sheet.preselect)) {
               selected = outcome.sheet.preselect;
@@ -362,10 +437,11 @@ export function showEmuSheet(
             // the doors stay open (retry, or the OS default).
             busy = false;
             progress.hidden = true;
+            pendingAccess = null;
             receipt.hidden = false;
             receipt.textContent = outcome.message;
             for (const r of radios) r.disabled = false;
-            primary.disabled = !primaryEnabled(selectedOpt());
+            refresh();
             notNow.disabled = false;
             notNow.textContent = picker ? "Cancel" : "Not now";
           }
@@ -373,12 +449,12 @@ export function showEmuSheet(
           busy = false;
           progress.hidden = true;
           for (const r of radios) r.disabled = false;
-          primary.disabled = !primaryEnabled(selectedOpt());
+          refresh();
           notNow.disabled = false;
           Toast.error(`That didn't work: ${errText(err)}`);
         }
       })();
-    });
+    }
 
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -486,6 +562,109 @@ export class EmuSection {
     const viewHost = el("div", "emu-view-host");
     viewHost.appendChild(this.viewCard(this.prefs.view));
     this.body.appendChild(viewHost);
+    // ---- ES-DE companion card (v2)
+    const eh = el("h3", "prefs-section", "ES-DE companion");
+    eh.style.marginTop = "1.4rem";
+    this.body.appendChild(eh);
+    this.body.appendChild(
+      el(
+        "p",
+        "prefs-note",
+        "ES-DE is a polished front-end that reads the same library through the unified view — same games, two front doors. Fable can install it for you and point it at your games and their artwork; what you do inside ES-DE stays ES-DE's business.",
+      ),
+    );
+    this.body.appendChild(this.esdeCard());
+    // ---- Drive access (sandbox grants, §4.4)
+    if (this.prefs.overrides.length > 0) {
+      const oh = el("h3", "prefs-section", "Drive access");
+      oh.style.marginTop = "1.4rem";
+      this.body.appendChild(oh);
+      this.body.appendChild(
+        el(
+          "p",
+          "prefs-note",
+          "Emulators installed as Flatpaks live in a sandbox. When you allowed one to see a drive so a game could play, the grant landed here — take it back any time.",
+        ),
+      );
+      for (const ov of this.prefs.overrides) {
+        this.body.appendChild(this.overrideRow(ov));
+      }
+    }
+  }
+
+  private esdeCard(): HTMLElement {
+    const esde = this.prefs!.esde;
+    const card = el("div", "emu-view-card");
+    const line = el(
+      "p",
+      "emu-view-state",
+      esde.installed
+        ? `Installed${esde.version ? ` — ES-DE ${esde.version}` : ""} · ${homeShort(esde.path)}`
+        : "Not installed yet.",
+    );
+    card.appendChild(line);
+    const actions = el("div", "emu-view-actions");
+    if (esde.installed) {
+      const open = el("button", "emu-btn", "Open ES-DE") as HTMLButtonElement;
+      open.addEventListener("click", () => {
+        void api.emuEsdeOpen().catch((err) => {
+          Toast.error(`Could not open ES-DE: ${errText(err)}`);
+        });
+      });
+      actions.appendChild(open);
+    } else {
+      const install = el(
+        "button",
+        "emu-btn",
+        "Install ES-DE",
+      ) as HTMLButtonElement;
+      install.addEventListener("click", () => {
+        install.disabled = true;
+        install.textContent = "Installing ES-DE…";
+        void api
+          .emuEsdeInstall()
+          .then((st) => {
+            if (this.prefs) this.prefs.esde = st;
+            Toast.success("ES-DE is installed — your library greets you there too.");
+            this.render();
+          })
+          .catch((err) => {
+            install.disabled = false;
+            install.textContent = "Install ES-DE";
+            Toast.error(`ES-DE didn't install: ${errText(err)}`);
+          });
+      });
+      actions.appendChild(install);
+    }
+    card.appendChild(actions);
+    return card;
+  }
+
+  private overrideRow(ov: EmuPrefs["overrides"][number]): HTMLElement {
+    const row = el("div", "emu-sys-row");
+    const head = el("div", "emu-sys-head");
+    head.appendChild(el("strong", "", ov.appLabel));
+    head.appendChild(el("span", "emu-sys-count", homeShort(ov.filesystem)));
+    row.appendChild(head);
+    const actions = el("div", "emu-bios-actions");
+    const revoke = el("button", "emu-btn", "Take back") as HTMLButtonElement;
+    revoke.addEventListener("click", () => {
+      revoke.disabled = true;
+      void (async () => {
+        try {
+          await api.emuRemoveOverride(ov.appId, ov.filesystem);
+          this.prefs = await api.emuPrefs();
+          Toast.success(`${ov.appLabel} can no longer see ${homeShort(ov.filesystem)}.`);
+          this.render();
+        } catch (err) {
+          revoke.disabled = false;
+          Toast.error(`That didn't work: ${errText(err)}`);
+        }
+      })();
+    });
+    actions.appendChild(revoke);
+    row.appendChild(actions);
+    return row;
   }
 
   private systemRow(sys: EmuPrefs["systems"][number]): HTMLElement {
