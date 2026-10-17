@@ -3610,7 +3610,11 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
    wide windows and goes full-bleed on narrow ones; the text is set
    in the system serif, sized by the reader's own A−/A+ steppers. */
 .reader-overlay { position: fixed; inset: 0; background: rgb(0 0 0 / 0.32); backdrop-filter: blur(6px) saturate(140%); display: flex; align-items: stretch; justify-content: center; z-index: 1300; }
-.reader-shell { display: flex; flex-direction: column; width: min(52rem, 100vw); max-height: 100vh; background: var(--ufm-content-canvas); color: var(--ufm-text); box-shadow: 0 1.5rem 4rem rgb(0 0 0 / 0.35); }
+.reader-shell { position: relative; display: flex; flex-direction: column; width: min(52rem, 100vw); max-height: 100vh; background: var(--ufm-content-canvas); color: var(--ufm-text); box-shadow: 0 1.5rem 4rem rgb(0 0 0 / 0.35); }
+/* Reading themes (Ebook P2): local variable overrides — the rest of
+   the app keeps its own colors; Dark is the app's own palette. */
+.reader-shell[data-rtheme="light"] { --ufm-content-canvas: #fdfdfb; --ufm-text: #1c1c1e; --ufm-text-muted: #6b6b70; --ufm-border: #e3e3de; }
+.reader-shell[data-rtheme="sepia"] { --ufm-content-canvas: #f4ecd8; --ufm-text: #433422; --ufm-text-muted: #8a7358; --ufm-border: #ddd0b4; }
 @media (min-width: 60rem) {
   .reader-overlay { align-items: center; padding: 2rem 0; }
   .reader-shell { max-height: calc(100vh - 4rem); border-radius: 18px; overflow: hidden; }
@@ -3622,13 +3626,34 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 .reader-tools { display: flex; gap: 0.375rem; flex: none; align-items: center; }
 .reader-tool { font-size: 0.8125rem; }
 .reader-body { flex: 1 1 auto; overflow-y: auto; }
-.reader-page { max-width: 38rem; margin: 0 auto; padding: 1.75rem 1.5rem 3rem; font-family: ui-serif, Georgia, "Times New Roman", serif; line-height: 1.62; }
+.reader-page { max-width: var(--reader-measure, 38rem); margin: 0 auto; padding: 1.75rem 1.5rem 3rem; font-family: var(--reader-font, ui-serif, Georgia, "Times New Roman", serif); line-height: var(--reader-lh, 1.62); }
 .reader-chapter-title { font-size: 1.35em; line-height: 1.3; margin: 0 0 1em; font-weight: 700; }
 .reader-para { margin: 0 0 0.9em; }
 .reader-note { color: var(--ufm-text-muted); font-family: var(--ufm-font-ui); font-size: 0.9375rem; line-height: 1.55; }
 .reader-foot { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1.25rem; border-top: 1px solid var(--ufm-border); }
 .reader-pos { font-size: 0.8125rem; color: var(--ufm-text-muted); white-space: nowrap; }
 .reader-select { flex: 1 1 auto; font: inherit; font-size: 0.8125rem; padding: 0.375rem 0.5rem; border-radius: 8px; border: 1px solid var(--ufm-border); background: var(--ufm-content-canvas); color: var(--ufm-text); min-width: 0; }
+/* The rich chapter (Ebook P2): guardrails under the publisher's own
+   scoped CSS, which is injected inside the page and wins ties. */
+.reader-pub { overflow-wrap: break-word; }
+.reader-pub img { max-width: 100%; height: auto; }
+.reader-pub a[data-fable-link], .reader-pub a[data-fable-ext] { color: inherit; text-decoration: underline; text-underline-offset: 0.15em; cursor: pointer; }
+.reader-pub a.fable-noteref { text-decoration: none; }
+.reader-pub .fable-note { font-size: 0.92em; }
+.reader-pub table { border-collapse: collapse; max-width: 100%; }
+.reader-pub td, .reader-pub th { padding: 0.25em 0.5em; }
+.reader-pub pre { overflow-x: auto; }
+.fable-img-missing { display: inline-block; padding: 0.5em 0.75em; border: 1px dashed var(--ufm-border); border-radius: 8px; color: var(--ufm-text-muted); font-family: var(--ufm-font-ui); font-size: 0.85em; }
+.fable-flash { animation: fable-flash 1.6s ease-out; }
+@keyframes fable-flash { 0% { background: rgb(255 213 79 / 0.45); } 100% { background: transparent; } }
+/* Text settings popover (Ebook P2). */
+.reader-settings { position: absolute; top: 4.25rem; right: 1.25rem; z-index: 5; width: 21.5rem; max-width: calc(100vw - 2rem); padding: 0.875rem 1rem; border: 1px solid var(--ufm-border); border-radius: 14px; background: var(--ufm-content-canvas); color: var(--ufm-text); box-shadow: 0 1rem 2.5rem rgb(0 0 0 / 0.30); display: flex; flex-direction: column; gap: 0.625rem; }
+.reader-set-row { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+.reader-set-label { font-family: var(--ufm-font-ui); font-size: 0.8125rem; color: var(--ufm-text-muted); flex: none; }
+.reader-set-value { font-family: var(--ufm-font-ui); font-size: 0.8125rem; min-width: 3ch; text-align: center; }
+.reader-seg { display: flex; gap: 0.25rem; flex-wrap: wrap; justify-content: flex-end; }
+.reader-seg-btn { font-family: var(--ufm-font-ui); font-size: 0.8125rem; padding: 0.3125rem 0.625rem; border-radius: 999px; border: 1px solid var(--ufm-border); background: transparent; color: var(--ufm-text); cursor: pointer; }
+.reader-seg-btn.on { background: var(--ufm-text); color: var(--ufm-content-canvas); border-color: transparent; }
 
 /* PDF Reader (2026-10-15): the same shell, a wider stage — pages
    are landscape-capable documents, not a text measure. The page

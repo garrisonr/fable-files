@@ -259,12 +259,20 @@ export interface BookOpen {
   note: string | null;
   startChapter: number;
   fontScale: number;
+  /** Ebook P2 — decoded chapter titles in spine order. */
+  chapterTitles: (string | null)[];
+  /** Ebook P2 — saved within-chapter place for startChapter. */
+  startScrollFrac: number | null;
 }
 
 export interface ChapterView {
   index: number;
   title: string | null;
   text: string;
+  /** Ebook P2 — sanitized publisher XHTML; null → render text. */
+  html: string | null;
+  /** Ebook P2 — scoped publisher CSS for the chapter. */
+  css: string | null;
   chapterCount: number;
 }
 
@@ -1300,8 +1308,13 @@ export const api = {
   openBook: (path: string) => invoke<BookOpen>("open_book", { path }),
   readChapter: (path: string, index: number) =>
     invoke<ChapterView>("read_chapter", { path, index }),
-  setReadingProgress: (path: string, chapter: number, fontScale?: number) =>
-    invoke<void>("set_reading_progress", { path, chapter, fontScale }),
+  setReadingProgress: (
+    path: string,
+    chapter: number,
+    fontScale?: number,
+    scrollFrac?: number,
+  ) =>
+    invoke<void>("set_reading_progress", { path, chapter, fontScale, scrollFrac }),
   /** PDF Reader — paginated documents in the same shell. */
   openPdf: (path: string) => invoke<PdfOpen>("open_pdf", { path }),
   readPdfPage: (path: string, page: number, widthPx: number) =>
