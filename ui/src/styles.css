@@ -5018,3 +5018,146 @@ body[data-layout="tv"] .w-glyph svg {
 .sc-print-none { color: var(--ufm-text-muted); font-size: 0.9rem; }
 @media (max-width: 60rem) { .sc-body { columns: 1; } }
 @media (prefers-reduced-motion: reduce) { .sc-in-fade { animation: none; } }
+
+/* ---- Books Home (Ebook P1 — "The Library") ----
+ * Same room grammar as Games Home: toolbar + chips + shelves of
+ * cards on the theme's own surfaces. Covers are the books' own
+ * art; the typographic spine is the honest no-cover card. */
+.bookshome {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: var(--ufm-content-canvas);
+  color: var(--ufm-text);
+}
+.bh-sub { color: var(--ufm-text-muted); font-size: 0.85rem; }
+.bh-tidy {
+  margin-left: auto;
+  border: 1px solid var(--ufm-accent);
+  background: color-mix(in srgb, var(--ufm-accent) 12%, transparent);
+  color: var(--ufm-accent-text);
+  border-radius: 999px; padding: 4px 14px; cursor: pointer;
+  font: inherit; font-size: 0.85rem; font-weight: 600;
+  height: var(--ufm-control-h);
+}
+.bh-tidy:hover { background: color-mix(in srgb, var(--ufm-accent) 20%, transparent); }
+.bh-chips {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--ufm-border);
+  background: var(--ufm-surface);
+}
+.bh-chip {
+  border: 1px solid var(--ufm-border);
+  background: none;
+  color: var(--ufm-text);
+  border-radius: 999px; padding: 3px 12px; cursor: pointer;
+  font: inherit; font-size: 0.82rem;
+}
+.bh-chip:hover { border-color: var(--ufm-accent); }
+.bh-chip.on {
+  border-color: var(--ufm-accent);
+  background: color-mix(in srgb, var(--ufm-accent) 14%, transparent);
+  color: var(--ufm-accent-text);
+  font-weight: 600;
+}
+.bh-body {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 18px 20px 36px;
+  display: flex; flex-direction: column; gap: 28px;
+}
+.bh-empty {
+  color: var(--ufm-text-muted);
+  max-width: 36rem; line-height: 1.55; font-size: 0.95rem;
+}
+.bh-shelf-head {
+  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+}
+.bh-shelf-title { margin: 0; font-size: 1rem; font-weight: 700; }
+.bh-shelf-note { color: var(--ufm-text-muted); font-size: 0.82rem; }
+.bh-rail {
+  display: flex; gap: 14px; overflow-x: auto;
+  padding: 10px 2px 8px;
+}
+.bh-card {
+  width: 132px; flex: none; cursor: pointer;
+  border-radius: var(--ufm-radius-md);
+}
+.bh-card:hover .bh-cover, .bh-card:hover .bh-spine {
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--ufm-text) 22%, transparent);
+}
+.bh-cover {
+  width: 132px; height: 198px; object-fit: cover; display: block;
+  border-radius: var(--ufm-radius-md);
+  border: 1px solid var(--ufm-border);
+  background: var(--ufm-surface);
+}
+.bh-spine {
+  width: 132px; height: 198px; box-sizing: border-box;
+  border-radius: var(--ufm-radius-md);
+  border: 1px solid var(--ufm-border);
+  background: var(--ufm-surface);
+  padding: 14px 12px;
+  display: flex; flex-direction: column; gap: 8px;
+  overflow: hidden;
+}
+.bh-spine-title { font-weight: 650; font-size: 0.88rem; line-height: 1.3; overflow-wrap: anywhere; }
+.bh-spine-author { margin-top: auto; color: var(--ufm-text-muted); font-size: 0.75rem; overflow-wrap: anywhere; }
+.bh-spine-waiting { border-style: dashed; color: var(--ufm-text-muted); font-size: 0.82rem; overflow-wrap: anywhere; }
+.bh-card-title {
+  margin-top: 8px; font-size: 0.88rem; font-weight: 600; line-height: 1.25;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.bh-card-name {
+  margin-top: 8px; font-size: 0.82rem; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.bh-card-sub {
+  color: var(--ufm-text-muted); font-size: 0.78rem; margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.bh-badge {
+  display: inline-block; margin-top: 6px;
+  border-radius: 999px; padding: 1px 8px; font-size: 0.72rem; font-weight: 600;
+  border: 1px solid var(--ufm-border); color: var(--ufm-text-muted);
+}
+.bh-badge-reading {
+  border-color: var(--ufm-accent);
+  background: color-mix(in srgb, var(--ufm-accent) 14%, transparent);
+  color: var(--ufm-accent-text);
+}
+.bh-badge-read {
+  border-color: var(--ufm-accent);
+  background: color-mix(in srgb, var(--ufm-accent) 26%, transparent);
+  color: var(--ufm-accent-text);
+}
+.bh-progress {
+  margin-top: 7px; height: 4px; border-radius: 2px;
+  background: color-mix(in srgb, var(--ufm-text) 12%, transparent);
+  overflow: hidden;
+}
+.bh-progress-fill { height: 100%; background: var(--ufm-accent); border-radius: 2px; }
+.bh-card-actions { margin-top: 7px; display: flex; flex-wrap: wrap; gap: 4px; }
+.bh-mini-btn {
+  border: 1px solid var(--ufm-border); background: none; color: var(--ufm-text);
+  border-radius: 999px; padding: 2px 9px; cursor: pointer;
+  font: inherit; font-size: 0.75rem;
+}
+.bh-mini-btn:hover { border-color: var(--ufm-accent); color: var(--ufm-accent-text); }
+.bh-finish {
+  border-color: var(--ufm-accent);
+  background: color-mix(in srgb, var(--ufm-accent) 16%, transparent);
+  color: var(--ufm-accent-text); font-weight: 600;
+}
+.bh-state-picker { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.bh-state-opt {
+  border: 1px solid var(--ufm-border); background: var(--ufm-surface);
+  color: var(--ufm-text); border-radius: 999px; padding: 2px 8px;
+  cursor: pointer; font: inherit; font-size: 0.72rem;
+}
+.bh-state-opt.on {
+  border-color: var(--ufm-accent);
+  background: color-mix(in srgb, var(--ufm-accent) 16%, transparent);
+  color: var(--ufm-accent-text); font-weight: 600;
+}

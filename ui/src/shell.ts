@@ -30,6 +30,7 @@ import { openConnectDialog } from "./network";
 import { showPluginRunDialog } from "./plugins";
 import { SearchView, fmtDay } from "./search";
 import { RomHome } from "./romhome";
+import { BooksHome } from "./bookshome";
 import { MediaResDialog } from "./mediares";
 import { RomOrganizeDialog } from "./romorg";
 import { AddLocationGate } from "./addlocation";
@@ -280,6 +281,11 @@ export class Shell {
    * updates waiting, or the prep pass at work. */
   private romsFleetPill: HTMLElement | null = null;
   private romsList!: HTMLElement;
+  /** Ebook P1: the Books Home room + its sidebar door. */
+  private booksHome!: import("./bookshome").BooksHome;
+  private booksHead: HTMLElement | null = null;
+  private booksDoorCount: HTMLElement | null = null;
+  private booksList!: HTMLElement;
   /** Chevron spans of the collapsible sidebar sections (Round 7.2:
    * kept so boot can re-apply durable collapse prefs to the DOM). */
   private labelChevEl: HTMLElement | null = null;
@@ -711,12 +717,17 @@ export class Shell {
         ]);
       },
     });
+    this.booksHome = new BooksHome({
+      onExit: () => this.exitBooksHome(),
+    });
+    void this.refreshBooksDoor();
     this.viewport.append(
       this.fileView.el,
       this.columnsView.el,
       this.galleryView.el,
       this.searchView.el,
       this.romHome.el,
+      this.booksHome.el,
       this.quickLook.el
     );
     // The search field lives in the toolbar; its results panel is in the viewport.
@@ -1192,6 +1203,32 @@ export class Shell {
     this.romsList = document.createElement("div");
     this.romsList.className = "side-list";
     this.romsList.hidden = true;
+    // Ebook P1 — the Books door, directly below the Games door:
+    // same grammar (glyph, word label, count, chevron), plain
+    // words per the terminology law.
+    const booksHead = document.createElement("button");
+    booksHead.className = "side-head rom-door";
+    booksHead.setAttribute("aria-label", "Open Books Home");
+    const booksGlyph = document.createElement("span");
+    booksGlyph.className = "rom-door-glyph";
+    booksGlyph.innerHTML = `<svg viewBox="0 0 48 48" aria-hidden="true">${SECTION_ICON_SVG.books}</svg>`;
+    const booksHeadText = document.createElement("span");
+    booksHeadText.className = "rom-door-label";
+    booksHeadText.textContent = "Books";
+    const booksCount = document.createElement("span");
+    booksCount.className = "rom-door-count";
+    const booksChev = document.createElement("span");
+    booksChev.className = "side-chev";
+    booksChev.textContent = "›";
+    booksHead.append(booksGlyph, booksHeadText, booksCount, booksChev);
+    booksHead.title = "Books Home — your library, shelved by series and author";
+    booksHead.addEventListener("click", () => this.enterBooksHome());
+    this.booksHead = booksHead;
+    this.booksDoorCount = booksCount;
+    void this.refreshBooksDoor();
+    this.booksList = document.createElement("div");
+    this.booksList.className = "side-list";
+    this.booksList.hidden = true;
     sidebar.append(
       favHead,
       this.favList,
@@ -1205,6 +1242,8 @@ export class Shell {
       this.smartList,
       this.romsHead,
       this.romsList,
+      this.booksHead as HTMLElement,
+      this.booksList,
       locHead,
       this.sidebarList,
     );
@@ -1335,6 +1374,7 @@ export class Shell {
   private async loadDir(tab: Tab): Promise<void> {
     const dir = currentDir(tab);
     if (tab === this.activeTab && this.romHome?.active) this.exitRomHome();
+    if (tab === this.activeTab && this.booksHome?.active) this.exitBooksHome();
     // Round 7 (Gemini audit): capture a load token; if a newer load for
     // this tab starts while we await, this result is stale — discard it
     // silently instead of overwriting the current view.
@@ -4881,6 +4921,7 @@ export class Shell {
    * the catalog alone. Leaving restores this view exactly (SPEC
    * §5 — the room is a place you visit, state intact both ways). */
   private enterRomHome(target?: { kind: "system"; name: string }): void {
+    if (this.booksHome?.active) this.exitBooksHome();
     if (this.searchView.active) this.searchView.clear();
     this.quickLook.close();
     this.fileView.el.hidden = true;
@@ -4902,6 +4943,42 @@ export class Shell {
       this.renderCrumbs();
       void this.refreshRomDoor();
     }
+  }
+
+  // ------------------------------------------------------------ Books Home
+
+  /** Enter the library: same room grammar as Games Home — the
+   * browse views hide, the room paints from the catalog alone. */
+  private enterBooksHome(): void {
+    if (this.romHome?.active) this.exitRomHome();
+    if (this.searchView.active) this.searchView.clear();
+    this.quickLook.close();
+    this.fileView.el.hidden = true;
+    this.columnsView.el.hidden = true;
+    this.galleryView.el.hidden = true;
+    this.searchView.el.hidden = true;
+    this.booksHead?.classList.add("selected");
+    void this.booksHome.open();
+  }
+
+  private exitBooksHome(): void {
+    if (!this.booksHome) return;
+    const wasActive = this.booksHome.active;
+    this.booksHome.close();
+    this.booksHome.el.hidden = true;
+    this.booksHead?.classList.remove("selected");
+    if (wasActive) {
+      this.showFileView();
+      this.renderCrumbs();
+      void this.refreshBooksDoor();
+    }
+  }
+
+  /** The Books door's number — identified books, from the catalog. */
+  private async refreshBooksDoor(): Promise<void> {
+    if (!this.booksHome || !this.booksDoorCount) return;
+    const n = await this.booksHome.doorCount().catch(() => 0);
+    this.booksDoorCount.textContent = n > 0 ? n.toLocaleString() : "";
   }
 
   /** The door's numbers — straight from the catalog, never a scan. */

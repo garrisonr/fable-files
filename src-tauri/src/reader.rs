@@ -184,12 +184,13 @@ pub async fn read_chapter(path: String, index: usize) -> Result<ChapterView, Str
 /// a book. Called by the reader on navigation and on close.
 #[tauri::command]
 pub fn set_reading_progress(
+    state: tauri::State<'_, crate::AppState>,
     path: String,
     chapter: usize,
     font_scale: Option<f32>,
 ) -> Result<(), String> {
     let mut progress = load_progress();
-    let entry = progress.books.entry(path).or_insert(ProgressEntry {
+    let entry = progress.books.entry(path.clone()).or_insert(ProgressEntry {
         chapter: 0,
         font_scale: 1.0,
         updated: String::new(),
@@ -201,7 +202,43 @@ pub fn set_reading_progress(
         entry.font_scale = scale.clamp(0.7, 2.2);
     }
     entry.updated = chrono::Utc::now().to_rfc3339();
-    save_progress(&progress)
+    let updated = entry.updated.clone();
+    save_progress(&progress)?;
+    // Ebook P1: progress existing IS the 'reading' state — the
+    // catalog's touch rules decide what automation may change.
+    let catalog = state.catalog.lock().unwrap();
+    let _ = catalog.touch_book_reading(&path, &updated);
+    Ok(())
+}
+
+/// One book's place in the reader's progress store (Books Home's
+/// Continue Reading source). Not a Tauri command — the room's
+/// payload composes it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProgressView {
+    pub path: String,
+    pub chapter: Option<usize>,
+    pub page: Option<usize>,
+    pub updated: String,
+}
+
+/// Every book with saved progress, most recently read first.
+/// Entries with no timestamp (pre-dating the field) sort last.
+pub fn list_reading_progress() -> Vec<ProgressView> {
+    let progress = load_progress();
+    let mut views: Vec<ProgressView> = progress
+        .books
+        .iter()
+        .map(|(path, e)| ProgressView {
+            path: path.clone(),
+            chapter: if e.page.is_some() { None } else { Some(e.chapter) },
+            page: e.page,
+            updated: e.updated.clone(),
+        })
+        .collect();
+    views.sort_by(|a, b| b.updated.cmp(&a.updated));
+    views
 }
 
 // ---------------------------------------------------------------------------
@@ -397,12 +434,13 @@ pub async fn read_pdf_page(
 /// change, and on close — the EPUB twin is `set_reading_progress`.
 #[tauri::command]
 pub fn set_pdf_progress(
+    state: tauri::State<'_, crate::AppState>,
     path: String,
     page: usize,
     zoom_mode: Option<String>,
 ) -> Result<(), String> {
     let mut progress = load_progress();
-    let entry = progress.books.entry(path).or_insert(ProgressEntry {
+    let entry = progress.books.entry(path.clone()).or_insert(ProgressEntry {
         chapter: 0,
         font_scale: 1.0,
         updated: String::new(),
@@ -414,7 +452,12 @@ pub fn set_pdf_progress(
         entry.zoom_mode = Some(mode);
     }
     entry.updated = chrono::Utc::now().to_rfc3339();
-    save_progress(&progress)
+    let updated = entry.updated.clone();
+    save_progress(&progress)?;
+    // Ebook P1: the EPUB twin above — progress means 'reading'.
+    let catalog = state.catalog.lock().unwrap();
+    let _ = catalog.touch_book_reading(&path, &updated);
+    Ok(())
 }
 
 #[cfg(test)]

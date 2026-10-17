@@ -759,6 +759,260 @@ fn build_excerpt(
     text.chars().take(MAX_EXCERPT_CHARS).collect()
 }
 
+// ---------------------------------------------------------------------------
+// Full book metadata (Ebook P1 — "The Library", 2026-10-17): the whole
+// Dublin Core + series surface of the OPF, parsed for the catalog.
+// The preview/reader decoders above deliberately stay untouched; this
+// is an additive API the indexer consumes at identify time.
+// ---------------------------------------------------------------------------
+
+/// Everything the OPF says about a book, beyond the preview's
+/// title/author pair. Series data arrives in two real-world dialects:
+/// EPUB 3 `belongs-to-collection` (with `group-position` refinements)
+/// and Calibre's `calibre:series` / `calibre:series_index` meta pair —
+/// both are read, EPUB 3 first.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct EpubMetadata {
+    pub title: Option<String>,
+    /// Every `dc:creator`, in document order (deduplicated).
+    pub authors: Vec<String>,
+    pub series: Option<String>,
+    /// Position within the series ("3", "3.0", "0.5" all occur).
+    pub series_index: Option<f64>,
+    pub publisher: Option<String>,
+    /// The raw `dc:date` string ("2011", "2011-08-23", …), unparsed —
+    /// the year extraction is [`published_year`].
+    pub published_date: Option<String>,
+    pub language: Option<String>,
+    pub description: Option<String>,
+    /// Every `dc:subject`, in document order (deduplicated).
+    pub subjects: Vec<String>,
+    /// The ISBN when any identifier declares itself one
+    /// (`opf:scheme="ISBN"` or a `urn:isbn:` value).
+    pub isbn: Option<String>,
+    /// The package's unique identifier (the `dc:identifier` whose id
+    /// matches `unique-identifier`), else the first identifier.
+    pub identifier: Option<String>,
+    /// Linear spine documents (chapters) — the reader's denominator.
+    pub spine_count: usize,
+}
+
+/// The year a raw `dc:date` names: the leading 4-digit group, when it
+/// is a plausible year. "2011-08-23" → 2011; "August 2011" → none.
+pub fn published_year(raw: &str) -> Option<i64> {
+    let head: String = raw.trim().chars().take(4).collect();
+    if head.len() == 4 && head.chars().all(|c| c.is_ascii_digit()) {
+        let y: i64 = head.parse().ok()?;
+        if (1000..=2999).contains(&y) {
+            return Some(y);
+        }
+    }
+    None
+}
+
+/// Every occurrence of `<tag …>text</tag>` as (opening-tag attributes,
+/// inner text) — the multi-value companion to [`tag_text`], for the
+/// repeated Dublin Core elements (`dc:creator`, `dc:subject`,
+/// `dc:identifier`) and text-bearing `meta` refinements. Self-closing
+/// tags yield an empty text.
+fn elements(xml: &str, tag: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let open = format!("<{tag}");
+    let mut rest = xml;
+    while let Some(pos) = rest.find(&open) {
+        let after = &rest[pos + open.len()..];
+        let next_ok = matches!(after.chars().next(), Some(c) if c == '>' || c == '/' || c.is_whitespace());
+        if !next_ok {
+            rest = after;
+            continue;
+        }
+        let Some(gt) = after.find('>') else { break };
+        let attrs = after[..gt].to_string();
+        if attrs.trim_end().ends_with('/') {
+            out.push((attrs, String::new()));
+            rest = &after[gt + 1..];
+            continue;
+        }
+        let close = format!("</{tag}>");
+        let inner_start = gt + 1;
+        match after[inner_start..].find(&close) {
+            Some(end) => {
+                let text = collapse_ws(&unescape(&after[inner_start..inner_start + end]));
+                out.push((attrs, text));
+                rest = &after[inner_start + end + close.len()..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Inner texts of every `<tag …>…</tag>`, in document order.
+fn tag_text_all(xml: &str, tag: &str) -> Vec<String> {
+    elements(xml, tag)
+        .into_iter()
+        .map(|(_, t)| t)
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+fn dedupe(values: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for v in values {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+fn parse_series_index(raw: &str) -> Option<f64> {
+    raw.trim().parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+/// Parse the full metadata surface out of an OPF document. Pure and
+/// total: missing data is `None` / empty, never an error.
+pub fn parse_opf_metadata(opf: &str) -> EpubMetadata {
+    let mut out = EpubMetadata::default();
+    out.title = tag_text(opf, "dc:title");
+    out.authors = dedupe(tag_text_all(opf, "dc:creator"));
+    out.publisher = tag_text(opf, "dc:publisher");
+    out.language = tag_text(opf, "dc:language");
+    out.subjects = dedupe(tag_text_all(opf, "dc:subject"));
+
+    // dc:date: prefer the explicit publication event when several
+    // dates ride along (OPF 2 modification dates are common).
+    let dates = elements(opf, "dc:date");
+    out.published_date = dates
+        .iter()
+        .find(|(a, _)| {
+            a.to_ascii_lowercase().contains("opf:event=\"publication\"")
+                || a.to_ascii_lowercase().contains("opf:event='publication'")
+        })
+        .or_else(|| dates.first())
+        .map(|(_, t)| t.clone())
+        .filter(|t| !t.is_empty());
+
+    // Description may carry markup — strip it to readable text.
+    out.description = tag_text(opf, "dc:description").map(|d| {
+        let plain = collapse_ws(&xhtml_to_text(&d));
+        plain.chars().take(2000).collect::<String>()
+    });
+
+    // Identifiers: the primary is the one the package names via
+    // unique-identifier; the ISBN is whichever declares itself one.
+    let unique_id = iter_tags(opf, "package")
+        .into_iter()
+        .find_map(|t| attr(t, "unique-identifier").map(str::to_owned));
+    let identifiers = elements(opf, "dc:identifier");
+    let mut first_identifier: Option<String> = None;
+    for (attrs, text) in &identifiers {
+        if text.is_empty() {
+            continue;
+        }
+        if first_identifier.is_none() {
+            first_identifier = Some(text.clone());
+        }
+        if let (Some(want), Some(id)) = (&unique_id, attr(attrs, "id")) {
+            if id == want {
+                out.identifier = Some(text.clone());
+            }
+        }
+        let scheme = attr(attrs, "opf:scheme").unwrap_or("");
+        if scheme.eq_ignore_ascii_case("isbn") {
+            out.isbn = Some(text.clone());
+        } else if text.len() > 9 && text[..9].eq_ignore_ascii_case("urn:isbn:") {
+            out.isbn = Some(text[9..].to_string());
+        }
+    }
+    if out.identifier.is_none() {
+        out.identifier = first_identifier;
+    }
+
+    // Series, EPUB 3 dialect: <belongs-to-collection id="c">Name</…>
+    // refined by <meta refines="#c" property="group-position">N</…>.
+    let metas = elements(opf, "meta");
+    let group_position = |target: &str| -> Option<f64> {
+        metas
+            .iter()
+            .find(|(a, _)| {
+                attr(a, "refines") == Some(target)
+                    && attr(a, "property") == Some("group-position")
+            })
+            .and_then(|(_, t)| parse_series_index(t))
+    };
+    let mut series: Option<(String, Option<f64>)> = None;
+    for (attrs, text) in elements(opf, "belongs-to-collection") {
+        if text.is_empty() {
+            continue;
+        }
+        let pos = attr(&attrs, "id").and_then(|id| group_position(&format!("#{id}")));
+        // Prefer a collection that carries a position; keep the
+        // first named one otherwise.
+        if series.is_none() || (series.as_ref().map(|(_, p)| p.is_none()).unwrap_or(false) && pos.is_some()) {
+            series = Some((text, pos));
+        }
+    }
+    if series.is_none() {
+        // Text-form meta (early EPUB 3): <meta property="belongs-to-collection">Name</meta>.
+        for (attrs, text) in &metas {
+            if attr(attrs, "property") == Some("belongs-to-collection") && !text.is_empty() {
+                let pos = attr(attrs, "id").and_then(|id| group_position(&format!("#{id}")));
+                series = Some((text.clone(), pos));
+                break;
+            }
+        }
+    }
+    if series.is_none() {
+        // Calibre dialect: name + index as content attributes.
+        let name = metas.iter().find_map(|(a, _)| {
+            if attr(a, "name") == Some("calibre:series") {
+                attr(a, "content").map(|c| collapse_ws(&unescape(c)))
+            } else {
+                None
+            }
+        });
+        if let Some(name) = name.filter(|n| !n.is_empty()) {
+            let pos = metas.iter().find_map(|(a, _)| {
+                if attr(a, "name") == Some("calibre:series_index") {
+                    attr(a, "content").and_then(parse_series_index)
+                } else {
+                    None
+                }
+            });
+            series = Some((name, pos));
+        }
+    }
+    if let Some((name, pos)) = series {
+        out.series = Some(name);
+        out.series_index = pos;
+    }
+    out
+}
+
+/// Decode ONLY a book's metadata (+ spine count) from its raw bytes —
+/// the indexer's entry point: no cover extraction, no excerpt walk.
+/// `None` when the archive or its OPF can't be read at all. Metadata
+/// reads even on DRM books (it isn't the encrypted payload).
+pub fn decode_epub_metadata(data: &[u8]) -> Option<EpubMetadata> {
+    let zip = ZipArchive::open(data)?;
+    let opf_path = zip
+        .read_text("META-INF/container.xml")
+        .and_then(|c| {
+            iter_tags(&c, "rootfile")
+                .into_iter()
+                .find_map(|t| attr(t, "full-path").map(str::to_owned))
+        })
+        .unwrap_or_else(|| "OEBPS/content.opf".to_string());
+    let opf = zip.read_text(&opf_path)?;
+    let mut meta = parse_opf_metadata(&opf);
+    meta.spine_count = iter_tags(&opf, "itemref")
+        .into_iter()
+        .filter(|t| attr(t, "linear") != Some("no"))
+        .count();
+    Some(meta)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1025,5 +1279,115 @@ mod tests {
         let p = decode_epub(&zip_fixture(&entries));
         let cover = p.cover.expect("meta cover found");
         assert_eq!(cover.data, vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]);
+    }
+
+    // -- Metadata (Ebook P1) ----------------------------------------
+
+    const OPF_RICH: &str = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" xmlns:opf="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bid" opf:scheme="ISBN">978-0-13-468599-1</dc:identifier>
+    <dc:identifier>urn:uuid:12345</dc:identifier>
+    <dc:title>Café &amp; Crème: A Tale</dc:title>
+    <dc:creator>Søren Åberg</dc:creator>
+    <dc:creator>Second Author</dc:creator>
+    <dc:creator>Søren Åberg</dc:creator>
+    <dc:publisher>Fixture House</dc:publisher>
+    <dc:date opf:event="publication">2011-08-23</dc:date>
+    <dc:date>2020-01-01</dc:date>
+    <dc:language>en</dc:language>
+    <dc:description>&lt;p&gt;A &lt;b&gt;rich&lt;/b&gt; description.&lt;/p&gt;</dc:description>
+    <dc:subject>Fiction</dc:subject>
+    <dc:subject>Sea stories</dc:subject>
+    <dc:subject>Fiction</dc:subject>
+    <meta name="calibre:series" content="The Alloy Wars"/>
+    <meta name="calibre:series_index" content="3.0"/>
+  </metadata>
+  <manifest><item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"#;
+
+    #[test]
+    fn metadata_reads_full_dublin_core_and_calibre_series() {
+        let m = parse_opf_metadata(OPF_RICH);
+        assert_eq!(m.title.as_deref(), Some("Café & Crème: A Tale"));
+        // Multi-author, deduplicated, document order kept.
+        assert_eq!(m.authors, vec!["Søren Åberg".to_string(), "Second Author".to_string()]);
+        assert_eq!(m.publisher.as_deref(), Some("Fixture House"));
+        // The publication-event date wins over the bare second date.
+        assert_eq!(m.published_date.as_deref(), Some("2011-08-23"));
+        assert_eq!(published_year("2011-08-23"), Some(2011));
+        assert_eq!(m.language.as_deref(), Some("en"));
+        assert_eq!(m.description.as_deref(), Some("A rich description."));
+        assert_eq!(m.subjects, vec!["Fiction".to_string(), "Sea stories".to_string()]);
+        assert_eq!(m.isbn.as_deref(), Some("978-0-13-468599-1"));
+        // Primary identifier = the unique-identifier target, not the uuid.
+        assert_eq!(m.identifier.as_deref(), Some("978-0-13-468599-1"));
+        assert_eq!(m.series.as_deref(), Some("The Alloy Wars"));
+        assert_eq!(m.series_index, Some(3.0));
+    }
+
+    #[test]
+    fn metadata_reads_epub3_belongs_to_collection_with_group_position() {
+        let opf = r##"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bid">urn:isbn:9781234567890</dc:identifier>
+    <dc:title>Second Verse</dc:title>
+    <dc:creator>Jane Tester</dc:creator>
+    <belongs-to-collection id="c01">The Long Shelf</belongs-to-collection>
+    <meta refines="#c01" property="collection-type">series</meta>
+    <meta refines="#c01" property="group-position">2</meta>
+  </metadata>
+  <manifest><item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>
+  <spine><itemref idref="ch1"/></spine>
+</package>"##;
+        let m = parse_opf_metadata(opf);
+        assert_eq!(m.series.as_deref(), Some("The Long Shelf"));
+        assert_eq!(m.series_index, Some(2.0));
+        assert_eq!(m.isbn.as_deref(), Some("9781234567890"));
+        assert_eq!(m.identifier.as_deref(), Some("urn:isbn:9781234567890"));
+    }
+
+    #[test]
+    fn metadata_epub3_wins_over_calibre_when_both_present() {
+        let opf = OPF_RICH.replace(
+            "<meta name=\"calibre:series\" content=\"The Alloy Wars\"/>",
+            "<belongs-to-collection id=\"c9\">EPUB3 Series</belongs-to-collection><meta refines=\"#c9\" property=\"group-position\">0.5</meta><meta name=\"calibre:series\" content=\"The Alloy Wars\"/>",
+        );
+        let m = parse_opf_metadata(&opf);
+        assert_eq!(m.series.as_deref(), Some("EPUB3 Series"));
+        assert_eq!(m.series_index, Some(0.5));
+    }
+
+    #[test]
+    fn metadata_sparse_opf_is_all_none_not_garbage() {
+        let m = parse_opf_metadata(OPF);
+        assert_eq!(m.title.as_deref(), Some("The Fixture Book"));
+        assert_eq!(m.authors, vec!["Jane Tester".to_string()]);
+        assert!(m.series.is_none());
+        assert!(m.series_index.is_none());
+        assert!(m.publisher.is_none());
+        assert!(m.subjects.is_empty());
+        assert_eq!(m.identifier.as_deref(), Some("urn:fixture:1"));
+        assert!(m.isbn.is_none());
+    }
+
+    #[test]
+    fn metadata_from_bytes_counts_spine_and_survives_garbage() {
+        let m = decode_epub_metadata(&book_fixture()).expect("metadata decodes");
+        assert_eq!(m.title.as_deref(), Some("The Fixture Book"));
+        assert_eq!(m.spine_count, 2);
+        assert!(decode_epub_metadata(b"not a zip").is_none());
+        assert!(decode_epub_metadata(&book_fixture()[..30]).is_none());
+    }
+
+    #[test]
+    fn published_year_rejects_non_years() {
+        assert_eq!(published_year("2011"), Some(2011));
+        assert_eq!(published_year("  1999-05-01 "), Some(1999));
+        assert_eq!(published_year("August 2011"), None);
+        assert_eq!(published_year(""), None);
+        assert_eq!(published_year("0999"), None);
     }
 }

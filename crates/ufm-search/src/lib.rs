@@ -46,6 +46,13 @@ pub enum FacetField {
     /// `starred:yes` — user metadata, lives in the catalog (path_stars),
     /// not in the name index; extracted and post-filtered by the caller.
     Starred,
+    /// `author:X` — book metadata (Ebook P1), lives in the catalog
+    /// (book_authors); extracted and post-filtered like Label/Starred.
+    Author,
+    /// `series:X` — book metadata (book_metadata.series).
+    Series,
+    /// `state:want|reading|read` — book reading state (book_state).
+    BookState,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -97,6 +104,9 @@ fn parse_atom(atom: &str) -> Result<Query> {
         let field = match field.to_lowercase().as_str() {
             "type" => FacetField::Type,
             "label" => FacetField::Label,
+            "author" => FacetField::Author,
+            "series" => FacetField::Series,
+            "state" => FacetField::BookState,
             "starred" | "star" => FacetField::Starred,
             "size" => FacetField::Size,
             "modified" => FacetField::Modified,
@@ -159,7 +169,12 @@ pub fn to_fts(q: &Query) -> String {
         // post-filters (see metadata_facets). Other facets keep the
         // MVP plain-text-over-name rendering.
         Query::Facet {
-            field: FacetField::Label | FacetField::Starred,
+            field:
+                FacetField::Label
+                | FacetField::Starred
+                | FacetField::Author
+                | FacetField::Series
+                | FacetField::BookState,
             ..
         } => String::new(),
         Query::Facet { value, .. } => words(value).join(" "),
@@ -241,6 +256,70 @@ pub fn metadata_facets(q: &Query) -> (Vec<String>, Option<bool>) {
     let (mut labels, mut starred) = (Vec::new(), None);
     walk(q, &mut labels, &mut starred);
     (labels, starred)
+}
+
+/// The book facets of a query (Ebook P1): `author:`, `series:` and
+/// `state:` values from the top-level And chain, under exactly the
+/// rules [`metadata_facets`] documents (no extraction from Or/Not;
+/// AND semantics — an item must satisfy every facet). The caller
+/// executes them against the catalog's book stores; they render
+/// empty in FTS, like label/starred. `state:` values are normalized
+/// to lowercase and only want|reading|read are meaningful — the
+/// caller's catalog lookup simply matches nothing for other values.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BookFacets {
+    pub authors: Vec<String>,
+    pub series: Vec<String>,
+    pub states: Vec<String>,
+}
+
+impl BookFacets {
+    pub fn is_empty(&self) -> bool {
+        self.authors.is_empty() && self.series.is_empty() && self.states.is_empty()
+    }
+}
+
+pub fn book_facets(q: &Query) -> BookFacets {
+    fn walk(q: &Query, out: &mut BookFacets) {
+        match q {
+            Query::And(parts) => {
+                for p in parts {
+                    walk(p, out);
+                }
+            }
+            Query::Facet {
+                field: FacetField::Author,
+                value,
+                ..
+            } => {
+                if !value.is_empty() {
+                    out.authors.push(value.clone());
+                }
+            }
+            Query::Facet {
+                field: FacetField::Series,
+                value,
+                ..
+            } => {
+                if !value.is_empty() {
+                    out.series.push(value.clone());
+                }
+            }
+            Query::Facet {
+                field: FacetField::BookState,
+                value,
+                ..
+            } => {
+                if !value.is_empty() {
+                    out.states.push(value.to_lowercase());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = BookFacets::default();
+    walk(q, &mut out);
+    out
 }
 
 /// Split raw text into FTS5-safe prefix terms: fragments on whitespace and
@@ -472,8 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_facets_render_empty_in_fts() {
-        // A label-only query must NOT degrade to a name search.
+    fn metadata_facets_render_empty_in_fts() {        // A label-only query must NOT degrade to a name search.
         assert_eq!(to_fts(&parse("label:taxes").unwrap()), "");
         assert_eq!(to_fts(&parse("starred:yes").unwrap()), "");
         // Mixed: the text part survives, the metadata parts drop out.
@@ -484,5 +562,27 @@ mod tests {
         // Negated metadata facets are not extracted (documented v1 limit).
         let q = parse("report AND NOT label:draft").unwrap();
         assert_eq!(metadata_facets(&q).0.len(), 0);
+    }
+
+    #[test]
+    fn book_facets_parse_extract_and_render_empty() {
+        // Parse + extract from the And chain; state is lowercased.
+        let q = parse("author:\"Le Guin\" AND series:Mistborn AND state:Reading").unwrap();
+        let f = book_facets(&q);
+        assert_eq!(f.authors, vec!["Le Guin".to_string()]);
+        assert_eq!(f.series, vec!["Mistborn".to_string()]);
+        assert_eq!(f.states, vec!["reading".to_string()]);
+        assert!(!f.is_empty());
+        // Book facets are catalog metadata, never name text.
+        assert_eq!(to_fts(&parse("author:\"Le Guin\"").unwrap()), "");
+        assert_eq!(
+            to_fts(&parse("series:Mistborn AND alloy").unwrap()),
+            "alloy*"
+        );
+        // No book facets in a plain query.
+        assert!(book_facets(&parse("plain text").unwrap()).is_empty());
+        // Facets inside Or are not extracted (the v1 rule).
+        let q = parse("author:A OR author:B").unwrap();
+        assert!(book_facets(&q).authors.is_empty());
     }
 }

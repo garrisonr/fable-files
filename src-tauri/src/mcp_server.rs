@@ -692,21 +692,26 @@ fn tool_search(catalog: &Catalog, args: &Value) -> Result<Value, String> {
     let query = ufm_search::parse(&query_text)
         .map_err(|e| format!("could not parse query {query_text:?}: {e}"))?;
     let (label_facets, starred_facet) = ufm_search::metadata_facets(&query);
-    let has_metadata = !label_facets.is_empty() || starred_facet.is_some();
+    let book_facets = ufm_search::book_facets(&query);
+    let has_metadata =
+        !label_facets.is_empty() || starred_facet.is_some() || !book_facets.is_empty();
     let fts_query = ufm_search::to_fts(&query);
 
     let mut items: Vec<ufm_vfs::Item> = if fts_query.trim().is_empty() {
         if !has_metadata {
             return Ok(json!({ "count": 0, "hits": [] }));
         }
-        // Metadata-only query: seed from the label/star stores.
+        // Metadata-only query: seed from the label/star/book stores.
         let mut seeded = if let Some(first) = label_facets.first() {
             catalog.items_by_label(first).map_err(|e| e.to_string())?
-        } else {
+        } else if starred_facet.is_some() {
             catalog.starred_items().map_err(|e| e.to_string())?
+        } else {
+            commands::book_seed_items(catalog, &book_facets).map_err(|e| e.to_string())?
         };
         seeded.retain(|item| {
             commands::metadata_match(catalog, item, &label_facets, starred_facet)
+                && commands::book_match(catalog, item, &book_facets)
         });
         if let Some(exts) = exts {
             seeded.retain(|item| {
@@ -737,6 +742,7 @@ fn tool_search(catalog: &Catalog, args: &Value) -> Result<Value, String> {
         if has_metadata {
             rows.retain(|(item, _)| {
                 commands::metadata_match(catalog, item, &label_facets, starred_facet)
+                    && commands::book_match(catalog, item, &book_facets)
             });
         }
         rows.into_iter().map(|(item, _)| item).collect()

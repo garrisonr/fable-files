@@ -4383,14 +4383,18 @@ pub async fn search(
     // User-metadata facets (label:, starred:) are NOT name text — they
     // execute against the catalog stores, either as a post-filter over
     // FTS rows or, when no name terms remain, as the candidate seed.
+    // Book facets (author:, series:, state: — Ebook P1) ride the same
+    // rails against the book stores.
     let (label_facets, starred_facet) = ufm_search::metadata_facets(&query);
-    let has_metadata = !label_facets.is_empty() || starred_facet.is_some();
+    let book_facets = ufm_search::book_facets(&query);
+    let has_metadata =
+        !label_facets.is_empty() || starred_facet.is_some() || !book_facets.is_empty();
     let fts_query = ufm_search::to_fts(&query);
     if fts_query.trim().is_empty() {
         if !has_metadata {
             return Ok(Vec::new());
         }
-        // Metadata-only query: seed from the label/star stores, apply
+        // Metadata-only query: seed from the label/star/book stores, apply
         // the remaining facets as filters, then the shared tail.
         let seeded = {
             let catalog = state.catalog.lock().unwrap();
@@ -4398,11 +4402,14 @@ pub async fn search(
                 catalog
                     .items_by_label(first)
                     .map_err(CommandError::from)?
-            } else {
+            } else if starred_facet.is_some() {
                 catalog.starred_items().map_err(CommandError::from)?
+            } else {
+                book_seed_items(&catalog, &book_facets).map_err(CommandError::from)?
             };
             items.retain(|item| {
                 metadata_match(&catalog, item, &label_facets, starred_facet)
+                    && book_match(&catalog, item, &book_facets)
             });
             if let Some(exts) = exts {
                 items.retain(|item| name_in_type(&item.name, exts));
@@ -4432,6 +4439,7 @@ pub async fn search(
         let catalog = state.catalog.lock().unwrap();
         rows.retain(|(item, _)| {
             metadata_match(&catalog, item, &label_facets, starred_facet)
+                && book_match(&catalog, item, &book_facets)
         });
     }
     finish_search(state, rows, scope, path_prefix.as_deref(), modified_after.as_deref(), modified_before.as_deref())
@@ -4465,6 +4473,76 @@ pub(crate) fn metadata_match(
         }
     }
     true
+}
+
+/// Does an item satisfy the extracted book facets (Ebook P1)?
+/// Author facets match ANY credited author (exact, case-insensitive —
+/// the catalog query's rule), series compares against the stored
+/// series name, state against the recorded reading state. All
+/// facets are ANDed. An item with no book metadata satisfies only an
+/// empty facet set.
+pub(crate) fn book_match(
+    catalog: &ufm_catalog::Catalog,
+    item: &Item,
+    facets: &ufm_search::BookFacets,
+) -> bool {
+    if facets.is_empty() {
+        return true;
+    }
+    let meta = catalog
+        .book_metadata_for(&item.id.to_string())
+        .ok()
+        .flatten();
+    for want in &facets.authors {
+        let ok = meta
+            .as_ref()
+            .map(|m| m.authors.iter().any(|a| a.eq_ignore_ascii_case(want)))
+            .unwrap_or(false);
+        if !ok {
+            return false;
+        }
+    }
+    for want in &facets.series {
+        let ok = meta
+            .as_ref()
+            .and_then(|m| m.series.as_ref())
+            .map(|s| s.eq_ignore_ascii_case(want))
+            .unwrap_or(false);
+        if !ok {
+            return false;
+        }
+    }
+    for want in &facets.states {
+        let ok = item
+            .provider_key
+            .as_deref()
+            .and_then(|pk| catalog.book_state_for(pk).ok().flatten())
+            .map(|(state, _, _)| state == *want)
+            .unwrap_or(false);
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Seed candidates for a metadata-only book-facet query: the first
+/// available facet's catalog set (author, else series, else state).
+/// The caller post-filters with [`book_match`] for the rest.
+pub(crate) fn book_seed_items(
+    catalog: &ufm_catalog::Catalog,
+    facets: &ufm_search::BookFacets,
+) -> ufm_core::Result<Vec<Item>> {
+    if let Some(first) = facets.authors.first() {
+        return catalog.items_by_book_author(first);
+    }
+    if let Some(first) = facets.series.first() {
+        return catalog.items_by_book_series(first);
+    }
+    if let Some(first) = facets.states.first() {
+        return catalog.items_by_book_state(first);
+    }
+    Ok(Vec::new())
 }
 
 /// Shared tail of `search`: apply the location scope, cache result paths
@@ -4659,6 +4737,7 @@ pub async fn start_indexing(
             ))));
         }
     };
+    let location_for_books = location;
     let location_rec = match location_for_index(&state, location, &root) {
         Ok(location_rec) => location_rec,
         Err(e) => {
@@ -4793,6 +4872,12 @@ pub async fn start_indexing(
                         .mark_network_indexed(&rec.uri, &chrono::Utc::now().to_rfc3339());
                 }
             }
+            drop(catalog);
+            // Ebook P1: books the walk just indexed get their library
+            // identity in the background (single-flight; fresh books
+            // are skipped by the freshness contract, so this costs a
+            // query on an unchanged library).
+            crate::books::identify_in_background(app.clone(), Some(location_for_books.to_string()));
         }
         let payload = state.index_state.lock().unwrap().clone();
         if let Err(e) = app.emit("index-progress", &payload) {

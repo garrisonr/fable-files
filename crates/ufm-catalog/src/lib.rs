@@ -584,6 +584,66 @@ impl Catalog {
                 );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Ebook P1 — "The Library" (2026-10-17): a book's identity and
+        // descriptive metadata, decoded from the file itself at
+        // identify time (EPUB OPF Dublin Core + series; PDF info
+        // dictionary). book_metadata is keyed by item_id like
+        // media_identities — the metadata is re-derivable from the
+        // file at any time, so it needs no path-survival of its own;
+        // the freshness snapshot (size_bytes + modified, the ES
+        // import contract) decides when a re-identify is owed.
+        // book_authors carries every credited author as an exact row
+        // (position 0 = primary) so Author shelves and the author:
+        // facet match exactly, never by LIKE over JSON. book_state is
+        // the reading state (want | reading | read), keyed by
+        // provider_key per the Phase-2 user-metadata pattern so it
+        // survives re-indexing; origin records whether the user set
+        // it or progress automation did.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS book_metadata (
+                    item_id TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+                    provider_key TEXT NOT NULL,
+                    format TEXT NOT NULL,
+                    title TEXT,
+                    series TEXT,
+                    series_index REAL,
+                    publisher TEXT,
+                    published_date TEXT,
+                    pub_year INTEGER,
+                    language TEXT,
+                    description TEXT,
+                    subjects_json TEXT NOT NULL DEFAULT '[]',
+                    isbn TEXT,
+                    identifier TEXT,
+                    spine_count INTEGER,
+                    page_count INTEGER,
+                    cover_path TEXT,
+                    source TEXT NOT NULL,
+                    size_bytes INTEGER,
+                    modified TEXT,
+                    identified_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_book_metadata_series
+                    ON book_metadata (series);
+                CREATE INDEX IF NOT EXISTS idx_book_metadata_provider_key
+                    ON book_metadata (provider_key);
+                CREATE TABLE IF NOT EXISTS book_authors (
+                    item_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    author TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    PRIMARY KEY (item_id, position)
+                );
+                CREATE INDEX IF NOT EXISTS idx_book_authors_author
+                    ON book_authors (author);
+                CREATE TABLE IF NOT EXISTS book_state (
+                    provider_key TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    origin TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
         // ROM Home (2026-10-15): per-game personal state — ratings,
         // favorites, completion, play history, and the user's own
         // overrides — keyed by path like path_stars so it survives
@@ -8359,6 +8419,597 @@ impl Catalog {
     }
 }
 
+// ------------------------------------------------------------------
+// Ebook P1 — "The Library" (2026-10-17): book identity, shelves,
+// reading states, facets. See the book_metadata schema comment in
+// migrate() for the storage doctrine.
+// ------------------------------------------------------------------
+
+/// One book's decoded metadata as stored in `book_metadata` +
+/// `book_authors`. `authors[0]` is the primary author (the first
+/// credited) — Author shelves group by it; the author: facet and
+/// `items_by_book_author` match ANY credited author exactly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BookMetadataRow {
+    pub item_id: String,
+    pub provider_key: String,
+    /// epub | pdf
+    pub format: String,
+    pub title: Option<String>,
+    pub authors: Vec<String>,
+    pub series: Option<String>,
+    pub series_index: Option<f64>,
+    pub publisher: Option<String>,
+    pub published_date: Option<String>,
+    pub pub_year: Option<i64>,
+    pub language: Option<String>,
+    pub description: Option<String>,
+    pub subjects: Vec<String>,
+    pub isbn: Option<String>,
+    pub identifier: Option<String>,
+    pub spine_count: Option<i64>,
+    pub page_count: Option<i64>,
+    pub cover_path: Option<String>,
+    /// opf | pdfinfo
+    pub source: String,
+    /// Freshness snapshot of the item at identify time (the ES
+    /// contract): a later size/mtime change makes the book a
+    /// re-identify candidate again.
+    pub size_bytes: Option<i64>,
+    pub modified: Option<String>,
+    pub identified_at: String,
+}
+
+/// One identified book as the shelves render it.
+#[derive(Debug, Clone)]
+pub struct BookShelfRow {
+    pub item: ufm_vfs::Item,
+    pub meta: BookMetadataRow,
+    /// want | reading | read, when a state is recorded.
+    pub state: Option<String>,
+}
+
+/// One series on the Series shelf: its books in reading order and
+/// the honest whole-number gaps in 1..=max(present).
+#[derive(Debug, Clone)]
+pub struct SeriesShelf {
+    pub series: String,
+    pub books: Vec<BookShelfRow>,
+    pub present: Vec<i64>,
+    pub missing: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BookCounts {
+    pub identified: u64,
+    pub unsorted: u64,
+    pub series: u64,
+    pub authors: u64,
+    pub want: u64,
+    pub reading: u64,
+    pub read: u64,
+}
+
+/// Whole-number series positions in 1..=max(present whole positions)
+/// that no book holds. Fractional indices (0.5 novellas) neither
+/// create nor fill a whole-number gap; a series holding only book 2
+/// honestly reports book 1 missing.
+pub fn series_missing_positions(present_indices: &[f64]) -> Vec<i64> {
+    let whole: Vec<i64> = present_indices
+        .iter()
+        .filter(|v| v.fract() == 0.0 && **v >= 1.0)
+        .map(|v| *v as i64)
+        .collect();
+    let Some(max) = whole.iter().max() else {
+        return Vec::new();
+    };
+    (1..=*max).filter(|n| !whole.contains(n)).collect()
+}
+
+impl Catalog {
+    /// Store one book's decoded metadata + authors + its
+    /// `media_identities` row (media_kind 'ebook' — the persisted
+    /// assignment of MediaKind::Ebook), in one transaction. The
+    /// identity's evidence JSON is built here from the row itself so
+    /// the two can never disagree.
+    pub fn upsert_book_metadata(&self, row: &BookMetadataRow) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO book_metadata
+             (item_id, provider_key, format, title, series, series_index,
+              publisher, published_date, pub_year, language, description,
+              subjects_json, isbn, identifier, spine_count, page_count,
+              cover_path, source, size_bytes, modified, identified_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            params![
+                row.item_id,
+                row.provider_key,
+                row.format,
+                row.title,
+                row.series,
+                row.series_index,
+                row.publisher,
+                row.published_date,
+                row.pub_year,
+                row.language,
+                row.description,
+                serde_json::to_string(&row.subjects).unwrap_or_else(|_| "[]".into()),
+                row.isbn,
+                row.identifier,
+                row.spine_count,
+                row.page_count,
+                row.cover_path,
+                row.source,
+                row.size_bytes,
+                row.modified,
+                row.identified_at,
+            ],
+        )
+        .map_err(|e| UfmError::Database(e.to_string()))?;
+        tx.execute(
+            "DELETE FROM book_authors WHERE item_id = ?1",
+            params![row.item_id],
+        )
+        .map_err(|e| UfmError::Database(e.to_string()))?;
+        for (pos, author) in row.authors.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO book_authors (item_id, author, position) VALUES (?1, ?2, ?3)",
+                params![row.item_id, author, pos as i64],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        }
+        let evidence = serde_json::json!({
+            "source": row.source,
+            "isbn": row.isbn,
+            "identifier": row.identifier,
+            "series": row.series,
+            "series_index": row.series_index,
+        })
+        .to_string();
+        tx.execute(
+            "INSERT OR REPLACE INTO media_identities
+             (item_id, media_kind, title, year, tmdb_id, platform, sha1,
+              match_evidence_json, season, episode, episode_end, confidence, confirmed)
+             VALUES (?1, 'ebook', ?2, ?3, NULL, ?4, NULL, ?5, NULL, NULL, NULL, NULL, 0)",
+            params![row.item_id, row.title, row.pub_year, row.format, evidence],
+        )
+        .map_err(|e| UfmError::Database(e.to_string()))?;
+        tx.commit().map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// One book's stored metadata by item id (authors re-read from
+    /// `book_authors` in credited order).
+    pub fn book_metadata_for(&self, item_id: &str) -> Result<Option<BookMetadataRow>> {
+        let mut rows = self.book_shelf_rows_inner(Some(item_id))?;
+        let first = rows.drain(..).next();
+        Ok(first.map(|r| r.meta))
+    }
+
+    /// Run an item-columns query with an optional single parameter.
+    fn query_items(&self, sql: &str, param: Option<&str>) -> Result<Vec<ufm_vfs::Item>> {
+        let mut stmt = self
+            .conn
+            .prepare(sql)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        };
+        let raw = match param {
+            Some(p) => stmt.query_map(params![p], map_row),
+            None => stmt.query_map([], map_row),
+        }
+        .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut items = Vec::new();
+        for row in raw {
+            let (id, loc, name, kind_s, size, modified, pk) =
+                row.map_err(|e| UfmError::Database(e.to_string()))?;
+            items.push(self.hydrate_item(&id, &loc, name, &kind_s, size, modified, pk)?);
+        }
+        Ok(items)
+    }
+
+    /// Book files (EPUB/PDF by name) that still owe an identify:
+    /// no metadata row, or the file's size/mtime moved since the
+    /// stored snapshot. Optionally scoped to one location (the
+    /// post-index hook identifies only what the walk just touched).
+    pub fn book_candidates(&self, location_id: Option<&str>) -> Result<Vec<ufm_vfs::Item>> {
+        let base = "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes, i.modified, i.provider_key
+             FROM items i LEFT JOIN book_metadata bm ON bm.item_id = i.id
+             WHERE i.provider_key IS NOT NULL
+               AND (lower(i.name) LIKE '%.epub' OR lower(i.name) LIKE '%.pdf')
+               AND (bm.item_id IS NULL
+                    OR bm.size_bytes IS NOT i.size_bytes
+                    OR bm.modified IS NOT i.modified)";
+        match location_id {
+            Some(loc) => self.query_items(&format!("{base} AND i.location_id = ?1 ORDER BY i.name"), Some(loc)),
+            None => self.query_items(&format!("{base} ORDER BY i.name"), None),
+        }
+    }
+
+    /// Book files with NO metadata row at all — the Unsorted pile.
+    /// (A book whose file yielded nothing still gets a row —
+    /// source 'filename' — so unsorted always means "not yet
+    /// identified", never "identified but thin".)
+    pub fn book_unsorted_items(&self) -> Result<Vec<ufm_vfs::Item>> {
+        self.query_items(
+            "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes, i.modified, i.provider_key
+             FROM items i LEFT JOIN book_metadata bm ON bm.item_id = i.id
+             WHERE bm.item_id IS NULL AND i.provider_key IS NOT NULL
+               AND (lower(i.name) LIKE '%.epub' OR lower(i.name) LIKE '%.pdf')
+             ORDER BY i.name",
+            None,
+        )
+    }
+
+    fn book_shelf_rows_inner(&self, only_item: Option<&str>) -> Result<Vec<BookShelfRow>> {
+        let sql = "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes, i.modified, i.provider_key,
+                    bm.format, bm.title, bm.series, bm.series_index, bm.publisher,
+                    bm.published_date, bm.pub_year, bm.language, bm.description,
+                    bm.subjects_json, bm.isbn, bm.identifier, bm.spine_count,
+                    bm.page_count, bm.cover_path, bm.source, bm.identified_at, bs.state
+             FROM items i
+             JOIN book_metadata bm ON bm.item_id = i.id
+             LEFT JOIN book_state bs ON bs.provider_key = i.provider_key";
+        let sql = match only_item {
+            Some(_) => format!("{sql} WHERE i.id = ?1"),
+            None => format!("{sql} ORDER BY lower(COALESCE(bm.title, i.name)), i.name"),
+        };
+        // Authors for every shelved book, in one pass.
+        let mut author_map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT item_id, author FROM book_authors ORDER BY item_id, position")
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for row in rows {
+                let (item_id, author) = row.map_err(|e| UfmError::Database(e.to_string()))?;
+                author_map.entry(item_id).or_default().push(author);
+            }
+        }
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<f64>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, Option<i64>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, String>(16)?,
+                row.get::<_, Option<String>>(17)?,
+                row.get::<_, Option<String>>(18)?,
+                row.get::<_, Option<i64>>(19)?,
+                row.get::<_, Option<i64>>(20)?,
+                row.get::<_, Option<String>>(21)?,
+                row.get::<_, String>(22)?,
+                row.get::<_, String>(23)?,
+                row.get::<_, Option<String>>(24)?,
+            ))
+        };
+        let raw = match only_item {
+            Some(id) => stmt.query_map(params![id], map_row),
+            None => stmt.query_map([], map_row),
+        }
+        .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in raw {
+            let (
+                id,
+                loc,
+                name,
+                kind_s,
+                size,
+                modified,
+                pk,
+                format,
+                title,
+                series,
+                series_index,
+                publisher,
+                published_date,
+                pub_year,
+                language,
+                description,
+                subjects_json,
+                isbn,
+                identifier,
+                spine_count,
+                page_count,
+                cover_path,
+                source,
+                identified_at,
+                state,
+            ) = row.map_err(|e| UfmError::Database(e.to_string()))?;
+            let item = self.hydrate_item(&id, &loc, name, &kind_s, size, modified.clone(), pk.clone())?;
+            let meta = BookMetadataRow {
+                item_id: id.clone(),
+                provider_key: pk.unwrap_or_default(),
+                format,
+                title,
+                authors: author_map.get(&id).cloned().unwrap_or_default(),
+                series,
+                series_index,
+                publisher,
+                published_date,
+                pub_year,
+                language,
+                description,
+                subjects: serde_json::from_str(&subjects_json).unwrap_or_default(),
+                isbn,
+                identifier,
+                spine_count,
+                page_count,
+                cover_path,
+                source,
+                size_bytes: size,
+                modified,
+                identified_at,
+            };
+            out.push(BookShelfRow { item, meta, state });
+        }
+        Ok(out)
+    }
+
+    /// Every identified book, title-ordered — the All Books shelf.
+    pub fn books_all(&self) -> Result<Vec<BookShelfRow>> {
+        self.book_shelf_rows_inner(None)
+    }
+
+    /// Series shelves: books grouped by series name, in reading
+    /// order (series index, unnumbered last, then title), with the
+    /// honest gap list computed over whole-number positions.
+    pub fn books_series_shelves(&self) -> Result<Vec<SeriesShelf>> {
+        let rows = self.book_shelf_rows_inner(None)?;
+        let mut by_series: std::collections::BTreeMap<String, Vec<BookShelfRow>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            if let Some(series) = &row.meta.series {
+                by_series.entry(series.clone()).or_default().push(row);
+            }
+        }
+        let mut shelves: Vec<SeriesShelf> = by_series
+            .into_iter()
+            .map(|(series, mut books)| {
+                books.sort_by(|a, b| {
+                    let ai = a.meta.series_index;
+                    let bi = b.meta.series_index;
+                    ai.is_none()
+                        .cmp(&bi.is_none())
+                        .then(ai.partial_cmp(&bi).unwrap_or(std::cmp::Ordering::Equal))
+                        .then(
+                            a.meta
+                                .title
+                                .clone()
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .cmp(&b.meta.title.clone().unwrap_or_default().to_lowercase()),
+                        )
+                });
+                let indices: Vec<f64> = books.iter().filter_map(|b| b.meta.series_index).collect();
+                let present: Vec<i64> = {
+                    let mut whole: Vec<i64> = indices
+                        .iter()
+                        .filter(|v| v.fract() == 0.0 && **v >= 1.0)
+                        .map(|v| *v as i64)
+                        .collect();
+                    whole.sort_unstable();
+                    whole.dedup();
+                    whole
+                };
+                SeriesShelf {
+                    series,
+                    missing: series_missing_positions(&indices),
+                    present,
+                    books,
+                }
+            })
+            .collect();
+        shelves.sort_by(|a, b| a.series.to_lowercase().cmp(&b.series.to_lowercase()));
+        Ok(shelves)
+    }
+
+    /// Author shelves: (primary author, their books) — books sorted
+    /// by series then title so an author's series reads in order.
+    pub fn books_author_shelves(&self) -> Result<Vec<(String, Vec<BookShelfRow>)>> {
+        let rows = self.book_shelf_rows_inner(None)?;
+        let mut by_author: std::collections::BTreeMap<String, Vec<BookShelfRow>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            if let Some(primary) = row.meta.authors.first() {
+                by_author.entry(primary.clone()).or_default().push(row);
+            }
+        }
+        let mut shelves: Vec<(String, Vec<BookShelfRow>)> = by_author.into_iter().collect();
+        for (_, books) in &mut shelves {
+            books.sort_by(|a, b| {
+                a.meta
+                    .series
+                    .clone()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .cmp(&b.meta.series.clone().unwrap_or_default().to_lowercase())
+                    .then(
+                        a.meta
+                            .series_index
+                            .partial_cmp(&b.meta.series_index)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
+                    .then(
+                        a.meta
+                            .title
+                            .clone()
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .cmp(&b.meta.title.clone().unwrap_or_default().to_lowercase()),
+                    )
+            });
+        }
+        shelves.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        Ok(shelves)
+    }
+
+    pub fn books_counts(&self) -> Result<BookCounts> {
+        let count = |sql: &str| -> Result<u64> {
+            self.conn
+                .query_row(sql, [], |r| r.get::<_, i64>(0))
+                .map(|c| c as u64)
+                .map_err(|e| UfmError::Database(e.to_string()))
+        };
+        let state_count = |state: &str| -> Result<u64> {
+            self.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM book_state WHERE state = ?1",
+                    params![state],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|c| c as u64)
+                .map_err(|e| UfmError::Database(e.to_string()))
+        };
+        Ok(BookCounts {
+            identified: count("SELECT COUNT(*) FROM book_metadata")?,
+            unsorted: count(
+                "SELECT COUNT(*) FROM items i LEFT JOIN book_metadata bm ON bm.item_id = i.id
+                 WHERE bm.item_id IS NULL AND i.provider_key IS NOT NULL
+                   AND (lower(i.name) LIKE '%.epub' OR lower(i.name) LIKE '%.pdf')",
+            )?,
+            series: count("SELECT COUNT(DISTINCT series) FROM book_metadata WHERE series IS NOT NULL")?,
+            authors: count("SELECT COUNT(DISTINCT author) FROM book_authors")?,
+            want: state_count("want")?,
+            reading: state_count("reading")?,
+            read: state_count("read")?,
+        })
+    }
+
+    // -- Reading states ---------------------------------------------
+
+    /// (state, origin, updated_at) for one book path.
+    pub fn book_state_for(&self, provider_key: &str) -> Result<Option<(String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT state, origin, updated_at FROM book_state WHERE provider_key = ?1")
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![provider_key], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r.map_err(|e| UfmError::Database(e.to_string()))?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_book_state(
+        &self,
+        provider_key: &str,
+        state: &str,
+        origin: &str,
+        updated_at: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO book_state (provider_key, state, origin, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![provider_key, state, origin, updated_at],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn delete_book_state(&self, provider_key: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM book_state WHERE provider_key = ?1",
+                params![provider_key],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Progress automation (the reader just saved a position at
+    /// `now`): the book is being read. Rules, in order: a recorded
+    /// 'read' is never auto-demoted; an auto row just refreshes; a
+    /// USER row older than this reading session yields to 'reading'
+    /// (the user's word stands until they actually read again —
+    /// then the truth is they're reading it).
+    pub fn touch_book_reading(&self, provider_key: &str, now: &str) -> Result<()> {
+        match self.book_state_for(provider_key)? {
+            None => self.set_book_state(provider_key, "reading", "auto", now),
+            Some((state, _, _)) if state == "read" => Ok(()),
+            Some((_, origin, updated)) if origin == "user" && updated.as_str() >= now => Ok(()),
+            Some(_) => self.set_book_state(provider_key, "reading", "auto", now),
+        }
+    }
+
+    // -- Facet lookups (search language: author: / series: / state:)
+
+    pub fn items_by_book_author(&self, author: &str) -> Result<Vec<ufm_vfs::Item>> {
+        self.items_by_query(
+            "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes, i.modified, i.provider_key
+             FROM items i JOIN book_authors ba ON ba.item_id = i.id
+             WHERE ba.author = ?1 COLLATE NOCASE
+             ORDER BY i.name",
+            author,
+        )
+    }
+
+    pub fn items_by_book_series(&self, series: &str) -> Result<Vec<ufm_vfs::Item>> {
+        self.items_by_query(
+            "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes, i.modified, i.provider_key
+             FROM items i JOIN book_metadata bm ON bm.item_id = i.id
+             WHERE bm.series = ?1 COLLATE NOCASE
+             ORDER BY bm.series_index IS NULL, bm.series_index, i.name",
+            series,
+        )
+    }
+
+    pub fn items_by_book_state(&self, state: &str) -> Result<Vec<ufm_vfs::Item>> {
+        self.items_by_query(
+            "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes, i.modified, i.provider_key
+             FROM items i JOIN book_state bs ON bs.provider_key = i.provider_key
+             WHERE bs.state = ?1
+             ORDER BY i.name",
+            state,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -12024,5 +12675,183 @@ mod rom_home_tests {
         if std::env::var("SHELF_SCALE_DIR").is_err() {
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    // -- Ebook P1 — The Library --------------------------------------
+
+    fn book_meta(item: &Item, title: &str) -> BookMetadataRow {
+        BookMetadataRow {
+            item_id: item.id.to_string(),
+            provider_key: item.provider_key.clone().unwrap(),
+            format: "epub".into(),
+            title: Some(title.into()),
+            authors: vec!["Søren Åberg".into()],
+            series: None,
+            series_index: None,
+            publisher: Some("Fixture House".into()),
+            published_date: Some("2011-08-23".into()),
+            pub_year: Some(2011),
+            language: Some("en".into()),
+            description: Some("A tale.".into()),
+            subjects: vec!["Fiction".into()],
+            isbn: Some("9780134685991".into()),
+            identifier: Some("urn:fixture:1".into()),
+            spine_count: Some(12),
+            page_count: None,
+            cover_path: None,
+            source: "opf".into(),
+            size_bytes: item.size_bytes.map(|s| s as i64),
+            modified: item.modified.map(|m| m.to_rfc3339()),
+            identified_at: "2026-10-17T09:00:00+00:00".into(),
+        }
+    }
+
+    fn seed_book(cat: &Catalog, loc: LocationId, name: &str) -> Item {
+        let item = named_item(loc, name, ItemKind::File);
+        cat.insert_item(&item).unwrap();
+        item
+    }
+
+    #[test]
+    fn book_metadata_roundtrip_writes_ebook_identity() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let item = seed_book(&cat, loc, "Cafe Creme.epub");
+        let mut meta = book_meta(&item, "Café & Crème");
+        meta.authors = vec!["Søren Åberg".into(), "Second Author".into()];
+        meta.series = Some("The Alloy Wars".into());
+        meta.series_index = Some(3.0);
+        cat.upsert_book_metadata(&meta).unwrap();
+
+        let back = cat.book_metadata_for(&item.id.to_string()).unwrap().unwrap();
+        assert_eq!(back, meta, "metadata must round-trip exactly");
+        // The identity row: MediaKind::Ebook's persisted assignment.
+        let ident = cat.media_identity_for(&item.id).unwrap().unwrap();
+        assert_eq!(ident.media_kind, "ebook");
+        assert_eq!(ident.title.as_deref(), Some("Café & Crème"));
+        assert_eq!(ident.year, Some(2011));
+        assert_eq!(ident.platform.as_deref(), Some("epub"));
+        assert!(ident.evidence_json.contains("9780134685991"), "{}", ident.evidence_json);
+        // Fresh snapshot → no longer a candidate.
+        assert!(cat.book_candidates(None).unwrap().is_empty());
+        assert!(cat.book_unsorted_items().unwrap().is_empty());
+    }
+
+    #[test]
+    fn book_candidates_extension_and_freshness_rules() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let epub = seed_book(&cat, loc, "A.epub");
+        let _pdf = seed_book(&cat, loc, "B.PDF");
+        let _txt = seed_book(&cat, loc, "C.txt");
+        let cands = cat.book_candidates(None).unwrap();
+        let names: Vec<&str> = cands.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["A.epub", "B.PDF"], "book extensions only, case-insensitive");
+        // Location scoping: another location sees none of them.
+        assert!(cat.book_candidates(Some("no-such-location")).unwrap().is_empty());
+        assert_eq!(cat.book_candidates(Some(&loc.to_string())).unwrap().len(), 2);
+        // Stale snapshot (size moved) → candidate again.
+        let mut meta = book_meta(&epub, "A");
+        meta.size_bytes = Some(999_999);
+        cat.upsert_book_metadata(&meta).unwrap();
+        let cands = cat.book_candidates(None).unwrap();
+        assert_eq!(cands.len(), 2, "stale epub + untouched pdf");
+        assert!(cands.iter().any(|i| i.name == "A.epub"));
+    }
+
+    #[test]
+    fn book_series_shelf_orders_and_reports_gaps() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        for (name, idx) in [("Wars Three.epub", Some(3.0)), ("Wars One.epub", Some(1.0)), ("Wars Novella.epub", Some(0.5)), ("Wars Unnumbered.epub", None)] {
+            let item = seed_book(&cat, loc, name);
+            let mut meta = book_meta(&item, name);
+            meta.series = Some("The Alloy Wars".into());
+            meta.series_index = idx;
+            cat.upsert_book_metadata(&meta).unwrap();
+        }
+        let shelves = cat.books_series_shelves().unwrap();
+        assert_eq!(shelves.len(), 1);
+        let shelf = &shelves[0];
+        assert_eq!(shelf.present, vec![1, 3]);
+        assert_eq!(shelf.missing, vec![2], "the 0.5 novella neither fills nor creates a gap");
+        let order: Vec<Option<f64>> = shelf.books.iter().map(|b| b.meta.series_index).collect();
+        assert_eq!(order, vec![Some(0.5), Some(1.0), Some(3.0), None], "reading order, unnumbered last");
+    }
+
+    #[test]
+    fn series_missing_positions_math() {
+        assert_eq!(series_missing_positions(&[]), Vec::<i64>::new());
+        assert_eq!(series_missing_positions(&[1.0, 2.0, 3.0]), Vec::<i64>::new());
+        assert_eq!(series_missing_positions(&[2.0]), vec![1]);
+        assert_eq!(series_missing_positions(&[1.0, 3.0]), vec![2]);
+        assert_eq!(series_missing_positions(&[0.5]), Vec::<i64>::new());
+        assert_eq!(series_missing_positions(&[1.0, 1.0, 4.0]), vec![2, 3]);
+    }
+
+    #[test]
+    fn book_author_facets_match_any_credited_author() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let item = seed_book(&cat, loc, "Duo.epub");
+        let mut meta = book_meta(&item, "Duo");
+        meta.authors = vec!["First Writer".into(), "Second Author".into()];
+        meta.series = Some("Duo Saga".into());
+        cat.upsert_book_metadata(&meta).unwrap();
+        assert_eq!(cat.items_by_book_author("second author").unwrap().len(), 1, "any author, case-insensitive");
+        assert_eq!(cat.items_by_book_author("First Writer").unwrap().len(), 1);
+        assert!(cat.items_by_book_author("Nobody").unwrap().is_empty());
+        assert_eq!(cat.items_by_book_series("duo saga").unwrap().len(), 1);
+        let shelves = cat.books_author_shelves().unwrap();
+        assert_eq!(shelves.len(), 1);
+        assert_eq!(shelves[0].0, "First Writer", "author shelf groups by primary author");
+    }
+
+    #[test]
+    fn book_state_touch_rules_respect_the_users_word() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let pk = "/fake/States.epub";
+        // No state → progress touch creates auto 'reading'.
+        cat.touch_book_reading(pk, "2026-10-17T10:00:00+00:00").unwrap();
+        assert_eq!(cat.book_state_for(pk).unwrap().unwrap().0, "reading");
+        // User marks Want AFTER (newer timestamp) → a stale progress
+        // save (older now) must not override the user's word.
+        cat.set_book_state(pk, "want", "user", "2026-10-17T11:00:00+00:00").unwrap();
+        cat.touch_book_reading(pk, "2026-10-17T10:30:00+00:00").unwrap();
+        assert_eq!(cat.book_state_for(pk).unwrap().unwrap().0, "want");
+        // But reading again (newer than the mark) tells the truth.
+        cat.touch_book_reading(pk, "2026-10-17T12:00:00+00:00").unwrap();
+        assert_eq!(cat.book_state_for(pk).unwrap().unwrap().0, "reading");
+        // 'read' is never auto-demoted.
+        cat.set_book_state(pk, "read", "user", "2026-10-17T13:00:00+00:00").unwrap();
+        cat.touch_book_reading(pk, "2026-10-17T14:00:00+00:00").unwrap();
+        assert_eq!(cat.book_state_for(pk).unwrap().unwrap().0, "read");
+        // State facet + counts read the same truth.
+        assert_eq!(cat.items_by_book_state("read").unwrap().len(), 0, "no item row exists for this path — facet joins items");
+        let counts = cat.books_counts().unwrap();
+        assert_eq!(counts.read, 1);
+    }
+
+    #[test]
+    fn book_counts_separate_identified_from_unsorted() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let known = seed_book(&cat, loc, "Known.epub");
+        let _unknown = seed_book(&cat, loc, "Unknown.epub");
+        let _movie = seed_book(&cat, loc, "Film.mkv");
+        cat.upsert_book_metadata(&book_meta(&known, "Known")).unwrap();
+        let counts = cat.books_counts().unwrap();
+        assert_eq!(counts.identified, 1);
+        assert_eq!(counts.unsorted, 1);
+        assert_eq!(counts.authors, 1);
+        assert_eq!(counts.series, 0);
+        let all = cat.books_all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].meta.title.as_deref(), Some("Known"));
     }
 }

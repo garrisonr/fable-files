@@ -776,6 +776,17 @@ export const api = {
    * catalog by path. No root = every registered location root. */
   esImport: (root?: string) =>
     invoke<EsImportReport>("es_import", { root: root ?? null }),
+  /** Ebook P1 — "The Library": identify books (single-flight;
+   * a second call while one runs reports alreadyRunning). */
+  booksIdentify: (locationId?: string) =>
+    invoke<BooksIdentifyReport>("books_identify", {
+      locationId: locationId ?? null,
+    }),
+  /** The whole Books Home room in one payload. */
+  booksHome: () => invoke<BooksHomePayload>("books_home"),
+  /** Set a book's reading state (want | reading | read); null clears. */
+  booksSetState: (path: string, bookState: string | null) =>
+    invoke<void>("books_set_state", { path, bookState }),
   /** PC Games P1: Playnite import (preview = parse + plan, no
    * writes; the import itself is idempotent) and the folder-scan
    * fallback for loose PC game folders. */
@@ -2163,6 +2174,78 @@ export interface PcScanReport {
   coveredByPlaynite: number;
   noExeFound: number;
   errors: string[];
+}
+
+/** One shelved book (Ebook P1). Mirrors src-tauri/src/books.rs. */
+export interface BookCard {
+  itemId: string;
+  path: string;
+  name: string;
+  title: string;
+  authors: string[];
+  authorLine: string;
+  series: string | null;
+  seriesIndex: number | null;
+  year: number | null;
+  format: string;
+  coverPath: string | null;
+  state: string | null;
+  publisher: string | null;
+  language: string | null;
+  subjects: string[];
+  description: string | null;
+}
+
+export interface BookContinueRow {
+  card: BookCard;
+  chapter: number | null;
+  page: number | null;
+  total: number | null;
+  fraction: number | null;
+  updated: string;
+  finishCandidate: boolean;
+}
+
+export interface BookSeriesShelf {
+  series: string;
+  books: BookCard[];
+  present: number[];
+  missing: number[];
+  gapLabel: string | null;
+}
+
+export interface BookAuthorShelf {
+  author: string;
+  books: BookCard[];
+}
+
+export interface BooksHomePayload {
+  counts: {
+    identified: number;
+    unsorted: number;
+    series: number;
+    authors: number;
+    want: number;
+    reading: number;
+    read: number;
+  };
+  continueReading: BookContinueRow[];
+  recentlyAdded: BookCard[];
+  series: BookSeriesShelf[];
+  authors: BookAuthorShelf[];
+  all: BookCard[];
+  unsorted: Array<{ path: string; name: string }>;
+  unsortedTotal: number;
+}
+
+export interface BooksIdentifyReport {
+  alreadyRunning: boolean;
+  total: number;
+  identified: number;
+  withSeries: number;
+  withCover: number;
+  failed: number;
+  failures: Array<[string, string]>;
 }
 
 /** ROM Home tallies (the sidebar door + the rail health line). */

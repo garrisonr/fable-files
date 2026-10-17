@@ -25,6 +25,7 @@ pub mod emu_esde;
 pub mod emu_farm;
 pub mod emu_prep;
 pub mod esimport;
+pub mod books;
 pub mod pcgames;
 pub mod plugins;
 pub mod reader;
@@ -662,6 +663,9 @@ pub fn run() {
             emu_esde::emu_esde_install,
             emu_esde::emu_esde_open,
             esimport::es_import,
+            books::books_identify,
+            books::books_home,
+            books::books_set_state,
             pcgames::pc_import_preview,
             pcgames::pc_import_playnite,
             pcgames::pc_scan_folder,
