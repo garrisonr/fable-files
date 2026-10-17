@@ -569,7 +569,7 @@ const SPLASH_MARK_SVG = `
 function splashScene(): SceneDef {
   return {
     id: "splash",
-    dwellMs: 6500,
+    dwellMs: 9000,
     interactive: false,
     build: () => {
       const s = el("section", "w-scene w-splash");
@@ -590,17 +590,147 @@ function splashScene(): SceneDef {
   };
 }
 
+interface AccountStep {
+  /** Fallback name for the step chrome — a rendered provider
+   * block's own heading wins when it has one. */
+  name: string;
+  mount: (host: HTMLElement) => void;
+}
+
+/** One login at a time (Dickles, 2026-10-17: "This part needs to
+ * show each login one at a time with a skip button to go to the
+ * next."). The account scenes STEP through their providers instead
+ * of stacking them in one tall card — the stack overflowed the
+ * card and clipped the second provider's copy mid-sentence.
+ *
+ * The sections are the very components Preferences → Metadata
+ * Accounts mounts; the stepper only decides which provider block
+ * is on stage. A block is a section's rendered provider element
+ * (.rm-source / .mr-tmdb); a section that renders no such block
+ * steps as one whole unit. A MutationObserver re-collects blocks
+ * as sections load and re-render (save/forget rebuilds them), so
+ * the stepper never forks the shared surface. */
+class AccountStepper {
+  private units: HTMLElement[] = [];
+  private names: string[] = [];
+  private idx = 0;
+  private observer: MutationObserver | null = null;
+  private queued = false;
+  private disposed = false;
+
+  constructor(
+    private stepsEl: HTMLElement,
+    private nameEl: HTMLElement,
+    private countEl: HTMLElement,
+    private pipsEl: HTMLElement,
+  ) {}
+
+  start(): void {
+    this.collect();
+    this.observer = new MutationObserver(() => this.schedule());
+    this.observer.observe(this.stepsEl, { childList: true, subtree: true });
+  }
+
+  private schedule(): void {
+    if (this.queued || this.disposed) return;
+    this.queued = true;
+    requestAnimationFrame(() => {
+      this.queued = false;
+      if (!this.disposed) this.collect();
+    });
+  }
+
+  private collect(): void {
+    const prev = this.units[this.idx];
+    // Retire the previous unit set completely: while a section is
+    // still loading, its unit is the whole mount; once rendered,
+    // the unit becomes the provider block inside it. Without this
+    // cleanup the stale mount keeps its w-unit-off and takes the
+    // freshly collected block down with it (the invisible-second-
+    // card bug, caught in the 2026-10-17 AFTER captures).
+    for (const u of this.units) u.classList.remove("w-unit-off", "w-unit-in");
+    const units: HTMLElement[] = [];
+    const names: string[] = [];
+    for (const m of [...this.stepsEl.children] as HTMLElement[]) {
+      const blocks = m.querySelectorAll<HTMLElement>(".rm-source, .mr-tmdb");
+      if (blocks.length > 0) {
+        blocks.forEach((b) => {
+          units.push(b);
+          names.push(stepNameOf(b) ?? m.dataset.stepName ?? "Account");
+        });
+      } else {
+        units.push(m);
+        names.push(m.dataset.stepName ?? "Account");
+      }
+    }
+    this.units = units;
+    this.names = names;
+    const keep = prev ? units.indexOf(prev) : -1;
+    this.idx =
+      keep >= 0 ? keep : Math.min(this.idx, Math.max(0, units.length - 1));
+    this.apply(false);
+  }
+
+  /** Advance to the next card. False when the current card was
+   * the last — the scene is complete. */
+  next(): boolean {
+    if (this.idx + 1 >= this.units.length) return false;
+    this.idx += 1;
+    this.apply(true);
+    return true;
+  }
+
+  private apply(animate: boolean): void {
+    this.units.forEach((u, i) => {
+      const on = i === this.idx;
+      u.classList.toggle("w-unit-off", !on);
+      if (on && animate) {
+        u.classList.remove("w-unit-in");
+        void u.offsetWidth; // restart the entrance on the new card
+        u.classList.add("w-unit-in");
+      }
+    });
+    this.nameEl.textContent = this.names[this.idx] ?? "";
+    this.countEl.textContent =
+      this.units.length > 1 ? `${this.idx + 1} of ${this.units.length}` : "";
+    this.pipsEl.innerHTML = "";
+    if (this.units.length > 1) {
+      this.units.forEach((_, i) => {
+        const pip = document.createElement("span");
+        pip.className = "w-pip" + (i === this.idx ? " on" : "");
+        this.pipsEl.appendChild(pip);
+      });
+    }
+    // A new card starts at its top, never mid-scroll.
+    this.stepsEl.scrollTop = 0;
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.observer?.disconnect();
+    this.observer = null;
+  }
+}
+
+function stepNameOf(block: HTMLElement): string | null {
+  const h = block.querySelector(".rm-source-name, .mc-h, h4, h5");
+  const t = h?.textContent?.trim();
+  if (!t) return null;
+  // "OpenSubtitles (subtitles)" steps under its plain name.
+  return t.split(" (")[0];
+}
+
 function accountsScene(
   meta: SceneMeta,
   eyebrow: string,
   title: string,
   intro: string,
   note: string,
-  mount: (host: HTMLElement) => void,
+  steps: AccountStep[],
 ): SceneDef {
   return {
     ...meta,
-    build: () => {
+    build: (tour) => {
       const s = el("section", "w-scene w-accounts-scene");
       const inner = el("div", "w-inner w-accounts-inner");
       inner.appendChild(el("p", "w-eyebrow w-line", eyebrow));
@@ -610,12 +740,37 @@ function accountsScene(
       inner.appendChild(p);
       const card = el("div", "w-card w-line");
       card.dataset.holdZone = "1";
-      const host = el("div", "w-accounts-host");
-      card.appendChild(host);
+      const stepsEl = el("div", "w-steps");
+      for (const step of steps) {
+        const host = el("div", "w-stepmount");
+        host.dataset.stepName = step.name;
+        stepsEl.appendChild(host);
+        step.mount(host);
+      }
+      card.appendChild(stepsEl);
+      const chrome = el("div", "w-stepper");
+      const nameEl = el("span", "w-step-name");
+      const countEl = el("span", "w-step-count");
+      const pipsEl = el("span", "w-pips");
+      const skip = el("button", "w-btn w-step-skip", "Skip ▸");
+      skip.title = "Skip this login — go to the next one.";
+      chrome.append(nameEl, countEl, pipsEl, skip);
+      card.appendChild(chrome);
       inner.appendChild(card);
       inner.appendChild(el("p", "w-note w-line", note));
       s.appendChild(inner);
-      mount(host);
+      const stepper = new AccountStepper(stepsEl, nameEl, countEl, pipsEl);
+      skip.addEventListener("click", () => {
+        if (!stepper.next()) {
+          // The last card is skipped: the scene's work is done —
+          // tell the tour (it advances like Continue does).
+          card.dispatchEvent(
+            new CustomEvent("w-steps-done", { bubbles: true }),
+          );
+        }
+      });
+      tour.registerStepper(stepper);
+      stepper.start();
       return s;
     },
   };
@@ -628,7 +783,7 @@ function buildScenes(): SceneDef[] {
   return [
     splashScene(),
     textScene(
-      { id: "philosophy", dwellMs: 11000, interactive: false },
+      { id: "philosophy", dwellMs: 19000, interactive: false },
       "THE IDEA",
       "Your files, understood.",
       [
@@ -637,7 +792,7 @@ function buildScenes(): SceneDef[] {
       ],
     ),
     textScene(
-      { id: "hog", dwellMs: 12000, interactive: false },
+      { id: "hog", dwellMs: 19400, interactive: false },
       "FULL DISCLOSURE",
       "Yes, it's a hog. Here's the receipt.",
       [
@@ -646,7 +801,7 @@ function buildScenes(): SceneDef[] {
       ],
     ),
     textScene(
-      { id: "files", dwellMs: 9000, interactive: false },
+      { id: "files", dwellMs: 11400, interactive: false },
       "THE ROOMS · 1 OF 4",
       "First, it's a file manager.",
       [
@@ -655,17 +810,17 @@ function buildScenes(): SceneDef[] {
       "folder",
     ),
     textScene(
-      { id: "roms", dwellMs: 10000, interactive: false },
+      { id: "roms", dwellMs: 23400, interactive: false },
       "THE ROOMS · 2 OF 4",
-      "ROM Home.",
+      "Games Home.",
       [
-        "Your cartridges, identified by their fingerprints and shelved by system — every dump of a game folded into one card, bad dumps badged and never in charge. Press Play, and the right emulator is already dressed.",
-        "Fable fetches emulators on request; it never bundles them. And it never, ever fetches a BIOS. Those are yours to bring.",
+        "Your cartridges, identified by their fingerprints and shelved by system — every dump of a game folded into one card, bad dumps badged and never in charge. Your PC games live on the same shelves, imported from Playnite with their art and sizes intact.",
+        "Press Play, and Fable dresses the right runner: the right emulator for a cartridge, Proton or Wine for a PC game — and when a game is Windows-only, it says so to your face. Fable fetches emulators on request; it never bundles them. And it never, ever fetches a BIOS. Those are yours to bring.",
       ],
       "roms",
     ),
     textScene(
-      { id: "music", dwellMs: 9000, interactive: false },
+      { id: "music", dwellMs: 9400, interactive: false },
       "THE ROOMS · 3 OF 4",
       "The music room.",
       [
@@ -674,7 +829,7 @@ function buildScenes(): SceneDef[] {
       "music",
     ),
     textScene(
-      { id: "smart", dwellMs: 9000, interactive: false },
+      { id: "smart", dwellMs: 10200, interactive: false },
       "THE ROOMS · 4 OF 4",
       "Shelves that keep themselves.",
       [
@@ -683,7 +838,7 @@ function buildScenes(): SceneDef[] {
       "books",
     ),
     textScene(
-      { id: "accounts-intro", dwellMs: 8000, interactive: false },
+      { id: "accounts-intro", dwellMs: 16200, interactive: false },
       "INTRODUCTIONS",
       "A few friends worth knowing.",
       [
@@ -692,34 +847,49 @@ function buildScenes(): SceneDef[] {
       ],
     ),
     accountsScene(
-      { id: "accounts-movies", dwellMs: 16000, interactive: true },
+      { id: "accounts-movies", dwellMs: 20000, interactive: true },
       "INTRODUCTIONS · MOVIES & TV",
       "For the movies.",
       "TMDB is how a file named like a license plate becomes *Border (2018)*. OpenSubtitles brings the words when the words are missing.",
       ACCOUNT_NOTE,
-      (host) => {
-        void new TmdbAccountSection().mount(host).catch(() => undefined);
-        void new OpenSubtitlesAccountSection()
-          .mount(host)
-          .catch(() => undefined);
-      },
+      [
+        {
+          name: "TMDB",
+          mount: (host) => {
+            void new TmdbAccountSection().mount(host).catch(() => undefined);
+          },
+        },
+        {
+          name: "OpenSubtitles",
+          mount: (host) => {
+            void new OpenSubtitlesAccountSection()
+              .mount(host)
+              .catch(() => undefined);
+          },
+        },
+      ],
     ),
     accountsScene(
-      { id: "accounts-games", dwellMs: 16000, interactive: true },
+      { id: "accounts-games", dwellMs: 20000, interactive: true },
       "INTRODUCTIONS · GAMES",
       "For the games.",
       "ScreenScraper and EmuMovies keep the box art, the manuals, and the trailers. TheGamesDB and SteamGridDB fill the gaps. Connect what you have — the rest can wait for a rainy day.",
       ACCOUNT_NOTE,
-      (host) => {
-        void new GameAccountsSection().mount(host).catch(() => undefined);
-      },
+      [
+        {
+          name: "Game accounts",
+          mount: (host) => {
+            void new GameAccountsSection().mount(host).catch(() => undefined);
+          },
+        },
+      ],
     ),
     textScene(
-      { id: "finale", dwellMs: 7000, interactive: false },
+      { id: "finale", dwellMs: 9400, interactive: false },
       "THAT'S THE HOUSE",
       "Welcome home.",
       [
-        "This welcome never nags: it's gone unless you ask for it. It's waiting in the About box, if you ever want the tour again.",
+        "This welcome never nags: it's gone unless you ask for it. If you ever want the tour again, it's waiting in the menu, the About box, and Preferences.",
         "Now — your library.",
       ],
     ),
@@ -761,6 +931,7 @@ export class WelcomeTour {
   private continueBtn: HTMLButtonElement | null = null;
   private soundBtn: HTMLButtonElement | null = null;
   private score: WelcomeScore;
+  private steppers: AccountStepper[] = [];
   private idx = -1;
   private tickHandle: unknown = null;
   private elapsedBase = 0;
@@ -797,6 +968,12 @@ export class WelcomeTour {
 
   get finished(): boolean {
     return this.done;
+  }
+
+  /** Account scenes register their stepper here so the tour can
+   * dispose its observers when the show ends. */
+  registerStepper(stepper: AccountStepper): void {
+    this.steppers.push(stepper);
   }
 
   get currentScene(): number {
@@ -859,6 +1036,13 @@ export class WelcomeTour {
 
     document.body.appendChild(overlay);
     this.el = overlay;
+    overlay.addEventListener("w-steps-done", () => {
+      // The last account card was skipped: the scene is complete,
+      // so the show moves on — same contract as Continue.
+      if (this.done || !this.scenes[this.idx]?.interactive) return;
+      this.holdDefeated = true;
+      this.advance();
+    });
     overlay.addEventListener("pointerdown", this.gestureHandler);
     window.addEventListener("keydown", this.keyHandler, true);
     overlay.focus();
@@ -890,7 +1074,7 @@ export class WelcomeTour {
       this.stage.appendChild(s);
       // Lines settle in one by one when the scene takes the stage.
       s.querySelectorAll<HTMLElement>(".w-line").forEach((n, li) => {
-        n.style.animationDelay = `${li * 110}ms`;
+        n.style.animationDelay = `${li * 130}ms`;
       });
       if (this.scenes[i].interactive) this.wireHold(s);
     }
@@ -1028,19 +1212,56 @@ export class WelcomeTour {
     }
     window.removeEventListener("keydown", this.keyHandler, true);
     this.score.stop();
+    for (const s of this.steppers) s.dispose();
+    this.steppers = [];
     const overlay = this.el;
     if (activeTour === this) activeTour = null;
     if (overlay) {
       overlay.classList.add("bye");
-      overlay.style.transitionDuration =
-        reason === "finished"
-          ? this.reduced
-            ? "120ms"
-            : "1200ms"
-          : "180ms";
-      const fadeMs =
-        reason === "finished" ? (this.reduced ? 120 : 1200) : 200;
-      this.clock.setTimeout(() => overlay.remove(), fadeMs + 40);
+      let fadeMs: number;
+      if (reason === "finished" && !this.reduced) {
+        // Natural end (Dickles, 2026-10-17): "the last message to
+        // fade out and into your files" — the finale's lines bow
+        // out first, one by one, then the room itself dissolves
+        // into the live file view underneath. Only the natural
+        // end earns this; Esc/Skip stay snappy below.
+        overlay.classList.add("finale-bye");
+        const scene = this.sceneEls.get(this.idx);
+        scene
+          ?.querySelectorAll<HTMLElement>(".w-line")
+          .forEach((n, li) => {
+            // Retire the entrance animation first — its fill
+            // would hold opacity at 1 and fight the bow-out.
+            n.style.animation = "none";
+            n.style.transition =
+              "opacity 500ms ease, transform 500ms ease";
+            n.style.transitionDelay = `${li * 70}ms`;
+            n.style.opacity = "0";
+            n.style.transform = "translateY(-6px)";
+          });
+        overlay.style.transitionDuration = "1500ms";
+        overlay.style.transitionDelay = "400ms";
+        fadeMs = 400 + 1500;
+      } else if (reason === "finished") {
+        // Reduced motion: a plain opacity dissolve, nothing moves.
+        overlay.style.transitionDuration = "600ms";
+        fadeMs = 600;
+      } else {
+        overlay.style.transitionDuration = "180ms";
+        fadeMs = 200;
+      }
+      const kill = (): void => overlay.remove();
+      // Removal is cosmetic from here (.bye already released the
+      // pointer) — the timeout is the guarantee, transitionend
+      // just lets a healthy webview finish on the fade's own beat.
+      overlay.addEventListener(
+        "transitionend",
+        (e) => {
+          if (e.target === overlay && e.propertyName === "opacity") kill();
+        },
+        { once: true },
+      );
+      this.clock.setTimeout(kill, fadeMs + 60);
     }
     this.onDone?.(reason);
   }

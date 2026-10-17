@@ -42,7 +42,7 @@ export type PrefsPage =
 const PREFS_PAGES: Array<{ id: PrefsPage; label: string }> = [
   { id: "appearance", label: "Appearance" },
   { id: "library", label: "Library & Indexing" },
-  { id: "roms", label: "ROMs & Emulation" },
+  { id: "roms", label: "ROMs (Games) & Emulation" },
   { id: "accounts", label: "Metadata Accounts" },
   { id: "media", label: "Movies, TV & Music" },
   { id: "advanced", label: "Advanced" },
@@ -228,7 +228,7 @@ export class PreferencesDialog {
     );
     page.appendChild(
       this.toggleRow(
-        "ROMs section expanded",
+        "Games section expanded",
         null,
         !hooks.sectionCollapsed("ff-roms-collapsed"),
         (on) => hooks.setSectionCollapsed("ff-roms-collapsed", !on),
@@ -238,7 +238,7 @@ export class PreferencesDialog {
     // ROM icon set chooser (Dickles, 2026-10-15): three complete sets —
     // 3D art, photorealistic, flat outline. Applies to the sidebar the
     // moment it's picked; the choice persists across launches.
-    page.appendChild(this.section("ROM icons"));
+    page.appendChild(this.section("Game icons"));
     const iconSetNote = document.createElement("p");
     iconSetNote.className = "prefs-note";
     iconSetNote.textContent =
@@ -302,7 +302,7 @@ export class PreferencesDialog {
   private buildRoms(page: HTMLElement, hooks: PreferencesHooks): void {
     page.appendChild(
       this.toggleRow(
-        "ROM Collections",
+        "Games Collection",
         "Game systems in the sidebar, identified against the No-Intro / Redump / MAME lists.",
         hooks.romsOn(),
         (on) => hooks.setRomsOn(on),
@@ -311,7 +311,7 @@ export class PreferencesDialog {
     const scopeNote = document.createElement("p");
     scopeNote.className = "prefs-note";
     scopeNote.textContent =
-      "ROM collection scope — which drives a system draws from — is set per system in the Roms system editor (sidebar ▸ Roms).";
+      "Games collection scope — which drives a system draws from — is set per system in the Games system editor (sidebar ▸ Games).";
     page.appendChild(scopeNote);
 
     // Game Media (ROM media enrichment): mounted from its own

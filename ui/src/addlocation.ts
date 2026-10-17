@@ -314,7 +314,7 @@ export class AddLocationGate {
       renderStats();
     });
     const romText = el("span", "gate-row-text");
-    romText.appendChild(el("span", "gate-row-name", "This is a ROM drive — index games only"));
+    romText.appendChild(el("span", "gate-row-name", "This is a ROM (Games) drive — index games only"));
     romText.appendChild(
       el(
         "span",

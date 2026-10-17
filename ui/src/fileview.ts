@@ -248,7 +248,7 @@ export async function showItemMenu(
     );
     if (hits.length > 0)
       items.push({
-        label: "Open in ROM Home",
+        label: "Open in Games Home",
         action: () => hooks.onOpenInRomHome!(item),
       });
   }
@@ -907,7 +907,7 @@ export class FileView {
     text.textContent = `\uD83C\uDFAE This folder is mostly ${system} games.`;
     const open = document.createElement("button");
     open.className = "pill-btn rom-banner-open";
-    open.textContent = "Open in ROM Home";
+    open.textContent = "Open in Games Home";
     open.addEventListener("click", () =>
       this.hooks.onOpenRomFolder!(system),
     );

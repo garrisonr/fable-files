@@ -527,7 +527,7 @@ export class EmuSection {
         el(
           "p",
           "prefs-note",
-          "No game systems in the library yet — when ROMs are identified, their emulators appear here.",
+          "No game systems in the library yet — when games are identified, their emulators appear here.",
         ),
       );
     }
@@ -609,14 +609,14 @@ export class EmuSection {
     // slate for a big new drive. The confirmation in resetCard()
     // states exactly what clears and what survives BEFORE he
     // commits — no surprises.
-    const rh = el("h3", "prefs-section", "ROM collection");
+    const rh = el("h3", "prefs-section", "Games collection");
     rh.style.marginTop = "1.4rem";
     this.body.appendChild(rh);
     this.body.appendChild(
       el(
         "p",
         "prefs-note",
-        "Identification is what turns files into the shelves in ROM Home. Start it over when you want a clean slate — a fresh drive, a reorganized library, a identification pass you don't trust.",
+        "Identification is what turns files into the shelves in Games Home. Start it over when you want a clean slate — a fresh drive, a reorganized library, an identification pass you don't trust.",
       ),
     );
     this.body.appendChild(this.resetCard());
@@ -758,13 +758,13 @@ export class EmuSection {
           el(
             "p",
             "emu-view-state",
-            "Reset removes every ROM identification and all fetched ROM media links from the catalog. ROM Home's shelves empty until you run Identify ROMs again.",
+            "Reset removes every game identification and all fetched game media links from the catalog. Games Home's shelves empty until you run Identify Games again.",
           ),
         );
         const btn = el(
           "button",
           "emu-btn",
-          "Reset ROM collection…",
+          "Reset Games collection…",
         ) as HTMLButtonElement;
         btn.addEventListener("click", () => paint("confirm"));
         const actions = el("div", "emu-view-actions");
@@ -782,7 +782,7 @@ export class EmuSection {
           el(
             "p",
             "emu-view-state",
-            "Reset the ROM collection now?",
+            "Reset the Games collection now?",
           ),
         );
         const yes = el(
@@ -804,7 +804,7 @@ export class EmuSection {
               );
               paint(
                 "done",
-                "The shelves are empty. Open ROM Home and run Identify ROMs to rebuild — your ratings, favorites, and history will re-attach as games are recognized.",
+                "The shelves are empty. Open Games Home and run Identify Games to rebuild — your ratings, favorites, and history will re-attach as games are recognized.",
               );
             } catch (err) {
               Toast.error(`Reset didn't happen: ${errText(err)}`);

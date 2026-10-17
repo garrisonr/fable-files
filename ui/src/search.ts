@@ -1029,13 +1029,13 @@ export class SearchView {
       this.restoreScroll(key);
       return;
     }
-    this.renderStatus(`Identifying ROMs for “${name}”…`);
+    this.renderStatus(`Identifying games for “${name}”…`);
     if (!this.romProgressWired) {
       this.romProgressWired = true;
       void onRomIdentifyProgress((p) => {
         if (this.active && this.lastRom) {
           this.renderStatus(
-            `Identifying ROMs… ${p.done.toLocaleString()} of ${p.total.toLocaleString()} checked · ${p.matched.toLocaleString()} identified`,
+            `Identifying games… ${p.done.toLocaleString()} of ${p.total.toLocaleString()} checked · ${p.matched.toLocaleString()} identified`,
           );
         }
       }).catch(() => undefined);
@@ -1068,7 +1068,7 @@ export class SearchView {
         const note = document.createElement("p");
         note.className = "search-hint";
         note.textContent =
-          "No verified ROMs yet. Membership comes from the No-Intro / Redump / MAME lists — a file joins only when its contents match a known game exactly.";
+          "No verified games yet. Membership comes from the No-Intro / Redump / MAME lists — a file joins only when its contents match a known game exactly.";
         help.appendChild(note);
         const pointer = document.createElement("p");
         pointer.className = "search-hint";

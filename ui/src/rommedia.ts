@@ -811,7 +811,7 @@ function renderReport(
       el(
         "p",
         "prefs-note",
-        "No identified games yet. Media follows identification: once ROMs are verified against the lists, their art can be fetched.",
+        "No identified games yet. Media follows identification: once games are verified against the lists, their art can be fetched.",
       ),
     );
     return;

@@ -4636,11 +4636,45 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 @keyframes w-line-in {
   from {
     opacity: 0;
-    transform: translateY(6px);
+    transform: translateY(10px);
   }
 }
 .w-scene.on .w-line {
-  animation: w-line-in 800ms ease both;
+  animation: w-line-in 900ms ease both;
+}
+/* Livelier, still calm (Dickles, 2026-10-17): the incoming
+   scene's content settles the last percent of scale as it
+   arrives, the scene glyph breathes in, and each progress dot
+   pulses once when it lights. Nothing loops; nothing bounces. */
+.w-scene .w-inner {
+  transform: scale(1.012);
+  transition: transform 1100ms ease;
+}
+.w-scene.on .w-inner {
+  transform: none;
+}
+@keyframes w-glyph-in {
+  from {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+}
+.w-scene.on .w-glyph {
+  animation: w-glyph-in 900ms ease both;
+}
+@keyframes w-dot-in {
+  0% {
+    transform: scale(1);
+  }
+  40% {
+    transform: scale(1.6);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+.w-dot.lit {
+  animation: w-dot-in 500ms ease;
 }
 /* --- Splash: the shelf mark, the pause, the wordmark --- */
 .w-splash-inner {
@@ -4713,19 +4747,98 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 .w-accounts-inner {
   max-width: 880px;
   width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
 }
+/* The card is a column: the steps region scrolls (only as a
+   safety net), the stepper chrome stays pinned below it. One
+   provider block is on stage at a time — the old stacked layout
+   squeezed every provider into 44vh and clipped the second
+   one's copy mid-sentence (Dickles, 2026-10-17). */
 .w-card {
   background: var(--ufm-surface);
   border: 1px solid var(--ufm-border);
   border-radius: var(--ufm-radius-md);
   padding: 18px 20px;
-  max-height: 44vh;
-  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   text-align: left;
   pointer-events: none;
 }
 .w-scene.on .w-card {
   pointer-events: auto;
+}
+.w-steps {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+/* Tour-frame embed hygiene: the sections keep their Preferences
+   stacking chrome (dividers, boxes) in Preferences; inside the
+   tour the card IS the box, so the stack chrome comes off. */
+.w-card .mr-tmdb {
+  margin-top: 0;
+  border-top: 0;
+  padding-top: 0;
+}
+.w-card .rm-body {
+  margin-bottom: 0;
+}
+.w-card .rm-source {
+  border: 0;
+  background: none;
+  padding: 0;
+  margin: 0;
+}
+.w-unit-off {
+  display: none !important;
+}
+@keyframes w-unit-in {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+}
+.w-unit-in {
+  animation: w-unit-in 450ms ease both;
+}
+/* --- Stepper chrome: who's on stage, how far along, Skip --- */
+.w-stepper {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--ufm-border);
+}
+.w-step-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+.w-step-count {
+  font-size: 13px;
+  color: var(--ufm-text-muted);
+}
+.w-pips {
+  display: flex;
+  gap: 6px;
+}
+.w-pip {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--ufm-text) 22%, transparent);
+}
+.w-pip.on {
+  background: var(--ufm-text-muted);
+}
+.w-step-skip {
+  margin-left: auto;
 }
 /* --- Chrome: dots, hold chip, exits --- */
 .w-bottom {
@@ -4795,8 +4908,15 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 .welcome-overlay.reduced .w-wordmark,
 .welcome-overlay.reduced .w-sub,
 .welcome-overlay.reduced .w-esc-hint,
-.welcome-overlay.reduced .w-scene.on .w-line {
+.welcome-overlay.reduced .w-scene.on .w-line,
+.welcome-overlay.reduced .w-scene.on .w-glyph,
+.welcome-overlay.reduced .w-unit-in,
+.welcome-overlay.reduced .w-dot.lit {
   animation: none;
+}
+.welcome-overlay.reduced .w-scene .w-inner {
+  transform: none;
+  transition: none;
 }
 /* TV: the show reads across a room. */
 body[data-layout="tv"] .w-title {
@@ -4813,9 +4933,6 @@ body[data-layout="tv"] .w-glyph svg {
   .w-bottom {
     flex-wrap: wrap;
     padding: 12px 16px 18px;
-  }
-  .w-card {
-    max-height: 38vh;
   }
   .w-scene {
     padding: 4vh 5vw 2vh;

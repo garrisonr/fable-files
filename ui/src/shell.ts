@@ -4766,12 +4766,12 @@ export class Shell {
         ],
       },
       {
-        label: romsEnabled() ? "Roms Collection \u2713" : "Roms Collection",
+        label: romsEnabled() ? "Games Collection \u2713" : "Games Collection",
         action: () => {
           const on = !romsEnabled();
           setRomsEnabled(on);
           void this.buildSidebar();
-          Toast.success(on ? "Roms Collection is on." : "Roms Collection is off. Your systems are kept.");
+          Toast.success(on ? "Games Collection is on." : "Games Collection is off. Your systems are kept.");
         },
       },
       { label: "Terminal", shortcut: formatBinding(bindingById("app.terminal")!, isMacPlatform()), action: () => void this.toggleTerminal() },
@@ -4921,7 +4921,7 @@ export class Shell {
       if (badge && badge.updates > 0) {
         pill.hidden = false;
         pill.textContent = `${badge.updates} update${badge.updates === 1 ? "" : "s"}`;
-        pill.title = "Emulator updates are waiting — Preferences → ROMs";
+        pill.title = "Emulator updates are waiting — Preferences → ROMs (Games)";
         pill.classList.add("has-updates");
       } else if (badge && badge.prepping) {
         pill.hidden = false;
@@ -4935,8 +4935,8 @@ export class Shell {
     if (this.romsHead) {
       this.romsHead.title =
         counts.total > 0
-          ? `ROM Home — ${counts.total.toLocaleString()} games${counts.missingMedia > 0 ? `, ${counts.missingMedia.toLocaleString()} missing media` : ""} (right-click to add a system)`
-          : "ROM Home — right-click to add a system";
+          ? `Games Home — ${counts.total.toLocaleString()} games${counts.missingMedia > 0 ? `, ${counts.missingMedia.toLocaleString()} missing media` : ""} (right-click to add a system)`
+          : "Games Home — right-click to add a system";
     }
   }
 
@@ -4946,9 +4946,9 @@ export class Shell {
    * the gate threshold detours through the folder-pick sheet
    * before anything is registered or indexed. */
   private async addRomFolder(): Promise<void> {
-    const path = await this.picker.pick("Add a ROM folder…", [], null);
+    const path = await this.picker.pick("Add a game folder…", [], null);
     if (!path) return;
-    const name = path.split("/").filter(Boolean).pop() ?? "ROMs";
+    const name = path.split("/").filter(Boolean).pop() ?? "Games";
     try {
       await this.addGate.add(name, path, { romDoor: true });
     } catch (err) {
@@ -5036,7 +5036,7 @@ export class Shell {
           <p class="smart-hint">A system gathers files with those extensions from your indexed locations. Shared extensions (iso, bin, zip) can appear under several systems.</p>
         </div>
         <p class="smart-hint rom-dat-note" hidden>This system is governed by the ROM lists (No-Intro / Redump / MAME): a file appears only when its contents match a known game exactly — extensions don't decide, so there is nothing to edit here.</p>
-        <label class="smart-lab">Look for ROMs on
+        <label class="smart-lab">Look for games (ROMs) on
           <select class="smart-in rom-scope">
             <option value="all">All drives</option>
             <option value="boot">Boot drive only</option>

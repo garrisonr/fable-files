@@ -68,7 +68,7 @@ export interface RomHomeHooks {
   onOpenWith(item: Item): void;
   /** "See in File Auditor". */
   onOpenAuditor(): void;
-  /** "Add a ROM folder…" — the shell's add-location flow. */
+  /** "Add a game folder…" — the shell's add-location flow. */
   onAddRomFolder(): void;
   /** Right-click on a rail system: the shell's Manage/Delete menu
    * (the retired tree's doors, preserved in the room). */
@@ -1858,7 +1858,7 @@ export class RomHome {
     const run = el(
       "button",
       "pill-btn primary rh-needsid-run",
-      "Identify ROMs",
+      "Identify Games",
     ) as HTMLButtonElement;
     run.addEventListener("click", () => {
       run.disabled = true;
@@ -1974,7 +1974,7 @@ export class RomHome {
         });
         p.append(link, document.createTextNode("."));
         note.appendChild(p);
-        const btn = el("button", "pill-btn rh-empty-action", "Add a ROM folder…") as HTMLButtonElement;
+        const btn = el("button", "pill-btn rh-empty-action", "Add a game folder…") as HTMLButtonElement;
         btn.addEventListener("click", () => this.hooks.onAddRomFolder());
         note.appendChild(btn);
         break;
@@ -1988,7 +1988,7 @@ export class RomHome {
       default:
         add("🎮", "No games yet", "This room is your collection's home — shelves of art, your ratings and history, every system's library in one calm place. Add a folder of games and Fable will identify them against the DAT sets — then the shelves fill themselves.");
         if (this.counts.total === 0) {
-          const btn = el("button", "pill-btn rh-empty-action", "Add a ROM folder…") as HTMLButtonElement;
+          const btn = el("button", "pill-btn rh-empty-action", "Add a game folder…") as HTMLButtonElement;
           btn.addEventListener("click", () => this.hooks.onAddRomFolder());
           note.appendChild(btn);
         }
@@ -3455,7 +3455,7 @@ export class RomHome {
         action: () => this.scanPcFolderMenu(anchor),
       },
       {
-        label: "Add a ROM folder…",
+        label: "Add a game folder…",
         action: () => this.hooks.onAddRomFolder(),
       },
       {

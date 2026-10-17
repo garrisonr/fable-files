@@ -61,7 +61,7 @@ export const SHORTCUT_GROUPS: Array<{ id: GroupId; title: string }> = [
   { id: "navigation", title: "Navigation & Quick Look" },
   { id: "tabs", title: "Tabs & Windows" },
   { id: "search", title: "Search" },
-  { id: "romhome", title: "ROM Home" },
+  { id: "romhome", title: "Games Home" },
   { id: "players", title: "Music & Video" },
   { id: "reading", title: "Reading & Viewing" },
   { id: "app", title: "App" },
@@ -86,7 +86,7 @@ export const SHORTCUTS: ShortcutBinding[] = [
   { id: "files.selectAll", label: "Select everything in the view", group: "files", surfaces: ["File list"], chords: [P("a")], dispatch: "shell" },
   { id: "files.makeExecutable", label: "Make the selected file executable", group: "files", surfaces: ["File list"], chords: [P("e")], dispatch: "shell" },
   { id: "files.print", label: "Print the selected item", group: "files", surfaces: ["File list"], chords: [P("p")], dispatch: "shell" },
-  { id: "files.search", label: "Search this library", group: "files", surfaces: ["File list"], chords: [P("f")], dispatch: "shell", note: "Inside ROM Home, this finds a game instead." },
+  { id: "files.search", label: "Search this library", group: "files", surfaces: ["File list"], chords: [P("f")], dispatch: "shell", note: "Inside Games Home, this finds a game instead." },
 
   // ------------------------------------------- Navigation & Quick Look
   { id: "nav.arrows", label: "Move the selection", group: "navigation", surfaces: ["File list"], chords: [N("ArrowUp"), N("ArrowDown"), N("ArrowLeft"), N("ArrowRight")], dispatch: "surface", display: { mac: "↑ ↓ ← →", other: "↑ ↓ ← →" } },
@@ -115,13 +115,13 @@ export const SHORTCUTS: ShortcutBinding[] = [
   { id: "search.trash", label: "Trash the selected results", group: "search", surfaces: ["Search results"], chords: [N("Delete"), N("Backspace")], dispatch: "surface", note: "Runs through the same Trash action as the file list.", display: { mac: "⌫", other: "Del · Backspace" } },
 
   // ------------------------------------------------------------ ROM Home
-  { id: "rom.move", label: "Move around the shelf", group: "romhome", surfaces: ["ROM Home"], chords: [N("ArrowUp"), N("ArrowDown"), N("ArrowLeft"), N("ArrowRight")], dispatch: "surface", display: { mac: "↑ ↓ ← →", other: "↑ ↓ ← →" } },
-  { id: "rom.extend", label: "Add to the selection", group: "romhome", surfaces: ["ROM Home"], chords: [{ mod: "none", shift: true, key: "ArrowUp" }], dispatch: "surface", display: { mac: "Shift + Arrows", other: "Shift + Arrows" } },
-  { id: "rom.firstLast", label: "First / last game", group: "romhome", surfaces: ["ROM Home"], chords: [N("Home"), N("End")], dispatch: "surface" },
-  { id: "rom.play", label: "Play the selected game", group: "romhome", surfaces: ["ROM Home"], chords: [N("Enter")], dispatch: "surface" },
-  { id: "rom.preview", label: "Quick Look the selected game", group: "romhome", surfaces: ["ROM Home"], chords: [N("Space")], dispatch: "surface" },
-  { id: "rom.find", label: "Find a game", group: "romhome", surfaces: ["ROM Home"], chords: [N("/"), P("f")], dispatch: "surface" },
-  { id: "rom.exit", label: "Clear selection · leave the room", group: "romhome", surfaces: ["ROM Home"], chords: [N("Escape")], dispatch: "surface" },
+  { id: "rom.move", label: "Move around the shelf", group: "romhome", surfaces: ["Games Home"], chords: [N("ArrowUp"), N("ArrowDown"), N("ArrowLeft"), N("ArrowRight")], dispatch: "surface", display: { mac: "↑ ↓ ← →", other: "↑ ↓ ← →" } },
+  { id: "rom.extend", label: "Add to the selection", group: "romhome", surfaces: ["Games Home"], chords: [{ mod: "none", shift: true, key: "ArrowUp" }], dispatch: "surface", display: { mac: "Shift + Arrows", other: "Shift + Arrows" } },
+  { id: "rom.firstLast", label: "First / last game", group: "romhome", surfaces: ["Games Home"], chords: [N("Home"), N("End")], dispatch: "surface" },
+  { id: "rom.play", label: "Play the selected game", group: "romhome", surfaces: ["Games Home"], chords: [N("Enter")], dispatch: "surface" },
+  { id: "rom.preview", label: "Quick Look the selected game", group: "romhome", surfaces: ["Games Home"], chords: [N("Space")], dispatch: "surface" },
+  { id: "rom.find", label: "Find a game", group: "romhome", surfaces: ["Games Home"], chords: [N("/"), P("f")], dispatch: "surface" },
+  { id: "rom.exit", label: "Clear selection · leave the room", group: "romhome", surfaces: ["Games Home"], chords: [N("Escape")], dispatch: "surface" },
 
   // ------------------------------------------------------ Music & Video
   { id: "music.play", label: "Play / pause", group: "players", surfaces: ["Music player"], chords: [N("Space")], dispatch: "surface" },
