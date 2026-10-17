@@ -74,6 +74,9 @@ export interface PreferencesHooks {
   sectionCollapsed(key: string): boolean;
   setSectionCollapsed(key: string, collapsed: boolean): void;
   showShortcuts(): void;
+  /** Replay the first-run welcome (it plays by itself; the seen
+   * flag is untouched — replay is a visit, not a reset). */
+  replayWelcome(): void;
 }
 
 export class PreferencesDialog {
@@ -267,6 +270,18 @@ export class PreferencesDialog {
       b.setAttribute("aria-pressed", b.dataset.set === hooks.romIconSet() ? "true" : "false");
     }
     page.appendChild(picker);
+
+    page.appendChild(this.section("Welcome"));
+    const welcomeNote = document.createElement("p");
+    welcomeNote.className = "prefs-note";
+    welcomeNote.textContent =
+      "The first-run welcome — the philosophy, the honest weight, the rooms, the introductions. It plays by itself and never nags; besides the About box, this is the only door back to it.";
+    page.appendChild(welcomeNote);
+    const replay = document.createElement("button");
+    replay.className = "pill-btn";
+    replay.textContent = "Show the welcome again";
+    replay.addEventListener("click", () => hooks.replayWelcome());
+    page.appendChild(replay);
   }
 
   // ---------------------------------------------------------------

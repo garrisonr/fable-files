@@ -11,6 +11,7 @@ import { errText } from "./toast";
  * manager. No hard-coded colors anywhere in this tree.
  */
 import { Shell } from "./shell";
+import { maybeShowFirstRunWelcome } from "./welcome";
 import { VideoPlayer } from "./video";
 import { api, mediaSrc } from "./api";
 import { emit } from "@tauri-apps/api/event";
@@ -38,6 +39,10 @@ async function boot(): Promise<void> {
 
   const shell = new Shell();
   document.getElementById("app-root")!.appendChild(shell.el);
+  // The first-run welcome (2026-10-16): a self-playing presentation
+  // over the booting shell. Not awaited — the shell boots underneath
+  // it, and the tour's own gate decides whether it stays.
+  maybeShowFirstRunWelcome();
   try {
     await shell.boot();
   } catch (e) {

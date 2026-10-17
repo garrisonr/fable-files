@@ -19,6 +19,7 @@ import { FileView, dragState, showItemMenu, romSystemNameForKey, type FileViewHo
 import { ColumnsView } from "./columns";
 import { GalleryView } from "./gallery";
 import { AboutDialog } from "./about";
+import { playWelcomeTour } from "./welcome";
 import { CommandPalette, type PaletteCommand } from "./palette";
 import { IndexTracker } from "./indexing";
 import { reducedMotion, animateFromLive, liveOpacity } from "./motion";
@@ -814,7 +815,7 @@ export class Shell {
       if (prefs && typeof prefs === "object") {
         this.uiPrefs = prefs;
         let migrated = false;
-        for (const key of ["ff-labels-collapsed", "ff-roms-collapsed"]) {
+        for (const key of ["ff-labels-collapsed", "ff-roms-collapsed", "ff-welcome-seen", "ff-welcome-muted"]) {
           if (typeof this.uiPrefs[key] !== "boolean") {
             try {
               const ls = localStorage.getItem(key);
@@ -4540,6 +4541,7 @@ export class Shell {
         this.applyCollapsePrefs();
       },
       showShortcuts: () => this.showShortcuts(),
+      replayWelcome: () => playWelcomeTour(),
     }, page);
   }
 
@@ -4787,6 +4789,7 @@ export class Shell {
           },
         ],
       },
+      { label: "Welcome Tour", action: () => playWelcomeTour() },
       { label: "About Fable Files", action: () => this.aboutDialog.open() },
       { label: "Restore Defaults\u2026", danger: true, action: () => void this.restoreDefaults() },
     ]);

@@ -4,6 +4,7 @@
  * doors (they open the project's GitHub issue tracker).
  */
 import { api } from "./api";
+import { playWelcomeTour } from "./welcome";
 
 const ISSUES = "https://github.com/garrisonr/fable-files/issues/new";
 
@@ -64,11 +65,18 @@ export class AboutDialog {
         `${ISSUES}?title=${encodeURIComponent("[Feature] ")}&body=${encodeURIComponent("What I want:\n\nWhy it would help:\n")}&labels=enhancement`
       );
     });
+    const tour = document.createElement("button");
+    tour.className = "about-btn";
+    tour.textContent = "Welcome Tour";
+    tour.addEventListener("click", () => {
+      this.close();
+      playWelcomeTour();
+    });
     const closeBtn = document.createElement("button");
     closeBtn.className = "about-btn about-close";
     closeBtn.textContent = "Close";
     closeBtn.addEventListener("click", () => this.close());
-    actions.append(bug, feat, closeBtn);
+    actions.append(bug, feat, tour, closeBtn);
 
     dialog.append(bear, title, tagline, version, credit, emuCredit, actions);
     overlay.appendChild(dialog);
