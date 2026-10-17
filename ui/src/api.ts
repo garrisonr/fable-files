@@ -776,6 +776,23 @@ export const api = {
    * catalog by path. No root = every registered location root. */
   esImport: (root?: string) =>
     invoke<EsImportReport>("es_import", { root: root ?? null }),
+  /** PC Games P1: Playnite import (preview = parse + plan, no
+   * writes; the import itself is idempotent) and the folder-scan
+   * fallback for loose PC game folders. */
+  pcImportPreview: (root?: string) =>
+    invoke<PcImportPreview>("pc_import_preview", { root: root ?? null }),
+  pcImportPlaynite: (root?: string) =>
+    invoke<PcImportReport>("pc_import_playnite", { root: root ?? null }),
+  pcScanFolder: (root: string) =>
+    invoke<PcScanReport>("pc_scan_folder", { root }),
+  pcGameSheet: (providerKey: string) =>
+    invoke<PcGameSheet | null>("pc_game_sheet", { providerKey }),
+  pcSetLaunchBadge: (providerKey: string, badge: string, note?: string) =>
+    invoke<boolean>("pc_set_launch_badge", {
+      providerKey,
+      badge,
+      note: note ?? null,
+    }),
   romCollectionItems: (system: string, scope: RomScope) =>
     invoke<RomHit[]>("rom_collection_items", { system, scope }),
   // ROM identification Phase 2: identities are the banner's and the
@@ -2031,6 +2048,121 @@ export interface RomHomeGame {
   volumeLabel: string | null;
   volumeOffline: boolean;
   volumeLastSeen: string | null;
+  /** PC Games P1: present on pc-game rows only. */
+  pc?: PcGameCard | null;
+}
+
+/** PC Games P1: the card facts for one PC game (library it came
+ * from, storefronts, verified-install state, launch badge). */
+export interface PcGameCard {
+  sourceKind: string;
+  libraryName: string;
+  storefronts: string[];
+  /** "present" = verified on a mounted volume; "recorded" = the
+   * record exists but the install could not be verified here. */
+  installState: string;
+  /** not-checked | boots | boots-with-notes | wont-boot |
+   * windows-only — moves only on an observed launch or a
+   * manual mark (the ladder itself is Phase 2). */
+  launchBadge: string;
+  installSize: number | null;
+  version: string | null;
+  exeName: string | null;
+  mislabelNote: string | null;
+}
+
+export interface PcLink {
+  name: string;
+  url: string;
+}
+
+export interface PcInstallRow {
+  providerKey: string;
+  title: string;
+  libraryName: string;
+  sourceKind: string;
+  present: boolean;
+  launchBadge: string;
+  exeName: string | null;
+  installSize: number | null;
+}
+
+/** The game sheet's PC sections (PC Games P1). */
+export interface PcGameSheet {
+  providerKey: string;
+  title: string;
+  year: number | null;
+  sourceKind: string;
+  libraryName: string;
+  playniteId: string | null;
+  gameGuid: string | null;
+  description: string | null;
+  genres: string[];
+  developers: string[];
+  publishers: string[];
+  series: string[];
+  features: string[];
+  ageRatings: string[];
+  links: PcLink[];
+  storefronts: string[];
+  criticScore: number | null;
+  communityScore: number | null;
+  installSize: number | null;
+  version: string | null;
+  exeName: string | null;
+  exeRel: string | null;
+  releaseRaw: string | null;
+  mislabelNote: string | null;
+  importedAt: string;
+  present: boolean;
+  launchBadge: string;
+  launchNote: string | null;
+  checkedAt: string | null;
+  installs: PcInstallRow[];
+}
+
+export interface PcImportReport {
+  alreadyRunning: boolean;
+  libraryPath: string;
+  root: string;
+  recordsSeen: number;
+  imported: number;
+  refreshed: number;
+  upgraded: number;
+  recordedNotPresent: number;
+  duplicatesMerged: number;
+  artAdopted: number;
+  artMissing: number;
+  orphanMediaFolders: number;
+  mislabelNotes: number;
+  skippedPrecedence: number;
+  errors: string[];
+}
+
+export interface PcImportPreview {
+  found: boolean;
+  libraryPath: string;
+  root: string;
+  recordsSeen: number;
+  wouldImportPresent: number;
+  recordedNotPresent: number;
+  duplicatesMerged: number;
+  artAvailable: number;
+  artMissing: number;
+  orphanMediaFolders: number;
+  notes: string[];
+  errors: string[];
+}
+
+export interface PcScanReport {
+  alreadyRunning: boolean;
+  root: string;
+  foldersSeen: number;
+  imported: number;
+  refreshed: number;
+  coveredByPlaynite: number;
+  noExeFound: number;
+  errors: string[];
 }
 
 /** ROM Home tallies (the sidebar door + the rail health line). */
@@ -2045,6 +2177,9 @@ export interface RomHomeCounts {
   recentGroups: number;
   /** Per-system byte totals + offline truth (session badges). */
   perSystemExtra: RomHomeSystemExtra[];
+  /** PC Games P1: [library name, group count] for the PC
+   * section's library sub-shelves. */
+  pcLibraries: Array<[string, number]>;
 }
 
 export interface RomHomeSystemExtra {
@@ -2076,6 +2211,9 @@ export interface RomHomeShelfSpec {
   query?: string | null;
   searchPlatforms: string[];
   memberKeys?: string[] | null;
+  /** PC Games P1: library sub-shelf (groups claimed by this
+   * library, any member). */
+  pcSource?: string | null;
   filters: RomHomeShelfFilters;
   sort: string;
   cursor?: string | null;

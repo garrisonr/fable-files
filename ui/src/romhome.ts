@@ -24,6 +24,8 @@ import {
   type RomNeedsIdEntry,
   type RomVariantInfo,
   type RomSmartList,
+  type PcGameCard,
+  type PcGameSheet,
 } from "./api";
 import {
   loadRomSystems,
@@ -42,7 +44,7 @@ import {
 } from "./roms";
 import { ROM_FLAT_ICONS } from "./romicons_flat";
 import { ContextMenu, type MenuItem } from "./contextmenu";
-import { Toast, promptDialog, errText } from "./toast";
+import { Toast, promptDialog, confirmDialog, errText } from "./toast";
 import { openGuideLink } from "./guidelinks";
 import { fmtDay } from "./search";
 import { springTo, reducedMotion } from "./motion";
@@ -146,6 +148,8 @@ export interface RoomGame {
   /** Group play totals (sheet display): sums across versions. */
   playTotal?: number;
   playLast?: string | null;
+  /** PC Games P1: card facts for pc-game rows (null for ROMs). */
+  pc: PcGameCard | null;
 }
 
 /** One version of a grouped game (Phase 3): a distinct dump /
@@ -321,6 +325,11 @@ export class RomHome {
   private gamesByKey = new Map<string, RoomGame>();
   private systems: RoomSystem[] = [];
   private counts = { total: 0, missingMedia: 0, favoriteGroups: 0, recentGroups: 0 };
+  /** PC Games P1: [library name, group count] for the PC
+   * section's sub-shelf chips. */
+  private pcLibraries: Array<[string, number]> = [];
+  /** The PC library sub-shelf in force (null = all PC games). */
+  private pcLibrary: string | null = null;
   private perSystemTallies = new Map<string, [number, number]>();
   private countsExtra = new Map<
     string,
@@ -632,6 +641,13 @@ export class RomHome {
       favoriteGroups: counts.favoriteGroups,
       recentGroups: counts.recentGroups,
     };
+    this.pcLibraries = counts.pcLibraries ?? [];
+    if (
+      this.pcLibrary &&
+      !this.pcLibraries.some(([name]) => name === this.pcLibrary)
+    ) {
+      this.pcLibrary = null;
+    }
     this.perSystemTallies = new Map(
       counts.perSystem.map(([p, g, m]) => [p, [g, m] as [number, number]]),
     );
@@ -720,6 +736,8 @@ export class RomHome {
       query: null,
       searchPlatforms: [],
       memberKeys: null,
+      pcSource:
+        ref.kind === "system" && ref.name === "PC" ? this.pcLibrary : null,
       filters: {
         systems: [],
         genres: [],
@@ -920,6 +938,11 @@ export class RomHome {
     for (const m of g.media) {
       if (m.found && m.localPath) media.set(m.mediaType, m.localPath);
     }
+    // PC games carry their adopted art as "cover"; the room's art
+    // surfaces all read "boxart" (and only PC items carry cover).
+    if (media.has("cover") && !media.has("boxart")) {
+      media.set("boxart", media.get("cover")!);
+    }
     const systemName = systemNameForKey(g.platform);
     return {
       key: g.item.provider_key ?? g.item.id,
@@ -948,6 +971,7 @@ export class RomHome {
       groupKey: g.groupKey,
       variant: g.variant,
       crc: g.crc,
+      pc: g.pc ?? null,
     };
   }
 
@@ -1002,6 +1026,7 @@ export class RomHome {
             groupKey: null,
             variant: null,
             crc: null,
+            pc: null,
           });
           changed = true;
         }
@@ -2081,11 +2106,51 @@ export class RomHome {
     if (!actions) return;
     actions.innerHTML = "";
     const ref = this.shelf;
+    const isPcShelf = ref.kind === "system" && ref.name === "PC";
     let missingForFetch = 0;
     if (ref.kind === "all" || ref.kind === "missing") {
       missingForFetch = this.counts.missingMedia;
-    } else if (ref.kind === "system") {
+    } else if (ref.kind === "system" && !isPcShelf) {
+      // PC games fetch their art at import, never from the ROM
+      // cascade — no Get-missing-media button on the PC shelf.
       missingForFetch = this.systems.find((s) => s.name === ref.name)?.missing ?? 0;
+    }
+    if (isPcShelf) {
+      // Library sub-shelves + the two PC doors, right on the
+      // section header (PC Games P1).
+      const chip = (label: string, active: boolean, pick: () => void) => {
+        const b = el(
+          "button",
+          active ? "pill-btn rh-pc-chip on" : "pill-btn rh-pc-chip",
+          label,
+        ) as HTMLButtonElement;
+        b.addEventListener("click", pick);
+        actions.appendChild(b);
+      };
+      chip("All PC games", this.pcLibrary === null, () => {
+        this.pcLibrary = null;
+        this.renderShelf(true);
+      });
+      for (const [name, n] of this.pcLibraries) {
+        chip(`${name} (${n.toLocaleString()})`, this.pcLibrary === name, () => {
+          this.pcLibrary = name;
+          this.renderShelf(true);
+        });
+      }
+      const imp = el(
+        "button",
+        "pill-btn rh-pc-import",
+        "Import Playnite library…",
+      ) as HTMLButtonElement;
+      imp.addEventListener("click", () => void this.importPcLibrary());
+      actions.appendChild(imp);
+      const scan = el(
+        "button",
+        "pill-btn rh-pc-scan",
+        "Scan a folder…",
+      ) as HTMLButtonElement;
+      scan.addEventListener("click", () => this.scanPcFolderMenu(scan));
+      actions.appendChild(scan);
     }
     if (ref.kind === "smart") {
       const editRule = el("button", "pill-btn rh-edit-rule", "Edit rule") as HTMLButtonElement;
@@ -2520,6 +2585,39 @@ export class RomHome {
       titleRow.appendChild(pill);
     }
     tile.appendChild(titleRow);
+    if (g.pc) {
+      // PC Games P1 card facts: the library it came from, the
+      // verified-install state, the launch badge, the size.
+      const pc = g.pc;
+      const row = el("div", "rh-pc-row");
+      row.appendChild(el("span", "rh-pc-lib", pc.libraryName));
+      const state = el(
+        "span",
+        pc.installState === "present" ? "rh-pc-state ok" : "rh-pc-state",
+        pc.installState === "present" ? "On this volume" : "Not on this volume",
+      );
+      row.appendChild(state);
+      const badgeText =
+        pc.launchBadge === "not-checked"
+          ? "Launch: not checked"
+          : pc.launchBadge === "boots"
+            ? "Launch: boots"
+            : pc.launchBadge === "boots-with-notes"
+              ? "Launch: boots with notes"
+              : pc.launchBadge === "wont-boot"
+                ? "Launch: won't boot"
+                : "Launch: Windows only";
+      row.appendChild(el("span", "rh-pc-badge", badgeText));
+      if (pc.installSize) {
+        row.appendChild(el("span", "rh-pc-size", formatBytes(pc.installSize)));
+      }
+      if (pc.mislabelNote) {
+        const note = el("span", "rh-pc-mislabel", "⚠ naming");
+        note.title = pc.mislabelNote;
+        row.appendChild(note);
+      }
+      tile.appendChild(row);
+    }
 
     tile.addEventListener("click", (e) => {
       this.selectFromPointer(g, ordered, e);
@@ -2849,6 +2947,18 @@ export class RomHome {
       this.legacyPlay(g);
       return;
     }
+    if (g.pc) {
+      // PC games don't launch through the emulator sheet —
+      // launching is the PC launch ladder (a later phase). The
+      // inspector carries the honest state + the mark door.
+      this.selection = new Set([g.key]);
+      this.renderInspector();
+      Toast.info(
+        "Launching PC games from Fable arrives with the PC launch phase — for now the card shows the verified install and its launch state.",
+        7000,
+      );
+      return;
+    }
     // Emulation resolution (Architecture A): the backend checks
     // presence, the saved choice and what's installed; Play either
     // launches the real file or returns the ask-once sheet. Any
@@ -2951,6 +3061,118 @@ export class RomHome {
       await this.softRefresh();
     } catch (err) {
       Toast.error(`EmulationStation import failed: ${errText(err)}`);
+    }
+  }
+
+  /** PC Games P1: the Playnite door. Preview first (parse +
+   * plan, no writes) — the confirm names the real numbers,
+   * including anything the records get wrong (mislabels,
+   * duplicate records) — then the import runs idempotently. */
+  private async importPcLibrary(): Promise<void> {
+    Toast.info("Reading your Playnite library…", 4000);
+    let preview;
+    try {
+      preview = await api.pcImportPreview();
+    } catch (err) {
+      Toast.error(`Playnite import failed: ${errText(err)}`);
+      return;
+    }
+    if (!preview.found) {
+      Toast.info(
+        preview.errors[0] ??
+          "No Playnite library found in your locations. Add the drive or folder that holds Playnite as a location first.",
+        9000,
+      );
+      return;
+    }
+    const lines = [
+      `${preview.recordsSeen.toLocaleString()} games in the library at ${preview.libraryPath}.`,
+      `${preview.wouldImportPresent.toLocaleString()} verified on a mounted volume · ${preview.recordedNotPresent.toLocaleString()} recorded but not found here (another drive letter, or the drive isn't plugged in).`,
+      `${preview.artAvailable.toLocaleString()} artworks to adopt · ${preview.orphanMediaFolders.toLocaleString()} orphan media folder(s) left alone.`,
+    ];
+    if (preview.duplicatesMerged > 0) {
+      lines.push(
+        `${preview.duplicatesMerged} duplicate record(s) share a folder with another record — they merge into one game.`,
+      );
+    }
+    for (const n of preview.notes.slice(0, 3)) lines.push(n);
+    if (preview.notes.length > 3) {
+      lines.push(`…and ${preview.notes.length - 3} more naming notes.`);
+    }
+    const ok = await confirmDialog(
+      "Import Playnite library",
+      lines.join("\n"),
+      "Import",
+    );
+    if (!ok) return;
+    Toast.info(
+      "Importing your Playnite library… the room refreshes when it lands.",
+      6000,
+    );
+    try {
+      const rep = await api.pcImportPlaynite();
+      if (rep.alreadyRunning) {
+        Toast.info("A PC games import or scan is already running.");
+        return;
+      }
+      if (rep.errors.length > 0 && rep.imported + rep.refreshed === 0) {
+        Toast.error(`Playnite import failed: ${rep.errors[0]}`, 12000);
+        return;
+      }
+      Toast.success(
+        `Playnite import: ${rep.imported.toLocaleString()} new · ${rep.refreshed.toLocaleString()} refreshed · ${rep.recordedNotPresent.toLocaleString()} recorded (not on a mounted volume) · ${rep.artAdopted.toLocaleString()} artworks in${rep.duplicatesMerged > 0 ? ` · ${rep.duplicatesMerged} duplicate record(s) merged` : ""}${rep.mislabelNotes > 0 ? ` · ${rep.mislabelNotes} naming note(s) on cards` : ""}${rep.errors.length > 0 ? ` · ${rep.errors.length} error(s)` : ""}.`,
+        12000,
+      );
+      await this.softRefresh();
+    } catch (err) {
+      Toast.error(`Playnite import failed: ${errText(err)}`);
+    }
+  }
+
+  /** PC Games P1: the folder-scan door. Pick one of your
+   * locations; its game folders (each holding an .exe) join the
+   * PC shelf as "Folder finds" — no Playnite required. */
+  private scanPcFolderMenu(anchor: HTMLElement): void {
+    void api.listLocations().then((locs) => {
+      const withPath = locs.filter((l) => l.path);
+      if (withPath.length === 0) {
+        Toast.info(
+          "No locations to scan yet — add the folder that holds your PC games as a location first.",
+          9000,
+        );
+        return;
+      }
+      const r = anchor.getBoundingClientRect();
+      this.ctxMenu.open(
+        r.left,
+        r.bottom + 4,
+        withPath.map((l) => ({
+          label: `${l.display_name} — ${l.path}`,
+          action: () => void this.scanPcFolder(l.path!),
+        })),
+      );
+    });
+  }
+
+  private async scanPcFolder(root: string): Promise<void> {
+    Toast.info(`Scanning ${root} for PC games…`, 5000);
+    try {
+      const rep = await api.pcScanFolder(root);
+      if (rep.alreadyRunning) {
+        Toast.info("A PC games import or scan is already running.");
+        return;
+      }
+      if (rep.errors.length > 0 && rep.imported + rep.refreshed === 0) {
+        Toast.error(`Folder scan failed: ${rep.errors[0]}`, 12000);
+        return;
+      }
+      Toast.success(
+        `Folder scan: ${rep.imported.toLocaleString()} new PC games · ${rep.refreshed.toLocaleString()} refreshed · ${rep.coveredByPlaynite.toLocaleString()} already in Playnite · ${rep.noExeFound.toLocaleString()} folder(s) with no game executable.`,
+        12000,
+      );
+      await this.softRefresh();
+    } catch (err) {
+      Toast.error(`Folder scan failed: ${errText(err)}`);
     }
   }
 
@@ -3076,7 +3298,9 @@ export class RomHome {
     games = games.flatMap((g) =>
       g.versions ? g.versions.flatMap((v) => v.games) : [g],
     );
-    const wanted = games.filter((g) => g.source === "dat" && !g.offline);
+    const wanted = games.filter(
+      (g) => g.source === "dat" && !g.offline && !g.pc,
+    );
     const retry: { itemId: string; mediaType: "boxart" | "screenshot" | "titleshot" | "trailer" }[] = [];
     for (const g of wanted) {
       for (const t of MEDIA_TYPES) {
@@ -3221,6 +3445,14 @@ export class RomHome {
       {
         label: "Import EmulationStation data…",
         action: () => void this.importEsData(),
+      },
+      {
+        label: "Import Playnite library…",
+        action: () => void this.importPcLibrary(),
+      },
+      {
+        label: "Scan a folder for PC games…",
+        action: () => this.scanPcFolderMenu(anchor),
       },
       {
         label: "Add a ROM folder…",
@@ -3431,7 +3663,7 @@ export class RomHome {
       for (const g of games) void this.setCompleted(g, true);
     });
     insp.append(fav, done);
-    const missing = games.filter((g) => g.source === "dat" && !g.media.has("boxart")).length;
+    const missing = games.filter((g) => g.source === "dat" && !g.pc && !g.media.has("boxart")).length;
     if (missing > 0) {
       const get = el(
         "button",
@@ -3517,6 +3749,158 @@ export class RomHome {
     return row;
   }
 
+  /** PC Games P1: the inspector's PC block — the launch row
+   * (badge + the manual mark door; launching itself is a later
+   * phase and the row says so) and the imported record's
+   * sections, filled from the catalog sheet. Vendor description
+   * HTML is rendered as TEXT — never injected. */
+  private buildPcInspector(insp: HTMLElement, g: RoomGame): void {
+    const pc = g.pc!;
+    const row = el("div", "rh-play-row rh-pc-launch-row");
+    const badgeLabel =
+      pc.launchBadge === "not-checked"
+        ? "Launch: not checked"
+        : pc.launchBadge === "boots"
+          ? "Launch: boots"
+          : pc.launchBadge === "boots-with-notes"
+            ? "Launch: boots with notes"
+            : pc.launchBadge === "wont-boot"
+              ? "Launch: won't boot"
+              : "Launch: Windows only";
+    row.appendChild(el("span", "rh-pc-launch-badge", badgeLabel));
+    const mark = el(
+      "button",
+      "pill-btn rh-pc-mark",
+      "Mark launch state…",
+    ) as HTMLButtonElement;
+    mark.addEventListener("click", () => {
+      const r = mark.getBoundingClientRect();
+      const options: Array<[string, string]> = [
+        ["boots", "Boots"],
+        ["boots-with-notes", "Boots with notes"],
+        ["wont-boot", "Won't boot"],
+        ["windows-only", "Windows only"],
+        ["not-checked", "Not checked"],
+      ];
+      this.ctxMenu.open(
+        r.left,
+        r.bottom + 4,
+        options.map(([badge, label]) => ({
+          label,
+          checked: pc.launchBadge === badge,
+          action: () => {
+            const pk = g.item.provider_key;
+            if (!pk) return;
+            void api
+              .pcSetLaunchBadge(pk, badge)
+              .then(() => {
+                pc.launchBadge = badge;
+                this.renderInspector();
+                this.renderShelf(true);
+              })
+              .catch((err) => Toast.error(`Couldn't save: ${errText(err)}`));
+          },
+        })),
+      );
+    });
+    row.appendChild(mark);
+    insp.appendChild(row);
+    insp.appendChild(
+      el(
+        "p",
+        "rh-pc-launch-note",
+        pc.installState === "present"
+          ? "Install verified on this volume. Launching from Fable arrives with the PC launch phase."
+          : "Recorded from the library, but the install wasn't found on a mounted volume — reconnect the drive it lives on, or re-import.",
+      ),
+    );
+    const host = el("div", "rh-pc-sheet");
+    insp.appendChild(host);
+    const pk = g.item.provider_key;
+    if (!pk) return;
+    void api
+      .pcGameSheet(pk)
+      .then((sheet) => {
+        if (!sheet || !host.isConnected) return;
+        this.fillPcSheet(host, sheet);
+      })
+      .catch(() => undefined);
+  }
+
+  private fillPcSheet(host: HTMLElement, sheet: PcGameSheet): void {
+    const lab = (t: string) => host.appendChild(el("span", "rh-insp-lab", t));
+    const line = (t: string) =>
+      host.appendChild(el("p", "rh-pc-line", t));
+    if (sheet.mislabelNote) {
+      host.appendChild(el("p", "rh-pc-mislabel-note", `⚠ ${sheet.mislabelNote}`));
+    }
+    if (sheet.description) {
+      lab("About");
+      // Vendor HTML → plain text (tags stripped by the parser,
+      // text assigned via textContent — never markup).
+      const doc = new DOMParser().parseFromString(sheet.description, "text/html");
+      const text = (doc.body.textContent ?? "").replace(/\s+/g, " ").trim();
+      if (text) {
+        const p = el("p", "rh-pc-desc");
+        p.textContent = text.slice(0, 1200);
+        host.appendChild(p);
+      }
+    }
+    const facts: Array<[string, string]> = [];
+    if (sheet.developers.length)
+      facts.push(["Developed by", sheet.developers.join(", ")]);
+    if (sheet.publishers.length)
+      facts.push(["Published by", sheet.publishers.join(", ")]);
+    if (sheet.genres.length) facts.push(["Genres", sheet.genres.join(" · ")]);
+    if (sheet.series.length) facts.push(["Series", sheet.series.join(", ")]);
+    if (sheet.features.length)
+      facts.push(["Features", sheet.features.join(" · ")]);
+    if (sheet.ageRatings.length)
+      facts.push(["Age ratings", sheet.ageRatings.join(", ")]);
+    if (sheet.storefronts.length)
+      facts.push(["Storefronts", sheet.storefronts.join(" · ")]);
+    if (sheet.criticScore != null)
+      facts.push(["Critic score (from Playnite)", String(sheet.criticScore)]);
+    if (sheet.communityScore != null)
+      facts.push([
+        "Community score (from Playnite)",
+        String(sheet.communityScore),
+      ]);
+    if (sheet.installSize)
+      facts.push(["Install size", formatBytes(sheet.installSize)]);
+    if (sheet.version) facts.push(["Version", sheet.version]);
+    if (sheet.releaseRaw) facts.push(["Released", sheet.releaseRaw]);
+    if (facts.length) {
+      lab("Details");
+      for (const [k, v] of facts) line(`${k}: ${v}`);
+    }
+    if (sheet.links.length) {
+      lab("Links");
+      for (const l of sheet.links.slice(0, 8)) {
+        const a = el("a", "rh-pc-link", l.name) as HTMLAnchorElement;
+        a.href = l.url;
+        a.title = l.url;
+        a.addEventListener("click", (e) => {
+          e.preventDefault();
+          void api.openUrl(l.url).catch(() => undefined);
+        });
+        host.appendChild(a);
+      }
+    }
+    if (sheet.installs.length) {
+      lab(
+        sheet.installs.length > 1
+          ? `Installs (${sheet.installs.length})`
+          : "Install",
+      );
+      for (const inst of sheet.installs) {
+        line(
+          `${inst.present ? "On this volume" : "Not on this volume"} · ${inst.libraryName} · ${inst.providerKey}`,
+        );
+      }
+    }
+  }
+
   private buildInspector(insp: HTMLElement, g: RoomGame): void {
     // ---- Hero: trailer (hover) or the best still.
     const hero = el("div", "rh-hero");
@@ -3572,19 +3956,27 @@ export class RomHome {
     insp.appendChild(titleRow);
     insp.appendChild(el("p", "rh-insp-sub", g.systemName));
 
-    // ---- Play: ONE primary action.
-    const playRow = el("div", "rh-play-row");
-    const play = el("button", "pill-btn primary rh-play", "▶ Play") as HTMLButtonElement;
-    if (g.offline) {
-      play.disabled = true;
-      play.title = `On ${g.volumeLabel ?? "a disconnected volume"}`;
+    // ---- Play: ONE primary action. PC games get the honest
+    // launch row instead (PC Games P1): there is no emulator to
+    // launch through, and the ladder that will run them is a
+    // later phase — the badge + the manual mark are what's true
+    // today.
+    if (g.pc) {
+      this.buildPcInspector(insp, g);
+    } else {
+      const playRow = el("div", "rh-play-row");
+      const play = el("button", "pill-btn primary rh-play", "▶ Play") as HTMLButtonElement;
+      if (g.offline) {
+        play.disabled = true;
+        play.title = `On ${g.volumeLabel ?? "a disconnected volume"}`;
+      }
+      play.addEventListener("click", () => void this.playGame(g));
+      const withBtn = el("button", "pill-btn rh-playwith", "Play with…") as HTMLButtonElement;
+      if (g.offline) withBtn.disabled = true;
+      withBtn.addEventListener("click", () => void this.playWith(g));
+      playRow.append(play, withBtn);
+      insp.appendChild(playRow);
     }
-    play.addEventListener("click", () => void this.playGame(g));
-    const withBtn = el("button", "pill-btn rh-playwith", "Play with…") as HTMLButtonElement;
-    if (g.offline) withBtn.disabled = true;
-    withBtn.addEventListener("click", () => void this.playWith(g));
-    playRow.append(play, withBtn);
-    insp.appendChild(playRow);
     if (g.offline) {
       insp.appendChild(
         el(

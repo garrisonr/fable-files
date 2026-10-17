@@ -535,6 +535,55 @@ impl Catalog {
                 );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
+        // PC Games (2026-10-17, PC Games Library P1): the imported
+        // descriptive long tail for pc-game identities (Playnite /
+        // folder-scan provenance), path-keyed and import-owned like
+        // es_metadata — a re-import refreshes it wholesale, while
+        // identity and personal state (rom_game_state /
+        // rom_group_state, shared with ROMs by the design's one
+        // game-state ruling) live apart. pc_game_state carries ONLY
+        // install/launch facts the importer or a launch proof can
+        // swear to: presence (verified on disk at import time) and
+        // the launch badge, which starts at 'not-checked' and only
+        // moves on an observed launch or Dickles' own mark — never
+        // on a guess (the Forge "honest badge" rule).
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS pc_metadata (
+                    provider_key TEXT PRIMARY KEY,
+                    source_kind TEXT NOT NULL,
+                    library_name TEXT NOT NULL,
+                    playnite_id TEXT,
+                    game_guid TEXT,
+                    description TEXT,
+                    genres_json TEXT NOT NULL DEFAULT '[]',
+                    developers_json TEXT NOT NULL DEFAULT '[]',
+                    publishers_json TEXT NOT NULL DEFAULT '[]',
+                    series_json TEXT NOT NULL DEFAULT '[]',
+                    features_json TEXT NOT NULL DEFAULT '[]',
+                    age_ratings_json TEXT NOT NULL DEFAULT '[]',
+                    links_json TEXT NOT NULL DEFAULT '[]',
+                    storefronts_json TEXT NOT NULL DEFAULT '[]',
+                    critic_score INTEGER,
+                    community_score INTEGER,
+                    install_size INTEGER,
+                    version TEXT,
+                    exe_name TEXT,
+                    exe_rel TEXT,
+                    release_raw TEXT,
+                    mislabel_note TEXT,
+                    imported_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS pc_game_state (
+                    provider_key TEXT PRIMARY KEY,
+                    present INTEGER NOT NULL DEFAULT 0,
+                    launch_badge TEXT NOT NULL DEFAULT 'not-checked',
+                    launch_note TEXT,
+                    checked_at TEXT,
+                    updated_at TEXT NOT NULL
+                );",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
         // ROM Home (2026-10-15): per-game personal state — ratings,
         // favorites, completion, play history, and the user's own
         // overrides — keyed by path like path_stars so it survives
@@ -4232,6 +4281,154 @@ pub struct RomGameMedia {
     pub source: Option<String>,
 }
 
+/// The PC facts a Games Home card shows for a pc-game identity
+/// (PC Games P1, 2026-10-17): where the record came from, which
+/// library and storefronts claim it, whether its install was
+/// verified on a mounted volume, and the launch badge — which is
+/// 'not-checked' until an observed launch or Dickles' own mark
+/// moves it (P2 owns the ladder; P1 never guesses).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PcGameCard {
+    /// "playnite" | "folder-scan"
+    pub source_kind: String,
+    /// The library it came from ("Playnite" or "Folder finds").
+    pub library_name: String,
+    /// Storefront labels derived from the record's links
+    /// (Steam / GOG / Epic / itch.io / …), display order.
+    pub storefronts: Vec<String>,
+    /// "present" — install dir + play exe verified on disk at
+    /// import; "recorded" — the record exists but the install
+    /// could not be verified here (another drive letter / the
+    /// volume is not mounted). Never a guess either way.
+    pub install_state: String,
+    /// Raw badge: not-checked | boots | boots-with-notes |
+    /// wont-boot | windows-only (the last four are P2 / manual).
+    pub launch_badge: String,
+    pub install_size: Option<i64>,
+    pub version: Option<String>,
+    pub exe_name: Option<String>,
+    /// Set when the folder/exe naming contradicts the record's
+    /// title (a vendor mislabel, e.g. Innocence pointing at the
+    /// Requiem folder) — shown, never silently "fixed".
+    pub mislabel_note: Option<String>,
+}
+
+/// One outbound link from an imported record (name + URL).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PcLink {
+    pub name: String,
+    pub url: String,
+}
+
+/// One PC install to write — the importer's unit of work (PC
+/// Games P1). The item it lands on is the install FOLDER: shallow
+/// (contents are never walked), keyed by its absolute path under
+/// the given location, exactly like every Library Memory item.
+#[derive(Debug, Clone)]
+pub struct PcInstallRecord {
+    pub location_id: String,
+    /// Absolute install-folder path (the item's provider key).
+    pub provider_key: String,
+    pub folder_name: String,
+    pub folder_modified: Option<chrono::DateTime<chrono::Utc>>,
+    pub title: String,
+    pub year: Option<i64>,
+    /// Identity evidence JSON (source, library, ids, volume
+    /// facts) — the §U foreign-writer contract, stored verbatim.
+    pub evidence_json: String,
+    /// "playnite" | "folder-scan"
+    pub source_kind: String,
+    pub library_name: String,
+    pub playnite_id: Option<String>,
+    pub game_guid: Option<String>,
+    pub description: Option<String>,
+    pub genres: Vec<String>,
+    pub developers: Vec<String>,
+    pub publishers: Vec<String>,
+    pub series: Vec<String>,
+    pub features: Vec<String>,
+    pub age_ratings: Vec<String>,
+    pub links: Vec<PcLink>,
+    pub storefronts: Vec<String>,
+    pub critic_score: Option<i64>,
+    pub community_score: Option<i64>,
+    pub install_size: Option<i64>,
+    pub version: Option<String>,
+    pub exe_name: Option<String>,
+    pub exe_rel: Option<String>,
+    pub release_raw: Option<String>,
+    pub mislabel_note: Option<String>,
+    /// The import verified the install on disk (folder + play exe).
+    pub present: bool,
+    pub imported_at: String,
+}
+
+/// What one upsert did, so the import report can bucket honestly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PcUpsertOutcome {
+    pub item_id: String,
+    /// A pc-game identity was created by this write.
+    pub created: bool,
+    /// A folder-scan identity was upgraded to a richer source.
+    pub upgraded: bool,
+    /// The write was refused: an equal-or-richer source (or a
+    /// non-PC identity) already owns the folder.
+    pub skipped_precedence: bool,
+}
+
+/// One install of a game (a shelf group's member), for the sheet.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PcInstallRow {
+    pub provider_key: String,
+    pub title: String,
+    pub library_name: String,
+    pub source_kind: String,
+    pub present: bool,
+    pub launch_badge: String,
+    pub exe_name: Option<String>,
+    pub install_size: Option<i64>,
+}
+
+/// The game sheet's PC sections: the full imported record plus
+/// every install of the same shelf group.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PcGameSheet {
+    pub provider_key: String,
+    pub title: String,
+    pub year: Option<i64>,
+    pub source_kind: String,
+    pub library_name: String,
+    pub playnite_id: Option<String>,
+    pub game_guid: Option<String>,
+    pub description: Option<String>,
+    pub genres: Vec<String>,
+    pub developers: Vec<String>,
+    pub publishers: Vec<String>,
+    pub series: Vec<String>,
+    pub features: Vec<String>,
+    pub age_ratings: Vec<String>,
+    pub links: Vec<PcLink>,
+    pub storefronts: Vec<String>,
+    pub critic_score: Option<i64>,
+    pub community_score: Option<i64>,
+    pub install_size: Option<i64>,
+    pub version: Option<String>,
+    pub exe_name: Option<String>,
+    pub exe_rel: Option<String>,
+    pub release_raw: Option<String>,
+    pub mislabel_note: Option<String>,
+    pub imported_at: String,
+    pub present: bool,
+    pub launch_badge: String,
+    pub launch_note: Option<String>,
+    pub checked_at: Option<String>,
+    pub installs: Vec<PcInstallRow>,
+}
+
 /// One row of the ROM Home shelf queries: everything the room
 /// renders for a game.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -4263,6 +4460,11 @@ pub struct RomHomeGame {
     pub state: RomGameState,
     /// An open File Auditor flag names this game's path.
     pub auditor_flagged: bool,
+    /// PC facts for pc-game identities (None for ROMs): the card
+    /// renders its library / install-state / launch badges from
+    /// this, and the sheet opens with the same key.
+    #[serde(default)]
+    pub pc: Option<PcGameCard>,
 }
 
 /// Catalog-only collection tallies for the room: total identified
@@ -4282,6 +4484,11 @@ pub struct RomHomeCounts {
     /// game set in memory to know its numbers.
     pub favorite_groups: i64,
     pub recent_groups: i64,
+    /// PC Games P1: (library name, group count) for the PC
+    /// section's library sub-shelves — a group claimed by two
+    /// libraries counts under both, like shelf membership itself.
+    #[serde(default)]
+    pub pc_libraries: Vec<(String, i64)>,
 }
 
 /// The lean row every ROM Home query shares: identity + item
@@ -4351,6 +4558,10 @@ pub struct RomHomeShelfSpec {
     /// List shelf: the list items' provider keys / item ids.
     #[serde(default)]
     pub member_keys: Option<Vec<String>>,
+    /// PC section sub-shelf: keep only groups claimed by this
+    /// library (any member — the same ANY rule as also-platforms).
+    #[serde(default)]
+    pub pc_source: Option<String>,
     #[serde(default)]
     pub filters: RomHomeShelfFilters,
     /// title | year | recent-played | most-played | recent-added
@@ -4432,6 +4643,12 @@ struct ShelfGroupFacts {
     members: Vec<ShelfMemberFacts>,
     /// Cross-listed platforms, union over members (self removed).
     also: Vec<String>,
+    /// PC Games P1: libraries claiming this group (union over
+    /// members' imported sources), and the imported genres union —
+    /// pc-game groups carry their facets in pc_metadata, not in
+    /// rom_group_state, so the scan folds them in from there.
+    pc_sources: Vec<String>,
+    pc_genres: Vec<String>,
     has_boxart: bool,
     has_trailer: bool,
     group_state: Option<RomGameState>,
@@ -4761,6 +4978,18 @@ fn shelf_group_matches_search(
             return true;
         }
     }
+    if g.pc_genres
+        .iter()
+        .any(|genre| genre.to_lowercase().contains(&q))
+    {
+        return true;
+    }
+    if g.pc_sources
+        .iter()
+        .any(|s| s.to_lowercase().contains(&q))
+    {
+        return true;
+    }
     for m in &g.members {
         if m.title.to_lowercase().contains(&q) {
             return true;
@@ -4833,6 +5062,13 @@ fn shelf_group_matches(
         }
         _ => {}
     }
+    // PC library sub-shelf: ANY member's library claims the group
+    // (the also-platforms rule), regardless of shelf kind.
+    if let Some(source) = spec.pc_source.as_deref() {
+        if !g.pc_sources.iter().any(|s| s == source) {
+            return false;
+        }
+    }
     let f = &spec.filters;
     if !f.ignore_systems && !f.systems.is_empty() {
         let hit = f.systems.iter().any(|s| s == &g.platform)
@@ -4842,9 +5078,17 @@ fn shelf_group_matches(
         }
     }
     if !f.genres.is_empty() {
-        match g.group_state.as_ref().and_then(|s| s.genre.as_ref()) {
-            Some(genre) if f.genres.iter().any(|x| x == genre) => {}
-            _ => return false,
+        // ROM groups carry genre in group state; pc-game groups
+        // carry the imported genre UNION — either satisfies.
+        let state_hit = g
+            .group_state
+            .as_ref()
+            .and_then(|s| s.genre.as_ref())
+            .map(|genre| f.genres.iter().any(|x| x == genre))
+            .unwrap_or(false);
+        let pc_hit = g.pc_genres.iter().any(|x| f.genres.contains(x));
+        if !state_hit && !pc_hit {
+            return false;
         }
     }
     if !f.players.is_empty() {
@@ -4960,7 +5204,8 @@ impl Catalog {
                     mi.year, mi.sha1, mi.match_evidence_json
              FROM media_identities AS mi
              JOIN items AS i ON i.id = mi.item_id
-             WHERE mi.media_kind = 'rom' AND mi.title IS NOT NULL
+             WHERE mi.media_kind IN ('rom', 'pc-game')
+               AND mi.title IS NOT NULL
                AND mi.platform IS NOT NULL",
         );
         if platform.is_some() {
@@ -5217,6 +5462,71 @@ impl Catalog {
                 flagged.insert(r.map_err(|e| UfmError::Database(e.to_string()))?);
             }
         }
+        // PC cards for the window's pc-game rows (PC Games P1) —
+        // batched like every other side read here.
+        let mut pc_by_path: std::collections::HashMap<String, PcGameCard> =
+            std::collections::HashMap::new();
+        for chunk in paths.chunks(400) {
+            let placeholders: Vec<String> =
+                chunk.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT pm.provider_key, pm.source_kind, pm.library_name,
+                        pm.storefronts_json, pm.install_size, pm.version,
+                        pm.exe_name, pm.mislabel_note,
+                        COALESCE(pgs.present, 0),
+                        COALESCE(pgs.launch_badge, 'not-checked')
+                 FROM pc_metadata AS pm
+                 LEFT JOIN pc_game_state AS pgs
+                   ON pgs.provider_key = pm.provider_key
+                 WHERE pm.provider_key IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let values: Vec<rusqlite::types::Value> =
+                chunk.iter().map(|s| rusqlite::types::Value::Text(s.clone())).collect();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                let (pk, source_kind, library_name, fronts_json, size, version, exe, note, present, badge) =
+                    r.map_err(|e| UfmError::Database(e.to_string()))?;
+                pc_by_path.insert(
+                    pk,
+                    PcGameCard {
+                        source_kind,
+                        library_name,
+                        storefronts: serde_json::from_str(&fronts_json)
+                            .unwrap_or_default(),
+                        install_state: if present != 0 {
+                            "present".to_string()
+                        } else {
+                            "recorded".to_string()
+                        },
+                        launch_badge: badge,
+                        install_size: size,
+                        version,
+                        exe_name: exe,
+                        mislabel_note: note,
+                    },
+                );
+            }
+        }
         let parse_id = |s: &str, what: &str| {
             uuid::Uuid::parse_str(s)
                 .map_err(|e| UfmError::Database(format!("bad {what} id {s:?}: {e}")))
@@ -5286,6 +5596,9 @@ impl Catalog {
                 media: media_by_item.get(&id).cloned().unwrap_or_default(),
                 state,
                 auditor_flagged,
+                pc: provider_key
+                    .as_ref()
+                    .and_then(|pk| pc_by_path.get(pk).cloned()),
             });
         }
         Ok(out)
@@ -5422,7 +5735,17 @@ impl Catalog {
             for r in rows {
                 let (item_id, media_type) =
                     r.map_err(|e| UfmError::Database(e.to_string()))?;
-                if let Some((_, bit)) = ROM_MEDIA_BIT.iter().find(|(n, _)| *n == media_type) {
+                // PC games carry their box art as 'cover' (adopted
+                // from the source library at import); it IS the
+                // group's box art for every missing/has-art rule.
+                // ROM items never carry 'cover', so ROM readings
+                // are untouched.
+                let bit = ROM_MEDIA_BIT
+                    .iter()
+                    .find(|(n, _)| *n == media_type)
+                    .map(|(_, b)| *b)
+                    .or(if media_type == "cover" { Some(1) } else { None });
+                if let Some(bit) = bit {
                     *media_found.entry(item_id).or_default() |= bit;
                 }
             }
@@ -5443,6 +5766,34 @@ impl Catalog {
                 labels_by_path.entry(pk).or_default().push(label);
             }
         }
+        // PC Games P1: the imported facet facts for pc-game
+        // groups, keyed by install path — libraries claiming the
+        // group and its genre union. Read once per scan like every
+        // other side map; PC libraries are hundreds of rows, not a
+        // scale concern beside the ROM stream.
+        let mut pc_facts: HashMap<String, (String, Vec<String>)> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT provider_key, library_name, genres_json FROM pc_metadata")
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                let (pk, library, genres_json) =
+                    r.map_err(|e| UfmError::Database(e.to_string()))?;
+                let genres: Vec<String> =
+                    serde_json::from_str(&genres_json).unwrap_or_default();
+                pc_facts.insert(pk, (library, genres));
+            }
+        }
         // The lean identity stream: no enrichment, no per-row side
         // queries — fold straight into group facts.
         let mut groups: HashMap<String, ShelfGroupFacts> = HashMap::new();
@@ -5454,7 +5805,8 @@ impl Catalog {
                             mi.year, mi.sha1, i.modified, mi.match_evidence_json
                      FROM media_identities AS mi
                      JOIN items AS i ON i.id = mi.item_id
-                     WHERE mi.media_kind = 'rom' AND mi.title IS NOT NULL
+                     WHERE mi.media_kind IN ('rom', 'pc-game')
+                       AND mi.title IS NOT NULL
                        AND mi.platform IS NOT NULL",
                 )
                 .map_err(|e| UfmError::Database(e.to_string()))?;
@@ -5506,6 +5858,16 @@ impl Catalog {
                     if starred.contains(pk) {
                         g.any_starred = true;
                     }
+                    if let Some((library, genres)) = pc_facts.get(pk) {
+                        if !g.pc_sources.contains(library) {
+                            g.pc_sources.push(library.clone());
+                        }
+                        for genre in genres {
+                            if !g.pc_genres.contains(genre) {
+                                g.pc_genres.push(genre.clone());
+                            }
+                        }
+                    }
                 }
                 for a in also {
                     if !g.also.contains(&a) {
@@ -5537,6 +5899,8 @@ impl Catalog {
             g.also.sort();
             g.also.dedup();
             g.also.retain(|a| a != &g.platform);
+            g.pc_sources.sort();
+            g.pc_genres.sort();
             if light {
                 continue;
             }
@@ -5677,6 +6041,13 @@ impl Catalog {
         });
         let mut out = Vec::new();
         for g in groups {
+            // PC games never enter the ROM media-fetch cascade:
+            // their art is adopted from the source library at
+            // import (or honestly absent), and the fetch sources
+            // serve emulated systems. Declared in the P1 design.
+            if g.platform == "pc" {
+                continue;
+            }
             for m in &g.members {
                 let bits = scan.media_found.get(&m.item_id).copied().unwrap_or(0);
                 for (name, bit) in ROM_MEDIA_BIT {
@@ -5696,6 +6067,9 @@ impl Catalog {
     /// in GAMES (group rows carry genre — the backfill invariant
     /// makes scoped state group-owned). Ordered by count desc,
     /// then name, like the popover has always presented them.
+    /// PC Games P1: pc-game groups carry imported genres instead,
+    /// counted per GROUP from the same scan the shelves use and
+    /// merged in — a genre living in both worlds sums.
     pub fn rom_home_genre_facets(&self) -> Result<Vec<(String, i64)>> {
         let mut stmt = self
             .conn
@@ -5710,8 +6084,22 @@ impl Catalog {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .map_err(|e| UfmError::Database(e.to_string()))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| UfmError::Database(e.to_string()))
+        let mut merged: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        for r in rows {
+            let (genre, n) = r.map_err(|e| UfmError::Database(e.to_string()))?;
+            *merged.entry(genre).or_default() += n;
+        }
+        drop(stmt);
+        let scan = self.rom_home_scan_mode(false, true)?;
+        for g in &scan.groups {
+            for genre in &g.pc_genres {
+                *merged.entry(genre.clone()).or_default() += 1;
+            }
+        }
+        let mut out: Vec<(String, i64)> = merged.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
     }
 
     /// Lean per-file rows for the per-system tallies the command
@@ -5743,8 +6131,43 @@ impl Catalog {
                 })
             })
             .map_err(|e| UfmError::Database(e.to_string()))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| UfmError::Database(e.to_string()))
+        let mut out: Vec<RomHomeSystemFileRow> =
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+        drop(stmt);
+        // PC Games P1: pc-game folder items carry no content size
+        // of their own (contents are never walked); the section's
+        // byte total is the imported install sizes, which is the
+        // number the source library itself reports.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT i.id, i.location_id, i.provider_key, mi.platform,
+                        mi.title, pm.install_size
+                 FROM media_identities AS mi
+                 JOIN items AS i ON i.id = mi.item_id
+                 LEFT JOIN pc_metadata AS pm ON pm.provider_key = i.provider_key
+                 WHERE mi.media_kind = 'pc-game' AND mi.title IS NOT NULL
+                   AND mi.platform IS NOT NULL
+                 ORDER BY mi.title COLLATE NOCASE, i.id",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(RomHomeSystemFileRow {
+                    item_id: row.get(0)?,
+                    location_id: row.get(1)?,
+                    provider_key: row.get(2)?,
+                    platform: row.get(3)?,
+                    title: row.get(4)?,
+                    size_bytes: row.get(5)?,
+                })
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        for r in rows {
+            out.push(r.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
     }
 
     /// Raw rows for a specific set of item ids (the window's
@@ -5764,7 +6187,8 @@ impl Catalog {
                         mi.year, mi.sha1, mi.match_evidence_json
                  FROM media_identities AS mi
                  JOIN items AS i ON i.id = mi.item_id
-                 WHERE mi.media_kind = 'rom' AND mi.title IS NOT NULL
+                 WHERE mi.media_kind IN ('rom', 'pc-game')
+                   AND mi.title IS NOT NULL
                    AND mi.platform IS NOT NULL AND i.id IN ({})",
                 placeholders.join(",")
             );
@@ -5814,6 +6238,8 @@ impl Catalog {
         counts.total = scan.groups.len() as i64;
         let mut per: std::collections::HashMap<String, (i64, i64)> =
             std::collections::HashMap::new();
+        let mut pc_libs: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
         for g in &scan.groups {
             if !g.has_boxart {
                 counts.missing_media += 1;
@@ -5823,6 +6249,9 @@ impl Catalog {
             }
             if g.play_last.is_some() {
                 counts.recent_groups += 1;
+            }
+            for lib in &g.pc_sources {
+                *pc_libs.entry(lib.clone()).or_default() += 1;
             }
             for shelf in std::iter::once(&g.platform).chain(g.also.iter()) {
                 let e = per.entry(shelf.clone()).or_default();
@@ -5838,7 +6267,489 @@ impl Catalog {
             .collect();
         per_system.sort_by(|a, b| a.0.cmp(&b.0));
         counts.per_system = per_system;
+        let mut pc_libraries: Vec<(String, i64)> = pc_libs.into_iter().collect();
+        pc_libraries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        counts.pc_libraries = pc_libraries;
         Ok(counts)
+    }
+
+    // --------------------------------------------------------
+    // PC Games (2026-10-17, PC Games Library P1): the import
+    // write path + the sheet read. Identities ride the shared
+    // Games Home shelf scan above (media_kind 'pc-game',
+    // platform 'pc'); descriptive metadata and install/launch
+    // facts live in pc_metadata / pc_game_state; personal state
+    // deliberately shares rom_game_state / rom_group_state (the
+    // design's one-game-state ruling — no forked favorites).
+    // --------------------------------------------------------
+
+    /// Insert a catalog location row ONLY when absent — the
+    /// importers resolve locations that usually already exist
+    /// (volume locations written by the indexer), and
+    /// insert_location's INSERT OR REPLACE would clobber the
+    /// stored capabilities of a live row.
+    pub fn pc_ensure_location(
+        &self,
+        id: &str,
+        provider: &str,
+        display_name: &str,
+        capabilities_json: &str,
+    ) -> Result<()> {
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM locations WHERE id = ?1)",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n != 0)
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        if exists {
+            return Ok(());
+        }
+        let caps: serde_json::Value =
+            serde_json::from_str(capabilities_json).unwrap_or(serde_json::json!({}));
+        self.insert_location(&ufm_vfs::Location {
+            id: ufm_core::LocationId(
+                uuid::Uuid::parse_str(id)
+                    .map_err(|e| UfmError::InvalidInput(format!("location id: {e}")))?,
+            ),
+            provider: provider.to_string(),
+            display_name: display_name.to_string(),
+            capabilities: serde_json::from_value::<ufm_vfs::Capabilities>(caps)
+                .map_err(|e| UfmError::InvalidInput(format!("capabilities: {e}")))?,
+            protected: ufm_vfs::ProtectionTier::None,
+        })
+    }
+
+    /// Write one PC install: the shallow folder item, its
+    /// pc-game identity, the imported metadata and the install
+    /// facts — one transaction per game, so a crashed import
+    /// leaves whole games, never halves, and a re-run finishes
+    /// the job (idempotent by provider key throughout).
+    ///
+    /// Source precedence is playnite > folder-scan: a folder-scan
+    /// write never touches a folder a Playnite import owns, and a
+    /// Playnite write UPGRADES a folder-scan identity in place
+    /// (personal state lives in other tables and is untouched
+    /// either way). A folder already carrying a non-PC identity
+    /// is never clobbered.
+    pub fn upsert_pc_install(&self, rec: &PcInstallRecord) -> Result<PcUpsertOutcome> {
+        let location_uuid = uuid::Uuid::parse_str(&rec.location_id)
+            .map_err(|e| UfmError::InvalidInput(format!("location id: {e}")))?;
+        // Read BEFORE writing: precedence is judged on what already
+        // owns the folder, and an existing item is refreshed with a
+        // plain UPDATE — insert_item's INSERT OR REPLACE would
+        // cascade-delete the very identity this write maintains.
+        let existing_row: Option<(String, Option<String>, Option<String>)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT i.id, mi.media_kind, mi.match_evidence_json
+                     FROM items AS i
+                     LEFT JOIN media_identities AS mi ON mi.item_id = i.id
+                     WHERE i.location_id = ?1 AND i.provider_key = ?2",
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let mut rows = stmt
+                .query_map(params![rec.location_id, rec.provider_key], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            match rows.next() {
+                Some(r) => Some(r.map_err(|e| UfmError::Database(e.to_string()))?),
+                None => None,
+            }
+        };
+        let mut outcome = PcUpsertOutcome {
+            item_id: String::new(),
+            created: false,
+            upgraded: false,
+            skipped_precedence: false,
+        };
+        if let Some((_, kind, evidence)) = &existing_row {
+            if let Some(kind) = kind {
+                if kind != "pc-game" {
+                    outcome.skipped_precedence = true;
+                    outcome.item_id = existing_row.as_ref().unwrap().0.clone();
+                    return Ok(outcome);
+                }
+                let existing_source = evidence
+                    .as_deref()
+                    .and_then(|e| serde_json::from_str::<serde_json::Value>(e).ok())
+                    .and_then(|v| {
+                        v.get("source")
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string())
+                    });
+                match (existing_source.as_deref(), rec.source_kind.as_str()) {
+                    (Some("playnite"), "folder-scan") => {
+                        outcome.skipped_precedence = true;
+                        outcome.item_id = existing_row.as_ref().unwrap().0.clone();
+                        return Ok(outcome);
+                    }
+                    (Some("folder-scan"), "playnite") => outcome.upgraded = true,
+                    _ => {}
+                }
+            }
+        }
+        let had_pc_identity = existing_row
+            .as_ref()
+            .map(|(_, kind, _)| kind.as_deref() == Some("pc-game"))
+            .unwrap_or(false);
+        outcome.created = !had_pc_identity;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let item_id = match &existing_row {
+            Some((id, _, _)) => {
+                self.conn
+                    .execute(
+                        "UPDATE items SET name = ?2, modified = ?3 WHERE id = ?1",
+                        params![
+                            id,
+                            rec.folder_name,
+                            rec.folder_modified.map(|m| m.to_rfc3339()),
+                        ],
+                    )
+                    .map_err(|e| UfmError::Database(e.to_string()))?;
+                id.clone()
+            }
+            None => {
+                let item = ufm_vfs::Item {
+                    id: ufm_core::ItemId::new(),
+                    location: ufm_core::LocationId(location_uuid),
+                    name: rec.folder_name.clone(),
+                    kind: ufm_vfs::ItemKind::Folder,
+                    size_bytes: None,
+                    modified: rec.folder_modified,
+                    provider_key: Some(rec.provider_key.clone()),
+                    labels: vec![],
+                    starred: false,
+                };
+                let id = item.id.to_string();
+                self.insert_item(&item)?;
+                id
+            }
+        };
+        outcome.item_id = item_id.clone();
+        self.conn
+            .execute(
+                "INSERT INTO media_identities
+                    (item_id, media_kind, title, year, tmdb_id, platform,
+                     sha1, match_evidence_json)
+                 VALUES (?1, 'pc-game', ?2, ?3, NULL, 'pc', NULL, ?4)
+                 ON CONFLICT(item_id) DO UPDATE SET
+                    media_kind = 'pc-game', title = excluded.title,
+                    year = excluded.year, platform = 'pc',
+                    match_evidence_json = excluded.match_evidence_json",
+                params![item_id, rec.title, rec.year, rec.evidence_json],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let json_list = |v: &Vec<String>| serde_json::to_string(v).unwrap_or_else(|_| "[]".into());
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO pc_metadata
+                    (provider_key, source_kind, library_name, playnite_id,
+                     game_guid, description, genres_json, developers_json,
+                     publishers_json, series_json, features_json,
+                     age_ratings_json, links_json, storefronts_json,
+                     critic_score, community_score, install_size, version,
+                     exe_name, exe_rel, release_raw, mislabel_note,
+                     imported_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                         ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                         ?21, ?22, ?23)",
+                params![
+                    rec.provider_key,
+                    rec.source_kind,
+                    rec.library_name,
+                    rec.playnite_id,
+                    rec.game_guid,
+                    rec.description,
+                    json_list(&rec.genres),
+                    json_list(&rec.developers),
+                    json_list(&rec.publishers),
+                    json_list(&rec.series),
+                    json_list(&rec.features),
+                    json_list(&rec.age_ratings),
+                    serde_json::to_string(&rec.links).unwrap_or_else(|_| "[]".into()),
+                    json_list(&rec.storefronts),
+                    rec.critic_score,
+                    rec.community_score,
+                    rec.install_size,
+                    rec.version,
+                    rec.exe_name,
+                    rec.exe_rel,
+                    rec.release_raw,
+                    rec.mislabel_note,
+                    rec.imported_at,
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Install facts: presence is import-owned and refreshes;
+        // the launch badge is NOT — it moves only on an observed
+        // launch or a manual mark (pc_set_launch_badge).
+        self.conn
+            .execute(
+                "INSERT INTO pc_game_state
+                    (provider_key, present, launch_badge, launch_note,
+                     checked_at, updated_at)
+                 VALUES (?1, ?2, 'not-checked', NULL, ?3, ?3)
+                 ON CONFLICT(provider_key) DO UPDATE SET
+                    present = excluded.present,
+                    checked_at = excluded.checked_at,
+                    updated_at = excluded.updated_at",
+                params![rec.provider_key, rec.present as i64, rec.imported_at],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        tx.commit().map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(outcome)
+    }
+
+    /// Move a game's launch badge — the ONLY door that writes it:
+    /// an observed launch (P2's ladder) or Dickles marking a game
+    /// by hand. Returns false when the path has no PC install.
+    pub fn pc_set_launch_badge(
+        &self,
+        provider_key: &str,
+        badge: &str,
+        note: Option<&str>,
+        at: &str,
+    ) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE pc_game_state SET launch_badge = ?2,
+                        launch_note = ?3, updated_at = ?4
+                 WHERE provider_key = ?1",
+                params![provider_key, badge, note, at],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(n > 0)
+    }
+
+    /// The game sheet's PC record for one install path, plus every
+    /// install of the same shelf group. None when the path is not
+    /// a PC install.
+    /// All provider keys owned by Playnite imports — the
+    /// folder scan defers to these (a candidate folder that IS
+    /// one, or CONTAINS one as a descendant, is already
+    /// covered by the richer record).
+    pub fn pc_playnite_keys(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT provider_key FROM pc_metadata
+                 WHERE source_kind = 'playnite'",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    pub fn pc_game_sheet(&self, provider_key: &str) -> Result<Option<PcGameSheet>> {
+        let row = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT mi.title, mi.year, pm.source_kind,
+                            pm.library_name, pm.playnite_id, pm.game_guid,
+                            pm.description, pm.genres_json,
+                            pm.developers_json, pm.publishers_json,
+                            pm.series_json, pm.features_json,
+                            pm.age_ratings_json, pm.links_json,
+                            pm.storefronts_json, pm.critic_score,
+                            pm.community_score, pm.install_size,
+                            pm.version, pm.exe_name, pm.exe_rel,
+                            pm.release_raw, pm.mislabel_note,
+                            pm.imported_at, COALESCE(pgs.present, 0),
+                            COALESCE(pgs.launch_badge, 'not-checked'),
+                            pgs.launch_note, pgs.checked_at
+                     FROM pc_metadata AS pm
+                     JOIN items AS i ON i.provider_key = pm.provider_key
+                     JOIN media_identities AS mi ON mi.item_id = i.id
+                     LEFT JOIN pc_game_state AS pgs
+                       ON pgs.provider_key = pm.provider_key
+                     WHERE pm.provider_key = ?1
+                       AND mi.media_kind = 'pc-game'",
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let mut rows = stmt
+                .query_map(params![provider_key], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
+                        row.get::<_, String>(14)?,
+                        row.get::<_, Option<i64>>(15)?,
+                        row.get::<_, Option<i64>>(16)?,
+                        row.get::<_, Option<i64>>(17)?,
+                        row.get::<_, Option<String>>(18)?,
+                        row.get::<_, Option<String>>(19)?,
+                        row.get::<_, Option<String>>(20)?,
+                        row.get::<_, Option<String>>(21)?,
+                        row.get::<_, Option<String>>(22)?,
+                        row.get::<_, String>(23)?,
+                        row.get::<_, i64>(24)?,
+                        row.get::<_, String>(25)?,
+                        row.get::<_, Option<String>>(26)?,
+                        row.get::<_, Option<String>>(27)?,
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            match rows.next() {
+                Some(r) => Some(r.map_err(|e| UfmError::Database(e.to_string()))?),
+                None => None,
+            }
+        };
+        let Some((
+            title,
+            year,
+            source_kind,
+            library_name,
+            playnite_id,
+            game_guid,
+            description,
+            genres_json,
+            developers_json,
+            publishers_json,
+            series_json,
+            features_json,
+            age_ratings_json,
+            links_json,
+            storefronts_json,
+            critic_score,
+            community_score,
+            install_size,
+            version,
+            exe_name,
+            exe_rel,
+            release_raw,
+            mislabel_note,
+            imported_at,
+            present,
+            launch_badge,
+            launch_note,
+            checked_at,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let parse_list = |s: &str| -> Vec<String> {
+            serde_json::from_str(s).unwrap_or_default()
+        };
+        // Group siblings: every pc install whose identity folds
+        // into the same shelf group (same title, other folders /
+        // editions / libraries).
+        let mut installs = Vec::new();
+        if let Some(group_key) = self.rom_group_key_for_path(provider_key)? {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT i.provider_key, mi.title, mi.platform,
+                            COALESCE(pm.library_name, ''),
+                            COALESCE(pm.source_kind, ''),
+                            COALESCE(pgs.present, 0),
+                            COALESCE(pgs.launch_badge, 'not-checked'),
+                            pm.exe_name, pm.install_size
+                     FROM media_identities AS mi
+                     JOIN items AS i ON i.id = mi.item_id
+                     LEFT JOIN pc_metadata AS pm
+                       ON pm.provider_key = i.provider_key
+                     LEFT JOIN pc_game_state AS pgs
+                       ON pgs.provider_key = i.provider_key
+                     WHERE mi.media_kind = 'pc-game'
+                       AND mi.title IS NOT NULL AND mi.platform IS NOT NULL",
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                let (pk, t, platform, lib, kind, pres, badge, exe, size) =
+                    r.map_err(|e| UfmError::Database(e.to_string()))?;
+                if ufm_media::romdat::rom_group_key(&platform, &t) == group_key {
+                    installs.push(PcInstallRow {
+                        provider_key: pk,
+                        title: t,
+                        library_name: lib,
+                        source_kind: kind,
+                        present: pres != 0,
+                        launch_badge: badge,
+                        exe_name: exe,
+                        install_size: size,
+                    });
+                }
+            }
+            installs.sort_by(|a, b| a.provider_key.cmp(&b.provider_key));
+        }
+        Ok(Some(PcGameSheet {
+            provider_key: provider_key.to_string(),
+            title,
+            year,
+            source_kind,
+            library_name,
+            playnite_id,
+            game_guid,
+            description,
+            genres: parse_list(&genres_json),
+            developers: parse_list(&developers_json),
+            publishers: parse_list(&publishers_json),
+            series: parse_list(&series_json),
+            features: parse_list(&features_json),
+            age_ratings: parse_list(&age_ratings_json),
+            links: serde_json::from_str(&links_json).unwrap_or_default(),
+            storefronts: parse_list(&storefronts_json),
+            critic_score,
+            community_score,
+            install_size,
+            version,
+            exe_name,
+            exe_rel,
+            release_raw,
+            mislabel_note,
+            imported_at,
+            present: present != 0,
+            launch_badge,
+            launch_note,
+            checked_at,
+            installs,
+        }))
     }
 
     // --------------------------------------------------------
@@ -5860,7 +6771,7 @@ impl Catalog {
             .prepare(
                 "SELECT mi.platform, mi.title FROM items AS i
                  JOIN media_identities AS mi ON mi.item_id = i.id
-                 WHERE i.provider_key = ?1 AND mi.media_kind = 'rom'
+                 WHERE i.provider_key = ?1 AND mi.media_kind IN ('rom', 'pc-game')
                    AND mi.title IS NOT NULL AND mi.platform IS NOT NULL
                  LIMIT 1",
             )
@@ -9912,6 +10823,303 @@ mod rom_home_tests {
     // Neo Geo, no art), Super Mario World (missing-art row).
     // --------------------------------------------------------
 
+    // --------------------------------------------------------
+    // PC Games P1 (2026-10-17): import writes, precedence,
+    // shelf integration at the imported scale.
+    // --------------------------------------------------------
+
+    fn pc_record(
+        loc: &str,
+        path: &str,
+        title: &str,
+        source_kind: &str,
+        library: &str,
+    ) -> PcInstallRecord {
+        PcInstallRecord {
+            location_id: loc.to_string(),
+            provider_key: path.to_string(),
+            folder_name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            folder_modified: None,
+            title: title.to_string(),
+            year: Some(2019),
+            evidence_json: format!(
+                "{{\"source\":\"{source_kind}\",\"library\":\"test-uuid\"}}"
+            ),
+            source_kind: source_kind.to_string(),
+            library_name: library.to_string(),
+            playnite_id: Some(format!("pid-{title}")),
+            game_guid: None,
+            description: Some(format!("About {title}")),
+            genres: vec!["Action".to_string()],
+            developers: vec!["Dev".to_string()],
+            publishers: vec![],
+            series: vec![],
+            features: vec!["Single Player".to_string()],
+            age_ratings: vec![],
+            links: vec![PcLink {
+                name: "Steam".to_string(),
+                url: "https://store.steampowered.com/app/1".to_string(),
+            }],
+            storefronts: vec!["Steam".to_string()],
+            critic_score: Some(85),
+            community_score: None,
+            install_size: Some(1_000_000),
+            version: Some("1.0".to_string()),
+            exe_name: Some("game.exe".to_string()),
+            exe_rel: Some("game.exe".to_string()),
+            release_raw: Some("2019-5-14".to_string()),
+            mislabel_note: None,
+            present: true,
+            imported_at: "2026-10-17T00:00:00Z".to_string(),
+        }
+    }
+
+    fn pc_seed_location(cat: &Catalog) -> String {
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        loc.to_string()
+    }
+
+    #[test]
+    fn pc_import_double_run_is_idempotent() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = pc_seed_location(&cat);
+        for (path, title) in [
+            ("/games/Alpha", "Alpha"),
+            ("/games/Beta", "Beta"),
+            ("/games/Gamma", "Gamma"),
+        ] {
+            let out = cat
+                .upsert_pc_install(&pc_record(&loc, path, title, "playnite", "Playnite"))
+                .unwrap();
+            assert!(out.created, "first import creates");
+        }
+        for (path, title) in [
+            ("/games/Alpha", "Alpha"),
+            ("/games/Beta", "Beta"),
+            ("/games/Gamma", "Gamma"),
+        ] {
+            let out = cat
+                .upsert_pc_install(&pc_record(&loc, path, title, "playnite", "Playnite"))
+                .unwrap();
+            assert!(!out.created && !out.upgraded && !out.skipped_precedence);
+        }
+        let n = |sql: &str| -> i64 {
+            cat.conn.query_row(sql, [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(n("SELECT COUNT(*) FROM media_identities WHERE media_kind='pc-game'"), 3);
+        assert_eq!(n("SELECT COUNT(*) FROM pc_metadata"), 3);
+        assert_eq!(n("SELECT COUNT(*) FROM pc_game_state"), 3);
+        assert_eq!(n("SELECT COUNT(*) FROM items"), 3);
+        let counts = cat.rom_home_counts().unwrap();
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.per_system, vec![("pc".to_string(), 3, 3)]);
+        assert_eq!(counts.pc_libraries, vec![("Playnite".to_string(), 3)]);
+    }
+
+    #[test]
+    fn pc_folder_scan_upgrades_never_downgrades() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = pc_seed_location(&cat);
+        let out = cat
+            .upsert_pc_install(&pc_record(
+                &loc,
+                "/games/loose/Solo",
+                "Solo",
+                "folder-scan",
+                "Folder finds",
+            ))
+            .unwrap();
+        assert!(out.created);
+        let out = cat
+            .upsert_pc_install(&pc_record(
+                &loc,
+                "/games/loose/Solo",
+                "Solo",
+                "playnite",
+                "Playnite",
+            ))
+            .unwrap();
+        assert!(out.upgraded, "playnite upgrades a folder find");
+        let sheet = cat.pc_game_sheet("/games/loose/Solo").unwrap().unwrap();
+        assert_eq!(sheet.source_kind, "playnite");
+        assert_eq!(sheet.library_name, "Playnite");
+        let out = cat
+            .upsert_pc_install(&pc_record(
+                &loc,
+                "/games/loose/Solo",
+                "Solo",
+                "folder-scan",
+                "Folder finds",
+            ))
+            .unwrap();
+        assert!(out.skipped_precedence, "folder scan never downgrades");
+        let sheet = cat.pc_game_sheet("/games/loose/Solo").unwrap().unwrap();
+        assert_eq!(sheet.source_kind, "playnite", "still playnite-owned");
+    }
+
+    #[test]
+    fn pc_shelf_windows_sources_genres_and_facets() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = pc_seed_location(&cat);
+        let mut seed = |path: &str, title: &str, kind: &str, lib: &str, genres: Vec<&str>| {
+            let mut rec = pc_record(&loc, path, title, kind, lib);
+            rec.genres = genres.iter().map(|s| s.to_string()).collect();
+            cat.upsert_pc_install(&rec).unwrap();
+            // Cover adopted for one of them.
+            if title == "Alpha" {
+                let item_id: String = cat
+                    .conn
+                    .query_row(
+                        "SELECT id FROM items WHERE provider_key = ?1",
+                        params![path],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                cat.upsert_rom_media(
+                    &item_id,
+                    "cover",
+                    "found",
+                    Some("playnite"),
+                    Some("/media/pc/alpha/cover.jpg"),
+                    "{}",
+                )
+                .unwrap();
+            }
+        };
+        seed("/games/Alpha", "Alpha", "playnite", "Playnite", vec!["Action"]);
+        seed("/games/Beta", "Beta", "playnite", "Playnite", vec!["RPG"]);
+        seed("/games/Gamma", "Gamma", "folder-scan", "Folder finds", vec!["Action"]);
+
+        // The PC system shelf sees all three; Alpha has art via
+        // its adopted cover.
+        let mut spec = shelf_spec("system");
+        spec.platform = Some("pc".to_string());
+        let page = cat.rom_home_shelf_window(&spec).unwrap();
+        assert_eq!(page.total, 3);
+        let alpha = page
+            .games
+            .iter()
+            .find(|g| g.title == "Alpha")
+            .expect("alpha row");
+        let card = alpha.pc.as_ref().expect("pc card attached");
+        assert_eq!(card.library_name, "Playnite");
+        assert_eq!(card.install_state, "present");
+        assert_eq!(card.launch_badge, "not-checked");
+        assert_eq!(card.storefronts, vec!["Steam".to_string()]);
+        // Library sub-shelves.
+        let mut sub = shelf_spec("system");
+        sub.platform = Some("pc".to_string());
+        sub.pc_source = Some("Folder finds".to_string());
+        let page = cat.rom_home_shelf_window(&sub).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.games[0].title, "Gamma");
+        // Genre filter reads imported genres.
+        let mut filtered = shelf_spec("system");
+        filtered.platform = Some("pc".to_string());
+        filtered.filters.genres = vec!["RPG".to_string()];
+        let page = cat.rom_home_shelf_window(&filtered).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.games[0].title, "Beta");
+        // Search matches an imported genre too.
+        let mut search = shelf_spec("search");
+        search.query = Some("rpg".to_string());
+        let page = cat.rom_home_shelf_window(&search).unwrap();
+        assert_eq!(page.total, 1);
+        // Facets + counts carry the PC facts.
+        let facets = cat.rom_home_genre_facets().unwrap();
+        assert!(facets.contains(&("Action".to_string(), 2)), "{facets:?}");
+        assert!(facets.contains(&("RPG".to_string(), 1)), "{facets:?}");
+        let counts = cat.rom_home_counts().unwrap();
+        assert_eq!(counts.missing_media, 2, "cover counts as art");
+        assert_eq!(
+            counts.pc_libraries,
+            vec![("Playnite".to_string(), 2), ("Folder finds".to_string(), 1)]
+        );
+        // Missing pairs never include PC items (fetch is ROM-only).
+        let pairs = cat.rom_home_missing_pairs(&shelf_spec("all")).unwrap();
+        assert!(pairs.is_empty(), "{pairs:?}");
+        // Byte totals ride install_size, not the folder item.
+        let rows = cat.rom_home_system_file_rows().unwrap();
+        let pc_rows: Vec<_> = rows.iter().filter(|r| r.platform == "pc").collect();
+        assert_eq!(pc_rows.len(), 3);
+        assert!(pc_rows.iter().all(|r| r.size_bytes == Some(1_000_000)));
+    }
+
+    #[test]
+    fn pc_badge_survives_reimport_and_state_routes_to_group() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = pc_seed_location(&cat);
+        cat.upsert_pc_install(&pc_record(
+            &loc,
+            "/games/Alpha",
+            "Alpha",
+            "playnite",
+            "Playnite",
+        ))
+        .unwrap();
+        // Personal state routes to the group for pc paths exactly
+        // like ROM paths (one game-state model).
+        cat.rom_game_set_favorite("/games/Alpha", true).unwrap();
+        let counts = cat.rom_home_counts().unwrap();
+        assert_eq!(counts.favorite_groups, 1);
+        // Badge starts at not-checked, moves only through its door,
+        // and a re-import (presence refresh) never resets it.
+        assert!(cat
+            .pc_set_launch_badge("/games/Alpha", "boots", Some("ran clean"), "2026-10-17T01:00:00Z")
+            .unwrap());
+        let mut rec = pc_record(&loc, "/games/Alpha", "Alpha", "playnite", "Playnite");
+        rec.present = false;
+        cat.upsert_pc_install(&rec).unwrap();
+        let sheet = cat.pc_game_sheet("/games/Alpha").unwrap().unwrap();
+        assert_eq!(sheet.launch_badge, "boots");
+        assert_eq!(sheet.launch_note.as_deref(), Some("ran clean"));
+        assert!(!sheet.present, "presence refreshed honestly");
+        assert_eq!(sheet.installs.len(), 1);
+        assert_eq!(sheet.genres, vec!["Action".to_string()]);
+        assert_eq!(sheet.links.len(), 1);
+    }
+
+    #[test]
+    fn pc_window_walk_at_imported_scale() {
+        // The brief's scale: a real imported library (392 groups)
+        // walks window by window, each group exactly once, with
+        // the TRUE total on every page.
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = pc_seed_location(&cat);
+        for i in 0..392 {
+            let title = format!("Game {i:03}");
+            cat.upsert_pc_install(&pc_record(
+                &loc,
+                &format!("/games/{title}"),
+                &title,
+                "playnite",
+                "Playnite",
+            ))
+            .unwrap();
+        }
+        let mut spec = shelf_spec("system");
+        spec.platform = Some("pc".to_string());
+        spec.limit = 100;
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..10 {
+            spec.cursor = cursor.clone();
+            let page = cat.rom_home_shelf_window(&spec).unwrap();
+            assert_eq!(page.total, 392);
+            for g in &page.games {
+                if !seen.contains(&g.group_key) {
+                    seen.push(g.group_key.clone());
+                }
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 392, "every group exactly once");
+    }
+
     fn shelf_spec(kind: &str) -> RomHomeShelfSpec {
         RomHomeShelfSpec {
             kind: kind.to_string(),
@@ -9919,6 +11127,7 @@ mod rom_home_tests {
             query: None,
             search_platforms: vec![],
             member_keys: None,
+            pc_source: None,
             filters: RomHomeShelfFilters::default(),
             sort: "title".to_string(),
             cursor: None,
@@ -10668,6 +11877,7 @@ mod rom_home_tests {
             query: None,
             search_platforms: vec![],
             member_keys: None,
+            pc_source: None,
             filters: RomHomeShelfFilters::default(),
             sort: "title".into(),
             cursor: None,

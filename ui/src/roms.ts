@@ -68,6 +68,7 @@ export const ROM_SYSTEM_KEYS: Record<string, string> = {
   "Nintendo 64": "n64",
   "Nintendo DS": "nds",
   "Odyssey²": "odyssey2",
+  "PC": "pc",
   "PC-FX": "pcfx",
   "PlayStation": "psx",
   "PlayStation 2": "ps2",
@@ -177,6 +178,7 @@ export const ROM_SYSTEM_META: Record<string, RomSystemMeta> = {
   "Nintendo Switch": { maker: "Nintendo", gen: 8 },
   "Switch 2": { maker: "Nintendo", gen: 9 },
   "Odyssey²": { maker: "Magnavox", gen: 2 },
+  "PC": { maker: "PC", gen: null },
   "PC-FX": { maker: "NEC", gen: 5 },
   "PlayStation": { maker: "Sony", gen: 5 },
   "PlayStation 2": { maker: "Sony", gen: 6 },
@@ -369,6 +371,7 @@ const SEED_FLAG = "ff-roms-v1";
 const SEED_FLAG_V2 = "ff-roms-v2";
 const SEED_FLAG_V3 = "ff-roms-v3";
 const SEED_FLAG_V4 = "ff-roms-v4";
+const SEED_FLAG_V5 = "ff-roms-v5";
 const ENABLED_KEY = "ff-roms-enabled";
 
 /** Round 7.1 additions (Dickles): modern consoles + arcade. Applied as a
@@ -465,6 +468,7 @@ export const ROM_SEED: RomSystem[] = [
   { name: "Nintendo 3DS", extensions: ["3ds", "cia"] },
   { name: "Nintendo 64", extensions: ["n64", "z64", "v64"] },
   { name: "Nintendo DS", extensions: ["nds"] },
+  { name: "PC", extensions: [] },
   { name: "PlayStation", extensions: ["cue", "chd", "pbp", "iso"] },
   { name: "PlayStation 2", extensions: ["iso", "chd"] },
   { name: "PSP", extensions: ["iso", "cso", "pbp"] },
@@ -581,6 +585,21 @@ export function loadRomSystems(): RomSystem[] {
       saveRomSystems(list);
     }
     try { localStorage.setItem(SEED_FLAG_V4, "1"); } catch { /* ignore */ }
+  }
+  // PC Games P1 (2026-10-17): the PC section of Games Home. PC has
+  // no extension rules — its games arrive by import (Playnite) and
+  // folder scan, never by extension gathering, so the seed carries
+  // an empty list exactly like a placeholder. One-time additive
+  // merge; a deleted PC entry stays deleted.
+  let mergedV5 = false;
+  try { mergedV5 = !!localStorage.getItem(SEED_FLAG_V5); } catch { mergedV5 = true; }
+  if (!mergedV5) {
+    if (!list.some((s) => s.name === "PC")) {
+      list.push({ name: "PC", extensions: [] });
+      list.sort((a, b) => a.name.localeCompare(b.name));
+      saveRomSystems(list);
+    }
+    try { localStorage.setItem(SEED_FLAG_V5, "1"); } catch { /* ignore */ }
   }
   return list;
 }

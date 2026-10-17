@@ -3943,6 +3943,22 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
   display: flex; align-items: baseline; gap: 6px;
   margin-top: 7px; padding: 0 2px;
 }
+/* PC Games P1: card fact row + inspector sections. */
+.rh-pc-row {
+  display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline;
+  padding: 0 2px; margin-top: 2px;
+  font-size: 0.72rem; color: var(--ufm-fg-dim);
+}
+.rh-pc-lib { font-weight: 600; color: var(--ufm-fg); }
+.rh-pc-state.ok { color: var(--ufm-accent); }
+.rh-pc-mislabel { color: var(--ufm-warn, #d8a03c); }
+.rh-pc-chip.on { background: var(--ufm-accent); color: var(--ufm-on-accent, #fff); }
+.rh-pc-launch-badge { font-weight: 600; align-self: center; }
+.rh-pc-launch-note { color: var(--ufm-fg-dim); font-size: 0.82rem; }
+.rh-pc-line { margin: 2px 0; font-size: 0.85rem; overflow-wrap: anywhere; }
+.rh-pc-desc { font-size: 0.85rem; line-height: 1.45; }
+.rh-pc-link { display: block; margin: 2px 0; font-size: 0.85rem; }
+.rh-pc-mislabel-note { color: var(--ufm-warn, #d8a03c); font-size: 0.85rem; }
 .rh-tile-name {
   flex: 1; min-width: 0; font-weight: 550;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;

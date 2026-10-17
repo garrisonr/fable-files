@@ -487,7 +487,7 @@ pub(crate) fn human_date(rfc3339: &str) -> String {
 /// Deterministic UUID for a volume seed string (FNV-1a 128-bit): the
 /// same mount path must yield the same location / root-item ids on every
 /// enumeration, or sidebar refresh would churn ids under open tabs.
-fn volume_uuid(seed: &str) -> uuid::Uuid {
+pub(crate) fn volume_uuid(seed: &str) -> uuid::Uuid {
     let mut h1: u64 = 0xcbf2_9ce4_8422_2325;
     for b in seed.bytes() {
         h1 = (h1 ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
@@ -8971,6 +8971,8 @@ pub struct RomHomeGameWire {
     pub media: Vec<ufm_catalog::RomGameMedia>,
     pub state: ufm_catalog::RomGameState,
     pub auditor_flagged: bool,
+    /// PC Games P1: card facts for pc-game rows (null for ROMs).
+    pub pc: Option<ufm_catalog::PcGameCard>,
     /// Library Memory: the volume this game lives on, when known.
     pub volume_label: Option<String>,
     pub volume_offline: bool,
@@ -9021,6 +9023,7 @@ fn wire_rom_home_games(
             media: row.media,
             state: row.state,
             auditor_flagged: row.auditor_flagged,
+            pc: row.pc,
             volume_label: badge.map(|b| b.volume_label.clone()),
             volume_offline: badge.map(|b| b.offline).unwrap_or(false),
             volume_last_seen: badge.and_then(|b| b.last_seen.clone()),
