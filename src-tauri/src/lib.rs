@@ -9,6 +9,7 @@
 pub mod commands;
 pub mod deps;
 pub mod library;
+pub mod locscope;
 pub mod network;
 pub mod mcp_server;
 pub mod auditor;
@@ -713,6 +714,8 @@ pub fn run() {
             commands::media_url_for_path,
             commands::add_path_location,
             commands::remove_path_location,
+            commands::census_location,
+            commands::add_scoped_location,
             commands::net_connect,
             commands::net_disconnect,
             commands::unmount_device,

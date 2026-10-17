@@ -32,6 +32,8 @@ import { SearchView, fmtDay } from "./search";
 import { RomHome } from "./romhome";
 import { MediaResDialog } from "./mediares";
 import { RomOrganizeDialog } from "./romorg";
+import { AddLocationGate } from "./addlocation";
+import { partitionReindex } from "./addscope";
 import { MusicCompleteDialog } from "./musiccomplete";
 import { PropertiesDialog } from "./properties";
 import { AuditorPanel } from "./auditor";
@@ -254,6 +256,11 @@ export class Shell {
   private searchOpenWith = new OpenWithDialog();
   private mediaRename = new MediaResDialog();
   private romOrganize = new RomOrganizeDialog();
+  /** Safety gate (2026-10-16): every user-picked folder add passes
+   * the census first; big trees detour through the pick sheet. */
+  private addGate = new AddLocationGate({
+    onAdded: (summary) => void this.afterRomFolderAdded(summary),
+  });
   private musicComplete = new MusicCompleteDialog();
   private musicPlayer = new MusicPlayer();
   private labelList!: HTMLElement;
@@ -4476,11 +4483,37 @@ export class Shell {
     Toast.show("Re-indexing the library…", "info");
     // Offline server bookmarks can't be walked — Connect indexes them.
     // Devices stay out even here: a phone is never library memory.
-    void this.indexTracker.reindexAll(
-      this.locations
-        .filter((l) => l.online && l.provider !== "device")
-        .map((l) => l.id),
+    const eligible = this.locations.filter(
+      (l) => l.online && l.provider !== "device",
     );
+    // Safety-gate amendment (Dickles, 2026-10-16): volumes pass the
+    // census gate before they queue — an over-threshold volume is
+    // never walked unscoped from this door either. Non-volumes keep
+    // the one-click behavior exactly; gated volumes go one at a
+    // time, and only a confirmed (or under-threshold) census queues.
+    const { immediate, gated } = partitionReindex(eligible);
+    void this.indexTracker.reindexAll(immediate.map((l) => l.id));
+    void (async () => {
+      for (const vol of gated) {
+        if (!vol.path) {
+          Toast.error(
+            `“${vol.display_name}” has no path right now, so it was left out of the re-index rather than walked unchecked.`,
+          );
+          continue;
+        }
+        try {
+          const ok = await this.addGate.gateExisting(
+            vol.display_name,
+            vol.path,
+          );
+          if (ok) void this.indexTracker.reindexAll([vol.id]);
+        } catch (err) {
+          Toast.error(
+            `Could not check “${vol.display_name}” before re-indexing: ${errText(err)}`,
+          );
+        }
+      }
+    })();
   }
 
   /** File Auditor: the sidebar badge carries the open-flag count
@@ -4908,23 +4941,31 @@ export class Shell {
   }
 
   /** "Add a ROM folder…": register the folder as a location; the
-   * indexer + identification fill the shelves from there. */
+   * indexer + identification fill the shelves from there. The add
+   * routes through the safety gate: census first, and a tree over
+   * the gate threshold detours through the folder-pick sheet
+   * before anything is registered or indexed. */
   private async addRomFolder(): Promise<void> {
     const path = await this.picker.pick("Add a ROM folder…", [], null);
     if (!path) return;
     const name = path.split("/").filter(Boolean).pop() ?? "ROMs";
     try {
-      const summary = await api.addPathLocation(name, path);
-      await this.refreshLocations();
-      void this.indexTracker.reindexAll([summary.id]);
-      Toast.success(
-        `Added “${name}” — its games join the shelves as they're identified.`,
-      );
-      this.romHome.invalidate();
-      void this.refreshRomDoor();
+      await this.addGate.add(name, path, { romDoor: true });
     } catch (err) {
       Toast.error(`Could not add that folder: ${errText(err)}`);
     }
+  }
+
+  /** The post-add routine for a ROM-door location, whichever way
+   * the gate registered it (plain or scoped). */
+  private async afterRomFolderAdded(summary: LocationSummary): Promise<void> {
+    await this.refreshLocations();
+    void this.indexTracker.reindexAll([summary.id]);
+    Toast.success(
+      `Added “${summary.display_name}” — its games join the shelves as they're identified.`,
+    );
+    this.romHome.invalidate();
+    void this.refreshRomDoor();
   }
 
   /** The inspector's "Show in Files": leave the room, walk the

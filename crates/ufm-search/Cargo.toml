@@ -17,3 +17,7 @@ walkdir.workspace = true
 # key (the shape of the live superdog evidence), which no public
 # catalog query exposes — read the test's own scratch db directly.
 rusqlite.workspace = true
+# Safety-gate proofs run against the PRODUCTION candidate list, not
+# a copy: the ROM-focus filter must admit exactly what the identify
+# pass would feed on. (ufm-media depends only on ufm-core — no cycle.)
+ufm-media = { path = "../ufm-media" }

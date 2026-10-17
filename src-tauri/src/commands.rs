@@ -4669,6 +4669,9 @@ pub async fn start_indexing(
 
     let catalog_path = state.catalog_path.clone();
     let checkpoint_path = state.checkpoint_path.clone();
+    // Safety gate: the locscope sidecar lives with the other app
+    // settings (rom_media_base is that directory).
+    let scope_base = rom_media_base(&state);
     let root_for_mark = root.clone();
     // The background task re-enters state through the owned AppHandle, so the
     // borrow of `state` never escapes this command.
@@ -4712,7 +4715,26 @@ pub async fn start_indexing(
                 }
                 let _ = progress_app.emit("index-progress", &payload);
             }));
-            indexer.index_root(&root, &location_rec)
+            // Safety gate: a root the census gate scoped walks
+            // under that scope — folder pick + ROM focus — on every
+            // indexing pass, not just the add-time one. Roots with
+            // no recorded scope walk exactly as they always have.
+            match crate::locscope::scope_for_root(&scope_base, &root) {
+                Some(stored) => {
+                    let candidates: std::collections::HashSet<String> =
+                        ufm_media::romdat::candidate_extensions()
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect();
+                    indexer.index_root_scoped(
+                        &root,
+                        &location_rec,
+                        &stored.to_index_scope(),
+                        &candidates,
+                    )
+                }
+                None => indexer.index_root(&root, &location_rec),
+            }
         })
         .await;
         let state = app.state::<AppState>();
@@ -9187,6 +9209,17 @@ pub async fn add_path_location(
     name: String,
     path: String,
 ) -> Cmd<LocationSummary> {
+    register_path_location(&state, name, path)
+}
+
+/// The registration body shared by `add_path_location` and the
+/// safety gate's `add_scoped_location`: same maps, same reuse of an
+/// existing registration for the same root.
+fn register_path_location(
+    state: &AppState,
+    name: String,
+    path: String,
+) -> Cmd<LocationSummary> {
     let root = std::path::PathBuf::from(&path);
     if !root.is_dir() {
         return Err(CommandError::from(UfmError::NotFound(format!(
@@ -9248,17 +9281,77 @@ pub async fn add_path_location(
     Ok(summary)
 }
 
+/// The census report the add-location sheet renders: the raw
+/// metadata walk plus the gate verdict for its totals.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CensusReport {
+    pub census: ufm_search::Census,
+    pub over_threshold: bool,
+    pub threshold: u64,
+}
+
+/// Safety gate (2026-10-16): census a would-be location BEFORE it
+/// is registered or indexed. Read-only by construction — the walk
+/// is `ufm_search::census_root`, metadata only — so a user who
+/// backs out here has changed nothing anywhere: no location, no
+/// scope, no catalog row.
+#[tauri::command]
+pub async fn census_location(path: String) -> Cmd<CensusReport> {
+    let candidates: std::collections::HashSet<String> =
+        ufm_media::romdat::candidate_extensions()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    let root = std::path::PathBuf::from(&path);
+    let census = tauri::async_runtime::spawn_blocking(move || {
+        ufm_search::census_root(&root, &candidates)
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("census task failed: {e}"))))??;
+    Ok(CensusReport {
+        over_threshold: census.over_threshold(),
+        threshold: ufm_search::GATE_THRESHOLD_FILES,
+        census,
+    })
+}
+
+/// Safety gate: register a location AND record the scope chosen in
+/// the census sheet. The scope is written only after registration
+/// succeeds, keyed by the root path; `start_indexing` applies it on
+/// every walk of this root. A plain `add_path_location` never
+/// writes a scope — the gate is the only door that makes catalog
+/// promises, so it is the only door that records them.
+#[tauri::command]
+pub async fn add_scoped_location(
+    state: State<'_, AppState>,
+    name: String,
+    path: String,
+    scope: crate::locscope::LocationScope,
+) -> Cmd<LocationSummary> {
+    let summary = register_path_location(&state, name, path.clone())?;
+    let root = std::path::PathBuf::from(&path);
+    crate::locscope::save_scope(&rom_media_base(&state), &root, &scope)
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    Ok(summary)
+}
+
 /// Remove a runtime location (unmount). The seeded Home location is
 /// not removable through here — callers only pass runtime ids.
 #[tauri::command]
 pub async fn remove_path_location(state: State<'_, AppState>, location: LocationId) -> Cmd<()> {
-    state.local_roots.lock().unwrap().remove(&location);
+    let root = state.local_roots.lock().unwrap().remove(&location);
     state.root_items.lock().unwrap().remove(&location);
     state
         .locations
         .lock()
         .unwrap()
         .retain(|l| l.id != location);
+    // Safety gate: removal forgets the root's scope — a later
+    // re-add starts from a fresh census, not a stale pick.
+    if let Some(root) = root {
+        crate::locscope::forget_scope(&rom_media_base(&state), &root);
+    }
     Ok(())
 }
 

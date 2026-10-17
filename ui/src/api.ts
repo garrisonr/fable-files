@@ -4,6 +4,7 @@
  */
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { CensusReport, LocationScopeWire } from "./addscope";
 
 /** A mounted root: local dir, cloud account, archive, search… */
 export interface DiskPart {
@@ -699,6 +700,18 @@ export const api = {
     invoke<LocationSummary>("add_path_location", { name, path }),
   removePathLocation: (location: string) =>
     invoke<void>("remove_path_location", { location }),
+  /** Safety gate: census a would-be location (metadata-only,
+   * read-only) before anything is registered or indexed. */
+  censusLocation: (path: string) =>
+    invoke<CensusReport>("census_location", { path }),
+  /** Safety gate: register a location and record the scope the
+   * census sheet chose; indexing walks only what the scope admits. */
+  addScopedLocation: (
+    name: string,
+    path: string,
+    scope: LocationScopeWire,
+  ) =>
+    invoke<LocationSummary>("add_scoped_location", { name, path, scope }),
   /** Network Locations: connect a server via GIO (smb/ftp/ftps/
    *  sftp/dav/davs/nfs/afp). The password reaches the OS keyring
    *  only when rememberPassword is set and the mount succeeds. */

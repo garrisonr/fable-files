@@ -38,6 +38,8 @@ use serde::{Deserialize, Serialize};
 use ufm_core::{Result, UfmError};
 use ufm_vfs::Location;
 
+use crate::scope::IndexScope;
+
 /// Per-run totals returned by [`Indexer::index_root`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IndexStats {
@@ -73,6 +75,16 @@ struct Checkpoint {
     /// would never be indexed. Completion only licenses a fresh re-walk.
     #[serde(default)]
     run_complete: bool,
+    /// Safety gate (2026-10-16): the [`IndexScope`] fingerprint of
+    /// the run that wrote this checkpoint ("" = unscoped, including
+    /// every pre-gate checkpoint). A resumed run whose scope tag
+    /// differs must NOT prune from this checkpoint: directories were
+    /// completed under different admission rules, and trusting them
+    /// would hide subtrees the new scope never walked (the P0-2
+    /// poison class). Serde-defaulted so old files parse; a tag
+    /// mismatch costs one fresh walk, never correctness.
+    #[serde(default)]
+    scope_tag: String,
 }
 
 const CHECKPOINT_VERSION: u32 = 2;
@@ -98,15 +110,15 @@ pub struct Indexer {
     catalog: ufm_catalog::Catalog,
     checkpoint_path: PathBuf,
     completed_dirs: HashSet<String>,
-    /// Roots THIS Indexer instance has fully walked. Only these may
-    /// take the zeroed-stats fast path. A checkpoint loaded from
-    /// disk must never fast-path a root: the writer can persist the
-    /// root itself in a resumable (run_complete = false) checkpoint
-    /// when a run dies during the final drain, and trusting it made
-    /// a location permanently invisible — every later re-index
-    /// returned instantly with zero stats while whole subtrees
-    /// (btrfs sibling subvolumes on Dickles' superdog) had never
-    /// been walked (P0-2, 2026-10-14).
+    /// (root, scope tag) pairs THIS Indexer instance has fully
+    /// walked. Only these may take the zeroed-stats fast path. A
+    /// checkpoint loaded from disk must never fast-path a root: the
+    /// writer can persist the root itself in a resumable
+    /// (run_complete = false) checkpoint when a run dies during the
+    /// final drain, and trusting it made a location permanently
+    /// invisible — every later re-index returned instantly with
+    /// zero stats while whole subtrees (btrfs sibling subvolumes
+    /// on Dickles' superdog) had never been walked (P0-2, 2026-10-14).
     session_completed: HashSet<String>,
     /// Cumulative totals, restored from the checkpoint and re-persisted.
     files_done: u64,
@@ -119,6 +131,13 @@ pub struct Indexer {
     /// When the last non-final checkpoint actually hit disk (freeze
     /// fix: cadence writes inside the throttle window are skipped).
     last_checkpoint_write: Option<std::time::Instant>,
+    /// The scope tag of the checkpoint loaded from disk ("" when
+    /// none was loaded or it predates the gate). Compared against
+    /// each run's tag before any pruning is trusted.
+    loaded_scope_tag: String,
+    /// The scope tag of the run currently walking; stamped into
+    /// every checkpoint it writes.
+    active_scope_tag: String,
 }
 
 impl Indexer {
@@ -138,6 +157,8 @@ impl Indexer {
             files_removed: 0,
             progress: None,
             last_checkpoint_write: None,
+            loaded_scope_tag: String::new(),
+            active_scope_tag: String::new(),
         };
         me.load_checkpoint()?;
         Ok(me)
@@ -170,18 +191,73 @@ impl Indexer {
     /// filesystem beyond the root stat (a checkpoint on disk never earns
     /// that fast path — see `session_completed`).
     pub fn index_root(&mut self, root: &Path, location: &Location) -> Result<IndexStats> {
+        // The historic behavior is a scoped walk whose scope admits
+        // everything. The candidate set is never consulted by an
+        // unrestricted scope, so an empty one is honest here.
+        let no_candidates: HashSet<String> = HashSet::new();
+        self.index_root_scoped(root, location, &IndexScope::ALL, &no_candidates)
+    }
+
+    /// Index `root` under `location`, admitting only what `scope`
+    /// allows (safety gate, 2026-10-16). `candidates` is the
+    /// lowercase ROM-identification candidate extension set; it is
+    /// consulted only when `scope.rom_focus` is set.
+    ///
+    /// Semantics beyond [`Indexer::index_root`]:
+    /// - Unpicked top-level subtrees are pruned at the walker — they
+    ///   are never descended into, let alone cataloged.
+    /// - A complete scoped walk reconciles like a complete walk:
+    ///   `delete_unseen` drops catalog rows the scope no longer
+    ///   admits. The scope IS the catalog contract for the location:
+    ///   narrowing it and re-indexing forgets what was excluded.
+    /// - A checkpoint left by a run under a DIFFERENT scope tag is
+    ///   not trusted for pruning (its completed dirs were completed
+    ///   under other rules); the walk starts fresh instead.
+    pub fn index_root_scoped(
+        &mut self,
+        root: &Path,
+        location: &Location,
+        scope: &IndexScope,
+        candidates: &HashSet<String>,
+    ) -> Result<IndexStats> {
+        let tag = scope.tag(candidates);
+        if tag != self.loaded_scope_tag && !self.completed_dirs.is_empty() {
+            // The on-disk checkpoint belongs to a run with different
+            // admission rules. Its completed set is a prune filter
+            // for a walk that never happened under THIS scope —
+            // drop it and walk fresh (correctness over resume speed,
+            // the P0-2 lesson).
+            self.completed_dirs.clear();
+            self.files_done = 0;
+            self.bytes_done = 0;
+        }
+        self.active_scope_tag = tag;
+        self.index_root_inner(root, location, scope, candidates)
+    }
+
+    fn index_root_inner(
+        &mut self,
+        root: &Path,
+        location: &Location,
+        scope: &IndexScope,
+        candidates: &HashSet<String>,
+    ) -> Result<IndexStats> {
         self.catalog.insert_location(location)?;
         let canon = root.canonicalize().map_err(|e| UfmError::Provider {
             provider: "local".into(),
             message: format!("index root {}: {e}", root.display()),
         })?;
         let canon_s = canon.to_string_lossy().into_owned();
+        // The session fast path is keyed by root AND scope tag:
+        // a root walked under one scope has not been walked under
+        // another.
+        let session_key = format!("{canon_s}|{}", self.active_scope_tag);
 
         // Session fast path: THIS Indexer already walked the whole
         // root. Loaded checkpoint state deliberately does NOT count
         // (see session_completed): it is a prune filter, never proof
         // of completion.
-        if self.session_completed.contains(&canon_s) {
+        if self.session_completed.contains(&session_key) {
             return Ok(IndexStats::default());
         }
 
@@ -254,6 +330,12 @@ impl Indexer {
         // A dir is complete once walk depth drops back below its own depth.
         let mut dir_stack: Vec<(String, usize)> = vec![(canon_s.clone(), 0)];
 
+        // The prune closure owns its copies: it cannot borrow the
+        // scope, the candidate set, or the root while the loop below
+        // needs `&mut self`.
+        let scope_owned = scope.clone();
+        let candidates_owned = candidates.clone();
+        let canon_for_prune = canon.clone();
         let walker = walkdir::WalkDir::new(&canon)
             .follow_links(false)
             .into_iter()
@@ -262,7 +344,20 @@ impl Indexer {
                     return true; // root: handled above, never pruned
                 }
                 if !e.file_type().is_dir() {
-                    return true;
+                    return true; // files are filtered in the loop
+                }
+                // Safety gate: prune top-level subtrees the folder
+                // pick excluded — never descend into them at all.
+                // (Deeper dirs inherit their top directory's verdict;
+                // the pick only ever names depth-1 entries.) If the
+                // relative path cannot be derived, admit: never
+                // prune on uncertainty.
+                if !scope_owned.is_unrestricted() {
+                    if let Ok(rel) = e.path().strip_prefix(&canon_for_prune) {
+                        if !scope_owned.admits(rel, e.depth(), true, &candidates_owned) {
+                            return false;
+                        }
+                    }
                 }
                 // Prune already-completed subtrees on resume.
                 !done_snapshot.contains(e.path().to_string_lossy().as_ref())
@@ -290,6 +385,18 @@ impl Indexer {
             }
             let path = entry.path();
             let is_dir = entry.file_type().is_dir();
+            // Safety gate: entries outside the scope are not
+            // cataloged and never enter the seen-set (a complete
+            // scoped walk reconciles the catalog to exactly the
+            // scope via delete_unseen below). Directories reaching
+            // this point already passed the prune closure with the
+            // same predicate, so in practice this filters files:
+            // unpicked root files and — under ROM focus —
+            // non-candidate files.
+            let rel = path.strip_prefix(&canon).unwrap_or(path);
+            if !scope.admits(rel, depth, is_dir, candidates) {
+                continue;
+            }
             match ufm_vfs::item_from_path(location.id, path) {
                 Some(item) => {
                     // The seen-set is populated on every walk now
@@ -345,13 +452,16 @@ impl Indexer {
             completed_this_run += 1;
         }
         if fresh_walk {
-            // The walk saw everything: rows for vanished files go away.
+            // The walk saw everything the scope admits: rows for
+            // vanished files go away — and, for a scoped walk, rows
+            // the scope excludes. That is the gate's contract: the
+            // catalog holds what the user picked, nothing else.
             let removed = self.catalog.delete_unseen(&location.id, &seen)?;
             stats.files_removed = removed;
             self.files_removed += removed;
         }
         self.write_checkpoint(true)?;
-        self.session_completed.insert(canon_s);
+        self.session_completed.insert(session_key);
         self.report_progress();
         Ok(stats)
     }
@@ -392,6 +502,9 @@ impl Indexer {
             // than refuse to index.
             return Ok(());
         }
+        // Remember which scope wrote this checkpoint; a run under a
+        // different tag discards the prune set (index_root_scoped).
+        self.loaded_scope_tag = ck.scope_tag.clone();
         if ck.run_complete {
             // The last run finished the whole root. Pruning from it would
             // hide every file added since — start a fresh walk instead
@@ -432,6 +545,7 @@ impl Indexer {
             files_done: self.files_done,
             bytes_done: self.bytes_done,
             run_complete,
+            scope_tag: self.active_scope_tag.clone(),
         };
         let json = serde_json::to_string(&ck)
             .map_err(|e| UfmError::Database(format!("serialize checkpoint: {e}")))?;

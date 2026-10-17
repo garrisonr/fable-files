@@ -9,8 +9,12 @@
 use serde::{Deserialize, Serialize};
 use ufm_core::{CollectionId, LocationId, Result, UfmError};
 
+pub mod census;
 pub mod indexer;
+pub mod scope;
+pub use census::{census_root, Census, TopEntry, GATE_THRESHOLD_FILES};
 pub use indexer::{Indexer, IndexStats};
+pub use scope::IndexScope;
 
 // ---------------------------------------------------------------------------
 // Query AST — parsed once, executed against the catalog index.
