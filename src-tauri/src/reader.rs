@@ -25,11 +25,20 @@
 //! reading width and are cached in the freedesktop family's style —
 //! md5(file-uri) naming, mtime freshness — one app-private tier:
 //! `~/.cache/fable-files/pdf-pages/<md5>-p<page>-w<bucket>.png`.
+//!
+//! THE READING ROOM (Ebook P2, 2026-10-17): chapters now arrive
+//! RICH — `decode_epub_book_rich` returns the publisher's own
+//! sanitized XHTML + scoped CSS for the chapter being read, beside
+//! the same chapter text as always (the text stays the fallback
+//! and the read-aloud path). Progress entries gain an optional
+//! `scroll_frac` (within-chapter place, 0..=1) so reopening lands
+//! on the same place, not just the same chapter; entries without
+//! it serialize exactly as P1 wrote them.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use ufm_preview::epub::decode_epub_book;
+use ufm_preview::epub::{decode_epub_book, decode_epub_book_rich};
 
 /// Books larger than this get a plain-language refusal instead of a
 /// long, memory-hungry decode.
@@ -59,6 +68,11 @@ struct ProgressEntry {
     /// like "125"). Absent on EPUB entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     zoom_mode: Option<String>,
+    /// EPUB within-chapter place (Ebook P2): the fraction of the
+    /// chapter's scrollable height the reader had reached, 0..=1.
+    /// Absent on entries P2 hasn't touched and on PDF entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scroll_frac: Option<f64>,
 }
 
 fn default_font_scale() -> f32 {
@@ -117,6 +131,13 @@ pub struct BookOpenView {
     /// Where the reader left off (0-based, clamped to the book).
     pub start_chapter: usize,
     pub font_scale: f32,
+    /// Decoded chapter titles in spine order (P2) — the chapter
+    /// menu is complete from the moment the book opens, instead of
+    /// learning titles only for chapters already visited.
+    pub chapter_titles: Vec<Option<String>>,
+    /// The saved within-chapter place for `start_chapter` (P2),
+    /// when the progress entry carries one.
+    pub start_scroll_frac: Option<f64>,
 }
 
 #[tauri::command]
@@ -143,6 +164,8 @@ pub async fn open_book(path: String) -> Result<BookOpenView, String> {
                 .map(|e| e.font_scale)
                 .unwrap_or(1.0)
                 .clamp(0.7, 2.2),
+            chapter_titles: book.chapters.iter().map(|c| c.title.clone()).collect(),
+            start_scroll_frac: entry.as_ref().and_then(|e| e.scroll_frac),
         })
     })
     .await
@@ -155,6 +178,14 @@ pub struct ChapterView {
     pub index: usize,
     pub title: Option<String>,
     pub text: String,
+    /// The chapter's sanitized XHTML for the rich surface (P2),
+    /// when the markup parsed. Absent → the reader renders `text`
+    /// exactly as P1 did.
+    pub html: Option<String>,
+    /// The chapter's publisher CSS, sanitized and scoped to the
+    /// reader's `.reader-pub` container (P2). Absent when the
+    /// chapter uses no stylesheets or style blocks.
+    pub css: Option<String>,
     pub chapter_count: usize,
 }
 
@@ -162,8 +193,13 @@ pub struct ChapterView {
 pub async fn read_chapter(path: String, index: usize) -> Result<ChapterView, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let bytes = read_book_bytes(Path::new(&path))?;
-        let book = decode_epub_book(&bytes);
+        let book = decode_epub_book_rich(&bytes, Some(index));
         let chapter_count = book.chapters.len();
+        let rich = book.rich.into_iter().nth(index).flatten();
+        let (html, css) = match rich {
+            Some(r) => (r.html, r.css),
+            None => (None, None),
+        };
         let chapter = book
             .chapters
             .into_iter()
@@ -173,6 +209,8 @@ pub async fn read_chapter(path: String, index: usize) -> Result<ChapterView, Str
             index,
             title: chapter.title,
             text: chapter.text,
+            html,
+            css,
             chapter_count,
         })
     })
@@ -180,14 +218,16 @@ pub async fn read_chapter(path: String, index: usize) -> Result<ChapterView, Str
     .map_err(|e| format!("reader task failed: {e}"))?
 }
 
-/// Persist the reading position (and optionally the type scale) for
-/// a book. Called by the reader on navigation and on close.
+/// Persist the reading position (and optionally the type scale and
+/// the within-chapter place) for a book. Called by the reader on
+/// navigation, on scroll settle, and on close.
 #[tauri::command]
 pub fn set_reading_progress(
     state: tauri::State<'_, crate::AppState>,
     path: String,
     chapter: usize,
     font_scale: Option<f32>,
+    scroll_frac: Option<f64>,
 ) -> Result<(), String> {
     let mut progress = load_progress();
     let entry = progress.books.entry(path.clone()).or_insert(ProgressEntry {
@@ -196,8 +236,17 @@ pub fn set_reading_progress(
         updated: String::new(),
         page: None,
         zoom_mode: None,
+        scroll_frac: None,
     });
+    let chapter_changed = entry.chapter != chapter;
     entry.chapter = chapter;
+    match scroll_frac {
+        Some(frac) => entry.scroll_frac = Some(frac.clamp(0.0, 1.0)),
+        // A chapter change without a fresh place must not inherit
+        // the old chapter's place.
+        None if chapter_changed => entry.scroll_frac = None,
+        None => {}
+    }
     if let Some(scale) = font_scale {
         entry.font_scale = scale.clamp(0.7, 2.2);
     }
@@ -220,6 +269,10 @@ pub struct ProgressView {
     pub path: String,
     pub chapter: Option<usize>,
     pub page: Option<usize>,
+    /// Within-chapter place for EPUB entries (P2), so Continue
+    /// Reading's percentage counts the part of the chapter the
+    /// reader has actually read.
+    pub scroll_frac: Option<f64>,
     pub updated: String,
 }
 
@@ -234,6 +287,7 @@ pub fn list_reading_progress() -> Vec<ProgressView> {
             path: path.clone(),
             chapter: if e.page.is_some() { None } else { Some(e.chapter) },
             page: e.page,
+            scroll_frac: if e.page.is_some() { None } else { e.scroll_frac },
             updated: e.updated.clone(),
         })
         .collect();
@@ -446,6 +500,7 @@ pub fn set_pdf_progress(
         updated: String::new(),
         page: None,
         zoom_mode: None,
+        scroll_frac: None,
     });
     entry.page = Some(page);
     if let Some(mode) = zoom_mode {
@@ -488,6 +543,10 @@ mod tests {
         let out = serde_json::to_string(&progress).unwrap();
         assert!(!out.contains("\"page\""), "epub entry gained a page key: {out}");
         assert!(!out.contains("zoom_mode"), "epub entry gained zoom: {out}");
+        assert!(
+            !out.contains("scroll_frac"),
+            "legacy entry gained a scroll_frac key: {out}"
+        );
 
         // A PDF entry round-trips its page + zoom mode.
         let mut progress = ReadingProgress::default();
@@ -499,6 +558,7 @@ mod tests {
                 updated: "2026-10-15T00:00:00Z".into(),
                 page: Some(41),
                 zoom_mode: Some("fit-page".into()),
+                scroll_frac: None,
             },
         );
         let text = serde_json::to_string(&progress).unwrap();
@@ -506,6 +566,30 @@ mod tests {
         let entry = &back.books["/docs/b.pdf"];
         assert_eq!(entry.page, Some(41));
         assert_eq!(entry.zoom_mode.as_deref(), Some("fit-page"));
+    }
+
+    #[test]
+    fn scroll_frac_roundtrips_on_epub_entries() {
+        // P2: an EPUB entry that carries a within-chapter place
+        // keeps it through a save/load cycle.
+        let mut progress = ReadingProgress::default();
+        progress.books.insert(
+            "/books/c.epub".into(),
+            ProgressEntry {
+                chapter: 2,
+                font_scale: 1.0,
+                updated: "2026-10-17T00:00:00Z".into(),
+                page: None,
+                zoom_mode: None,
+                scroll_frac: Some(0.45),
+            },
+        );
+        let text = serde_json::to_string(&progress).unwrap();
+        assert!(text.contains("scroll_frac"), "place was not saved: {text}");
+        let back: ReadingProgress = serde_json::from_str(&text).unwrap();
+        let entry = &back.books["/books/c.epub"];
+        assert_eq!(entry.chapter, 2);
+        assert_eq!(entry.scroll_frac, Some(0.45));
     }
 
     #[test]

@@ -463,15 +463,25 @@ fn card(row: &BookShelfRow) -> BookCard {
 /// Progress fraction along a book (0..=1) and whether the reader is
 /// at its end. EPUB positions are 0-based chapter indices over the
 /// spine; PDF positions are 0-based pages over the page count.
+/// Ebook P2: when the EPUB entry carries a within-chapter place,
+/// the fraction counts the part of the current chapter actually
+/// read — (chapter + scroll_frac) / total — instead of crediting
+/// the whole chapter the moment it opens. Entries without a place
+/// keep P1's math exactly. The finish rule never changes: being on
+/// the final chapter is what offers Mark as Read.
 fn progress_math(
     chapter: Option<usize>,
     page: Option<usize>,
+    scroll_frac: Option<f64>,
     spine_count: Option<i64>,
     page_count: Option<i64>,
 ) -> (Option<f64>, bool) {
     if let (Some(ch), Some(total)) = (chapter, spine_count) {
         if total > 0 {
-            let frac = ((ch as f64) + 1.0) / (total as f64);
+            let frac = match scroll_frac {
+                Some(f) => ((ch as f64) + f.clamp(0.0, 1.0)) / (total as f64),
+                None => ((ch as f64) + 1.0) / (total as f64),
+            };
             return (Some(frac.min(1.0)), ch as i64 >= total - 1);
         }
     }
@@ -544,8 +554,13 @@ pub fn books_home(state: tauri::State<'_, AppState>) -> Cmd<BooksHomePayload> {
                 )
             }
         };
-        let (fraction, finish) =
-            progress_math(entry.chapter, entry.page, spine, pages);
+        let (fraction, finish) = progress_math(
+            entry.chapter,
+            entry.page,
+            entry.scroll_frac,
+            spine,
+            pages,
+        );
         continue_reading.push(ContinueRow {
             total: spine.or(pages),
             chapter: entry.chapter,
@@ -670,25 +685,46 @@ mod tests {
     #[test]
     fn progress_math_epub_and_pdf() {
         // Chapter 0 of 4 → a quarter along, not finished.
-        let (f, fin) = progress_math(Some(0), None, Some(4), None);
+        let (f, fin) = progress_math(Some(0), None, None, Some(4), None);
         assert_eq!(f, Some(0.25));
         assert!(!fin);
         // Final chapter → fraction 1, finish candidate.
-        let (f, fin) = progress_math(Some(3), None, Some(4), None);
+        let (f, fin) = progress_math(Some(3), None, None, Some(4), None);
         assert_eq!(f, Some(1.0));
         assert!(fin);
         // PDF pages behave the same.
-        let (f, fin) = progress_math(None, Some(9), None, Some(10));
+        let (f, fin) = progress_math(None, Some(9), None, None, Some(10));
         assert_eq!(f, Some(1.0));
         assert!(fin);
         // No total → no fraction, no fake finish.
-        let (f, fin) = progress_math(Some(2), None, None, None);
+        let (f, fin) = progress_math(Some(2), None, None, None, None);
         assert_eq!(f, None);
         assert!(!fin);
         // Zero-total guards.
-        let (f, fin) = progress_math(Some(0), None, Some(0), None);
+        let (f, fin) = progress_math(Some(0), None, None, Some(0), None);
         assert_eq!(f, None);
         assert!(!fin);
+    }
+
+    #[test]
+    fn progress_math_counts_the_part_of_the_chapter_read() {
+        // P2: halfway through chapter 0 of 4 → an eighth along,
+        // not the quarter P1 credited on open.
+        let (f, fin) = progress_math(Some(0), None, Some(0.5), Some(4), None);
+        assert_eq!(f, Some(0.125));
+        assert!(!fin);
+        // Top of chapter 2 of 4 → exactly halfway.
+        let (f, fin) = progress_math(Some(2), None, Some(0.0), Some(4), None);
+        assert_eq!(f, Some(0.5));
+        assert!(!fin);
+        // A part-read final chapter still offers the finish (the
+        // rule is the chapter, never the fraction).
+        let (f, fin) = progress_math(Some(3), None, Some(0.25), Some(4), None);
+        assert_eq!(f, Some(0.8125));
+        assert!(fin);
+        // A wild stored place is clamped, never trusted.
+        let (f, _) = progress_math(Some(0), None, Some(7.5), Some(4), None);
+        assert_eq!(f, Some(0.25));
     }
 
     #[test]
