@@ -490,6 +490,51 @@ impl Catalog {
                 );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
+        // EmulationStation import (Hyperbase #5, 2026-10-17): the
+        // descriptive metadata a gamelist carries that has no other
+        // catalog home — description, credits, family, region, the
+        // scrape provenance, and artwork refs Fable has no surface
+        // for yet (marquee/fanart/manual). Path-keyed like
+        // rom_game_state so it survives re-indexing; import-owned
+        // (a re-import refreshes it wholesale), while identity,
+        // personal state and found art merge under the precedence
+        // rules in es_apply. Declared schema addition — see the
+        // Hyperbase #5 receipt.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS es_metadata (
+                    provider_key TEXT PRIMARY KEY,
+                    es_system TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    gamelist_path TEXT NOT NULL,
+                    name TEXT,
+                    description TEXT,
+                    developer TEXT,
+                    publisher TEXT,
+                    genre TEXT,
+                    family TEXT,
+                    players TEXT,
+                    lang TEXT,
+                    region TEXT,
+                    release_year INTEGER,
+                    releasedate_raw TEXT,
+                    source_id TEXT,
+                    scrap_source TEXT,
+                    scrap_date TEXT,
+                    md5 TEXT,
+                    crc32 TEXT,
+                    hidden INTEGER NOT NULL DEFAULT 0,
+                    kidgame INTEGER NOT NULL DEFAULT 0,
+                    gametime_secs INTEGER,
+                    image_path TEXT,
+                    marquee_path TEXT,
+                    thumbnail_path TEXT,
+                    fanart_path TEXT,
+                    manual_path TEXT,
+                    imported_at TEXT NOT NULL
+                );",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
         // ROM Home (2026-10-15): per-game personal state — ratings,
         // favorites, completion, play history, and the user's own
         // overrides — keyed by path like path_stars so it survives
@@ -3334,6 +3379,801 @@ impl Catalog {
             out.insert(id, path);
         }
         Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EmulationStation import (Hyperbase #5, 2026-10-17): attach gamelist
+// metadata to the catalog items Fable already indexed, by path.
+//
+// Precedence — the contract the whole feature stands on (pinned by
+// the es_import tests in this crate):
+//   P1  DAT identity is never modified. A media_identities row the
+//       identify pass wrote (evidence matched, or any titled row
+//       that isn't the import's own) keeps title / platform / sha1 /
+//       evidence / year, untouched.
+//   P2  A gamelist identity is written only onto: no row at all, a
+//       row the import itself wrote before (evidence source
+//       "gamelist" — refreshed), or an unmatched title-less row.
+//       The evidence carries the item's current size+modified, so
+//       the identify pass's freshness check treats the row as
+//       fresh and leaves it; if the file's bytes later change,
+//       identification re-runs and DAT gets first claim again.
+//   P3  The user's title_override is never written by the import.
+//   P4  Personal state merges, never replaces: rating / genre /
+//       players fill only empty slots; favorite is set-only;
+//       play_count and last_played take the max of two histories
+//       (his ES launches and his Fable launches are one history).
+//   P5  Found artwork is never displaced: a rom_media row already
+//       'found' from any source wins; the import fills absent
+//       slots and upgrades 'missing' rows, source "gamelist".
+// The descriptive long tail (description, credits, scrape
+// provenance, no-surface-yet art refs) lives in es_metadata —
+// import-owned, refreshed wholesale on every import.
+// ---------------------------------------------------------------------------
+
+/// What the import decided about one item's identity row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EsIdentityOutcome {
+    /// A DAT (or otherwise titled) identity already stood — untouched.
+    DatKept,
+    /// No identity row existed; the gamelist's was written.
+    GamelistWritten,
+    /// A previous gamelist identity was refreshed in place.
+    GamelistRefreshed,
+    /// An unmatched, title-less row gained the gamelist identity.
+    FilledUnmatched,
+    /// The gamelist entry carries no name — nothing honest to title it.
+    NoName,
+    /// The item's identity belongs to another medium — skipped.
+    NotRom,
+}
+
+/// Counters for one system's import (the totals use the same shape).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EsCounters {
+    pub entries: u64,
+    pub folder_count: u64,
+    pub no_path: u64,
+    pub unresolvable: u64,
+    pub duplicates: u64,
+    pub matched_exact: u64,
+    pub matched_casefold: u64,
+    /// Matched a catalog item whose file is not on disk right now
+    /// (an offline volume's Library Memory row) — imported anyway.
+    pub matched_offline: u64,
+    pub unmatched_not_indexed: u64,
+    pub unmatched_missing_file: u64,
+    pub dat_kept: u64,
+    pub identity_written: u64,
+    pub identity_refreshed: u64,
+    pub identity_filled: u64,
+    pub identity_no_name: u64,
+    pub not_rom: u64,
+    pub art_filled: u64,
+    pub art_kept: u64,
+    pub state_updates: u64,
+}
+
+impl EsCounters {
+    /// Fold another counter set into this one (report totals).
+    pub fn add(&mut self, o: &EsCounters) {
+        self.entries += o.entries;
+        self.folder_count += o.folder_count;
+        self.no_path += o.no_path;
+        self.unresolvable += o.unresolvable;
+        self.duplicates += o.duplicates;
+        self.matched_exact += o.matched_exact;
+        self.matched_casefold += o.matched_casefold;
+        self.matched_offline += o.matched_offline;
+        self.unmatched_not_indexed += o.unmatched_not_indexed;
+        self.unmatched_missing_file += o.unmatched_missing_file;
+        self.dat_kept += o.dat_kept;
+        self.identity_written += o.identity_written;
+        self.identity_refreshed += o.identity_refreshed;
+        self.identity_filled += o.identity_filled;
+        self.identity_no_name += o.identity_no_name;
+        self.not_rom += o.not_rom;
+        self.art_filled += o.art_filled;
+        self.art_kept += o.art_kept;
+        self.state_updates += o.state_updates;
+    }
+}
+
+/// One system's import outcome; `parse_error` set means the
+/// gamelist itself could not be read or parsed and every counter
+/// is zero — the failure is this system's alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EsSystemReport {
+    pub es_system: String,
+    pub platform: String,
+    pub gamelist_path: String,
+    pub parse_error: Option<String>,
+    pub counts: EsCounters,
+}
+
+/// A whole import run: one report per system plus folded totals.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EsImportReport {
+    /// Set when an import was asked for while one was already
+    /// running — the running one is the truth; apart from this
+    /// flag the report is empty.
+    pub already_running: bool,
+    /// Location roots examined for ES data.
+    pub roots_searched: u64,
+    /// Of those, roots where an ES layout was detected.
+    pub roots_with_es: u64,
+    pub systems: Vec<EsSystemReport>,
+    pub totals: EsCounters,
+}
+
+/// The stored es_metadata row (read-back for surfaces + proof).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EsMetadataRow {
+    pub provider_key: String,
+    pub es_system: String,
+    pub platform: String,
+    pub gamelist_path: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub developer: Option<String>,
+    pub publisher: Option<String>,
+    pub genre: Option<String>,
+    pub family: Option<String>,
+    pub players: Option<String>,
+    pub lang: Option<String>,
+    pub region: Option<String>,
+    pub release_year: Option<i64>,
+    pub releasedate_raw: Option<String>,
+    pub source_id: Option<String>,
+    pub scrap_source: Option<String>,
+    pub scrap_date: Option<String>,
+    pub md5: Option<String>,
+    pub crc32: Option<String>,
+    pub hidden: bool,
+    pub kidgame: bool,
+    pub gametime_secs: Option<i64>,
+    pub image_path: Option<String>,
+    pub marquee_path: Option<String>,
+    pub thumbnail_path: Option<String>,
+    pub fanart_path: Option<String>,
+    pub manual_path: Option<String>,
+    pub imported_at: String,
+}
+
+/// Everything the apply step needs for one matched game: the
+/// gamelist's facts (converted where a Fable home wants another
+/// shape), the resolved artwork, and the item's freshness facts.
+#[derive(Debug, Clone)]
+pub struct EsApplyInput {
+    pub item_id: ItemId,
+    pub provider_key: String,
+    pub es_system: String,
+    pub platform: String,
+    pub gamelist_path: String,
+    pub name: Option<String>,
+    pub desc: Option<String>,
+    pub developer: Option<String>,
+    pub publisher: Option<String>,
+    pub genre: Option<String>,
+    pub family: Option<String>,
+    pub players: Option<String>,
+    pub lang: Option<String>,
+    pub region: Option<String>,
+    pub release_year: Option<i64>,
+    pub releasedate_raw: Option<String>,
+    pub source_id: Option<String>,
+    pub scrap_source: Option<String>,
+    pub scrap_date: Option<String>,
+    pub md5: Option<String>,
+    pub crc32: Option<String>,
+    pub hidden: bool,
+    pub kidgame: bool,
+    pub gametime_secs: Option<i64>,
+    pub rating_stars: Option<i64>,
+    pub favorite: bool,
+    pub playcount: Option<i64>,
+    pub last_played_rfc3339: Option<String>,
+    /// Resolved absolute paths of artwork that EXISTS on disk.
+    pub boxart_path: Option<String>,
+    /// Which gamelist tag won the boxart slot (image|boxart|cover|mix|thumbnail).
+    pub boxart_kind: Option<String>,
+    pub trailer_path: Option<String>,
+    pub screenshot_path: Option<String>,
+    /// Resolved refs kept as provenance (existence not required).
+    pub image_path: Option<String>,
+    pub marquee_path: Option<String>,
+    pub thumbnail_path: Option<String>,
+    pub fanart_path: Option<String>,
+    pub manual_path: Option<String>,
+    /// The item's freshness facts, exactly as the identify pass
+    /// computes them (evidence contract, P2).
+    pub item_size: u64,
+    pub item_modified_rfc3339: Option<String>,
+}
+
+/// What one apply did, in the report's vocabulary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EsApplyOutcome {
+    pub identity: EsIdentityOutcome,
+    pub art_filled: Vec<String>,
+    pub art_kept: Vec<String>,
+    pub state_fields: Vec<String>,
+}
+
+/// Parse an RFC 3339 string for instant comparison; unparseable
+/// values sort as the epoch so a stored oddity never blocks a
+/// genuinely newer import.
+fn rfc3339_instant(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&chrono::Utc))
+}
+
+impl Catalog {
+    /// Every catalog item whose provider_key lives under a
+    /// directory (passed WITHOUT a trailing separator). The ES
+    /// import loads one system's candidates this way and matches
+    /// gamelist paths against them in memory.
+    pub fn items_under_prefix(&self, dir: &str) -> Result<Vec<ufm_vfs::Item>> {
+        let lower = format!("{dir}/");
+        let upper = format!("{dir}0"); // '/' is 0x2F; '0' bounds every child.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, location_id, name, kind, size_bytes, modified, provider_key
+                 FROM items WHERE provider_key >= ?1 AND provider_key < ?2
+                 ORDER BY provider_key",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![lower, upper], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let parse_id = |s: &str, what: &str| {
+            uuid::Uuid::parse_str(s)
+                .map_err(|e| UfmError::Database(format!("bad {what} id {s:?}: {e}")))
+        };
+        let mut out = Vec::new();
+        for r in rows {
+            let (id, location_id, name, kind_s, size_bytes, modified_s, pk) =
+                r.map_err(|e| UfmError::Database(e.to_string()))?;
+            out.push(ufm_vfs::Item {
+                id: ufm_core::ItemId(parse_id(&id, "item")?),
+                location: ufm_core::LocationId(parse_id(&location_id, "location")?),
+                name,
+                kind: parse_kind(&kind_s),
+                size_bytes: size_bytes.map(|s| s as u64),
+                modified: modified_s.and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                }),
+                provider_key: pk,
+                labels: Vec::new(),
+                starred: false,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The es_metadata row for one path, when an import wrote one.
+    pub fn es_metadata_for(&self, provider_key: &str) -> Result<Option<EsMetadataRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT provider_key, es_system, platform, gamelist_path, name,
+                        description, developer, publisher, genre, family, players,
+                        lang, region, release_year, releasedate_raw, source_id,
+                        scrap_source, scrap_date, md5, crc32, hidden, kidgame,
+                        gametime_secs, image_path, marquee_path, thumbnail_path,
+                        fanart_path, manual_path, imported_at
+                 FROM es_metadata WHERE provider_key = ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut rows = stmt
+            .query_map(params![provider_key], |row| {
+                Ok(EsMetadataRow {
+                    provider_key: row.get(0)?,
+                    es_system: row.get(1)?,
+                    platform: row.get(2)?,
+                    gamelist_path: row.get(3)?,
+                    name: row.get(4)?,
+                    description: row.get(5)?,
+                    developer: row.get(6)?,
+                    publisher: row.get(7)?,
+                    genre: row.get(8)?,
+                    family: row.get(9)?,
+                    players: row.get(10)?,
+                    lang: row.get(11)?,
+                    region: row.get(12)?,
+                    release_year: row.get(13)?,
+                    releasedate_raw: row.get(14)?,
+                    source_id: row.get(15)?,
+                    scrap_source: row.get(16)?,
+                    scrap_date: row.get(17)?,
+                    md5: row.get(18)?,
+                    crc32: row.get(19)?,
+                    hidden: row.get::<_, i64>(20)? != 0,
+                    kidgame: row.get::<_, i64>(21)? != 0,
+                    gametime_secs: row.get(22)?,
+                    image_path: row.get(23)?,
+                    marquee_path: row.get(24)?,
+                    thumbnail_path: row.get(25)?,
+                    fanart_path: row.get(26)?,
+                    manual_path: row.get(27)?,
+                    imported_at: row.get(28)?,
+                })
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r.map_err(|e| UfmError::Database(e.to_string()))?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Write the gamelist's identity onto an item the precedence
+    /// rules say the import may title (P2). Evidence mirrors the
+    /// identify pass's shape, with source "gamelist" and the
+    /// item's freshness facts, so the pass treats the row as
+    /// fresh until the file itself changes.
+    fn write_gamelist_identity(&self, input: &EsApplyInput) -> Result<()> {
+        let ev = serde_json::json!({
+            "matched": false,
+            "source": "gamelist",
+            "size": input.item_size,
+            "modified": input.item_modified_rfc3339,
+            "esSystem": input.es_system,
+            "gamelist": input.gamelist_path,
+            "also": [],
+        });
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO media_identities
+                 (item_id, media_kind, title, year, tmdb_id, platform, sha1, match_evidence_json)
+                 VALUES (?1, 'rom', ?2, ?3, NULL, ?4, NULL, ?5)",
+                params![
+                    input.item_id.to_string(),
+                    input.name,
+                    input.release_year,
+                    input.platform,
+                    ev.to_string()
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Apply one matched gamelist entry to the catalog under the
+    /// precedence contract at this section's head. Idempotent: a
+    /// second identical apply changes no state (provenance's
+    /// imported_at stamp aside) and reports no fills.
+    pub fn es_apply(&self, input: &EsApplyInput) -> Result<EsApplyOutcome> {
+        let now = ufm_core::now_utc().to_rfc3339();
+        // -- Descriptive provenance: import-owned, refreshed wholesale.
+        self.conn
+            .execute(
+                "INSERT INTO es_metadata
+                 (provider_key, es_system, platform, gamelist_path, name, description,
+                  developer, publisher, genre, family, players, lang, region,
+                  release_year, releasedate_raw, source_id, scrap_source, scrap_date,
+                  md5, crc32, hidden, kidgame, gametime_secs, image_path, marquee_path,
+                  thumbnail_path, fanart_path, manual_path, imported_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                         ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26,
+                         ?27, ?28, ?29)
+                 ON CONFLICT(provider_key) DO UPDATE SET
+                    es_system = excluded.es_system,
+                    platform = excluded.platform,
+                    gamelist_path = excluded.gamelist_path,
+                    name = excluded.name,
+                    description = excluded.description,
+                    developer = excluded.developer,
+                    publisher = excluded.publisher,
+                    genre = excluded.genre,
+                    family = excluded.family,
+                    players = excluded.players,
+                    lang = excluded.lang,
+                    region = excluded.region,
+                    release_year = excluded.release_year,
+                    releasedate_raw = excluded.releasedate_raw,
+                    source_id = excluded.source_id,
+                    scrap_source = excluded.scrap_source,
+                    scrap_date = excluded.scrap_date,
+                    md5 = excluded.md5,
+                    crc32 = excluded.crc32,
+                    hidden = excluded.hidden,
+                    kidgame = excluded.kidgame,
+                    gametime_secs = excluded.gametime_secs,
+                    image_path = excluded.image_path,
+                    marquee_path = excluded.marquee_path,
+                    thumbnail_path = excluded.thumbnail_path,
+                    fanart_path = excluded.fanart_path,
+                    manual_path = excluded.manual_path,
+                    imported_at = excluded.imported_at",
+                params![
+                    input.provider_key,
+                    input.es_system,
+                    input.platform,
+                    input.gamelist_path,
+                    input.name,
+                    input.desc,
+                    input.developer,
+                    input.publisher,
+                    input.genre,
+                    input.family,
+                    input.players,
+                    input.lang,
+                    input.region,
+                    input.release_year,
+                    input.releasedate_raw,
+                    input.source_id,
+                    input.scrap_source,
+                    input.scrap_date,
+                    input.md5,
+                    input.crc32,
+                    input.hidden as i64,
+                    input.kidgame as i64,
+                    input.gametime_secs,
+                    input.image_path,
+                    input.marquee_path,
+                    input.thumbnail_path,
+                    input.fanart_path,
+                    input.manual_path,
+                    now
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+
+        // -- Identity (P1/P2). A name is required to title anything.
+        let identity = match self.media_identity_for(&input.item_id)? {
+            _ if input.name.is_none() => EsIdentityOutcome::NoName,
+            None => {
+                self.write_gamelist_identity(input)?;
+                EsIdentityOutcome::GamelistWritten
+            }
+            Some(row) if row.media_kind != "rom" => EsIdentityOutcome::NotRom,
+            Some(row) => {
+                let ev: serde_json::Value =
+                    serde_json::from_str(&row.evidence_json).unwrap_or(serde_json::Value::Null);
+                let source = ev.get("source").and_then(|v| v.as_str()).unwrap_or("");
+                let matched = ev
+                    .get("matched")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if source == "gamelist" {
+                    self.write_gamelist_identity(input)?;
+                    EsIdentityOutcome::GamelistRefreshed
+                } else if matched || row.title.is_some() {
+                    EsIdentityOutcome::DatKept
+                } else {
+                    self.write_gamelist_identity(input)?;
+                    EsIdentityOutcome::FilledUnmatched
+                }
+            }
+        };
+
+        // -- Artwork (P5): fill only; a found row from any source wins.
+        let mut art_filled: Vec<String> = Vec::new();
+        let mut art_kept: Vec<String> = Vec::new();
+        for (media_type, path, kind) in [
+            ("boxart", &input.boxart_path, &input.boxart_kind),
+            ("trailer", &input.trailer_path, &Some("video".to_string())),
+            ("screenshot", &input.screenshot_path, &Some("screenshot".to_string())),
+        ] {
+            let Some(path) = path else { continue };
+            let existing: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT status FROM rom_media WHERE item_id = ?1 AND media_type = ?2",
+                    params![input.item_id.to_string(), media_type],
+                    |r| r.get(0),
+                )
+                .ok();
+            if existing.as_deref() == Some("found") {
+                art_kept.push(media_type.to_string());
+                continue;
+            }
+            let detail = serde_json::json!({
+                "esKind": kind,
+                "gamelist": input.gamelist_path,
+            });
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO rom_media
+                     (item_id, media_type, status, source, local_path, detail_json, checked_at)
+                     VALUES (?1, ?2, 'found', 'gamelist', ?3, ?4, ?5)",
+                    params![input.item_id.to_string(), media_type, path, detail.to_string(), now],
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            art_filled.push(media_type.to_string());
+        }
+
+        // -- Personal state (P4): merge, never replace.
+        let mut state_fields: Vec<String> = Vec::new();
+        let current = self.rom_game_state_for(&input.provider_key)?;
+        let mut scoped_sets: Vec<(&str, rusqlite::types::Value)> = Vec::new();
+        if let Some(stars) = input.rating_stars {
+            if current.rating.is_none() {
+                scoped_sets.push(("rating", rusqlite::types::Value::Integer(stars)));
+            }
+        }
+        if input.favorite && !current.favorite {
+            scoped_sets.push(("favorite", rusqlite::types::Value::Integer(1)));
+        }
+        if let Some(g) = input.genre.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if current.genre.as_deref().unwrap_or("").trim().is_empty() {
+                scoped_sets.push(("genre", rusqlite::types::Value::Text(g.to_string())));
+            }
+        }
+        if let Some(p) = input.players.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if current.players.as_deref().unwrap_or("").trim().is_empty() {
+                scoped_sets.push(("players", rusqlite::types::Value::Text(p.to_string())));
+            }
+        }
+        if !scoped_sets.is_empty() {
+            let apply = scoped_sets
+                .iter()
+                .map(|(c, _)| format!("{c} = ?"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let args: Vec<rusqlite::types::Value> =
+                scoped_sets.iter().map(|(_, v)| v.clone()).collect();
+            state_fields.extend(scoped_sets.iter().map(|(c, _)| c.to_string()));
+            match self.rom_group_key_for_path(&input.provider_key)? {
+                Some(gk) => self.rom_group_state_touch(&gk, &apply, &args)?,
+                None => self.rom_game_state_touch(&input.provider_key, &apply, &args)?,
+            }
+        }
+        // Play history lives on the path row; max-merge both fields.
+        let path_row = self.rom_path_state_row(&input.provider_key)?;
+        let cur_count = path_row.as_ref().map(|r| r.play_count).unwrap_or(0);
+        let cur_last = path_row.as_ref().and_then(|r| r.last_played.clone());
+        let mut hist_sets: Vec<(&str, rusqlite::types::Value)> = Vec::new();
+        if let Some(pc) = input.playcount {
+            if pc > cur_count {
+                hist_sets.push(("play_count", rusqlite::types::Value::Integer(pc)));
+            }
+        }
+        if let Some(lp) = &input.last_played_rfc3339 {
+            let newer = match &cur_last {
+                None => true,
+                Some(cur) => match (rfc3339_instant(lp), rfc3339_instant(cur)) {
+                    (Some(n), Some(c)) => n > c,
+                    _ => lp.as_str() > cur.as_str(),
+                },
+            };
+            if newer {
+                hist_sets.push((
+                    "last_played",
+                    rusqlite::types::Value::Text(lp.clone()),
+                ));
+            }
+        }
+        if !hist_sets.is_empty() {
+            let apply = hist_sets
+                .iter()
+                .map(|(c, _)| format!("{c} = ?"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let args: Vec<rusqlite::types::Value> =
+                hist_sets.iter().map(|(_, v)| v.clone()).collect();
+            state_fields.extend(hist_sets.iter().map(|(c, _)| c.to_string()));
+            self.rom_game_state_touch(&input.provider_key, &apply, &args)?;
+        }
+
+        Ok(EsApplyOutcome {
+            identity,
+            art_filled,
+            art_kept,
+            state_fields,
+        })
+    }
+
+    /// Import one system's gamelist into the catalog: parse it,
+    /// match its entries against the items indexed under the
+    /// system folder BY PATH, and apply each match under the
+    /// precedence contract. Filesystem contact is metadata only
+    /// (existence checks) — no game file is ever opened.
+    pub fn import_es_system(
+        &self,
+        sys: &ufm_media::esgamelist::EsSystemDir,
+    ) -> Result<EsSystemReport> {
+        use ufm_media::esgamelist::{fable_platform, parse_gamelist, resolve_es_ref};
+        let mut rep = EsSystemReport {
+            es_system: sys.es_name.clone(),
+            platform: fable_platform(&sys.es_name),
+            gamelist_path: sys.gamelist_path.to_string_lossy().into_owned(),
+            parse_error: None,
+            counts: EsCounters::default(),
+        };
+        let xml = match std::fs::read_to_string(&sys.gamelist_path) {
+            Ok(x) => x,
+            Err(e) => {
+                rep.parse_error = Some(format!("couldn't read the gamelist: {e}"));
+                return Ok(rep);
+            }
+        };
+        let list = match parse_gamelist(&xml) {
+            Ok(l) => l,
+            Err(e) => {
+                rep.parse_error = Some(e.to_string());
+                return Ok(rep);
+            }
+        };
+        rep.counts.entries = list.games.len() as u64;
+        rep.counts.folder_count = list.folder_count as u64;
+
+        let items = self.items_under_prefix(&sys.dir.to_string_lossy())?;
+        let mut by_key: std::collections::HashMap<String, ufm_vfs::Item> =
+            std::collections::HashMap::new();
+        let mut by_fold: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for it in items {
+            if let Some(pk) = &it.provider_key {
+                by_fold
+                    .entry(pk.to_lowercase())
+                    .or_insert_with(|| pk.clone());
+                by_key.insert(pk.clone(), it);
+            }
+        }
+
+        let resolve_str = |raw: Option<&str>| -> Option<String> {
+            raw.and_then(|r| resolve_es_ref(&sys.dir, r))
+                .map(|p| p.to_string_lossy().into_owned())
+        };
+        let resolve_existing = |raw: Option<&str>| -> Option<String> {
+            let p = resolve_es_ref(&sys.dir, raw?)?;
+            if p.is_file() {
+                Some(p.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        };
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for game in &list.games {
+            let Some(raw_path) = game.path.as_deref() else {
+                rep.counts.no_path += 1;
+                continue;
+            };
+            let Some(resolved) = resolve_es_ref(&sys.dir, raw_path) else {
+                rep.counts.unresolvable += 1;
+                continue;
+            };
+            let key = resolved.to_string_lossy().into_owned();
+            if !seen.insert(key.clone()) {
+                rep.counts.duplicates += 1;
+                continue;
+            }
+            let on_disk = resolved.is_file();
+            let (item, casefold) = match by_key.get(&key) {
+                Some(it) => (it, false),
+                None => match by_fold.get(&key.to_lowercase()).and_then(|k| by_key.get(k)) {
+                    Some(it) => (it, true),
+                    None => {
+                        if on_disk {
+                            rep.counts.unmatched_not_indexed += 1;
+                        } else {
+                            rep.counts.unmatched_missing_file += 1;
+                        }
+                        continue;
+                    }
+                },
+            };
+            if item.kind == ufm_vfs::ItemKind::Folder {
+                // A gamelist path that resolves to a folder row is
+                // not the game file's item; say so in the honest
+                // bucket rather than titling a folder.
+                rep.counts.unmatched_not_indexed += 1;
+                continue;
+            }
+            if casefold {
+                rep.counts.matched_casefold += 1;
+            } else {
+                rep.counts.matched_exact += 1;
+            }
+            if !on_disk {
+                rep.counts.matched_offline += 1;
+            }
+
+            // Art slots: the boxart slot takes the first of the
+            // cover-ish tags whose file actually exists.
+            let mut boxart_path: Option<String> = None;
+            let mut boxart_kind: Option<String> = None;
+            for (tag, raw) in [
+                ("image", game.image.as_deref()),
+                ("boxart", game.boxart.as_deref()),
+                ("cover", game.cover.as_deref()),
+                ("mix", game.mix.as_deref()),
+                ("thumbnail", game.thumbnail.as_deref()),
+            ] {
+                if let Some(p) = resolve_existing(raw) {
+                    boxart_path = Some(p);
+                    boxart_kind = Some(tag.to_string());
+                    break;
+                }
+            }
+
+            let input = EsApplyInput {
+                item_id: item.id,
+                provider_key: key.clone(),
+                es_system: sys.es_name.clone(),
+                platform: rep.platform.clone(),
+                gamelist_path: rep.gamelist_path.clone(),
+                name: game.name.clone(),
+                desc: game.desc.clone(),
+                developer: game.developer.clone(),
+                publisher: game.publisher.clone(),
+                genre: game.genre.clone(),
+                family: game.family.clone(),
+                players: game.players.clone(),
+                lang: game.lang.clone(),
+                region: game.region.clone(),
+                release_year: game
+                    .releasedate
+                    .as_deref()
+                    .and_then(ufm_media::esgamelist::es_release_year),
+                releasedate_raw: game.releasedate.clone(),
+                source_id: game.source_id.clone(),
+                scrap_source: game.scrap_source.clone(),
+                scrap_date: game.scrap_date.clone(),
+                md5: game.md5.clone(),
+                crc32: game.crc32.clone(),
+                hidden: game.hidden,
+                kidgame: game.kidgame,
+                gametime_secs: game.gametime.map(|s| s as i64),
+                rating_stars: game
+                    .rating
+                    .and_then(ufm_media::esgamelist::es_rating_to_stars),
+                favorite: game.favorite,
+                playcount: game.playcount.map(|c| c as i64),
+                last_played_rfc3339: game
+                    .lastplayed
+                    .as_deref()
+                    .and_then(ufm_media::esgamelist::es_datetime_to_rfc3339),
+                boxart_path,
+                boxart_kind,
+                trailer_path: resolve_existing(game.video.as_deref()),
+                screenshot_path: resolve_existing(game.screenshot.as_deref()),
+                image_path: resolve_str(game.image.as_deref()),
+                marquee_path: resolve_str(game.marquee.as_deref()),
+                thumbnail_path: resolve_str(game.thumbnail.as_deref()),
+                fanart_path: resolve_str(game.fanart.as_deref()),
+                manual_path: resolve_str(game.manual.as_deref()),
+                item_size: item.size_bytes.unwrap_or(0),
+                item_modified_rfc3339: item.modified.map(|m| m.to_rfc3339()),
+            };
+            let outcome = self.es_apply(&input)?;
+            match outcome.identity {
+                EsIdentityOutcome::DatKept => rep.counts.dat_kept += 1,
+                EsIdentityOutcome::GamelistWritten => rep.counts.identity_written += 1,
+                EsIdentityOutcome::GamelistRefreshed => rep.counts.identity_refreshed += 1,
+                EsIdentityOutcome::FilledUnmatched => rep.counts.identity_filled += 1,
+                EsIdentityOutcome::NoName => rep.counts.identity_no_name += 1,
+                EsIdentityOutcome::NotRom => rep.counts.not_rom += 1,
+            }
+            rep.counts.art_filled += outcome.art_filled.len() as u64;
+            rep.counts.art_kept += outcome.art_kept.len() as u64;
+            if !outcome.state_fields.is_empty() {
+                rep.counts.state_updates += 1;
+            }
+        }
+        Ok(rep)
     }
 }
 
@@ -7560,5 +8400,378 @@ mod rom_home_tests {
         let mid = CollectionId::new();
         cat.create_collection(&mid, "Manual", "manual").unwrap();
         assert!(cat.smart_collection_query(&mid).unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // EmulationStation import (Hyperbase #5): the precedence contract.
+    // -----------------------------------------------------------------
+
+    fn es_input(item: &ufm_vfs::Item, pk: &str) -> EsApplyInput {
+        EsApplyInput {
+            item_id: item.id,
+            provider_key: pk.to_string(),
+            es_system: "snes".to_string(),
+            platform: "snes".to_string(),
+            gamelist_path: "/roms/snes/gamelist.xml".to_string(),
+            name: Some("Gamelist Name".to_string()),
+            desc: Some("A description.".to_string()),
+            developer: Some("Dev".to_string()),
+            publisher: Some("Pub".to_string()),
+            genre: Some("Platform".to_string()),
+            family: None,
+            players: Some("1".to_string()),
+            lang: None,
+            region: Some("USA".to_string()),
+            release_year: Some(1992),
+            releasedate_raw: Some("19921101T000000".to_string()),
+            source_id: Some("2424".to_string()),
+            scrap_source: Some("ScreenScraper".to_string()),
+            scrap_date: None,
+            md5: None,
+            crc32: None,
+            hidden: false,
+            kidgame: false,
+            gametime_secs: Some(3600),
+            rating_stars: Some(4),
+            favorite: true,
+            playcount: Some(6),
+            last_played_rfc3339: Some("2023-08-07T11:46:07Z".to_string()),
+            boxart_path: Some("/roms/snes/images/Game-image.png".to_string()),
+            boxart_kind: Some("image".to_string()),
+            trailer_path: None,
+            screenshot_path: None,
+            image_path: Some("/roms/snes/images/Game-image.png".to_string()),
+            marquee_path: None,
+            thumbnail_path: None,
+            fanart_path: None,
+            manual_path: None,
+            item_size: 12345,
+            item_modified_rfc3339: Some("2026-01-01T00:00:00Z".to_string()),
+        }
+    }
+
+    fn es_test_item(cat: &Catalog, loc: LocationId, pk: &str) -> ufm_vfs::Item {
+        let mut item = named_item(loc, "Game (USA).zip", ItemKind::File);
+        item.provider_key = Some(pk.to_string());
+        cat.insert_item(&item).unwrap();
+        item
+    }
+
+    #[test]
+    fn es_apply_writes_identity_metadata_art_and_state() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let pk = "/roms/snes/Game (USA).zip";
+        let item = es_test_item(&cat, loc, pk);
+        let out = cat.es_apply(&es_input(&item, pk)).unwrap();
+        assert_eq!(out.identity, EsIdentityOutcome::GamelistWritten);
+        assert_eq!(out.art_filled, vec!["boxart".to_string()]);
+        // Identity: gamelist title + platform + year, gamelist evidence
+        // carrying the freshness facts the identify pass checks.
+        let row = cat.media_identity_for(&item.id).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("Gamelist Name"));
+        assert_eq!(row.platform.as_deref(), Some("snes"));
+        assert_eq!(row.year, Some(1992));
+        let ev: serde_json::Value = serde_json::from_str(&row.evidence_json).unwrap();
+        assert_eq!(ev["source"], "gamelist");
+        assert_eq!(ev["size"], 12345);
+        assert_eq!(ev["modified"], "2026-01-01T00:00:00Z");
+        // Descriptive provenance landed whole.
+        let meta = cat.es_metadata_for(pk).unwrap().unwrap();
+        assert_eq!(meta.description.as_deref(), Some("A description."));
+        assert_eq!(meta.developer.as_deref(), Some("Dev"));
+        assert_eq!(meta.release_year, Some(1992));
+        assert_eq!(meta.gametime_secs, Some(3600));
+        // Art + state landed in their real homes.
+        let art = cat.rom_media_art(&[item.id.to_string()]).unwrap();
+        assert_eq!(
+            art.get(&item.id.to_string()).map(|s| s.as_str()),
+            Some("/roms/snes/images/Game-image.png")
+        );
+        let st = cat.rom_game_state_for(pk).unwrap();
+        assert_eq!(st.rating, Some(4));
+        assert!(st.favorite);
+        assert_eq!(st.genre.as_deref(), Some("Platform"));
+        assert_eq!(st.play_count, 6);
+        assert_eq!(st.last_played.as_deref(), Some("2023-08-07T11:46:07Z"));
+    }
+
+    #[test]
+    fn es_apply_never_touches_dat_identity() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let pk = "/roms/snes/Game (USA).zip";
+        let item = es_test_item(&cat, loc, pk);
+        cat.upsert_media_identity(
+            &item.id,
+            "rom",
+            Some("DAT Name"),
+            Some("snes"),
+            Some("0123456789abcdef0123456789abcdef01234567"),
+            r#"{"matched":true,"source":"no-intro","size":12345,"modified":null,"also":[]}"#,
+        )
+        .unwrap();
+        let out = cat.es_apply(&es_input(&item, pk)).unwrap();
+        assert_eq!(out.identity, EsIdentityOutcome::DatKept, "P1: DAT truth stands");
+        let row = cat.media_identity_for(&item.id).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("DAT Name"));
+        assert_eq!(
+            row.sha1.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        // The descriptive data still lands — only the identity is sacred.
+        let meta = cat.es_metadata_for(pk).unwrap().unwrap();
+        assert_eq!(meta.name.as_deref(), Some("Gamelist Name"));
+    }
+
+    #[test]
+    fn es_apply_fills_unmatched_row_and_refreshes_its_own() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let pk = "/roms/snes/Game (USA).zip";
+        let item = es_test_item(&cat, loc, pk);
+        // The identify pass's unmatched row shape (no title, no source).
+        cat.upsert_media_identity(
+            &item.id,
+            "rom",
+            None,
+            None,
+            None,
+            r#"{"matched":false,"size":1,"modified":null,"also":[]}"#,
+        )
+        .unwrap();
+        let out = cat.es_apply(&es_input(&item, pk)).unwrap();
+        assert_eq!(out.identity, EsIdentityOutcome::FilledUnmatched);
+        // A re-import refreshes its own row rather than keeping it.
+        let out2 = cat.es_apply(&es_input(&item, pk)).unwrap();
+        assert_eq!(out2.identity, EsIdentityOutcome::GamelistRefreshed);
+        // A film identity is never the import's business.
+        let mut movie = named_item(loc, "Film.mkv", ItemKind::File);
+        movie.provider_key = Some("/films/Film.mkv".to_string());
+        cat.insert_item(&movie).unwrap();
+        cat.upsert_video_identity(
+            &movie.id, "movie", Some("Film"), Some(2020), None, None, None, None,
+            None, false, "{}",
+        )
+        .unwrap();
+        let mut input = es_input(&movie, "/films/Film.mkv");
+        input.item_id = movie.id;
+        let out3 = cat.es_apply(&input).unwrap();
+        assert_eq!(out3.identity, EsIdentityOutcome::NotRom);
+        assert_eq!(
+            cat.media_identity_for(&movie.id).unwrap().unwrap().title.as_deref(),
+            Some("Film")
+        );
+    }
+
+    #[test]
+    fn es_apply_state_merges_fill_only_and_max() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let pk = "/roms/snes/Game (USA).zip";
+        let item = es_test_item(&cat, loc, pk);
+        // His Fable-side truth: 5 stars, 10 plays, later last-played,
+        // his own genre. The import must not demote any of it (P4).
+        cat.rom_game_set_rating(pk, Some(5)).unwrap();
+        cat.rom_game_set_overrides(pk, None, Some("His Genre"), None, None)
+            .unwrap();
+        let mut input = es_input(&item, pk);
+        input.playcount = Some(10);
+        input.last_played_rfc3339 = Some("2024-01-01T00:00:00Z".to_string());
+        cat.es_apply(&input).unwrap();
+        let st = cat.rom_game_state_for(pk).unwrap();
+        assert_eq!(st.rating, Some(5), "his rating wins over the import's 4");
+        assert_eq!(st.genre.as_deref(), Some("His Genre"));
+        assert_eq!(st.play_count, 10);
+        assert_eq!(st.last_played.as_deref(), Some("2024-01-01T00:00:00Z"));
+        assert!(st.favorite, "favorite is set-only: the import's true lands");
+        // The import's weaker history must not drag anything down.
+        let mut weaker = es_input(&item, pk);
+        weaker.rating_stars = Some(2);
+        weaker.playcount = Some(3);
+        weaker.last_played_rfc3339 = Some("2020-01-01T00:00:00Z".to_string());
+        let out = cat.es_apply(&weaker).unwrap();
+        assert!(out.state_fields.is_empty(), "a no-news import writes no state");
+        let st = cat.rom_game_state_for(pk).unwrap();
+        assert_eq!(st.rating, Some(5));
+        assert_eq!(st.play_count, 10);
+        // And a second identical apply is a state no-op (idempotence).
+        let out2 = cat.es_apply(&input).unwrap();
+        assert!(out2.state_fields.is_empty());
+        assert!(out2.art_filled.is_empty());
+    }
+
+    #[test]
+    fn es_apply_art_found_row_wins() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let pk = "/roms/snes/Game (USA).zip";
+        let item = es_test_item(&cat, loc, pk);
+        cat.upsert_rom_media(
+            &item.id.to_string(),
+            "boxart",
+            "found",
+            Some("libretro"),
+            Some("/fable-media/covers/Game.png"),
+            "{}",
+        )
+        .unwrap();
+        let out = cat.es_apply(&es_input(&item, pk)).unwrap();
+        assert_eq!(out.art_kept, vec!["boxart".to_string()], "P5: found wins");
+        assert!(out.art_filled.is_empty());
+        let art = cat.rom_media_art(&[item.id.to_string()]).unwrap();
+        assert_eq!(
+            art.get(&item.id.to_string()).map(|s| s.as_str()),
+            Some("/fable-media/covers/Game.png")
+        );
+        // A 'missing' row, though, yields to the import's real file.
+        let pk2 = "/roms/snes/Other (USA).zip";
+        let item2 = es_test_item(&cat, loc, pk2);
+        cat.upsert_rom_media(
+            &item2.id.to_string(),
+            "boxart",
+            "missing",
+            Some("screenscraper"),
+            None,
+            "{}",
+        )
+        .unwrap();
+        let out2 = cat.es_apply(&es_input(&item2, pk2)).unwrap();
+        assert_eq!(out2.art_filled, vec!["boxart".to_string()]);
+    }
+
+    #[test]
+    fn es_import_system_end_to_end() {
+        use ufm_media::esgamelist::EsSystemDir;
+        let base = std::env::temp_dir().join(format!(
+            "ufm-es-import-{}-{}",
+            std::process::id(),
+            "e2e"
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let sysdir = base.join("snes");
+        let images = sysdir.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::write(sysdir.join("Game One (USA).zip"), b"rom-bytes").unwrap();
+        std::fs::write(images.join("Game One (USA)-image.png"), b"png").unwrap();
+        std::fs::write(
+            sysdir.join("gamelist.xml"),
+            r#"<?xml version="1.0"?>
+<gameList>
+  <game id="1">
+    <path>./Game One (USA).zip</path>
+    <name>Game One</name>
+    <desc>The first game.</desc>
+    <genre>Platform</genre>
+    <players>1</players>
+    <rating>0.9</rating>
+    <releasedate>19930101T000000</releasedate>
+    <image>./images/Game One (USA)-image.png</image>
+  </game>
+  <game id="2">
+    <path>./Ghost (USA).zip</path>
+    <name>Ghost</name>
+  </game>
+</gameList>"#,
+        )
+        .unwrap();
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let game_path = sysdir.join("Game One (USA).zip");
+        let mut item = named_item(loc, "Game One (USA).zip", ItemKind::File);
+        item.provider_key = Some(game_path.to_string_lossy().into_owned());
+        item.size_bytes = Some(9);
+        cat.insert_item(&item).unwrap();
+
+        let sys = EsSystemDir {
+            es_name: "snes".to_string(),
+            dir: sysdir.clone(),
+            gamelist_path: sysdir.join("gamelist.xml"),
+        };
+        let rep = cat.import_es_system(&sys).unwrap();
+        assert!(rep.parse_error.is_none(), "{:?}", rep.parse_error);
+        assert_eq!(rep.counts.entries, 2);
+        assert_eq!(rep.counts.matched_exact, 1);
+        assert_eq!(rep.counts.unmatched_missing_file, 1, "Ghost has no file, no item");
+        assert_eq!(rep.counts.identity_written, 1);
+        assert_eq!(rep.counts.art_filled, 1);
+        let row = cat.media_identity_for(&item.id).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("Game One"));
+        assert_eq!(row.year, Some(1993));
+        let pk_str = game_path.to_string_lossy().into_owned();
+        let st = cat.rom_game_state_for(&pk_str).unwrap();
+        assert_eq!(st.rating, Some(5), "0.9 rounds to 5 stars");
+        // Re-import: everything reconciles to refreshed + no fills.
+        let rep2 = cat.import_es_system(&sys).unwrap();
+        assert_eq!(rep2.counts.identity_refreshed, 1);
+        assert_eq!(rep2.counts.art_filled, 0);
+        assert_eq!(rep2.counts.art_kept, 1);
+        assert_eq!(rep2.counts.state_updates, 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn es_import_system_malformed_duplicates_and_casefold() {
+        use ufm_media::esgamelist::EsSystemDir;
+        let base = std::env::temp_dir().join(format!(
+            "ufm-es-import-{}-{}",
+            std::process::id(),
+            "neg"
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let sysdir = base.join("nes");
+        std::fs::create_dir_all(&sysdir).unwrap();
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+
+        // Malformed: the whole system reports its error, counts zero.
+        std::fs::write(sysdir.join("gamelist.xml"), "<gameList><game><path>./x.zip</path>")
+            .unwrap();
+        let sys = EsSystemDir {
+            es_name: "nes".to_string(),
+            dir: sysdir.clone(),
+            gamelist_path: sysdir.join("gamelist.xml"),
+        };
+        let rep = cat.import_es_system(&sys).unwrap();
+        assert!(rep.parse_error.is_some());
+        assert_eq!(rep.counts.entries, 0);
+
+        // Duplicates + a case-mismatched path + a missing file.
+        std::fs::write(sysdir.join("Case Game (USA).nes"), b"rom").unwrap();
+        std::fs::write(
+            sysdir.join("gamelist.xml"),
+            r#"<?xml version="1.0"?>
+<gameList>
+  <game><path>./case game (usa).nes</path><name>Case Game</name></game>
+  <game><path>./case game (usa).nes</path><name>Case Game Again</name></game>
+  <game><path>./Gone (USA).nes</path><name>Gone</name></game>
+  <game><name>No Path At All</name></game>
+</gameList>"#,
+        )
+        .unwrap();
+        let mut item = named_item(loc, "Case Game (USA).nes", ItemKind::File);
+        item.provider_key = Some(
+            sysdir
+                .join("Case Game (USA).nes")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        cat.insert_item(&item).unwrap();
+        let rep = cat.import_es_system(&sys).unwrap();
+        assert!(rep.parse_error.is_none(), "{:?}", rep.parse_error);
+        assert_eq!(rep.counts.entries, 4);
+        assert_eq!(rep.counts.matched_casefold, 1, "case-folded path still matches");
+        assert_eq!(rep.counts.duplicates, 1);
+        assert_eq!(rep.counts.unmatched_missing_file, 1);
+        assert_eq!(rep.counts.no_path, 1);
+        assert_eq!(rep.counts.identity_written, 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

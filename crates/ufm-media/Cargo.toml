@@ -17,3 +17,6 @@ sha1 = "0.10"
 flate2 = "1"
 lzma-rust = "0.1"
 claxon = "0.4"
+# EmulationStation gamelist import (esgamelist): streaming XML.
+# Already in the workspace lock graph (0.42.0) — no new download.
+quick-xml = "0.42"

@@ -24,6 +24,7 @@ pub mod emu;
 pub mod emu_esde;
 pub mod emu_farm;
 pub mod emu_prep;
+pub mod esimport;
 pub mod plugins;
 pub mod reader;
 pub mod templates;
@@ -656,6 +657,7 @@ pub fn run() {
             emu_esde::emu_esde_state,
             emu_esde::emu_esde_install,
             emu_esde::emu_esde_open,
+            esimport::es_import,
             emu_farm::emu_prefs,
             emu_prep::emu_fleet_badge,
             emu_prep::emu_apply_update,

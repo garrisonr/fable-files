@@ -240,6 +240,24 @@ export class AddLocationGate {
       ),
     );
 
+    // EmulationStation data rides along with a detected tree: the
+    // sheet names it and where the import lives — the census
+    // itself imports nothing (Hyperbase #5).
+    if (report.es && report.es.systems.length > 0) {
+      const names = report.es.systems.slice(0, 4).map((s) => s.esName);
+      const more =
+        report.es.systems.length > names.length
+          ? `, +${report.es.systems.length - names.length} more`
+          : "";
+      body.appendChild(
+        el(
+          "p",
+          "prefs-note gate-es-note",
+          `EmulationStation lists found for ${report.es.systems.length} systems (${names.join(", ")}${more}). After indexing, Games Home's ⋯ menu → “Import EmulationStation data” brings in their descriptions, artwork and play history — game identity still comes from the DAT sets, never the lists.`,
+        ),
+      );
+    }
+
     const list = el("div", "mrx-list gate-list");
     const statsLine = el("p", "gate-stats prefs-note");
     const addBtn = el("button", "pill-btn primary") as HTMLButtonElement;

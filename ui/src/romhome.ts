@@ -2340,6 +2340,42 @@ export class RomHome {
     });
   }
 
+  /** EmulationStation import (Hyperbase #5): bring gamelist
+   * descriptions, artwork and play history into the catalog for
+   * the games already indexed. The backend reconciles honestly —
+   * the toast reports its numbers, good and bad. */
+  private async importEsData(): Promise<void> {
+    Toast.info(
+      "Importing EmulationStation data… big libraries take a while; the room refreshes when it lands.",
+      6000,
+    );
+    try {
+      const rep = await api.esImport();
+      if (rep.alreadyRunning) {
+        Toast.info("An EmulationStation import is already running.");
+        return;
+      }
+      if (rep.rootsWithEs === 0) {
+        Toast.info(
+          "No EmulationStation lists found in your locations. Add the folder that holds them — a RetroBat folder, its roms folder, or one system folder — as a location first.",
+          9000,
+        );
+        return;
+      }
+      const t = rep.totals;
+      const matched = t.matchedExact + t.matchedCasefold;
+      const unmatched = t.unmatchedNotIndexed + t.unmatchedMissingFile;
+      const broken = rep.systems.filter((s) => s.parseError).length;
+      Toast.success(
+        `EmulationStation import: ${matched.toLocaleString()} games matched · ${t.artFilled.toLocaleString()} artworks in · ${t.datKept.toLocaleString()} DAT identities kept · ${unmatched.toLocaleString()} list entries had no indexed file${broken > 0 ? ` · ${broken} list(s) couldn't be read` : ""}.`,
+        12000,
+      );
+      await this.softRefresh();
+    } catch (err) {
+      Toast.error(`EmulationStation import failed: ${errText(err)}`);
+    }
+  }
+
   private applySheetResult(
     g: RoomGame,
     result: EmuSheetResult,
@@ -2602,6 +2638,10 @@ export class RomHome {
       {
         label: "Open in ES-DE",
         action: () => this.openEsde(),
+      },
+      {
+        label: "Import EmulationStation data…",
+        action: () => void this.importEsData(),
       },
       {
         label: "Add a ROM folder…",

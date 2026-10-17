@@ -34,10 +34,26 @@ export interface CensusWire {
   elapsedMs: number;
 }
 
+/** EmulationStation detection (Hyperbase #5): mirrors
+ * ufm_media::esgamelist::EsDetection — directory metadata only,
+ * found by the census; the sheet names the import, the import
+ * itself is a separate click in Games Home. */
+export interface EsSystemDirWire {
+  esName: string;
+  dir: string;
+  gamelistPath: string;
+}
+
+export interface EsDetectionWire {
+  kind: "system_dir" | "roms_dir" | "install_root";
+  systems: EsSystemDirWire[];
+}
+
 export interface CensusReport {
   census: CensusWire;
   overThreshold: boolean;
   threshold: number;
+  es: EsDetectionWire | null;
 }
 
 export interface LocationScopeWire {

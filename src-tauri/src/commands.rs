@@ -9289,6 +9289,10 @@ pub struct CensusReport {
     pub census: ufm_search::Census,
     pub over_threshold: bool,
     pub threshold: u64,
+    /// EmulationStation data found under the root (Hyperbase #5):
+    /// metadata-only detection, so the sheet can name the import.
+    /// The census itself imports nothing.
+    pub es: Option<ufm_media::esgamelist::EsDetection>,
 }
 
 /// Safety gate (2026-10-16): census a would-be location BEFORE it
@@ -9304,15 +9308,20 @@ pub async fn census_location(path: String) -> Cmd<CensusReport> {
             .map(|s| s.to_string())
             .collect();
     let root = std::path::PathBuf::from(&path);
-    let census = tauri::async_runtime::spawn_blocking(move || {
-        ufm_search::census_root(&root, &candidates)
+    let census = tauri::async_runtime::spawn_blocking({
+        let root = root.clone();
+        move || ufm_search::census_root(&root, &candidates)
     })
     .await
     .map_err(|e| CommandError::from(UfmError::Internal(format!("census task failed: {e}"))))??;
+    // ES detection is directory metadata only (a few listings —
+    // the census just walked this tree, so the drive is awake).
+    let es = ufm_media::esgamelist::detect_es_root(&root);
     Ok(CensusReport {
         over_threshold: census.over_threshold(),
         threshold: ufm_search::GATE_THRESHOLD_FILES,
         census,
+        es,
     })
 }
 

@@ -771,6 +771,11 @@ export const api = {
   },
   // ROM Lists: DAT-based identification + collection membership.
   identifyRoms: () => invoke<RomIdentifyStats>("identify_roms"),
+  /** EmulationStation import (Hyperbase #5): attach gamelist
+   * metadata (descriptions, artwork, play history) to the
+   * catalog by path. No root = every registered location root. */
+  esImport: (root?: string) =>
+    invoke<EsImportReport>("es_import", { root: root ?? null }),
   romCollectionItems: (system: string, scope: RomScope) =>
     invoke<RomHit[]>("rom_collection_items", { system, scope }),
   // ROM identification Phase 2: identities are the banner's and the
@@ -1311,6 +1316,46 @@ export interface RomIdentifyProgress {
   done: number;
   total: number;
   matched: number;
+}
+
+/** EmulationStation import (Hyperbase #5) — mirrors the
+ * ufm-catalog Es* report structs field-for-field. */
+export interface EsCounters {
+  entries: number;
+  folderCount: number;
+  noPath: number;
+  unresolvable: number;
+  duplicates: number;
+  matchedExact: number;
+  matchedCasefold: number;
+  matchedOffline: number;
+  unmatchedNotIndexed: number;
+  unmatchedMissingFile: number;
+  datKept: number;
+  identityWritten: number;
+  identityRefreshed: number;
+  identityFilled: number;
+  identityNoName: number;
+  notRom: number;
+  artFilled: number;
+  artKept: number;
+  stateUpdates: number;
+}
+
+export interface EsSystemReport {
+  esSystem: string;
+  platform: string;
+  gamelistPath: string;
+  parseError: string | null;
+  counts: EsCounters;
+}
+
+export interface EsImportReport {
+  alreadyRunning: boolean;
+  rootsSearched: number;
+  rootsWithEs: number;
+  systems: EsSystemReport[];
+  totals: EsCounters;
 }
 
 /** Per-collection scope (Dickles 2026-10-14): all drives (default),

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod chd;
 pub mod cso;
+pub mod esgamelist;
 pub mod gcz;
 pub mod lrc;
 pub mod musicid;
