@@ -10,6 +10,7 @@ ufm-vfs = { path = "../ufm-vfs" }
 serde.workspace = true
 serde_json = "1"
 flate2 = "1"
+quick-xml = "0.42"
 async-trait.workspace = true
 tokio.workspace = true
 

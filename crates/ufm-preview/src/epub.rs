@@ -1391,3 +1391,1744 @@ mod tests {
         assert_eq!(published_year("0999"), None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The Reading Room (Ebook P2 — 2026-10-17): rich chapter decode.
+//
+// `decode_epub_book` above flattens a chapter to text — right for a
+// preview, wrong for a reading surface: publisher CSS, images,
+// footnotes, and internal links all die in the flattening. This
+// additive API richly decodes ONE chapter (the one being read): its
+// XHTML is rewritten by a streaming sanitizer (quick-xml — already
+// the workspace's XML reader), its publisher CSS is collected,
+// sanitized, and scoped under the reader's `.reader-pub` container,
+// images are inlined as data URLs, and internal links are resolved
+// against the spine into `data-fable-link` positions the UI
+// navigates (the webview never sees a live book href). The chapter
+// TEXT this decode reports comes from the same `xhtml_to_text` walk
+// as the plain decode, so the text surface — and any future
+// read-aloud consumer — sees exactly the P1 chapters, in spine
+// order. Everything above this section is untouched.
+// ---------------------------------------------------------------------------
+
+/// Cap on one inlined media member (decoded bytes).
+const MAX_RICH_MEDIA_MEMBER: usize = 8 * 1024 * 1024;
+/// Cap on all inlined media in one chapter (images + CSS art/fonts).
+const MAX_RICH_MEDIA_TOTAL: usize = 24 * 1024 * 1024;
+/// Cap on one chapter's sanitized HTML fragment.
+const MAX_RICH_HTML_CHARS: usize = 1_500_000;
+/// Cap on one chapter's scoped CSS.
+const MAX_RICH_CSS_CHARS: usize = 256_000;
+/// Cap on @import chains followed inside the archive.
+const MAX_RICH_IMPORT_DEPTH: usize = 3;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct EpubChapterRich {
+    /// Sanitized XHTML fragment for the chapter, or None when the
+    /// chapter couldn't be faithfully rewritten (malformed markup,
+    /// over a cap) — the caller falls back to the chapter's text.
+    pub html: Option<String>,
+    /// Publisher CSS for the chapter: sanitized and scoped under
+    /// `.reader-pub`. None when the chapter carries no usable CSS.
+    pub css: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct EpubBookRich {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    /// Chapters in reading (spine) order — identical to
+    /// `decode_epub_book`'s chapters (same walk, same caps).
+    pub chapters: Vec<EpubChapter>,
+    /// Parallel to `chapters`; an entry is Some only for the
+    /// chapter the caller asked to richly decode (media inlining
+    /// is priced per chapter, not per book).
+    pub rich: Vec<Option<EpubChapterRich>>,
+    pub drm_protected: bool,
+    /// Plain-language reason the book is limited, when it is.
+    pub note: Option<String>,
+}
+
+/// Archive paths named by `META-INF/encryption.xml` (percent-decoded,
+/// leading slash stripped) — the font-face gate reads this: a font
+/// under encryption is obfuscated or locked, never inlined.
+fn encrypted_paths(zip: &ZipArchive) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if let Some(enc) = zip.read_text("META-INF/encryption.xml") {
+        for t in iter_tags(&enc, "CipherReference") {
+            if let Some(uri) = attr(t, "URI") {
+                out.insert(percent_decode(uri).trim_start_matches('/').to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Decode a whole EPUB like `decode_epub_book`, additionally
+/// richly decoding the chapter at `rich_index` when given.
+/// Never fails hard: worst case mirrors the plain decode's notes.
+pub fn decode_epub_book_rich(data: &[u8], rich_index: Option<usize>) -> EpubBookRich {
+    let mut out = EpubBookRich::default();
+    let Some(zip) = ZipArchive::open(data) else {
+        out.note = Some(
+            "This file isn't a readable EPUB (the book archive couldn't be opened).".into(),
+        );
+        return out;
+    };
+
+    // DRM: same rule as the decoders above.
+    if let Some(enc) = zip.read_text("META-INF/encryption.xml") {
+        let locked_content = iter_tags(&enc, "CipherReference").iter().any(|t| {
+            let uri = attr(t, "URI").unwrap_or("");
+            let lower = uri.to_lowercase();
+            !(lower.ends_with(".ttf")
+                || lower.ends_with(".otf")
+                || lower.ends_with(".woff")
+                || lower.ends_with(".woff2"))
+        });
+        if locked_content {
+            out.drm_protected = true;
+            out.note = Some(
+                "This book is protected by DRM, so Fable can't open it in the reader. \
+                 It will still open in your usual reader app."
+                    .into(),
+            );
+        }
+    }
+
+    let opf_path = zip
+        .read_text("META-INF/container.xml")
+        .and_then(|c| {
+            iter_tags(&c, "rootfile")
+                .into_iter()
+                .find_map(|t| attr(t, "full-path").map(str::to_owned))
+        })
+        .unwrap_or_else(|| "OEBPS/content.opf".to_string());
+    let Some(opf) = zip.read_text(&opf_path) else {
+        if out.note.is_none() {
+            out.note = Some(
+                "This EPUB is missing its book index (the OPF file), so it can't be read."
+                    .into(),
+            );
+        }
+        return out;
+    };
+    let opf_dir = opf_path
+        .rsplit_once('/')
+        .map(|(d, _)| d.to_string())
+        .unwrap_or_default();
+
+    out.title = tag_text(&opf, "dc:title");
+    out.author = tag_text(&opf, "dc:creator");
+
+    if out.drm_protected {
+        return out;
+    }
+
+    let mut manifest: HashMap<String, ManifestItem> = HashMap::new();
+    for t in iter_tags(&opf, "item") {
+        if let (Some(id), Some(href)) = (attr(t, "id"), attr(t, "href")) {
+            manifest.insert(
+                id.to_string(),
+                ManifestItem {
+                    href: href.to_string(),
+                    media_type: attr(t, "media-type").unwrap_or("").to_string(),
+                    properties: attr(t, "properties").unwrap_or("").to_string(),
+                },
+            );
+        }
+    }
+    // Archive path → declared media type (media inlining + gates).
+    let manifest_media: HashMap<String, String> = manifest
+        .values()
+        .map(|i| (resolve_href(&opf_dir, &i.href), i.media_type.clone()))
+        .collect();
+    let spine_ids: Vec<String> = iter_tags(&opf, "itemref")
+        .into_iter()
+        .filter(|t| attr(t, "linear") != Some("no"))
+        .filter_map(|t| attr(t, "idref").map(str::to_owned))
+        .take(MAX_SPINE_DOCS)
+        .collect();
+
+    // The chapter walk — deliberately the plain decode's walk, so
+    // `chapters` here and there can never disagree.
+    let mut chapter_paths: Vec<String> = Vec::new();
+    let mut total_chars = 0usize;
+    let mut truncated = false;
+    for id in &spine_ids {
+        let Some(item) = manifest.get(id) else {
+            continue;
+        };
+        if !item.media_type.contains("html") && !item.media_type.contains("xml") {
+            continue;
+        }
+        let path = resolve_href(&opf_dir, &item.href);
+        let Some(xhtml) = zip.read_text(&path) else {
+            continue;
+        };
+        let text = xhtml_to_text(&xhtml);
+        let text = text.trim();
+        let title = chapter_title(&xhtml, text);
+        let room = MAX_BOOK_CHARS.saturating_sub(total_chars);
+        let capped: String = text
+            .chars()
+            .take(MAX_CHAPTER_CHARS.min(room))
+            .collect();
+        if capped.chars().count() < text.chars().count() {
+            truncated = true;
+        }
+        total_chars += capped.chars().count();
+        chapter_paths.push(path);
+        out.chapters.push(EpubChapter {
+            title,
+            text: capped,
+        });
+    }
+    out.rich = vec![None; out.chapters.len()];
+    if out.chapters.is_empty() && out.note.is_none() {
+        out.note = Some("No readable chapters were found in this book.".into());
+    } else if truncated && out.note.is_none() {
+        out.note = Some(
+            "This book is very large, so the reader loaded only its first portion.".into(),
+        );
+    }
+
+    // The rich pass over the one chapter being read.
+    if let Some(i) = rich_index {
+        if let Some(path) = chapter_paths.get(i) {
+            let spine_index: HashMap<String, usize> = chapter_paths
+                .iter()
+                .enumerate()
+                .map(|(n, p)| (p.clone(), n))
+                .collect();
+            let chapter_dir = path
+                .rsplit_once('/')
+                .map(|(d, _)| d.to_string())
+                .unwrap_or_default();
+            let mut ctx = RichCtx {
+                zip: &zip,
+                manifest_media: &manifest_media,
+                spine_index: &spine_index,
+                encrypted: encrypted_paths(&zip),
+                chapter_dir,
+                chapter_index: i,
+                media_bytes: 0,
+                css_parts: Vec::new(),
+                imported_css: std::collections::HashSet::new(),
+            };
+            out.rich[i] = Some(rich_chapter(&mut ctx, path));
+        }
+    }
+    out
+}
+
+/// State shared by the sanitizer and the CSS pipeline for one
+/// chapter: the archive, the spine map, the media budget, and the
+/// CSS collected along the way ((base dir, raw text) in order).
+struct RichCtx<'a> {
+    zip: &'a ZipArchive<'a>,
+    manifest_media: &'a HashMap<String, String>,
+    spine_index: &'a HashMap<String, usize>,
+    encrypted: std::collections::HashSet<String>,
+    chapter_dir: String,
+    chapter_index: usize,
+    media_bytes: usize,
+    css_parts: Vec<(String, String)>,
+    imported_css: std::collections::HashSet<String>,
+}
+
+impl<'a> RichCtx<'a> {
+    /// Inline one archive member as a data URL, under the media
+    /// caps. Images and fonts only, by manifest type or extension;
+    /// an encrypted member is never inlined.
+    fn inline_media(&mut self, archive_path: &str) -> Option<String> {
+        if self.encrypted.contains(archive_path) {
+            return None;
+        }
+        let entry = self.zip.get(archive_path)?;
+        if entry.uncompressed_size as usize > MAX_RICH_MEDIA_MEMBER {
+            return None;
+        }
+        let media = media_type_for(self.manifest_media.get(archive_path), archive_path)?;
+        let bytes = self.zip.read(entry)?;
+        if self.media_bytes + bytes.len() > MAX_RICH_MEDIA_TOTAL {
+            return None;
+        }
+        self.media_bytes += bytes.len();
+        Some(format!("data:{media};base64,{}", b64_encode(&bytes)))
+    }
+}
+
+/// The media type a member may inline as: the manifest's declared
+/// type when it is an image/font type, else the extension's.
+fn media_type_for(manifest: Option<&String>, path: &str) -> Option<String> {
+    if let Some(m) = manifest {
+        let m = m.trim().to_ascii_lowercase();
+        if m.starts_with("image/")
+            || m.starts_with("font/")
+            || m == "application/font-woff"
+            || m == "application/vnd.ms-opentype"
+            || m == "application/x-font-ttf"
+        {
+            return Some(m);
+        }
+    }
+    let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+    Some(
+        match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "bmp" => "image/bmp",
+            "ttf" => "font/ttf",
+            "otf" => "font/otf",
+            "woff" => "font/woff",
+            "woff2" => "font/woff2",
+            _ => return None,
+        }
+        .to_string(),
+    )
+}
+
+/// Standard base64 (the module rolls its own, like its ZIP reader —
+/// no new dependency enters the tree for one encoder).
+fn b64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0] as u32,
+            *chunk.get(1).unwrap_or(&0) as u32,
+            *chunk.get(2).unwrap_or(&0) as u32,
+        ];
+        let n = (b[0] << 16) | (b[1] << 8) | b[2];
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Richly rewrite one chapter document: sanitize its XHTML and
+/// collect + scope its CSS. A chapter whose markup won't parse
+/// yields `html: None` (the caller falls back to its text).
+fn rich_chapter(ctx: &mut RichCtx, path: &str) -> EpubChapterRich {
+    let Some(xhtml) = ctx.zip.read_text(path) else {
+        return EpubChapterRich::default();
+    };
+    let html = sanitize_chapter(&xhtml, ctx)
+        .filter(|h| !h.trim().is_empty() && h.chars().count() <= MAX_RICH_HTML_CHARS);
+    let parts = std::mem::take(&mut ctx.css_parts);
+    let mut css = String::new();
+    for (base, raw) in &parts {
+        if css.chars().count() > MAX_RICH_CSS_CHARS {
+            break;
+        }
+        css.push_str(&scope_css(raw, base, ctx, 0));
+    }
+    let css = if css.trim().is_empty() {
+        None
+    } else {
+        Some(css.chars().take(MAX_RICH_CSS_CHARS).collect())
+    };
+    EpubChapterRich { html, css }
+}
+
+/// Resolve one entity reference body (the text between the
+/// ampersand and the semicolon) to what it names: numeric refs,
+/// the XML five, and
+/// the named HTML refs books actually use. Unknown names return
+/// None — the caller re-emits the reference for the webview's HTML
+/// parser, which knows the full HTML table.
+fn resolve_entity(name: &str) -> Option<String> {
+    if let Some(hex) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+        return u32::from_str_radix(hex, 16)
+            .ok()
+            .and_then(char::from_u32)
+            .map(|c| c.to_string());
+    }
+    if let Some(dec) = name.strip_prefix('#') {
+        return dec
+            .parse::<u32>()
+            .ok()
+            .and_then(char::from_u32)
+            .map(|c| c.to_string());
+    }
+    let c = match name {
+        "amp" => '&',
+        "lt" => '<',
+        "gt" => '>',
+        "quot" => '"',
+        "apos" => '\'',
+        "nbsp" => '\u{a0}',
+        "ensp" => '\u{2002}',
+        "emsp" => '\u{2003}',
+        "thinsp" => '\u{2009}',
+        "zwnj" => '\u{200c}',
+        "zwj" => '\u{200d}',
+        "lrm" => '\u{200e}',
+        "rlm" => '\u{200f}',
+        "ndash" => '\u{2013}',
+        "mdash" => '\u{2014}',
+        "lsquo" => '\u{2018}',
+        "rsquo" => '\u{2019}',
+        "sbquo" => '\u{201a}',
+        "ldquo" => '\u{201c}',
+        "rdquo" => '\u{201d}',
+        "bdquo" => '\u{201e}',
+        "laquo" => '\u{ab}',
+        "raquo" => '\u{bb}',
+        "lsaquo" => '\u{2039}',
+        "rsaquo" => '\u{203a}',
+        "hellip" => '\u{2026}',
+        "dagger" => '\u{2020}',
+        "Dagger" => '\u{2021}',
+        "bull" => '\u{2022}',
+        "prime" => '\u{2032}',
+        "Prime" => '\u{2033}',
+        "permil" => '\u{2030}',
+        "oline" => '\u{203e}',
+        "frasl" => '\u{2044}',
+        "copy" => '\u{a9}',
+        "reg" => '\u{ae}',
+        "trade" => '\u{2122}',
+        "middot" => '\u{b7}',
+        "sect" => '\u{a7}',
+        "para" => '\u{b6}',
+        "deg" => '\u{b0}',
+        "plusmn" => '\u{b1}',
+        "times" => '\u{d7}',
+        "divide" => '\u{f7}',
+        "minus" => '\u{2212}',
+        "infin" => '\u{221e}',
+        "ne" => '\u{2260}',
+        "le" => '\u{2264}',
+        "ge" => '\u{2265}',
+        "asymp" => '\u{2248}',
+        "euro" => '\u{20ac}',
+        "pound" => '\u{a3}',
+        "yen" => '\u{a5}',
+        "cent" => '\u{a2}',
+        "curren" => '\u{a4}',
+        "brvbar" => '\u{a6}',
+        "uml" => '\u{a8}',
+        "ordf" => '\u{aa}',
+        "ordm" => '\u{ba}',
+        "iexcl" => '\u{a1}',
+        "iquest" => '\u{bf}',
+        "szlig" => '\u{df}',
+        "agrave" => '\u{e0}',
+        "eacute" => '\u{e9}',
+        "egrave" => '\u{e8}',
+        "ccedil" => '\u{e7}',
+        "ntilde" => '\u{f1}',
+        "auml" => '\u{e4}',
+        "ouml" => '\u{f6}',
+        "uuml" => '\u{fc}',
+        "alpha" => '\u{3b1}',
+        "beta" => '\u{3b2}',
+        "gamma" => '\u{3b3}',
+        "delta" => '\u{3b4}',
+        "epsilon" => '\u{3b5}',
+        "lambda" => '\u{3bb}',
+        "mu" => '\u{3bc}',
+        "pi" => '\u{3c0}',
+        "sigma" => '\u{3c3}',
+        "phi" => '\u{3c6}',
+        "omega" => '\u{3c9}',
+        "Alpha" => '\u{391}',
+        "Delta" => '\u{394}',
+        "Omega" => '\u{3a9}',
+        "larr" => '\u{2190}',
+        "uarr" => '\u{2191}',
+        "rarr" => '\u{2192}',
+        "darr" => '\u{2193}',
+        "harr" => '\u{2194}',
+        "spades" => '\u{2660}',
+        "clubs" => '\u{2663}',
+        "hearts" => '\u{2665}',
+        "diams" => '\u{2666}',
+        "loz" => '\u{25ca}',
+        _ => return None,
+    };
+    Some(c.to_string())
+}
+
+/// Escape text content for the HTML fragment.
+fn esc_text_into(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+/// Escape an attribute value for the HTML fragment.
+fn esc_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Elements dropped WITH their contents: active content, embedding,
+/// forms, and inert templates. (`link` has its own arm — harvested
+/// for CSS first. Everything not allowed and not dropped here is
+/// UNWRAPPED: the tag dies, its children survive.)
+const RICH_DROP_CONTENTS: &[&str] = &[
+    "script", "iframe", "object", "embed", "form", "select", "textarea",
+    "button", "frame", "frameset", "applet", "template", "title",
+];
+
+/// The XHTML book vocabulary the reader renders. Anything else is
+/// unwrapped, so an unknown element costs its tag, never its text.
+const RICH_ALLOWED: &[&str] = &[
+    "p", "div", "span", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote",
+    "pre", "code", "em", "i", "strong", "b", "small", "sub", "sup", "a",
+    "img", "br", "hr", "ul", "ol", "li", "dl", "dt", "dd", "table",
+    "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "colgroup",
+    "col", "section", "article", "aside", "figure", "figcaption", "header",
+    "footer", "nav", "main", "q", "cite", "abbr", "time", "mark", "ruby",
+    "rt", "rp", "bdi", "bdo", "wbr", "ins", "del", "s", "u", "var", "kbd",
+    "samp", "data", "dfn",
+];
+
+/// One emitted element on the open stack, so its End event can be
+/// matched and closed (or silently consumed for voids/unwraps).
+enum Open {
+    Elem(String),
+    Bare(String),
+    ImgSpan,
+    Unwrap(String),
+}
+
+fn open_name(o: &Open) -> &str {
+    match o {
+        Open::Elem(n) | Open::Bare(n) | Open::Unwrap(n) => n,
+        Open::ImgSpan => "img",
+    }
+}
+
+/// An `<svg>` subtree in flight: only its image survives (the common
+/// full-page illustration pattern); a script inside poisons it.
+struct SvgState {
+    depth: usize,
+    image: Option<String>,
+    poison: bool,
+}
+
+/// An element's local name, lowercased (`epub:section` → `section`).
+fn elem_name(full: &str) -> String {
+    full.rsplit(':').next().unwrap_or(full).to_ascii_lowercase()
+}
+
+/// Directory part of an archive path ("" at the archive root).
+fn dir_of(path: &str) -> String {
+    path.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default()
+}
+
+/// Attribute (key, value) pairs of a start tag, values unescaped.
+/// quick-xml surfaces values raw; §U's rule applies (unescape here,
+/// with the module's own unescape as the error fallback).
+fn raw_attrs(e: &quick_xml::events::BytesStart) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for a in e.attributes() {
+        let Ok(a) = a else { continue };
+        let key = a.key.as_ref().to_ascii_lowercase();
+        let value = a
+            .unescape_value()
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| unescape(&a.value));
+        out.push((key, value));
+    }
+    out
+}
+
+fn digits_only(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The attribute filter: what may ride an emitted element.
+/// Everything else — every `on*` handler, every URL but the ones
+/// rewritten below, every presentational hook the CSS pass owns —
+/// is dropped. Publisher classes survive (the CSS needs them);
+/// `epub:type` note semantics become `fable-*` classes.
+fn filtered_attrs(
+    ctx: &mut RichCtx,
+    elem: &str,
+    e: &quick_xml::events::BytesStart,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut classes: Vec<String> = Vec::new();
+    let mut style: Option<String> = None;
+    let mut link_attrs: Vec<(String, String)> = Vec::new();
+    let base_dir = ctx.chapter_dir.clone();
+    for (key, value) in raw_attrs(e) {
+        match key.as_str() {
+            "class" => classes.extend(value.split_whitespace().map(str::to_string)),
+            "id" | "title" | "lang" | "dir" | "xml:lang" => out.push((key, value)),
+            "style" => {
+                let f = filter_declarations(&value, &base_dir, ctx);
+                if !f.is_empty() {
+                    style = Some(f);
+                }
+            }
+            "epub:type" => {
+                for tok in value.split_whitespace() {
+                    match tok {
+                        "noteref" => classes.push("fable-noteref".to_string()),
+                        "footnote" | "endnote" | "rearnote" | "note" | "footnotes"
+                        | "endnotes" => classes.push("fable-note".to_string()),
+                        _ => {}
+                    }
+                }
+            }
+            "role" => match value.trim() {
+                "doc-noteref" => classes.push("fable-noteref".to_string()),
+                "doc-footnote" | "doc-endnote" => classes.push("fable-note".to_string()),
+                _ => {}
+            },
+            "href" if elem == "a" => link_attrs = rewrite_href(ctx, &value),
+            "colspan" | "rowspan" if elem == "td" || elem == "th" => {
+                if digits_only(&value) {
+                    out.push((key, value));
+                }
+            }
+            "start" if elem == "ol" => {
+                if digits_only(&value) {
+                    out.push((key, value));
+                }
+            }
+            "value" if elem == "li" => {
+                if digits_only(&value) {
+                    out.push((key, value));
+                }
+            }
+            "type" if elem == "ol" => out.push((key, value)),
+            "datetime" if elem == "time" => out.push((key, value)),
+            _ => {}
+        }
+    }
+    if !classes.is_empty() {
+        out.push(("class".to_string(), classes.join(" ")));
+    }
+    if let Some(s) = style {
+        out.push(("style".to_string(), s));
+    }
+    out.extend(link_attrs);
+    out
+}
+
+/// Rewrite one `<a href>` into navigation data attributes — the
+/// webview never receives a live book href. Internal targets become
+/// `data-fable-link` (spine chapter) + optional `data-fable-frag`;
+/// web/mail targets become `data-fable-ext`; anything else (unknown
+/// schemes, targets outside the spine) loses its link and keeps
+/// its text.
+fn rewrite_href(ctx: &RichCtx, href: &str) -> Vec<(String, String)> {
+    let href = href.trim();
+    if href.is_empty() {
+        return Vec::new();
+    }
+    let lower = href.to_ascii_lowercase();
+    if lower.starts_with("http:") || lower.starts_with("https:") || lower.starts_with("mailto:") {
+        return vec![("data-fable-ext".to_string(), href.to_string())];
+    }
+    if let Some(colon) = href.find(':') {
+        if !href[..colon].contains('/') {
+            return Vec::new(); // javascript:, data:, file:… — dead by design
+        }
+    }
+    let (path, frag) = match href.split_once('#') {
+        Some((p, f)) => (p, Some(f)),
+        None => (href, None),
+    };
+    let target = if path.is_empty() {
+        Some(ctx.chapter_index)
+    } else {
+        let resolved = resolve_href(&ctx.chapter_dir, path);
+        ctx.spine_index.get(&resolved).copied()
+    };
+    match target {
+        Some(idx) => {
+            let mut v = vec![("data-fable-link".to_string(), idx.to_string())];
+            if let Some(f) = frag {
+                if !f.is_empty() {
+                    v.push(("data-fable-frag".to_string(), f.to_string()));
+                }
+            }
+            v
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Emit an allowed element's start tag and record it on the stack.
+fn emit_open(
+    ctx: &mut RichCtx,
+    name: &str,
+    e: &quick_xml::events::BytesStart,
+    out: &mut String,
+    stack: &mut Vec<Open>,
+) {
+    let attrs = filtered_attrs(ctx, name, e);
+    out.push('<');
+    out.push_str(name);
+    for (k, v) in &attrs {
+        out.push(' ');
+        out.push_str(k);
+        out.push_str("=\"");
+        out.push_str(&esc_attr(v));
+        out.push('"');
+    }
+    out.push('>');
+    if matches!(name, "br" | "hr" | "col" | "wbr") {
+        stack.push(Open::Bare(name.to_string()));
+    } else {
+        stack.push(Open::Elem(name.to_string()));
+    }
+}
+
+/// Emit an `<img>`: its source inlined when the archive can honestly
+/// provide it, else an honest placeholder span carrying the alt text
+/// (the End event closes whichever was emitted).
+fn emit_img(ctx: &mut RichCtx, e: &quick_xml::events::BytesStart, out: &mut String) -> Open {
+    let mut src: Option<String> = None;
+    let mut alt = String::new();
+    let mut classes: Vec<String> = Vec::new();
+    let mut dims: Vec<(String, String)> = Vec::new();
+    for (key, value) in raw_attrs(e) {
+        match key.as_str() {
+            "src" => src = Some(value),
+            "alt" => alt = value,
+            "class" => classes.extend(value.split_whitespace().map(str::to_string)),
+            "width" | "height" => {
+                if value.bytes().all(|b| b.is_ascii_digit() || b == b'%') && !value.is_empty() {
+                    dims.push((key, value));
+                }
+            }
+            _ => {}
+        }
+    }
+    let data = src.as_deref().and_then(|s| {
+        let path = resolve_href(&ctx.chapter_dir, s);
+        ctx.inline_media(&path)
+    });
+    match data {
+        Some(url) => {
+            out.push_str("<img src=\"");
+            out.push_str(&url);
+            out.push('"');
+            if !alt.is_empty() {
+                out.push_str(" alt=\"");
+                out.push_str(&esc_attr(&alt));
+                out.push('"');
+            }
+            if !classes.is_empty() {
+                out.push_str(" class=\"");
+                out.push_str(&esc_attr(&classes.join(" ")));
+                out.push('"');
+            }
+            for (k, v) in &dims {
+                out.push(' ');
+                out.push_str(k);
+                out.push_str("=\"");
+                out.push_str(&esc_attr(v));
+                out.push('"');
+            }
+            out.push('>');
+            Open::Bare("img".to_string())
+        }
+        None => {
+            out.push_str("<span class=\"fable-img-missing\">");
+            let label = if alt.is_empty() { "Image" } else { alt.as_str() };
+            esc_text_into(label, out);
+            Open::ImgSpan
+        }
+    }
+}
+
+/// A stylesheet `<link>`: harvest its CSS into the chapter's parts
+/// (document order matters, so this runs where the link appears).
+fn harvest_link(ctx: &mut RichCtx, e: &quick_xml::events::BytesStart) {
+    let mut rel = String::new();
+    let mut href: Option<String> = None;
+    for (key, value) in raw_attrs(e) {
+        match key.as_str() {
+            "rel" => rel = value,
+            "href" => href = Some(value),
+            _ => {}
+        }
+    }
+    if !rel.split_whitespace().any(|t| t.eq_ignore_ascii_case("stylesheet")) {
+        return;
+    }
+    let Some(href) = href else { return };
+    let path = resolve_href(&ctx.chapter_dir, &href);
+    if let Some(text) = ctx.zip.read_text(&path) {
+        let base = dir_of(&path);
+        ctx.css_parts
+            .push((base, text.chars().take(MAX_RICH_CSS_CHARS).collect()));
+    }
+}
+
+/// One start event inside an `<svg>` subtree: track nesting, watch
+/// for a script (poison), and capture the first resolvable image.
+fn svg_start(
+    svg: &mut SvgState,
+    name: &str,
+    e: &quick_xml::events::BytesStart,
+    ctx: &mut RichCtx,
+) {
+    match name {
+        "svg" => svg.depth += 1,
+        "script" => svg.poison = true,
+        "image" => {
+            if svg.image.is_none() {
+                for (key, value) in raw_attrs(e) {
+                    if key == "href" || key == "xlink:href" {
+                        let path = resolve_href(&ctx.chapter_dir, &value);
+                        if let Some(url) = ctx.inline_media(&path) {
+                            svg.image = Some(url);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The streaming sanitizer: one chapter document in, a safe HTML
+/// fragment out. `None` when the markup doesn't parse — the caller
+/// falls back to the chapter's text rather than showing a
+/// half-rewritten page.
+fn sanitize_chapter(xhtml: &str, ctx: &mut RichCtx) -> Option<String> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::reader::Reader::from_str(xhtml);
+    let cfg = reader.config_mut();
+    cfg.trim_text_start = false;
+    cfg.trim_text_end = false;
+    cfg.expand_empty_elements = true;
+
+    let mut out = String::with_capacity(xhtml.len().min(MAX_RICH_HTML_CHARS));
+    let mut stack: Vec<Open> = Vec::new();
+    let mut skip: Option<(String, usize)> = None;
+    let mut style_text: Option<String> = None;
+    let mut svg: Option<SvgState> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => {
+                let name = elem_name(e.name().as_ref());
+                if let Some(s) = &mut svg {
+                    svg_start(s, &name, &e, ctx);
+                    continue;
+                }
+                if let Some((root, depth)) = &mut skip {
+                    if name == *root {
+                        *depth += 1;
+                    }
+                    continue;
+                }
+                if style_text.is_some() {
+                    continue; // tags inside <style> aren't real
+                }
+                match name.as_str() {
+                    "style" => style_text = Some(String::new()),
+                    "link" => {
+                        harvest_link(ctx, &e);
+                        skip = Some(("link".to_string(), 1));
+                    }
+                    "svg" => {
+                        svg = Some(SvgState {
+                            depth: 1,
+                            image: None,
+                            poison: false,
+                        })
+                    }
+                    "img" => {
+                        let open = emit_img(ctx, &e, &mut out);
+                        stack.push(open);
+                    }
+                    _ if RICH_DROP_CONTENTS.contains(&name.as_str()) => {
+                        skip = Some((name, 1));
+                    }
+                    _ if RICH_ALLOWED.contains(&name.as_str()) => {
+                        emit_open(ctx, &name, &e, &mut out, &mut stack);
+                    }
+                    _ => stack.push(Open::Unwrap(name)),
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = elem_name(e.name().as_ref());
+                if let Some(mut s) = svg.take() {
+                    if name == "svg" {
+                        s.depth = s.depth.saturating_sub(1);
+                        if s.depth == 0 {
+                            if !s.poison {
+                                if let Some(url) = &s.image {
+                                    out.push_str("<img src=\"");
+                                    out.push_str(url);
+                                    out.push_str("\" alt=\"\">");
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    svg = Some(s);
+                    continue;
+                }
+                if style_text.is_some() {
+                    if name == "style" {
+                        let text = style_text.take().unwrap_or_default();
+                        ctx.css_parts.push((ctx.chapter_dir.clone(), text));
+                    }
+                    continue;
+                }
+                if let Some((root, depth)) = &mut skip {
+                    if name == *root {
+                        *depth -= 1;
+                        if *depth == 0 {
+                            skip = None;
+                        }
+                    }
+                    continue;
+                }
+                let matched = matches!(stack.last(), Some(o) if open_name(o) == name);
+                if matched {
+                    match stack.pop() {
+                        Some(Open::Elem(n)) => {
+                            out.push_str("</");
+                            out.push_str(&n);
+                            out.push('>');
+                        }
+                        Some(Open::ImgSpan) => out.push_str("</span>"),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Text(e)) => {
+                let text: &str = e.as_ref();
+                if let Some(cap) = &mut style_text {
+                    cap.push_str(text);
+                } else if skip.is_none() && svg.is_none() {
+                    esc_text_into(text, &mut out);
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                let name: &str = e.as_ref();
+                if let Some(cap) = &mut style_text {
+                    cap.push('&');
+                    cap.push_str(name);
+                    cap.push(';');
+                } else if skip.is_none() && svg.is_none() {
+                    match resolve_entity(name) {
+                        Some(s) => esc_text_into(&s, &mut out),
+                        None => {
+                            if !name.is_empty()
+                                && name
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b == b'#')
+                            {
+                                // Unknown but well-formed: hand it to
+                                // the webview's HTML parser, which
+                                // knows the full HTML entity table.
+                                out.push('&');
+                                out.push_str(name);
+                                out.push(';');
+                            } else {
+                                esc_text_into(name, &mut out);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::CData(e)) => {
+                let text: &str = e.as_ref();
+                if let Some(cap) = &mut style_text {
+                    cap.push_str(text);
+                } else if skip.is_none() && svg.is_none() {
+                    esc_text_into(text, &mut out);
+                }
+            }
+            Ok(_) => {} // comments, PIs, doctype, declarations
+            Err(_) => return None,
+        }
+        if out.len() > MAX_RICH_HTML_CHARS * 2 {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// Remove `/* … */` comments (quote-aware; an unterminated comment
+/// eats the tail, as CSS itself would treat it).
+fn strip_css_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut q: Option<char> = None;
+    let mut rest = css;
+    while !rest.is_empty() {
+        let c = rest.chars().next().unwrap_or('\u{fffd}');
+        if let Some(qc) = q {
+            out.push(c);
+            if c == qc {
+                q = None;
+            }
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            q = Some(c);
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        if rest.starts_with("/*") {
+            match rest[2..].find("*/") {
+                Some(end) => rest = &rest[2 + end + 2..],
+                None => break,
+            }
+            continue;
+        }
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
+/// Split a stylesheet (or an at-rule's block) into (prelude, block)
+/// items: a prelude ending at `;` is a statement (block None); one
+/// ending at `{` carries its balanced block. Quote- and paren-aware
+/// — CSS structure characters are ASCII, so the byte walk is safe.
+fn css_items(css: &str) -> Vec<(String, Option<String>)> {
+    let b = css.as_bytes();
+    let n = b.len();
+    let mut items = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let start = i;
+        let mut parens = 0i32;
+        let mut q: Option<u8> = None;
+        let mut term: Option<u8> = None;
+        while i < n {
+            let c = b[i];
+            if let Some(qc) = q {
+                if c == qc {
+                    q = None;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                b'"' | b'\'' => q = Some(c),
+                b'(' => parens += 1,
+                b')' => parens -= 1,
+                b'{' if parens == 0 => {
+                    term = Some(b'{');
+                    break;
+                }
+                b';' if parens == 0 => {
+                    term = Some(b';');
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let prelude = css[start..i].trim().to_string();
+        match term {
+            Some(b';') => {
+                i += 1;
+                if !prelude.is_empty() {
+                    items.push((prelude, None));
+                }
+            }
+            Some(b'{') => {
+                i += 1;
+                let bstart = i;
+                let mut depth = 1i32;
+                let mut q: Option<u8> = None;
+                let mut closed = false;
+                while i < n {
+                    let c = b[i];
+                    if let Some(qc) = q {
+                        if c == qc {
+                            q = None;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    match c {
+                        b'"' | b'\'' => q = Some(c),
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                closed = true;
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let block = if closed {
+                    &css[bstart..i.saturating_sub(1)]
+                } else {
+                    &css[bstart..i]
+                };
+                if !prelude.is_empty() {
+                    items.push((prelude, Some(block.to_string())));
+                }
+            }
+            _ => break,
+        }
+    }
+    items
+}
+
+/// Split a selector list on top-level commas (paren/bracket/quote
+/// aware — `:not(a, b)` and `[href="x,y"]` stay whole).
+fn split_top_commas(s: &str) -> Vec<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut q: Option<u8> = None;
+    let mut start = 0usize;
+    for i in 0..b.len() {
+        let c = b[i];
+        if let Some(qc) = q {
+            if c == qc {
+                q = None;
+            }
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => q = Some(c),
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(s[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].to_string());
+    out
+}
+
+/// Split a declaration block on top-level semicolons (paren/quote
+/// aware — `url(data:image/png;base64,…)` stays one declaration).
+fn split_declarations(block: &str) -> Vec<String> {
+    let b = block.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut q: Option<u8> = None;
+    let mut start = 0usize;
+    for i in 0..b.len() {
+        let c = b[i];
+        if let Some(qc) = q {
+            if c == qc {
+                q = None;
+            }
+            continue;
+        }
+        match c {
+            b'"' | b'\'' => q = Some(c),
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b';' if depth == 0 => {
+                out.push(block[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = &block[start..];
+    if !tail.trim().is_empty() {
+        out.push(tail.to_string());
+    }
+    out
+}
+
+/// Scope one selector under the reader's `.reader-pub` container.
+/// Document-level roots (html/body/:root) map onto the container
+/// itself; everything else descends from it.
+fn scope_selector(sel: &str) -> String {
+    let s = sel.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let lower = s.to_ascii_lowercase();
+    for root in ["body", "html", ":root"] {
+        if lower == root {
+            return ".reader-pub".to_string();
+        }
+        if lower.starts_with(root) {
+            let rest = &s[root.len()..];
+            if matches!(
+                rest.chars().next(),
+                Some('.' | '#' | '[' | ':' | ' ' | '>' | '+' | '~')
+            ) {
+                return format!(".reader-pub{rest}");
+            }
+        }
+    }
+    format!(".reader-pub {s}")
+}
+
+/// Rewrite every `url(…)` in a declaration value: data: and
+/// fragment refs pass through; archive members inline (encrypted
+/// members refuse inside `inline_media`); anything external kills
+/// the declaration (None).
+fn rewrite_css_urls(value: &str, base_dir: &str, ctx: &mut RichCtx) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let Some(pos) = lower.find("url(") else {
+            out.push_str(rest);
+            return Some(out);
+        };
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + 4..];
+        let close = after.find(')')?;
+        let inner = after[..close].trim().trim_matches(|c| c == '"' || c == '\'');
+        if inner.starts_with("data:") || inner.starts_with('#') {
+            out.push_str("url(");
+            out.push_str(&after[..close]);
+            out.push(')');
+        } else if inner.contains("://") || inner.starts_with("//") {
+            return None;
+        } else {
+            let path = resolve_href(base_dir, inner);
+            let url = ctx.inline_media(&path)?;
+            out.push_str("url(\"");
+            out.push_str(&url);
+            out.push_str("\")");
+        }
+        rest = &after[close + 1..];
+    }
+}
+
+/// Filter one declaration block: drop active/exfiltration-shaped
+/// declarations and flow-breaking positioning; rewrite urls
+/// through the archive. Returns "" when nothing survives.
+fn filter_declarations(block: &str, base_dir: &str, ctx: &mut RichCtx) -> String {
+    let mut out = String::new();
+    for decl in split_declarations(block) {
+        let Some(colon) = decl.find(':') else {
+            continue;
+        };
+        let prop = decl[..colon].trim();
+        let value = decl[colon + 1..].trim();
+        if prop.is_empty() || value.is_empty() {
+            continue;
+        }
+        let prop_l = prop.to_ascii_lowercase();
+        let val_l = value.to_ascii_lowercase();
+        if val_l.contains("expression(")
+            || val_l.contains("javascript:")
+            || val_l.contains("vbscript:")
+        {
+            continue;
+        }
+        if prop_l == "behavior" || prop_l == "-moz-binding" {
+            continue;
+        }
+        if prop_l == "position" && (val_l == "fixed" || val_l == "absolute") {
+            continue; // a reading column is a flow, not a canvas
+        }
+        let value = if val_l.contains("url(") {
+            match rewrite_css_urls(value, base_dir, ctx) {
+                Some(v) => v,
+                None => continue,
+            }
+        } else {
+            value.to_string()
+        };
+        out.push_str(prop);
+        out.push(':');
+        out.push_str(&value);
+        out.push(';');
+    }
+    out
+}
+
+/// The target of an `@import` prelude: a quoted string or a url().
+fn import_target(prelude: &str) -> Option<String> {
+    let p = prelude.trim();
+    if let Some(u) = p.to_ascii_lowercase().find("url(") {
+        let rest = &p[u + 4..];
+        let end = rest.find(')')?;
+        return Some(
+            rest[..end]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_string(),
+        );
+    }
+    let q = p.find(['"', '\''])?;
+    let quote = p.as_bytes()[q];
+    let rest = &p[q + 1..];
+    let end = rest.find(quote as char)?;
+    Some(rest[..end].to_string())
+}
+
+/// Sanitize + scope one stylesheet (or at-rule block) against the
+/// archive. `base_dir` is the directory the sheet's own relative
+/// references resolve against; `depth` bounds @import chains.
+fn scope_css(css: &str, base_dir: &str, ctx: &mut RichCtx, depth: usize) -> String {
+    let cleaned = strip_css_comments(css);
+    let mut out = String::new();
+    for (prelude, block) in css_items(&cleaned) {
+        if out.len() > MAX_RICH_CSS_CHARS {
+            break;
+        }
+        let p = prelude.trim();
+        if let Some(at) = p.strip_prefix('@') {
+            let name = format!(
+                "@{}",
+                at.split(|c: char| c.is_whitespace() || c == '(')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+            );
+            match name.as_str() {
+                "@import" => {
+                    if depth < MAX_RICH_IMPORT_DEPTH {
+                        if let Some(target) = import_target(p) {
+                            let resolved = resolve_href(base_dir, &target);
+                            let is_css = ctx
+                                .manifest_media
+                                .get(&resolved)
+                                .map(|m| m.contains("css"))
+                                .unwrap_or(false)
+                                || resolved.ends_with(".css");
+                            if is_css && !ctx.imported_css.contains(&resolved) {
+                                if let Some(text) = ctx.zip.read_text(&resolved) {
+                                    ctx.imported_css.insert(resolved.clone());
+                                    let base2 = dir_of(&resolved);
+                                    let inner = scope_css(&text, &base2, ctx, depth + 1);
+                                    out.push_str(&inner);
+                                }
+                            }
+                        }
+                    }
+                }
+                "@media" | "@supports" => {
+                    if let Some(b) = &block {
+                        let inner = scope_css(b, base_dir, ctx, depth);
+                        if !inner.trim().is_empty() {
+                            out.push_str(p);
+                            out.push('{');
+                            out.push_str(&inner);
+                            out.push('}');
+                        }
+                    }
+                }
+                "@font-face" => {
+                    if let Some(b) = &block {
+                        let had_url = b.to_ascii_lowercase().contains("url(");
+                        let decls = filter_declarations(b, base_dir, ctx);
+                        // inline_media refuses encrypted members, so a
+                        // surviving data: src is a clean font; a face
+                        // whose every src died is dropped whole.
+                        if !decls.is_empty() && (!had_url || decls.contains("data:")) {
+                            out.push_str("@font-face{");
+                            out.push_str(&decls);
+                            out.push('}');
+                        }
+                    }
+                }
+                "@keyframes" | "@-webkit-keyframes" => {
+                    if let Some(b) = &block {
+                        let mut inner = String::new();
+                        for (sel, blk) in css_items(b) {
+                            if let Some(bb) = &blk {
+                                let d = filter_declarations(bb, base_dir, ctx);
+                                if !d.is_empty() {
+                                    inner.push_str(sel.trim());
+                                    inner.push('{');
+                                    inner.push_str(&d);
+                                    inner.push('}');
+                                }
+                            }
+                        }
+                        if !inner.is_empty() {
+                            out.push_str(p);
+                            out.push('{');
+                            out.push_str(&inner);
+                            out.push('}');
+                        }
+                    }
+                }
+                _ => {} // @charset/@page/@viewport/… — dropped
+            }
+            continue;
+        }
+        let Some(b) = &block else { continue };
+        let decls = filter_declarations(b, base_dir, ctx);
+        if decls.is_empty() {
+            continue;
+        }
+        let selectors: Vec<String> = split_top_commas(p)
+            .iter()
+            .map(|s| scope_selector(s))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if selectors.is_empty() {
+            continue;
+        }
+        out.push_str(&selectors.join(","));
+        out.push('{');
+        out.push_str(&decls);
+        out.push('}');
+    }
+    out
+}
+
+#[cfg(test)]
+mod rich_tests {
+    use super::*;
+
+    // -- stored-only ZIP writer (the reader verifies no CRCs) --
+    fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut central: Vec<u8> = Vec::new();
+        for (name, data) in entries {
+            let offset = out.len() as u32;
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // stored
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // crc (unchecked)
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes());
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_start = out.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd_start.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    const RCONTAINER: &str = r#"<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#;
+
+    const ROPF: &str = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bid">urn:fixture:rich</dc:identifier>
+    <dc:title>The Rich Fixture</dc:title>
+    <dc:creator>Jane Tester</dc:creator>
+  </metadata>
+  <manifest>
+    <item id="ch1" href="text/ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="text/ch2.xhtml" media-type="application/xhtml+xml"/>
+    <item id="notes" href="text/notes.xhtml" media-type="application/xhtml+xml"/>
+    <item id="css" href="css/book.css" media-type="text/css"/>
+    <item id="xcss" href="css/extra.css" media-type="text/css"/>
+    <item id="fig" href="images/fig.png" media-type="image/png"/>
+    <item id="font" href="fonts/book.ttf" media-type="application/x-font-ttf"/>
+  </manifest>
+  <spine><itemref idref="ch1"/><itemref idref="ch2"/><itemref idref="notes"/></spine>
+</package>"#;
+
+    const RCSS: &str = r#"/* fixture sheet */
+@import url("extra.css");
+body { font-family: "BookFont", serif; color: #222; }
+.dropcap { font-size: 3em; float: left; line-height: 0.8; }
+.evil { background: url(http://evil.example/x.png); position: fixed; top: 0; }
+@font-face { font-family: "BookFont"; src: url(../fonts/book.ttf); }
+@media print { .dropcap { float: none; } }
+"#;
+
+    const RXCSS: &str = ".imported { letter-spacing: 0.1em; }";
+
+    const RCH1: &str = r##"<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>Ch 1 head</title><link rel="stylesheet" type="text/css" href="../css/book.css"/></head>
+<body>
+<h1 class="dropcap">Chapter One</h1>
+<p>Text with &amp; entity &mdash; dash &#8217; quote &unknownref; too.</p>
+<p>See the figure <img src="../images/fig.png" alt="A figure"/> and note.<a epub:type="noteref" href="notes.xhtml#n1"><sup>1</sup></a></p>
+<p><a href="ch2.xhtml">Next chapter</a> <a href="#local">local</a> <a href="https://example.com/x">external</a> <a href="javascript:evil()">bad</a></p>
+<p id="local">Local target.</p>
+<script>alert(1)</script>
+<p onclick="evil()">Clean para.</p>
+</body></html>"##;
+
+    const RCH2: &str = r#"<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:xlink="http://www.w3.org/1999/xlink">
+<head><title>Ch 2</title><style>p { margin: 0 0 1em; }</style></head>
+<body>
+<h1>Chapter Two</h1>
+<p style="color: red; position: absolute; top: 0">Styled para.</p>
+<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><image xlink:href="../images/fig.png" width="100" height="100"/></svg>
+</body></html>"#;
+
+    const RNOTES: &str = r#"<?xml version="1.0"?>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<head><title>Notes</title></head>
+<body>
+<aside epub:type="footnote" id="n1"><p>1. The note text. <a href="ch1.xhtml">back</a></p></aside>
+</body></html>"#;
+
+    const PNG_BYTES: &[u8] = b"\x89PNG\r\n\x1a\nFAKEFIG";
+    const TTF_BYTES: &[u8] = b"FAKETTF0";
+
+    fn rich_book() -> Vec<u8> {
+        stored_zip(&[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", RCONTAINER.as_bytes()),
+            ("OEBPS/content.opf", ROPF.as_bytes()),
+            ("OEBPS/css/book.css", RCSS.as_bytes()),
+            ("OEBPS/css/extra.css", RXCSS.as_bytes()),
+            ("OEBPS/images/fig.png", PNG_BYTES),
+            ("OEBPS/fonts/book.ttf", TTF_BYTES),
+            ("OEBPS/text/ch1.xhtml", RCH1.as_bytes()),
+            ("OEBPS/text/ch2.xhtml", RCH2.as_bytes()),
+            ("OEBPS/text/notes.xhtml", RNOTES.as_bytes()),
+        ])
+    }
+
+    #[test]
+    fn rich_chapters_match_plain_decode() {
+        let data = rich_book();
+        let plain = decode_epub_book(&data);
+        let rich = decode_epub_book_rich(&data, Some(0));
+        assert_eq!(rich.chapters, plain.chapters);
+        assert_eq!(rich.chapters.len(), 3);
+        assert_eq!(rich.chapters[0].title.as_deref(), Some("Chapter One"));
+        // No rich index requested → every rich slot stays empty.
+        let none = decode_epub_book_rich(&data, None);
+        assert!(none.rich.iter().all(|r| r.is_none()));
+    }
+
+    #[test]
+    fn rich_html_keeps_the_book_and_drops_the_danger() {
+        let rich = decode_epub_book_rich(&rich_book(), Some(0));
+        let ch = rich.rich[0].as_ref().expect("rich chapter");
+        let html = ch.html.as_deref().expect("html present");
+        // Publisher structure + classes survive.
+        assert!(html.contains("<h1 class=\"dropcap\">Chapter One</h1>"), "{html}");
+        // Entities: known refs resolve, unknown refs pass through.
+        assert!(html.contains("Text with &amp; entity — dash ’ quote &unknownref; too."), "{html}");
+        // Images inline as data URLs with their alt.
+        assert!(html.contains("<img src=\"data:image/png;base64,iVBORw0KG"), "{html}");
+        assert!(html.contains("alt=\"A figure\""), "{html}");
+        // The footnote reference is a navigation datum, tagged.
+        assert!(html.contains("data-fable-link=\"2\""), "{html}");
+        assert!(html.contains("data-fable-frag=\"n1\""), "{html}");
+        assert!(html.contains("class=\"fable-noteref\""), "{html}");
+        // Internal, fragment, external links — all rewritten.
+        assert!(html.contains("<a data-fable-link=\"1\">Next chapter</a>"), "{html}");
+        assert!(html.contains("data-fable-link=\"0\""), "{html}");
+        assert!(html.contains("data-fable-frag=\"local\""), "{html}");
+        assert!(html.contains("data-fable-ext=\"https://example.com/x\""), "{html}");
+        assert!(html.contains("<a>bad</a>"), "{html}");
+        // No live href, no script, no handler survives anywhere.
+        assert!(!html.contains("href="), "{html}");
+        assert!(!html.contains("<script"), "{html}");
+        assert!(!html.contains("alert"), "{html}");
+        assert!(!html.contains("onclick"), "{html}");
+    }
+
+    #[test]
+    fn rich_css_is_scoped_sanitized_and_complete() {
+        let rich = decode_epub_book_rich(&rich_book(), Some(0));
+        let css = rich.rich[0]
+            .as_ref()
+            .and_then(|c| c.css.as_deref())
+            .expect("css present")
+            .to_string();
+        // body maps onto the container; classes descend from it.
+        assert!(css.contains(".reader-pub{font-family:\"BookFont\", serif;color:#222;}"), "{css}");
+        assert!(css.contains(".reader-pub .dropcap{"), "{css}");
+        assert!(css.contains("float:left"), "{css}");
+        // The @import chain is followed inside the archive.
+        assert!(css.contains(".reader-pub .imported{letter-spacing:0.1em;}"), "{css}");
+        // External art and fixed positioning are gone; the rest stays.
+        assert!(!css.contains("evil.example"), "{css}");
+        assert!(!css.contains("position:fixed"), "{css}");
+        assert!(css.contains(".reader-pub .evil{top:0;}"), "{css}");
+        // The embedded font is inlined as a data URL.
+        assert!(css.contains("@font-face{"), "{css}");
+        assert!(css.contains("data:application/x-font-ttf;base64,"), "{css}");
+        // @media survives with scoped inner rules.
+        assert!(css.contains("@media print"), "{css}");
+        assert!(css.contains(".reader-pub .dropcap{float:none;}"), "{css}");
+    }
+
+    #[test]
+    fn rich_second_chapter_styles_and_svg() {
+        let rich = decode_epub_book_rich(&rich_book(), Some(1));
+        let ch = rich.rich[1].as_ref().expect("rich chapter");
+        let html = ch.html.as_deref().expect("html present");
+        // Inline style filtered: color + top survive, absolute dies.
+        assert!(html.contains("style=\"color:red;top:0;\""), "{html}");
+        // The SVG illustration becomes its image.
+        assert!(html.contains("<img src=\"data:image/png;base64,iVBORw0KG"), "{html}");
+        assert!(!html.contains("<svg"), "{html}");
+        // The chapter's own <style> block is scoped too.
+        let css = ch.css.as_deref().expect("css present");
+        assert!(css.contains(".reader-pub p{margin:0 0 1em;}"), "{css}");
+    }
+
+    #[test]
+    fn rich_notes_carry_the_note_class_and_back_link() {
+        let rich = decode_epub_book_rich(&rich_book(), Some(2));
+        let html = rich.rich[2]
+            .as_ref()
+            .and_then(|c| c.html.as_deref())
+            .expect("html present")
+            .to_string();
+        assert!(html.contains("class=\"fable-note\""), "{html}");
+        assert!(html.contains("id=\"n1\""), "{html}");
+        assert!(html.contains("data-fable-link=\"0\""), "{html}");
+    }
+
+    #[test]
+    fn rich_font_face_dies_when_the_font_is_encrypted() {
+        let enc = r#"<?xml version="1.0"?>
+<encryption xmlns="urn:oasis:names:tc:opendocument:xmlns:container"
+  xmlns:enc="http://www.w3.org/2001/04/xmlenc#">
+  <enc:EncryptedData><enc:CipherData><enc:CipherReference URI="OEBPS/fonts/book.ttf"/></enc:CipherData></enc:EncryptedData>
+</encryption>"#;
+        let entries: Vec<(&str, &[u8])> = vec![
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", RCONTAINER.as_bytes()),
+            ("META-INF/encryption.xml", enc.as_bytes()),
+            ("OEBPS/content.opf", ROPF.as_bytes()),
+            ("OEBPS/css/book.css", RCSS.as_bytes()),
+            ("OEBPS/css/extra.css", RXCSS.as_bytes()),
+            ("OEBPS/images/fig.png", PNG_BYTES),
+            ("OEBPS/fonts/book.ttf", TTF_BYTES),
+            ("OEBPS/text/ch1.xhtml", RCH1.as_bytes()),
+            ("OEBPS/text/ch2.xhtml", RCH2.as_bytes()),
+            ("OEBPS/text/notes.xhtml", RNOTES.as_bytes()),
+        ];
+        let rich = decode_epub_book_rich(&stored_zip(&entries), Some(0));
+        // Font-only encryption is not DRM; the book still reads.
+        assert!(!rich.drm_protected);
+        let css = rich.rich[0]
+            .as_ref()
+            .and_then(|c| c.css.as_deref())
+            .expect("css present")
+            .to_string();
+        assert!(!css.contains("@font-face"), "{css}");
+        // …while the rest of the sheet survives.
+        assert!(css.contains(".reader-pub .dropcap{"), "{css}");
+    }
+
+    #[test]
+    fn rich_malformed_chapter_falls_back_to_text() {
+        let broken = RCH1.replace(
+            "<p id=\"local\">Local target.</p>",
+            "<div><p id=\"local\">Local target.</div>",
+        );
+        let data = stored_zip(&[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", RCONTAINER.as_bytes()),
+            ("OEBPS/content.opf", ROPF.as_bytes()),
+            ("OEBPS/css/book.css", RCSS.as_bytes()),
+            ("OEBPS/css/extra.css", RXCSS.as_bytes()),
+            ("OEBPS/images/fig.png", PNG_BYTES),
+            ("OEBPS/fonts/book.ttf", TTF_BYTES),
+            ("OEBPS/text/ch1.xhtml", broken.as_bytes()),
+            ("OEBPS/text/ch2.xhtml", RCH2.as_bytes()),
+            ("OEBPS/text/notes.xhtml", RNOTES.as_bytes()),
+        ]);
+        let rich = decode_epub_book_rich(&data, Some(0));
+        // The chapter still exists as text (the P1 surface)…
+        assert!(rich.chapters[0].text.contains("Local target."));
+        // …but its rich form honestly declines.
+        let ch = rich.rich[0].as_ref().expect("rich slot");
+        assert!(ch.html.is_none(), "html: {:?}", ch.html);
+    }
+
+    #[test]
+    fn rich_missing_image_is_an_honest_placeholder() {
+        let ch1 = RCH1.replace("../images/fig.png", "../images/gone.png");
+        let data = stored_zip(&[
+            ("mimetype", b"application/epub+zip"),
+            ("META-INF/container.xml", RCONTAINER.as_bytes()),
+            ("OEBPS/content.opf", ROPF.as_bytes()),
+            ("OEBPS/css/book.css", RCSS.as_bytes()),
+            ("OEBPS/css/extra.css", RXCSS.as_bytes()),
+            ("OEBPS/images/fig.png", PNG_BYTES),
+            ("OEBPS/fonts/book.ttf", TTF_BYTES),
+            ("OEBPS/text/ch1.xhtml", ch1.as_bytes()),
+            ("OEBPS/text/ch2.xhtml", RCH2.as_bytes()),
+            ("OEBPS/text/notes.xhtml", RNOTES.as_bytes()),
+        ]);
+        let rich = decode_epub_book_rich(&data, Some(0));
+        let html = rich.rich[0]
+            .as_ref()
+            .and_then(|c| c.html.as_deref())
+            .expect("html present")
+            .to_string();
+        assert!(
+            html.contains("<span class=\"fable-img-missing\">A figure</span>"),
+            "{html}"
+        );
+    }
+}
