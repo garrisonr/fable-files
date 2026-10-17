@@ -808,6 +808,12 @@ export const api = {
   romHomeGames: (platform?: string | null) =>
     invoke<RomHomeGame[]>("rom_home_games", { platform: platform ?? null }),
   romHomeCounts: () => invoke<RomHomeCounts>("rom_home_counts"),
+  romHomeShelfWindow: (spec: RomHomeShelfSpec) =>
+    invoke<RomHomeShelfPage>("rom_home_shelf_window", { spec }),
+  romHomeMissingPairs: (spec: RomHomeShelfSpec) =>
+    invoke<RomHomeMissingPair[]>("rom_home_missing_pairs", { spec }),
+  romHomeGenreFacets: () =>
+    invoke<Array<[string, number]>>("rom_home_genre_facets"),
   romHomeSetRating: (providerKey: string, rating: number | null) =>
     invoke<void>("rom_home_set_rating", { providerKey, rating }),
   romHomeSetFavorite: (providerKey: string, on: boolean) =>
@@ -2033,6 +2039,60 @@ export interface RomHomeCounts {
   missingMedia: number;
   /** [platform, games, missing box art] */
   perSystem: Array<[string, number, number]>;
+  /** Hyperbase #4: group counts for the rail's Favorites /
+   * Recently Played shelves (the shelf queries' definitions). */
+  favoriteGroups: number;
+  recentGroups: number;
+  /** Per-system byte totals + offline truth (session badges). */
+  perSystemExtra: RomHomeSystemExtra[];
+}
+
+export interface RomHomeSystemExtra {
+  platform: string;
+  sizeBytes: number;
+  allOffline: boolean;
+  volumeLabel: string | null;
+  volumeLastSeen: string | null;
+}
+
+/** Games Home shelf filters — the room's RoomFilters vocabulary,
+ * judged over the full set in Rust (Hyperbase #4). */
+export interface RomHomeShelfFilters {
+  systems: string[];
+  genres: string[];
+  players: string[];
+  media: string[];
+  flags: string[];
+  ignoreSystems: boolean;
+}
+
+/** One bounded shelf-window request (Hyperbase #4). kind names
+ * the shelf: all | favorites | recent | missing | system |
+ * search | smart | list. For smart shelves, `filters` IS the
+ * list's rule; otherwise it is the room's toolbar filter set. */
+export interface RomHomeShelfSpec {
+  kind: string;
+  platform?: string | null;
+  query?: string | null;
+  searchPlatforms: string[];
+  memberKeys?: string[] | null;
+  filters: RomHomeShelfFilters;
+  sort: string;
+  cursor?: string | null;
+  limit: number;
+}
+
+export interface RomHomeShelfPage {
+  /** Groups matching the spec across the FULL set. */
+  total: number;
+  /** Member rows of this window's groups (whole groups). */
+  games: RomHomeGame[];
+  nextCursor: string | null;
+}
+
+export interface RomHomeMissingPair {
+  itemId: string;
+  mediaType: string;
 }
 
 /** Emulation: one option's verified state on this machine. */

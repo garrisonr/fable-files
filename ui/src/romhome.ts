@@ -19,6 +19,8 @@ import {
   type Item,
   type RomGameState,
   type RomHomeGame,
+  type RomHomeCounts,
+  type RomHomeShelfSpec,
   type RomNeedsIdEntry,
   type RomVariantInfo,
   type RomSmartList,
@@ -189,6 +191,9 @@ interface RoomSystem {
 }
 
 const STATE_KEY = "ff-romhome-state-v1";
+/** Groups per shelf window (Hyperbase #4) — one window paints
+ * immediately; scrolling chains the next by cursor. */
+const WINDOW_GROUPS = 240;
 const MEDIA_TYPES = ["boxart", "screenshot", "titleshot", "trailer"] as const;
 const MEDIA_LABEL: Record<string, string> = {
   boxart: "Box art",
@@ -305,10 +310,37 @@ export class RomHome {
   private ctxMenu = new ContextMenu();
 
   // Data
-  private games: RoomGame[] = [];
+  /** Hyperbase #4: the loaded windows of the CURRENT shelf —
+   * DAT member rows only, whole groups, in Rust window order.
+   * The full set never crosses the wire; the catalog judges
+   * shelves/filters/sorts and ships bounded windows. */
+  private datMembers: RoomGame[] = [];
+  /** Extension-rule games (they arrive whole per system, as
+   * they always have — the rule store is their backend). */
+  private extGames: RoomGame[] = [];
   private gamesByKey = new Map<string, RoomGame>();
   private systems: RoomSystem[] = [];
-  private counts = { total: 0, missingMedia: 0 };
+  private counts = { total: 0, missingMedia: 0, favoriteGroups: 0, recentGroups: 0 };
+  private perSystemTallies = new Map<string, [number, number]>();
+  private countsExtra = new Map<
+    string,
+    { sizeBytes: number; allOffline: boolean; volumeLabel: string | null; volumeLastSeen: string | null }
+  >();
+  private genreFacets: Array<[string, number]> = [];
+  // Shelf window chain state (Hyperbase #4).
+  private shelfTotal = 0;
+  private shelfCursor: string | null = null;
+  private shelfExhausted = true;
+  private shelfLoading = false;
+  private shelfError = false;
+  private shelfSpecKey = "";
+  private shelfGen = 0;
+  /** While a "show all" chain runs, windows widen (2,000 groups)
+   * so loading a whole shelf is a handful of fat windows, not
+   * hundreds of thin ones. Cursors are size-agnostic. */
+  private bulkLimit = 0;
+  private fillSeq = 0;
+  private bodyGen = 0;
   /** Needs-ID shelf contents (Phase 2): unidentified candidates in
    * ROM territory, pre-grouped by parsed filename on the backend. */
   private needsEntries: RomNeedsIdEntry[] = [];
@@ -337,6 +369,8 @@ export class RomHome {
   private railEl!: HTMLElement;
   private shelfEl!: HTMLElement;
   private shelfScroll!: HTMLElement;
+  private headSubEl: HTMLElement | null = null;
+  private headActionsEl: HTMLElement | null = null;
   private inspectorEl!: HTMLElement;
   private searchInput!: HTMLInputElement;
   private chipsBar!: HTMLElement;
@@ -360,12 +394,12 @@ export class RomHome {
     back.title = "Back to Files";
     back.setAttribute("aria-label", "Back to Files");
     back.addEventListener("click", () => this.hooks.onExit());
-    const title = el("span", "rh-title", "ROMs");
+    const title = el("span", "rh-title", "Games");
     const searchWrap = el("div", "rh-search");
     this.searchInput = el("input", "rh-search-in") as HTMLInputElement;
     this.searchInput.type = "search";
-    this.searchInput.placeholder = "Search all ROMs";
-    this.searchInput.setAttribute("aria-label", "Search all ROMs");
+    this.searchInput.placeholder = "Search all games";
+    this.searchInput.setAttribute("aria-label", "Search all games");
     let searchTimer = 0;
     this.searchInput.addEventListener("input", () => {
       window.clearTimeout(searchTimer);
@@ -550,6 +584,7 @@ export class RomHome {
   private async softRefresh(): Promise<void> {
     const keep = new Set(this.selection);
     await this.loadAll();
+    await this.ensureShelfWindow();
     this.selection = new Set([...keep].filter((k) => this.gamesByKey.has(k)));
     if (this.active) {
       this.renderRail();
@@ -560,29 +595,64 @@ export class RomHome {
 
   private async loadAll(): Promise<void> {
     const seq = ++this.loadSeq;
-    const [counts, datGames, collections, smartLists, settings, needs] =
+    const [counts, collections, smartLists, settings, needs, facets] =
       await Promise.all([
         api.romHomeCounts().catch(() => null),
-        api.romHomeGames(null).catch(() => []),
         api.listCollections().catch(() => []),
         api.romHomeSmartLists().catch(() => []),
         api.getRomMediaSettings().catch(() => null),
         api.romHomeNeedsId().catch(() => null),
+        api.romHomeGenreFacets().catch(() => null),
       ]);
     if (seq !== this.loadSeq) return;
     if (needs) this.needsEntries = needs;
-    if (counts) {
-      this.counts = { total: counts.total, missingMedia: counts.missingMedia };
-    }
+    if (counts) this.applyCounts(counts);
+    if (facets) this.genreFacets = facets;
     this.collections = collections;
     this.smartLists = smartLists;
     this.trailersEnabled = settings?.settings.trailers.enabled ?? false;
-    // Systems: UI definitions + catalog tallies by dataset key.
-    const perSystem = new Map<string, [number, number]>();
-    if (counts) for (const [p, g, m] of counts.perSystem) perSystem.set(p, [g, m]);
+    this.rebuildSystems();
+    // The set may have moved under the current shelf: its window
+    // chain restarts from the fresh tallies (Hyperbase #4).
+    this.shelfGen++;
+    this.shelfSpecKey = "";
+    this.datMembers = [];
+    this.rebuildIndex();
+    this.loaded = true;
+  }
+
+  /** Tallies from the catalog (Hyperbase #4: group counts for
+   * every rail shelf + per-system size/offline extras ride the
+   * same call, so the room never needs the full set to know its
+   * numbers). */
+  private applyCounts(counts: RomHomeCounts): void {
+    this.counts = {
+      total: counts.total,
+      missingMedia: counts.missingMedia,
+      favoriteGroups: counts.favoriteGroups,
+      recentGroups: counts.recentGroups,
+    };
+    this.perSystemTallies = new Map(
+      counts.perSystem.map(([p, g, m]) => [p, [g, m] as [number, number]]),
+    );
+    this.countsExtra = new Map(
+      counts.perSystemExtra.map((e) => [
+        e.platform,
+        {
+          sizeBytes: e.sizeBytes,
+          allOffline: e.allOffline,
+          volumeLabel: e.volumeLabel,
+          volumeLastSeen: e.volumeLastSeen,
+        },
+      ]),
+    );
+  }
+
+  private rebuildSystems(): void {
     this.systems = loadRomSystems().map((sys) => {
       const key = romSystemKey(sys);
-      const tally = key ? perSystem.get(key) : undefined;
+      const tally = key ? this.perSystemTallies.get(key) : undefined;
+      const extra = key ? this.countsExtra.get(key) : undefined;
       return {
         sys,
         name: sys.name,
@@ -590,27 +660,259 @@ export class RomHome {
         placeholder: isRomPlaceholder(sys),
         count: key ? (tally?.[0] ?? 0) : null,
         missing: key ? (tally?.[1] ?? 0) : 0,
-        sizeBytes: 0,
+        sizeBytes: extra?.sizeBytes ?? 0,
       };
     });
-    const games: RoomGame[] = datGames.map((g) => this.toRoomGame(g));
-    // Extension-system games already loaded this session stay merged.
-    for (const g of this.games) {
-      if (g.source === "ext") games.push(g);
-    }
-    this.games = games;
-    this.rebuildIndex();
-    // Per-system byte totals from the games themselves.
+    // Extension systems keep the counts their own loads set.
     for (const s of this.systems) {
-      s.sizeBytes = this.games
-        .filter((g) => g.systemName === s.name)
-        .reduce((a, g) => a + (g.item.size_bytes ?? 0), 0);
+      if (s.key === null && this.extLoaded.has(s.name)) {
+        const mine = this.extGames.filter((g) => g.systemName === s.name);
+        s.count = mine.length;
+        s.sizeBytes = mine.reduce((a, g) => a + (g.item.size_bytes ?? 0), 0);
+      }
     }
-    this.loaded = true;
+  }
+
+  /** Quiet tally refresh after a state write (a favorite lands,
+   * a play is noted): the rail's numbers re-read the catalog —
+   * never the loaded windows, which are a sample by design. */
+  private async refreshTallies(): Promise<void> {
+    const [counts, facets] = await Promise.all([
+      api.romHomeCounts().catch(() => null),
+      api.romHomeGenreFacets().catch(() => null),
+    ]);
+    if (counts) {
+      this.applyCounts(counts);
+      this.rebuildSystems();
+    }
+    if (facets) this.genreFacets = facets;
+    if (this.active) this.renderRail();
+  }
+
+  /** Every loaded game (window members + extension games) —
+   * the set the inspector, selection and group fan-out resolve
+   * against. Shelves judge the FULL set in Rust; this is only
+   * what has been shipped to the room so far. */
+  private allLoaded(): RoomGame[] {
+    return [...this.datMembers, ...this.extGames];
   }
 
   private rebuildIndex(): void {
-    this.gamesByKey = new Map(this.games.map((g) => [g.key, g]));
+    this.gamesByKey = new Map(this.allLoaded().map((g) => [g.key, g]));
+  }
+
+  // ------------------------------------------------------------ shelf windows (Hyperbase #4)
+
+  /** The window spec for the current shelf: the room's shelf,
+   * filters and sort, in the catalog's vocabulary. Smart shelves
+   * send their list's rule AS the filters (systems ignored, the
+   * standing list rule); other shelves layer the toolbar filters
+   * over membership. Null for shelves with no game windows
+   * (Needs-ID, hardware). */
+  private buildSpec(
+    cursor: string | null,
+    applyFilters = true,
+  ): RomHomeShelfSpec | null {
+    const ref = this.shelf;
+    const spec: RomHomeShelfSpec = {
+      kind: "all",
+      platform: null,
+      query: null,
+      searchPlatforms: [],
+      memberKeys: null,
+      filters: {
+        systems: [],
+        genres: [],
+        players: [],
+        media: [],
+        flags: [],
+        ignoreSystems: false,
+      },
+      sort: this.sort,
+      cursor,
+      limit: this.bulkLimit > 0 ? this.bulkLimit : WINDOW_GROUPS,
+    };
+    switch (ref.kind) {
+      case "all":
+        spec.kind = "all";
+        break;
+      case "favorites":
+        spec.kind = "favorites";
+        break;
+      case "recent":
+        spec.kind = "recent";
+        break;
+      case "missing":
+        spec.kind = "missing";
+        break;
+      case "system":
+        spec.kind = "system";
+        spec.platform = this.systemKeyOf(ref.name);
+        break;
+      case "search": {
+        spec.kind = "search";
+        spec.query = ref.query;
+        const q = ref.query.toLowerCase();
+        for (const s of loadRomSystems()) {
+          const key = romSystemKey(s);
+          if (key && (s.name.toLowerCase().includes(q) || key.toLowerCase().includes(q))) {
+            spec.searchPlatforms.push(key);
+          }
+        }
+        break;
+      }
+      case "list":
+        spec.kind = "list";
+        spec.memberKeys = this.listMemberKeys(ref.id);
+        break;
+      case "smart": {
+        spec.kind = "smart";
+        const s = this.smartLists.find((x) => x.id === ref.id);
+        if (!s) return null;
+        try {
+          const f = JSON.parse(s.queryJson) as RoomFilters;
+          spec.filters = {
+            systems: f.systems ?? [],
+            genres: f.genres ?? [],
+            players: f.players ?? [],
+            media: f.media ?? [],
+            flags: f.flags ?? [],
+            ignoreSystems: true,
+          };
+        } catch {
+          return null;
+        }
+        return spec;
+      }
+      default:
+        return null;
+    }
+    if (applyFilters) {
+      // (Smart shelves returned above with their rule as the
+      // filters — the toolbar layer never applies to them.)
+      spec.filters = {
+        systems: [...this.filters.systems],
+        genres: [...this.filters.genres],
+        players: [...this.filters.players],
+        media: [...this.filters.media],
+        flags: [...this.filters.flags],
+        ignoreSystems: false,
+      };
+    }
+    return spec;
+  }
+
+  /** Change key for the window chain: shelf + filters + sort +
+   * the refresh generation. When it moves, the chain restarts. */
+  private specKey(): string {
+    const spec = this.buildSpec(null);
+    if (!spec) return `none|${this.shelfGen}`;
+    const { cursor: _c, limit: _l, ...rest } = spec;
+    return `${JSON.stringify(rest)}|${this.shelfGen}`;
+  }
+
+  /** Make sure the first window of the current spec is loaded
+   * (resetting the chain when the spec moved). */
+  private async ensureShelfWindow(): Promise<void> {
+    const key = this.specKey();
+    if (key !== this.shelfSpecKey) {
+      this.shelfSpecKey = key;
+      this.datMembers = [];
+      this.shelfCursor = null;
+      this.shelfExhausted = false;
+      this.shelfTotal = 0;
+      this.shelfError = false;
+      this.rebuildIndex();
+    }
+    if (!this.shelfExhausted && this.datMembers.length === 0) {
+      await this.fetchNextWindow();
+    }
+  }
+
+  /** Pull the next window of the current chain and append its
+   * groups' members. Whole groups only (the catalog's promise);
+   * a group already riding along is never duplicated. */
+  private async fetchNextWindow(): Promise<void> {
+    if (this.shelfLoading || this.shelfExhausted) return;
+    const spec = this.buildSpec(this.shelfCursor);
+    if (!spec) {
+      this.shelfExhausted = true;
+      return;
+    }
+    this.shelfLoading = true;
+    const keyAtStart = this.shelfSpecKey;
+    try {
+      const page = await api.romHomeShelfWindow(spec);
+      if (keyAtStart !== this.shelfSpecKey) return; // superseded mid-flight
+      this.shelfTotal = page.total;
+      // The catalog never repeats a group within a chain; the
+      // key guard only has to survive refresh races.
+      const haveKeys = new Set(this.datMembers.map((g) => g.key));
+      for (const g of page.games) {
+        const rg = this.toRoomGame(g);
+        if (!haveKeys.has(rg.key)) {
+          this.datMembers.push(rg);
+          haveKeys.add(rg.key);
+        }
+      }
+      this.shelfCursor = page.nextCursor;
+      this.shelfExhausted = page.nextCursor === null;
+      this.rebuildIndex();
+    } catch {
+      // Honest stop: the header keeps the tallies it has, the
+      // body says the shelf couldn't be gathered.
+      this.shelfError = this.datMembers.length === 0;
+      this.shelfExhausted = true;
+    } finally {
+      this.shelfLoading = false;
+    }
+  }
+
+  /** "Show all in section": chain windows until the shelf is
+   * whole. Bounded chunks, one fetch at a time — the opposite
+   * of the old single giant payload. */
+  private async loadAllWindows(): Promise<void> {
+    const prev = this.bulkLimit;
+    this.bulkLimit = 2000;
+    try {
+      await this.ensureShelfWindow();
+      while (!this.shelfExhausted) {
+        await this.fetchNextWindow();
+      }
+    } finally {
+      this.bulkLimit = prev;
+    }
+  }
+
+  private loadedGroupCount(): number {
+    return new Set(this.datMembers.map((g) => g.groupKey)).size;
+  }
+
+  /** The count a shelf header may print: the window's true
+   * total once judged, else the catalog tallies' best reading
+   * (corrected the moment the first window lands). */
+  private displayTotal(): number {
+    const ext = this.extSubset().length;
+    if (this.shelfSpecKey === this.specKey() && this.buildSpec(null)) {
+      return this.shelfTotal + ext;
+    }
+    switch (this.shelf.kind) {
+      case "all":
+        return this.counts.total + this.extGames.length;
+      case "favorites":
+        return this.counts.favoriteGroups + ext;
+      case "recent":
+        return this.counts.recentGroups + ext;
+      case "missing":
+        return this.counts.missingMedia;
+      case "system": {
+        const key = this.systemKeyOf(this.shelf.name);
+        const tally = key ? this.perSystemTallies.get(key) : undefined;
+        return (tally?.[0] ?? 0) + ext;
+      }
+      default:
+        return ext;
+    }
   }
 
   private toRoomGame(g: RomHomeGame): RoomGame {
@@ -666,7 +968,7 @@ export class RomHome {
           const key = item.provider_key ?? item.id;
           if (this.gamesByKey.has(key)) continue;
           const b = badgeById.get(item.id);
-          this.games.push({
+          this.extGames.push({
             key,
             item,
             title: item.name.replace(/\.[^.]+$/, ""),
@@ -707,8 +1009,8 @@ export class RomHome {
           this.rebuildIndex();
           const rs = this.systems.find((x) => x.name === s.name);
           if (rs) {
-            rs.count = this.games.filter((g) => g.systemName === s.name).length;
-            rs.sizeBytes = this.games
+            rs.count = this.extGames.filter((g) => g.systemName === s.name).length;
+            rs.sizeBytes = this.extGames
               .filter((g) => g.systemName === s.name)
               .reduce((a, g) => a + (g.item.size_bytes ?? 0), 0);
           }
@@ -742,7 +1044,7 @@ export class RomHome {
    * table; the games query only covers identified ROMs, so ext
    * games hydrate their state per path once, when they join. */
   private async hydrateExtState(): Promise<void> {
-    const ext = this.games.filter((g) => g.source === "ext" && !g.stateHydrated);
+    const ext = this.extGames.filter((g) => g.source === "ext" && !g.stateHydrated);
     await Promise.all(
       ext.map(async (g) => {
         const pk = g.item.provider_key;
@@ -816,9 +1118,9 @@ export class RomHome {
     const lib = el("div", "rh-rail-group");
     const total = this.counts.total;
     lib.appendChild(this.shelfRow({ kind: "all" }, "🗄", "All Games", total > 0 ? String(total) : "—"));
-    const favCount = this.collapseGroups(this.games.filter((g) => g.state.favorite)).length;
+    const favCount = this.counts.favoriteGroups;
     lib.appendChild(this.shelfRow({ kind: "favorites" }, "♥", "Favorites", favCount > 0 ? String(favCount) : ""));
-    const recentCount = this.collapseGroups(this.games.filter((g) => g.state.lastPlayed)).length;
+    const recentCount = this.counts.recentGroups;
     lib.appendChild(this.shelfRow({ kind: "recent" }, "🕘", "Recently Played", recentCount > 0 ? String(recentCount) : ""));
     lib.appendChild(
       this.shelfRow(
@@ -1020,14 +1322,24 @@ export class RomHome {
   }
 
   /** A system is "offline" when it has games and every one of them
-   * sits on a disconnected volume (Library Memory truth). */
+   * sits on a disconnected volume (Library Memory truth). Keyed
+   * systems read the counts call's session extras (Hyperbase #4);
+   * extension systems judge their own loaded games, as before. */
   private systemOffline(name: string): boolean {
-    const gs = this.games.filter((g) => g.systemName === name);
+    const key = this.systemKeyOf(name);
+    if (key) return this.countsExtra.get(key)?.allOffline ?? false;
+    const gs = this.extGames.filter((g) => g.systemName === name);
     return gs.length > 0 && gs.every((g) => g.offline);
   }
 
   private systemVolumeLine(name: string): string | null {
-    const gs = this.games.filter((g) => g.systemName === name);
+    const key = this.systemKeyOf(name);
+    if (key) {
+      const extra = this.countsExtra.get(key);
+      if (!extra?.volumeLabel) return null;
+      return `${extra.volumeLabel} · last seen ${fmtDay(extra.volumeLastSeen)}`;
+    }
+    const gs = this.extGames.filter((g) => g.systemName === name);
     if (gs.length === 0) return null;
     const first = gs[0];
     if (!first.offline || !first.volumeLabel) return null;
@@ -1086,31 +1398,35 @@ export class RomHome {
     });
   }
 
-  /** The games a shelf holds, before filters/sort. */
-  private shelfGames(ref: ShelfRef = this.shelf): RoomGame[] {
+  /** The EXTENSION games a shelf holds (Hyperbase #4): DAT
+   * shelves are judged in Rust by window spec; extension games
+   * still arrive whole per system, so their shelf membership,
+   * filter and search readings stay client-side over their own
+   * (bounded, per-system) set — the same rules the room has
+   * always used, over the ext set alone. */
+  private extSubset(ref: ShelfRef = this.shelf): RoomGame[] {
+    let pool: RoomGame[];
     switch (ref.kind) {
       case "all":
-        return [...this.games];
+        pool = [...this.extGames];
+        break;
       case "favorites":
-        return this.games.filter((g) => g.state.favorite);
+        pool = this.extGames.filter((g) => g.state.favorite);
+        break;
       case "recent":
-        return this.games.filter((g) => g.state.lastPlayed !== null);
+        pool = this.extGames.filter((g) => g.state.lastPlayed !== null);
+        break;
       case "missing":
-        return this.games.filter((g) => g.source === "dat" && !g.media.has("boxart"));
       case "needsid":
-        // Not a game shelf — renderShelf paints the grouped list.
+      case "hardware":
         return [];
       case "system":
-        return this.games.filter(
-          (g) =>
-            g.systemName === ref.name ||
-            (g.platform !== null &&
-              (g.platform === this.systemKeyOf(ref.name) ||
-                g.alsoPlatforms.includes(this.systemKeyOf(ref.name) ?? ""))),
-        );
+        pool = this.extGames.filter((g) => g.systemName === ref.name);
+        break;
       case "list": {
         const memberIds = new Set(this.listMemberKeys(ref.id));
-        return this.games.filter((g) => memberIds.has(g.key) || memberIds.has(g.item.id));
+        pool = this.extGames.filter((g) => memberIds.has(g.key) || memberIds.has(g.item.id));
+        break;
       }
       case "smart": {
         const s = this.smartLists.find((x) => x.id === ref.id);
@@ -1121,11 +1437,11 @@ export class RomHome {
         } catch {
           return [];
         }
-        return this.games.filter((g) => this.matchesFilters(g, f, true));
+        return this.extGames.filter((g) => this.matchesFilters(g, f, true));
       }
       case "search": {
         const q = ref.query.toLowerCase();
-        return this.games.filter(
+        pool = this.extGames.filter(
           (g) =>
             g.title.toLowerCase().includes(q) ||
             g.datTitle.toLowerCase().includes(q) ||
@@ -1133,10 +1449,19 @@ export class RomHome {
             g.labels.some((l) => l.toLowerCase().includes(q)) ||
             g.systemName.toLowerCase().includes(q),
         );
+        break;
       }
-      case "hardware":
-        return [];
     }
+    // The toolbar filters judge ext games exactly as they judge
+    // DAT games in the spec (smart shelves already judged by
+    // their rule above).
+    const f = this.filters;
+    const hasFilters =
+      f.systems.length + f.genres.length + f.players.length + f.media.length + f.flags.length > 0;
+    if (hasFilters) {
+      pool = pool.filter((g) => this.matchesFilters(g, f));
+    }
+    return pool;
   }
 
   private listMemberKeysCache = new Map<string, string[]>();
@@ -1285,11 +1610,14 @@ export class RomHome {
 
   /** The whole group a representative stands for, rebuilt from
    * every loaded game — the Missing Media shelf collapses over a
-   * filtered member set, but its version lists must be complete. */
+   * filtered member set, but its version lists must be complete.
+   * (Hyperbase #4: windows ship whole groups, so a loaded group
+   * is always complete here — the rebuild now only ever confirms
+   * what the window already carried.) */
   private expandGroup(rep: RoomGame): RoomGame {
     if (!rep.groupKey || !rep.versions) return rep;
     const held = rep.versions.reduce((a, v) => a + v.games.length, 0);
-    const members = this.games.filter((g) => g.groupKey === rep.groupKey);
+    const members = this.allLoaded().filter((g) => g.groupKey === rep.groupKey);
     if (members.length <= held) return rep;
     return this.collapseOne(members);
   }
@@ -1311,8 +1639,12 @@ export class RomHome {
    * of the group (the backend stores it on the group; the room's
    * copies must agree without a reload). */
   private fanOutScoped(g: RoomGame): void {
+    // A scoped-state write can move shelf membership (favorite,
+    // completed, genre, a fresh play): the window chain re-judges
+    // on its next fetch (Hyperbase #4).
+    this.shelfGen++;
     if (!g.groupKey) return;
-    for (const m of this.games) {
+    for (const m of this.allLoaded()) {
       if (m === g || m.groupKey !== g.groupKey || m.source !== "dat") continue;
       m.state = {
         ...m.state,
@@ -1328,17 +1660,31 @@ export class RomHome {
     }
   }
 
-  private visibleGames(): RoomGame[] {
-    let games = this.collapseGroups(this.shelfGames());
+  /** The shelf's display list over what's LOADED (Hyperbase
+   * #4): DAT groups arrive judged and ordered by the window
+   * spec (filters + sort already applied over the full set in
+   * Rust), so the collapse is all that remains here. Extension
+   * games merge in client-side; when a shelf holds any, the
+   * merged list is client-sorted as the room has always sorted
+   * merged shelves — the Rust order governs the DAT backbone,
+   * and the seam is declared in the build receipt. */
+  private visibleLoaded(): RoomGame[] {
+    let games = this.collapseGroups(this.datMembers);
     if (this.shelf.kind === "missing") {
       games = games.map((rep) => this.expandGroup(rep));
     }
-    const f = this.filters;
-    const hasFilters =
-      f.systems.length + f.genres.length + f.players.length + f.media.length + f.flags.length > 0;
-    if (hasFilters && this.shelf.kind !== "smart") {
-      games = games.filter((g) => this.matchesFilters(g, f));
+    const ext = this.extSubset();
+    if (ext.length > 0) {
+      games = [...games, ...ext];
+      this.sortLoaded(games);
     }
+    this.lastVisible = games;
+    return games;
+  }
+
+  /** The room's standing sort orders, applied to a merged
+   * (DAT + extension) display list. */
+  private sortLoaded(games: RoomGame[]): void {
     const byTitle = (a: RoomGame, b: RoomGame) => a.title.localeCompare(b.title, undefined, { sensitivity: "base" });
     switch (this.sort) {
       case "title":
@@ -1357,8 +1703,6 @@ export class RomHome {
         games.sort((a, b) => (b.item.modified ?? "").localeCompare(a.item.modified ?? "") || byTitle(a, b));
         break;
     }
-    this.lastVisible = games;
-    return games;
   }
 
   // ------------------------------------------------------------ shelf
@@ -1415,15 +1759,61 @@ export class RomHome {
       return;
     }
 
-    const games = this.visibleGames();
+    // Game shelves fill asynchronously now (Hyperbase #4): the
+    // first window is fetched, then the body paints; scrolling
+    // chains further windows into the same body.
+    this.bodyGen++;
+    void this.fillShelf(keepScroll);
+    this.attachKeys(scroll);
+  }
+
+  /** Fetch the current shelf's window, then paint its body —
+   * superseded fills (a newer render, a shelf hop) stand down. */
+  private async fillShelf(keepScroll = false): Promise<void> {
+    const seq = ++this.fillSeq;
+    const gen = this.bodyGen;
+    await this.ensureShelfWindow();
+    if (seq !== this.fillSeq || gen !== this.bodyGen || !this.active) return;
+    const scroll = this.shelfScroll;
+    if (!scroll) return;
+    this.refreshHeadTexts();
+    this.renderChipsBar();
+    this.paintShelfGames(scroll);
+    if (keepScroll) this.restoreScroll();
+  }
+
+  /** Paint the game body from what's loaded: window members
+   * collapsed, extension games merged (see visibleLoaded). */
+  private paintShelfGames(scroll: HTMLElement): void {
+    // A fresh paint retires every filler closure of the last one.
+    this.bodyGen++;
+    scroll.innerHTML = "";
+    if (this.shelfError) {
+      const note = el("div", "rh-empty");
+      note.append(
+        el("div", "rh-empty-emoji", "🛠"),
+        el("h3", "", "This shelf couldn't be gathered"),
+        el("p", "", "The catalog didn't answer — reopen the room to try again. Nothing was changed."),
+      );
+      scroll.appendChild(note);
+      return;
+    }
+    const games = this.visibleLoaded();
     if (games.length === 0) {
       scroll.appendChild(this.emptyState());
       return;
     }
-    if (this.view === "grid") this.renderGrid(scroll, games);
-    else this.renderList(scroll, games);
-    if (keepScroll) this.restoreScroll();
-    this.attachKeys(scroll);
+    if (this.view === "grid") {
+      if (this.shelf.kind === "search") {
+        this.renderGridSearch(scroll, games);
+      } else {
+        const grid = el("div", "rh-grid");
+        scroll.appendChild(grid);
+        this.fillGridLive(grid);
+      }
+    } else {
+      this.renderListLive(scroll);
+    }
   }
 
   /** The Needs-ID shelf body (Dickles Q3 ✓, 2026-10-16): files no
@@ -1547,7 +1937,7 @@ export class RomHome {
         const rs = this.systems.find((s) => s.name === (this.shelf as { name: string }).name);
         note.append(
           el("div", "rh-empty-emoji", "🎮"),
-          el("h3", "", `No ${rs?.name ?? "games"} ROMs yet`),
+          el("h3", "", rs ? `No ${rs.name} games yet` : "No games yet"),
         );
         const p = el("p", "");
         p.append(
@@ -1571,7 +1961,7 @@ export class RomHome {
         add("✦", "Nothing matches… yet", "This list re-judges every game against its rule whenever you open it. As the library grows, matches gather here on their own.");
         break;
       default:
-        add("🎮", "No ROMs yet", "This room is your collection's home — shelves of art, your ratings and history, every system's library in one calm place. Add a folder of ROMs and Fable will identify them against the DAT sets — then the shelves fill themselves.");
+        add("🎮", "No games yet", "This room is your collection's home — shelves of art, your ratings and history, every system's library in one calm place. Add a folder of games and Fable will identify them against the DAT sets — then the shelves fill themselves.");
         if (this.counts.total === 0) {
           const btn = el("button", "pill-btn rh-empty-action", "Add a ROM folder…") as HTMLButtonElement;
           btn.addEventListener("click", () => this.hooks.onAddRomFolder());
@@ -1585,77 +1975,118 @@ export class RomHome {
     const head = el("div", "rh-shelf-head");
     const ref = this.shelf;
     let title = "";
-    let sub = "";
     let hero: HTMLElement | null = null;
-    let missingForFetch = 0;
     switch (ref.kind) {
       case "all":
         title = "All Games";
-        sub = `${this.collapseGroups(this.games).length.toLocaleString()} games`;
-        missingForFetch = this.counts.missingMedia;
         break;
       case "favorites":
         title = "Favorites";
-        sub = "The ones you love";
         break;
       case "recent":
         title = "Recently Played";
-        sub = "Your history, newest first";
         break;
       case "missing":
         title = "Missing Media";
-        sub = `${this.counts.missingMedia.toLocaleString()} games missing box art — fetch them right here`;
-        missingForFetch = this.counts.missingMedia;
         break;
       case "needsid":
         title = "Needs Identification";
-        sub =
-          this.needsEntries.length > 0
-            ? `${this.needsEntries.length.toLocaleString()} files no DAT claims — grouped by name`
-            : "Every file in ROM territory is identified";
         break;
-      case "system": {
-        const rs = this.systems.find((s) => s.name === ref.name);
+      case "system":
         title = ref.name;
         hero = this.iconEl(ref.name, 96);
         hero.classList.add("rh-hero-icon");
-        if (rs) {
-          const meta = romSystemMeta(ref.name);
-          const n = this.collapseGroups(this.shelfGames()).length;
-          const size = this.shelfGames().reduce((a, g) => a + (g.item.size_bytes ?? 0), 0);
-          sub = `${meta.gen !== null ? `${ordinal(meta.gen)} Generation · ` : ""}${n.toLocaleString()} games${size > 0 ? ` · ${formatBytes(size)}` : ""}`;
-          missingForFetch = rs.missing;
-          const vol = this.systemVolumeLine(ref.name);
-          if (vol) sub += ` — offline (${vol})`;
-        }
         break;
-      }
       case "hardware":
         title = ref.name;
-        sub = "Owned hardware";
         break;
       case "list": {
         const c = this.collections.find((x) => x.id === ref.id);
         title = c?.name ?? "List";
-        sub = "A shelf you fill by hand";
         break;
       }
       case "smart": {
         const s = this.smartLists.find((x) => x.id === ref.id);
         title = s?.name ?? "Smart List";
-        sub = s ? this.smartSentence(s) : "";
         break;
       }
       case "search":
         title = `“${ref.query}”`;
-        sub = `${this.shelfGames().length.toLocaleString()} games across every shelf`;
         break;
     }
     if (hero) head.appendChild(hero);
     const texts = el("div", "rh-head-texts");
-    texts.append(el("h2", "rh-head-title", title), el("p", "rh-head-sub", sub));
+    const sub = el("p", "rh-head-sub", this.shelfSubText());
+    this.headSubEl = sub;
+    texts.append(el("h2", "rh-head-title", title), sub);
     head.appendChild(texts);
     const actions = el("div", "rh-head-actions");
+    this.headActionsEl = actions;
+    head.appendChild(actions);
+    this.renderHeadActions();
+    return head;
+  }
+
+  /** The header's sub-line, computed from the best numbers the
+   * room holds: catalog tallies before the window lands, the
+   * shelf's TRUE total after (Hyperbase #4 — refreshHeadTexts
+   * re-runs this the moment the first window arrives). */
+  private shelfSubText(): string {
+    const ref = this.shelf;
+    switch (ref.kind) {
+      case "all":
+        return `${this.displayTotal().toLocaleString()} games`;
+      case "favorites":
+        return "The ones you love";
+      case "recent":
+        return "Your history, newest first";
+      case "missing":
+        return `${this.counts.missingMedia.toLocaleString()} games missing box art — fetch them right here`;
+      case "needsid":
+        return this.needsEntries.length > 0
+          ? `${this.needsEntries.length.toLocaleString()} files no DAT claims — grouped by name`
+          : "Every file in ROM territory is identified";
+      case "system": {
+        const rs = this.systems.find((s) => s.name === ref.name);
+        if (!rs) return "";
+        const meta = romSystemMeta(ref.name);
+        const n = this.displayTotal();
+        const key = this.systemKeyOf(ref.name);
+        const size = key
+          ? (this.countsExtra.get(key)?.sizeBytes ?? 0)
+          : this.extSubset().reduce((a, g) => a + (g.item.size_bytes ?? 0), 0);
+        let sub = `${meta.gen !== null ? `${ordinal(meta.gen)} Generation · ` : ""}${n.toLocaleString()} games${size > 0 ? ` · ${formatBytes(size)}` : ""}`;
+        const vol = this.systemVolumeLine(ref.name);
+        if (vol) sub += ` — offline (${vol})`;
+        return sub;
+      }
+      case "hardware":
+        return "Owned hardware";
+      case "list":
+        return "A shelf you fill by hand";
+      case "smart": {
+        const s = this.smartLists.find((x) => x.id === ref.id);
+        return s ? this.smartSentence(s) : "";
+      }
+      case "search":
+        return `${this.displayTotal().toLocaleString()} games across every shelf`;
+    }
+  }
+
+  /** Header actions (factored out so the window fill can refresh
+   * them — the Show-all button only exists once the true total
+   * is known, Hyperbase #4). */
+  private renderHeadActions(): void {
+    const actions = this.headActionsEl;
+    if (!actions) return;
+    actions.innerHTML = "";
+    const ref = this.shelf;
+    let missingForFetch = 0;
+    if (ref.kind === "all" || ref.kind === "missing") {
+      missingForFetch = this.counts.missingMedia;
+    } else if (ref.kind === "system") {
+      missingForFetch = this.systems.find((s) => s.name === ref.name)?.missing ?? 0;
+    }
     if (ref.kind === "smart") {
       const editRule = el("button", "pill-btn rh-edit-rule", "Edit rule") as HTMLButtonElement;
       editRule.addEventListener("click", () => {
@@ -1678,6 +2109,25 @@ export class RomHome {
     dice.title = "Surprise me — a random game from this shelf";
     dice.addEventListener("click", () => this.surprise());
     actions.appendChild(dice);
+    if (this.buildSpec(null) && this.shelfTotal > this.loadedGroupCount()) {
+      const total = this.displayTotal();
+      const showAll = el(
+        "button",
+        "pill-btn rh-show-all",
+        `Show all ${total.toLocaleString()}`,
+      ) as HTMLButtonElement;
+      showAll.title = "Load the whole shelf, window by window";
+      showAll.addEventListener("click", () => {
+        void this.loadAllWindows().then(() => {
+          if (this.active) {
+            this.refreshHeadTexts();
+            this.renderChipsBar();
+            this.paintShelfGames(this.shelfScroll);
+          }
+        });
+      });
+      actions.appendChild(showAll);
+    }
     if (missingForFetch > 0) {
       const get = el(
         "button",
@@ -1687,15 +2137,23 @@ export class RomHome {
       get.addEventListener("click", () => this.fetchMissingForShelf());
       actions.appendChild(get);
     }
-    head.appendChild(actions);
-    return head;
+  }
+
+  /** Re-read the header's dynamic texts once the first window
+   * (and its true total) has landed. */
+  private refreshHeadTexts(): void {
+    if (this.headSubEl) this.headSubEl.textContent = this.shelfSubText();
+    this.renderHeadActions();
   }
 
   /** Surprise me: a random game off this shelf, straight into the
    * inspector (the spec's serendipity door — no auto-play). */
   private surprise(): void {
-    const games = this.visibleGames().filter((g) => !g.offline);
-    const pool = games.length > 0 ? games : this.visibleGames();
+    // Picks from what's loaded (Hyperbase #4: the loaded windows
+    // are the room's working set — the dice never force a full
+    // fetch just to roll).
+    const games = this.visibleLoaded().filter((g) => !g.offline);
+    const pool = games.length > 0 ? games : this.visibleLoaded();
     if (pool.length === 0) return;
     const g = pool[Math.floor(Math.random() * pool.length)];
     this.selection = new Set([g.key]);
@@ -1735,18 +2193,27 @@ export class RomHome {
     }
   }
 
-  /** Get missing media for this shelf: every identified game here
-   * without art queues through the existing fetch door. */
-  private fetchMissingForShelf(): void {
-    const games = this.shelfGames().filter(
-      (g) => g.source === "dat" && !g.offline && !g.media.has("boxart"),
-    );
-    const retry: { itemId: string; mediaType: "boxart" | "screenshot" | "titleshot" | "trailer" }[] = [];
-    for (const g of games) {
-      for (const t of MEDIA_TYPES) {
-        if (!g.media.has(t)) retry.push({ itemId: g.item.id, mediaType: t });
-      }
+  /** Get missing media for this shelf: the catalog judges the
+   * shelf's missing pairs over the FULL set (Hyperbase #4) and
+   * the command drops pairs on disconnected volumes, exactly as
+   * the room's loaded-set reading did — the fetch list no
+   * longer depends on what's on screen. */
+  private async fetchMissingForShelf(): Promise<void> {
+    // Membership without the toolbar filter layer (the standing
+    // reading: the button means the shelf, not the filter).
+    const spec = this.buildSpec(null, false);
+    if (!spec) return;
+    const pairs = await api.romHomeMissingPairs(spec).catch(() => null);
+    if (!pairs) {
+      Toast.info("Couldn't gather the missing list — try again in a moment.");
+      return;
     }
+    const retry = pairs
+      .filter((p) => (MEDIA_TYPES as readonly string[]).includes(p.mediaType))
+      .map((p) => ({
+        itemId: p.itemId,
+        mediaType: p.mediaType as "boxart" | "screenshot" | "titleshot" | "trailer",
+      }));
     void this.startFetch(
       retry,
       `Fetching ${retry.length} missing ${retry.length === 1 ? "file" : "files"} — watch it in the jobs panel.`,
@@ -1792,7 +2259,7 @@ export class RomHome {
       chip.addEventListener("click", c.clear);
       bar.appendChild(chip);
     }
-    const count = el("span", "rh-chip-count", `${this.visibleGames().length.toLocaleString()} games`);
+    const count = el("span", "rh-chip-count", `${this.displayTotal().toLocaleString()} games`);
     bar.appendChild(count);
     const clearAll = el("button", "rh-chip-clear", "Clear") as HTMLButtonElement;
     clearAll.addEventListener("click", () => {
@@ -1866,38 +2333,48 @@ export class RomHome {
 
   // ------------------------------------------------------------ grid
 
-  private renderGrid(scroll: HTMLElement, games: RoomGame[]): void {
-    // Search results group by system; a shelf renders flat.
-    if (this.shelf.kind === "search") {
-      const bySystem = new Map<string, RoomGame[]>();
-      for (const g of games) {
-        const arr = bySystem.get(g.systemName) ?? [];
-        arr.push(g);
-        bySystem.set(g.systemName, arr);
-      }
-      for (const [name, gs] of bySystem) {
-        scroll.appendChild(el("h3", "rh-group-head", `${name} · ${gs.length}`));
-        const grid = el("div", "rh-grid");
-        this.fillGrid(grid, gs);
-        scroll.appendChild(grid);
-      }
-      const esc = el("div", "rh-search-escape");
-      const escBtn = el("button", "linklike rh-escape-btn", "Also search all files…") as HTMLButtonElement;
-      escBtn.addEventListener("click", () => {
-        if (this.shelf.kind === "search") this.hooks.onSearchAllFiles(this.shelf.query);
-      });
-      esc.appendChild(escBtn);
-      scroll.appendChild(esc);
-      return;
+  /** Search results group by system (Hyperbase #4: sections
+   * build from the loaded windows; further windows pull in on
+   * the reader's ask and the sections repaint). */
+  private renderGridSearch(scroll: HTMLElement, games: RoomGame[]): void {
+    const bySystem = new Map<string, RoomGame[]>();
+    for (const g of games) {
+      const arr = bySystem.get(g.systemName) ?? [];
+      arr.push(g);
+      bySystem.set(g.systemName, arr);
     }
-    const grid = el("div", "rh-grid");
-    this.fillGrid(grid, games);
-    scroll.appendChild(grid);
+    for (const [name, gs] of bySystem) {
+      scroll.appendChild(el("h3", "rh-group-head", `${name} · ${gs.length}`));
+      const grid = el("div", "rh-grid");
+      this.fillGridStatic(grid, gs);
+      scroll.appendChild(grid);
+    }
+    if (!this.shelfExhausted) {
+      const remaining = Math.max(0, this.displayTotal() - games.length);
+      const more = el(
+        "button",
+        "pill-btn rh-more-results",
+        `Show more results${remaining > 0 ? ` (${remaining.toLocaleString()} more)` : ""}`,
+      ) as HTMLButtonElement;
+      more.addEventListener("click", () => {
+        void this.fetchNextWindow().then(() => {
+          if (this.active && this.shelfScroll === scroll) this.paintShelfGames(scroll);
+        });
+      });
+      scroll.appendChild(more);
+    }
+    const esc = el("div", "rh-search-escape");
+    const escBtn = el("button", "linklike rh-escape-btn", "Also search all files…") as HTMLButtonElement;
+    escBtn.addEventListener("click", () => {
+      if (this.shelf.kind === "search") this.hooks.onSearchAllFiles(this.shelf.query);
+    });
+    esc.appendChild(escBtn);
+    scroll.appendChild(esc);
   }
 
-  /** Chunked fill: first 240 tiles paint immediately, the rest
-   * append as the reader scrolls (a 1,051-game shelf stays light). */
-  private fillGrid(grid: HTMLElement, games: RoomGame[]): void {
+  /** Chunked fill over a fixed set: first 240 tiles paint
+   * immediately, the rest append as the reader scrolls. */
+  private fillGridStatic(grid: HTMLElement, games: RoomGame[]): void {
     const CHUNK = 240;
     let idx = 0;
     const addChunk = (): void => {
@@ -1928,6 +2405,60 @@ export class RomHome {
       );
       io.observe(sentinel);
     }
+  }
+
+  /** The live shelf grid (Hyperbase #4): tiles append in
+   * window order as the reader scrolls; when the loaded groups
+   * run out, the sentinel pulls the NEXT window by cursor —
+   * never a re-fetch from zero. Rendered keys are tracked so a
+   * mid-scroll extension load can append without ever
+   * duplicating or skipping a tile. */
+  private fillGridLive(grid: HTMLElement): void {
+    const gen = this.bodyGen;
+    const CHUNK = 240;
+    const rendered = new Set<string>();
+    let sentinel: HTMLElement | null = null;
+    let io: IntersectionObserver | null = null;
+    const step = (): void => {
+      if (gen !== this.bodyGen) {
+        io?.disconnect();
+        return;
+      }
+      const reps = this.visibleLoaded();
+      const frag = document.createDocumentFragment();
+      let n = 0;
+      for (const g of reps) {
+        if (n >= CHUNK) break;
+        if (rendered.has(g.key)) continue;
+        rendered.add(g.key);
+        frag.appendChild(this.tileEl(g, reps));
+        n++;
+      }
+      grid.appendChild(frag);
+      const pending = reps.some((g) => !rendered.has(g.key));
+      if (!pending && this.shelfExhausted) {
+        io?.disconnect();
+        sentinel?.remove();
+        return;
+      }
+      if (!sentinel) {
+        sentinel = el("div", "rh-sentinel");
+        grid.appendChild(sentinel);
+        io = new IntersectionObserver(
+          (entries) => {
+            if (!entries.some((e) => e.isIntersecting)) return;
+            if (this.visibleLoaded().some((g) => !rendered.has(g.key))) {
+              step();
+              return;
+            }
+            void this.fetchNextWindow().then(() => step());
+          },
+          { root: this.shelfScroll, rootMargin: "600px" },
+        );
+        io.observe(sentinel);
+      }
+    };
+    step();
   }
 
   private tileEl(g: RoomGame, ordered: RoomGame[]): HTMLElement {
@@ -2029,7 +2560,12 @@ export class RomHome {
     return p;
   }
 
-  private renderList(scroll: HTMLElement, games: RoomGame[]): void {
+  /** The list view over the window chain (Hyperbase #4): the
+   * Show-more button spends loaded rows first, then pulls the
+   * next window — its count is the shelf's true remaining
+   * total, never a window-local number. */
+  private renderListLive(scroll: HTMLElement): void {
+    const gen = this.bodyGen;
     const table = el("div", "rh-table");
     const head = el("div", "rh-tr rh-tr-head");
     const cols: [string, SortKey | null][] = [
@@ -2054,26 +2590,50 @@ export class RomHome {
       head.appendChild(c);
     });
     table.appendChild(head);
+    scroll.appendChild(table);
     const CHUNK = 300;
-    let idx = 0;
+    const rendered = new Set<string>();
+    let more: HTMLButtonElement | null = null;
+    const syncMore = (): void => {
+      const repsLeft = this.visibleLoaded().some((g) => !rendered.has(g.key));
+      if (!repsLeft && this.shelfExhausted) {
+        more?.remove();
+        more = null;
+        return;
+      }
+      if (!more) {
+        more = el("button", "pill-btn rh-more-rows", "") as HTMLButtonElement;
+        more.addEventListener("click", () => {
+          if (gen !== this.bodyGen) return;
+          if (this.visibleLoaded().some((g) => !rendered.has(g.key))) {
+            addChunk();
+            return;
+          }
+          void this.fetchNextWindow().then(() => {
+            if (gen === this.bodyGen) addChunk();
+          });
+        });
+        scroll.appendChild(more);
+      }
+      const remaining = Math.max(0, this.displayTotal() - rendered.size);
+      more.textContent = `Show more (${remaining.toLocaleString()} more)`;
+    };
     const addChunk = (): void => {
+      if (gen !== this.bodyGen) return;
+      const reps = this.visibleLoaded();
       const frag = document.createDocumentFragment();
-      for (let n = 0; n < CHUNK && idx < games.length; n++, idx++) {
-        frag.appendChild(this.rowEl(games[idx], games));
+      let n = 0;
+      for (const g of reps) {
+        if (n >= CHUNK) break;
+        if (rendered.has(g.key)) continue;
+        rendered.add(g.key);
+        frag.appendChild(this.rowEl(g, reps));
+        n++;
       }
       table.appendChild(frag);
+      syncMore();
     };
     addChunk();
-    scroll.appendChild(table);
-    if (idx < games.length) {
-      const more = el("button", "pill-btn rh-more-rows", `Show more (${games.length - idx} more)`);
-      more.addEventListener("click", () => {
-        addChunk();
-        if (idx >= games.length) more.remove();
-        else more.textContent = `Show more (${games.length - idx} more)`;
-      });
-      scroll.appendChild(more);
-    }
   }
 
   private rowEl(g: RoomGame, ordered: RoomGame[]): HTMLElement {
@@ -2177,7 +2737,7 @@ export class RomHome {
   }
 
   private visibleOrder(): RoomGame[] {
-    return this.visibleGames();
+    return this.visibleLoaded();
   }
 
   private focusGame(key: string): void {
@@ -2216,6 +2776,24 @@ export class RomHome {
         next = 0;
         break;
       case "End":
+        if (!this.shelfExhausted) {
+          // The shelf's true end isn't loaded yet — chain the
+          // remaining windows, then land on the last game.
+          e.preventDefault();
+          void this.loadAllWindows().then(() => {
+            if (!this.active) return;
+            this.paintShelfGames(this.shelfScroll);
+            const ord = this.visibleLoaded();
+            if (ord.length > 0) {
+              this.selection = new Set([ord[ord.length - 1].key]);
+              this.anchorKey = ord[ord.length - 1].key;
+              this.syncSelectionDom();
+              this.renderInspector();
+              this.focusGame(ord[ord.length - 1].key);
+            }
+          });
+          return;
+        }
         next = ordered.length - 1;
         break;
       case "Enter":
@@ -2408,7 +2986,7 @@ export class RomHome {
     this.renderInspector();
     // Recently Played's membership changed under us; the rail
     // count and (if we're standing on it) the shelf follow.
-    this.renderRail();
+    void this.refreshTallies();
   }
 
   /** The pre-emulation Play: shell launch + play bookkeeping. */
@@ -2420,8 +2998,9 @@ export class RomHome {
         .romHomeNotePlay(pk)
         .then((st) => {
           g.state = st;
+          this.fanOutScoped(g);
           this.renderInspector();
-          this.renderRail();
+          void this.refreshTallies();
         })
         .catch(() => {
           // the launch already happened; bookkeeping can lag honestly
@@ -2460,7 +3039,7 @@ export class RomHome {
     } catch (err) {
       Toast.error(`Could not save: ${errText(err)}`);
     }
-    this.renderRail();
+    void this.refreshTallies();
     this.renderInspector();
   }
 
@@ -2650,8 +3229,42 @@ export class RomHome {
       {
         label: "Get missing media (everything)",
         action: () => {
-          const all = this.games.filter((g) => g.source === "dat");
-          this.fetchForGames(all);
+          // The whole library's missing pairs, judged in the
+          // catalog (Hyperbase #4) — same door as the shelf
+          // button, with the "all" spec and no filter layer.
+          const spec: RomHomeShelfSpec = {
+            kind: "all",
+            platform: null,
+            query: null,
+            searchPlatforms: [],
+            memberKeys: null,
+            filters: {
+              systems: [],
+              genres: [],
+              players: [],
+              media: [],
+              flags: [],
+              ignoreSystems: false,
+            },
+            sort: "title",
+            cursor: null,
+            limit: 1,
+          };
+          void api
+            .romHomeMissingPairs(spec)
+            .then((pairs) => {
+              const retry = pairs
+                .filter((p) => (MEDIA_TYPES as readonly string[]).includes(p.mediaType))
+                .map((p) => ({
+                  itemId: p.itemId,
+                  mediaType: p.mediaType as "boxart" | "screenshot" | "titleshot" | "trailer",
+                }));
+              void this.startFetch(
+                retry,
+                `Fetching ${retry.length} missing ${retry.length === 1 ? "file" : "files"} — watch it in the jobs panel.`,
+              );
+            })
+            .catch(() => Toast.info("Couldn't gather the missing list — try again in a moment."));
         },
       },
     ]);
@@ -2665,9 +3278,15 @@ export class RomHome {
     const r = anchor.getBoundingClientRect();
     pop.style.left = `${Math.max(8, r.left)}px`;
     pop.style.top = `${r.bottom + 6}px`;
-    const genreSet = new Map<string, number>();
-    for (const g of this.games) {
-      if (g.state.genre) genreSet.set(g.state.genre, (genreSet.get(g.state.genre) ?? 0) + 1);
+    // Genre facets come from the catalog's full-set counts now
+    // (Hyperbase #4) — the popover must offer every genre in the
+    // library, not just the ones in the loaded windows. The
+    // loaded fallback covers a facets call that failed.
+    const genreSet = new Map<string, number>(this.genreFacets);
+    if (genreSet.size === 0) {
+      for (const g of this.allLoaded()) {
+        if (g.state.genre) genreSet.set(g.state.genre, (genreSet.get(g.state.genre) ?? 0) + 1);
+      }
     }
     const datKeys: [string, string][] = this.systems
       .filter((s) => s.key)

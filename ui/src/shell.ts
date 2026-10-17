@@ -1152,13 +1152,13 @@ export class Shell {
     // right-click Add-a-System menu is preserved on the door.
     const romsHead = document.createElement("button");
     romsHead.className = "side-head rom-door";
-    romsHead.setAttribute("aria-label", "Open ROM Home");
+    romsHead.setAttribute("aria-label", "Open Games Home");
     const romsGlyph = document.createElement("span");
     romsGlyph.className = "rom-door-glyph";
     romsGlyph.innerHTML = `<svg viewBox="0 0 48 48" aria-hidden="true">${SECTION_ICON_SVG.roms}</svg>`;
     const romsHeadText = document.createElement("span");
     romsHeadText.className = "rom-door-label";
-    romsHeadText.textContent = "ROMs";
+    romsHeadText.textContent = "Games";
     const romsCount = document.createElement("span");
     romsCount.className = "rom-door-count";
     const romsDot = document.createElement("span");
@@ -1179,7 +1179,7 @@ export class Shell {
     // v2.1: the pill follows the fleet (prep progress + update
     // findings) live, not just when the door's counts refresh.
     void onEmuFleetChanged(() => void this.refreshRomDoor()).catch(() => {});
-    romsHead.title = "ROM Home — right-click to add a system";
+    romsHead.title = "Games Home — right-click to add a system";
     romsHead.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       e.stopPropagation();

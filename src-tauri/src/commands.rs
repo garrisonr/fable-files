@@ -8988,9 +8988,20 @@ pub async fn rom_home_games(
     let rows = catalog
         .rom_home_games(platform.as_deref())
         .map_err(CommandError::from)?;
+    Ok(wire_rom_home_games(state.inner(), &catalog, rows))
+}
+
+/// Session-wire conversion shared by the full fetch and the
+/// shelf window (Hyperbase #4): session item ids + Library
+/// Memory volume badges ride on the catalog rows.
+fn wire_rom_home_games(
+    state: &AppState,
+    catalog: &ufm_catalog::Catalog,
+    rows: Vec<ufm_catalog::RomHomeGame>,
+) -> Vec<RomHomeGameWire> {
     let items: Vec<Item> = rows.iter().map(|r| r.item.clone()).collect();
-    let remapped = remap_session_items(state.inner(), items);
-    let badges = badges_for_items(&catalog, &remapped);
+    let remapped = remap_session_items(state, items);
+    let badges = badges_for_items(catalog, &remapped);
     let badge_by_id: std::collections::HashMap<String, ItemVolumeBadge> =
         badges.into_iter().map(|b| (b.item_id.clone(), b)).collect();
     let mut out = Vec::with_capacity(rows.len());
@@ -9015,7 +9026,137 @@ pub async fn rom_home_games(
             volume_last_seen: badge.and_then(|b| b.last_seen.clone()),
         });
     }
-    Ok(out)
+    out
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomHomeShelfPageWire {
+    pub total: i64,
+    pub games: Vec<RomHomeGameWire>,
+    pub next_cursor: Option<String>,
+}
+
+/// One bounded window of a Games Home shelf (Hyperbase #4): the
+/// catalog judges the spec over the full set and ships only this
+/// window's groups, enriched. The room chains windows by cursor.
+#[tauri::command]
+pub async fn rom_home_shelf_window(
+    state: State<'_, AppState>,
+    spec: ufm_catalog::RomHomeShelfSpec,
+) -> Cmd<RomHomeShelfPageWire> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let page = catalog
+        .rom_home_shelf_window(&spec)
+        .map_err(CommandError::from)?;
+    Ok(RomHomeShelfPageWire {
+        total: page.total,
+        games: wire_rom_home_games(state.inner(), &catalog, page.games),
+        next_cursor: page.next_cursor,
+    })
+}
+
+/// The missing-media fetch pairs for a whole shelf spec —
+/// judged over the full set in the catalog (Hyperbase #4).
+/// Pairs on disconnected volumes are dropped here: offline
+/// truth is a session fact (the room's standing rule — never
+/// queue fetches for files that aren't plugged in).
+#[tauri::command]
+pub fn rom_home_missing_pairs(
+    state: State<'_, AppState>,
+    spec: ufm_catalog::RomHomeShelfSpec,
+) -> Cmd<Vec<ufm_catalog::RomHomeMissingPair>> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let pairs = catalog
+        .rom_home_missing_pairs(&spec)
+        .map_err(CommandError::from)?;
+    if pairs.is_empty() {
+        return Ok(pairs);
+    }
+    let rows = catalog.rom_home_system_file_rows().unwrap_or_default();
+    let row_by_id: std::collections::HashMap<&str, &ufm_catalog::RomHomeSystemFileRow> =
+        rows.iter().map(|r| (r.item_id.as_str(), r)).collect();
+    let mut items: Vec<Item> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for p in &pairs {
+        if !seen.insert(p.item_id.as_str()) {
+            continue;
+        }
+        let Some(r) = row_by_id.get(p.item_id.as_str()) else {
+            continue;
+        };
+        let (Ok(item_uuid), Ok(loc_uuid)) = (
+            uuid::Uuid::parse_str(&r.item_id),
+            uuid::Uuid::parse_str(&r.location_id),
+        ) else {
+            continue;
+        };
+        items.push(Item {
+            id: ItemId(item_uuid),
+            location: LocationId(loc_uuid),
+            name: r.title.clone(),
+            kind: ItemKind::File,
+            size_bytes: r.size_bytes.map(|s| s as u64),
+            modified: None,
+            provider_key: r.provider_key.clone(),
+            labels: vec![],
+            starred: false,
+        });
+    }
+    let remapped = remap_session_items(state.inner(), items.clone());
+    let badges = badges_for_items(&catalog, &remapped);
+    let mut session_to_catalog: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for (orig, rem) in items.iter().zip(remapped.iter()) {
+        session_to_catalog.insert(rem.id.to_string(), orig.id.to_string());
+    }
+    let offline: std::collections::HashSet<String> = badges
+        .iter()
+        .filter(|b| b.offline)
+        .filter_map(|b| session_to_catalog.get(&b.item_id).cloned())
+        .collect();
+    Ok(pairs
+        .into_iter()
+        .filter(|p| !offline.contains(&p.item_id))
+        .collect())
+}
+
+/// Genre facet counts (in games) for the room's Filters popover.
+#[tauri::command]
+pub fn rom_home_genre_facets(
+    state: State<'_, AppState>,
+) -> Cmd<Vec<(String, i64)>> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    catalog.rom_home_genre_facets().map_err(CommandError::from)
+}
+
+/// Per-system extras the catalog tallies can't know: byte totals
+/// are catalog facts, but offline truth is a session fact
+/// (Library Memory badges) — computed here from lean rows.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomHomeSystemExtra {
+    pub platform: String,
+    /// Sum of member file sizes on the PRIMARY platform (the
+    /// room's standing per-system byte reading).
+    pub size_bytes: i64,
+    /// Every member file sits on a disconnected volume.
+    pub all_offline: bool,
+    /// The first member's volume (in shelf order), when that
+    /// member is offline — the header's "last seen" line.
+    pub volume_label: Option<String>,
+    pub volume_last_seen: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomHomeCountsWire {
+    #[serde(flatten)]
+    pub counts: ufm_catalog::RomHomeCounts,
+    pub per_system_extra: Vec<RomHomeSystemExtra>,
 }
 
 /// The sidebar door's numbers (total games · games missing media),
@@ -9024,10 +9165,100 @@ pub async fn rom_home_games(
 #[tauri::command]
 pub fn rom_home_counts(
     state: State<'_, AppState>,
-) -> Cmd<ufm_catalog::RomHomeCounts> {
+) -> Cmd<RomHomeCountsWire> {
     let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
         .map_err(CommandError::from)?;
-    catalog.rom_home_counts().map_err(CommandError::from)
+    let counts = catalog.rom_home_counts().map_err(CommandError::from)?;
+    // Per-system extras: lean file rows + the badge machinery the
+    // games query already uses. Best-effort — the tallies above
+    // stand even if a row set can't be read.
+    let mut extras: Vec<RomHomeSystemExtra> = Vec::new();
+    if let Ok(rows) = catalog.rom_home_system_file_rows() {
+        let mut items: Vec<Item> = Vec::with_capacity(rows.len());
+        let mut kept: Vec<&ufm_catalog::RomHomeSystemFileRow> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let (Ok(item_uuid), Ok(loc_uuid)) = (
+                uuid::Uuid::parse_str(&r.item_id),
+                uuid::Uuid::parse_str(&r.location_id),
+            ) else {
+                continue;
+            };
+            kept.push(r);
+            items.push(Item {
+                id: ItemId(item_uuid),
+                location: LocationId(loc_uuid),
+                name: r.title.clone(),
+                kind: ItemKind::File,
+                size_bytes: r.size_bytes.map(|s| s as u64),
+                modified: None,
+                provider_key: r.provider_key.clone(),
+                labels: vec![],
+                starred: false,
+            });
+        }
+        let remapped = remap_session_items(state.inner(), items);
+        let badges = badges_for_items(&catalog, &remapped);
+        let badge_by_id: std::collections::HashMap<String, ItemVolumeBadge> =
+            badges.into_iter().map(|b| (b.item_id.clone(), b)).collect();
+        struct Acc {
+            size: i64,
+            files: i64,
+            offline_files: i64,
+            first_seen_row: bool,
+            first_offline: Option<(Option<String>, Option<String>)>,
+        }
+        let mut by_platform: std::collections::HashMap<String, Acc> =
+            std::collections::HashMap::new();
+        for (row, item) in kept.iter().zip(remapped.iter()) {
+            let acc = by_platform
+                .entry(row.platform.clone())
+                .or_insert_with(|| Acc {
+                    size: 0,
+                    files: 0,
+                    offline_files: 0,
+                    first_seen_row: false,
+                    first_offline: None,
+                });
+            acc.size += row.size_bytes.unwrap_or(0);
+            acc.files += 1;
+            let badge = badge_by_id.get(&item.id.to_string());
+            let offline = badge.map(|b| b.offline).unwrap_or(false);
+            if offline {
+                acc.offline_files += 1;
+            }
+            if !acc.first_seen_row {
+                acc.first_seen_row = true;
+                if offline {
+                    acc.first_offline = Some((
+                        badge.map(|b| b.volume_label.clone()),
+                        badge.and_then(|b| b.last_seen.clone()),
+                    ));
+                }
+            }
+        }
+        let mut platforms: Vec<String> = by_platform.keys().cloned().collect();
+        platforms.sort();
+        for p in platforms {
+            let acc = by_platform.remove(&p).expect("platform key");
+            extras.push(RomHomeSystemExtra {
+                platform: p,
+                size_bytes: acc.size,
+                all_offline: acc.files > 0 && acc.offline_files == acc.files,
+                volume_label: acc
+                    .first_offline
+                    .as_ref()
+                    .and_then(|(l, _)| l.clone()),
+                volume_last_seen: acc
+                    .first_offline
+                    .as_ref()
+                    .and_then(|(_, s)| s.clone()),
+            });
+        }
+    }
+    Ok(RomHomeCountsWire {
+        counts,
+        per_system_extra: extras,
+    })
 }
 
 #[tauri::command]

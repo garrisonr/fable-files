@@ -1978,10 +1978,16 @@ pub fn parsed_base_title(raw: &str) -> String {
 /// DAT names, so stripping tag groups can't merge "… '94" with
 /// "… '97" (AUDIT §8).
 pub fn rom_group_key(platform: &str, title: &str) -> String {
-    format!(
-        "{platform}\u{1}{}",
-        parsed_base_title(title).to_lowercase()
-    )
+    let base = parsed_base_title(title);
+    // ASCII fast path: identical results (ASCII lowercases the
+    // same in Unicode), and DAT titles are overwhelmingly ASCII
+    // — this runs once per identified file on hot paths.
+    let lowered = if base.is_ascii() {
+        base.to_ascii_lowercase()
+    } else {
+        base.to_lowercase()
+    };
+    format!("{platform}\u{1}{lowered}")
 }
 
 /// One version of a game, parsed from its DAT title (or a member /

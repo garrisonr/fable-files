@@ -789,6 +789,15 @@ impl Catalog {
                 );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Hyperbase #4 (2026-10-17): every ROM Home scan filters
+        // media_identities by kind + platform; the index keeps shelf
+        // windows cheap at 100k+ identified games. Additive only.
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_mi_kind_platform
+                 ON media_identities (media_kind, platform, title);",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
         self.backfill_rom_group_state()?;
         Ok(())
     }
@@ -4225,7 +4234,7 @@ pub struct RomGameMedia {
 
 /// One row of the ROM Home shelf queries: everything the room
 /// renders for a game.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RomHomeGame {
     pub item: ufm_vfs::Item,
     /// The DAT-verified title (display title = state.title_override
@@ -4267,6 +4276,634 @@ pub struct RomHomeCounts {
     /// on every shelf it belongs to (primary + `also` platforms);
     /// `total` / `missing_media` count each game once.
     pub per_system: Vec<(String, i64, i64)>,
+    /// Hyperbase #4: group counts for the rail's Favorites and
+    /// Recently Played shelves (same group-level definitions the
+    /// shelf window query uses), so the rail never needs the full
+    /// game set in memory to know its numbers.
+    pub favorite_groups: i64,
+    pub recent_groups: i64,
+}
+
+/// The lean row every ROM Home query shares: identity + item
+/// facts, before enrichment (Hyperbase #4 refactor — the full
+/// fetch and the shelf window enrich through the same code).
+type RomHomeRawRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+    String,
+);
+
+/// Found-media bits in the shelf scan (boxart, screenshot,
+/// titleshot, trailer) — one map read by the window query, the
+/// tallies and the pair builder so they can never disagree.
+const ROM_MEDIA_BIT: [(&str, u8); 4] = [
+    ("boxart", 1),
+    ("screenshot", 2),
+    ("titleshot", 4),
+    ("trailer", 8),
+];
+
+/// The room's filter vocabulary, mirrored 1:1 from the UI's
+/// RoomFilters so the window spec sends what the room holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomHomeShelfFilters {
+    pub systems: Vec<String>,
+    pub genres: Vec<String>,
+    pub players: Vec<String>,
+    pub media: Vec<String>,
+    pub flags: Vec<String>,
+    /// Smart List rules judge with their system facet ignored
+    /// (the room's standing rule); the UI sets this for lists.
+    #[serde(default)]
+    pub ignore_systems: bool,
+}
+
+/// One shelf-window request (Hyperbase #4). `kind` names the
+/// shelf: all | favorites | recent | missing | system | search |
+/// smart | list. For smart shelves, `filters` IS the list's rule;
+/// for the rest it is the room's toolbar filter set, applied on
+/// top of shelf membership — always over the full set, in Rust.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomHomeShelfSpec {
+    pub kind: String,
+    /// System shelf: the dataset key of the platform.
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// Search shelf: the query text.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Platform keys whose DISPLAY name matches the search text —
+    /// resolved by the UI, which owns the system-name table, so
+    /// "nintendo" still finds the NES shelf's games.
+    #[serde(default)]
+    pub search_platforms: Vec<String>,
+    /// List shelf: the list items' provider keys / item ids.
+    #[serde(default)]
+    pub member_keys: Option<Vec<String>>,
+    #[serde(default)]
+    pub filters: RomHomeShelfFilters,
+    /// title | year | recent-played | most-played | recent-added
+    pub sort: String,
+    /// Keyset cursor from the previous window (opaque; minted
+    /// only by this query). Never an offset: rows written by a
+    /// concurrent identification pass cannot shift the chain.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    pub limit: u32,
+}
+
+/// One bounded window of a shelf (Hyperbase #4).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomHomeShelfPage {
+    /// Groups matching the spec across the FULL set — the honest
+    /// number the shelf header shows, never the window size.
+    pub total: i64,
+    /// Member rows of this window's groups (whole groups only —
+    /// a group never splits across windows), in window order.
+    pub games: Vec<RomHomeGame>,
+    /// Cursor for the next window, when more groups remain.
+    pub next_cursor: Option<String>,
+}
+
+/// One missing-media fetch pair (item, media type) for the
+/// room's fetch actions, judged over the full set in Rust.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomHomeMissingPair {
+    pub item_id: String,
+    pub media_type: String,
+}
+
+/// Lean per-file row for the per-system tallies the command
+/// layer finishes with session volume badges.
+#[derive(Debug, Clone)]
+pub struct RomHomeSystemFileRow {
+    pub item_id: String,
+    pub location_id: String,
+    pub provider_key: Option<String>,
+    pub platform: String,
+    pub title: String,
+    pub size_bytes: Option<i64>,
+}
+
+/// Per-path personal facts the group scan folds (play history
+/// lives per path; scoped fields fall back here only when the
+/// group has no state row of its own).
+#[derive(Debug, Clone, Default)]
+struct ShelfPathFacts {
+    rating: Option<i64>,
+    favorite: bool,
+    completed: bool,
+    play_count: i64,
+    last_played: Option<String>,
+}
+
+/// One member file inside a group aggregate (lean — titles and
+/// identity facts only; enrichment happens per window).
+#[derive(Debug, Clone)]
+struct ShelfMemberFacts {
+    item_id: String,
+    provider_key: Option<String>,
+    title: String,
+    sha1: Option<String>,
+    crc: Option<String>,
+    year: Option<i64>,
+    modified: Option<String>,
+}
+
+/// Everything the shelf queries need to know about one group,
+/// folded from one lean scan (Hyperbase #4).
+#[derive(Debug, Clone, Default)]
+struct ShelfGroupFacts {
+    group_key: String,
+    platform: String,
+    members: Vec<ShelfMemberFacts>,
+    /// Cross-listed platforms, union over members (self removed).
+    also: Vec<String>,
+    has_boxart: bool,
+    has_trailer: bool,
+    group_state: Option<RomGameState>,
+    any_path_favorite: bool,
+    any_path_completed: bool,
+    max_path_rating: Option<i64>,
+    play_total: i64,
+    play_last: Option<String>,
+    any_starred: bool,
+    display_title: String,
+    sort_title: String,
+    /// The DEFAULT version's year / newest member stamp (group
+    /// sort keys — see shelf_default_version_span).
+    def_year: Option<i64>,
+    def_modified: Option<String>,
+}
+
+/// The scan's full yield: group facts + the found-media map +
+/// (search only) labels by path.
+struct ShelfScan {
+    groups: Vec<ShelfGroupFacts>,
+    media_found: std::collections::HashMap<String, u8>,
+    labels_by_path: std::collections::HashMap<String, Vec<String>>,
+}
+
+/// The total order key of one group under a sort — the cursor's
+/// payload and the comparator's whole input, so a window chain
+/// compares exactly what it sorted by.
+#[derive(Debug, Clone)]
+struct ShelfSortKey {
+    sort_title: String,
+    def_year: Option<i64>,
+    play_last: Option<String>,
+    play_total: i64,
+    def_modified: Option<String>,
+    group_key: String,
+}
+
+/// The opaque cursor string's contents (JSON). Carries the sort
+/// it was minted under; a cursor from another sort is refused
+/// (the chain restarts rather than mixing orders).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ShelfCursor {
+    sort: String,
+    sort_title: String,
+    def_year: Option<i64>,
+    play_last: Option<String>,
+    play_total: i64,
+    def_modified: Option<String>,
+    group_key: String,
+}
+
+
+/// The two shelf facts an identity's evidence JSON carries —
+/// `also` (other systems claiming the game) and `crc` (the DAT
+/// checksum) — extracted WITHOUT a full JSON parse on the hot
+/// path: a small scanner handles the app-owned evidence shape,
+/// and ANY anomaly defers to the real parser, which also
+/// defines the semantics (string-form crc reads as none;
+/// a non-string `also` element voids the array).
+fn shelf_evidence(evidence: &str) -> (Vec<String>, Option<String>) {
+    match shelf_evidence_fast(evidence) {
+        Some(v) => v,
+        None => {
+            let ev = serde_json::from_str::<serde_json::Value>(evidence).ok();
+            let also: Vec<String> = ev
+                .as_ref()
+                .and_then(|v| v.get("also"))
+                .and_then(|a| serde_json::from_value(a.clone()).ok())
+                .unwrap_or_default();
+            let crc: Option<String> = ev
+                .as_ref()
+                .and_then(|v| v.get("crc"))
+                .and_then(|c| c.as_u64())
+                .map(|n| format!("{n:08x}"));
+            (also, crc)
+        }
+    }
+}
+
+fn shelf_evidence_fast(evidence: &str) -> Option<(Vec<String>, Option<String>)> {
+    let mut also: Vec<String> = Vec::new();
+    if let Some(pos) = evidence.find("\"also\"") {
+        let rest = evidence[pos + 6..].trim_start();
+        let rest = rest.strip_prefix(':')?.trim_start();
+        let mut s = rest.strip_prefix('[')?;
+        loop {
+            s = s.trim_start();
+            if let Some(r) = s.strip_prefix(']') {
+                s = r;
+                break;
+            }
+            if let Some(r) = s.strip_prefix(',') {
+                s = r;
+                continue;
+            }
+            let r = s.strip_prefix('"')?;
+            let mut val = String::new();
+            let mut end: Option<usize> = None;
+            let mut chars = r.char_indices();
+            while let Some((i, c)) = chars.next() {
+                match c {
+                    '"' => {
+                        end = Some(i);
+                        break;
+                    }
+                    '\\' => {
+                        let (_, e) = chars.next()?;
+                        match e {
+                            '"' => val.push('"'),
+                            '\\' => val.push('\\'),
+                            '/' => val.push('/'),
+                            'n' => val.push('\n'),
+                            't' => val.push('\t'),
+                            'r' => val.push('\r'),
+                            _ => return None,
+                        }
+                    }
+                    _ => val.push(c),
+                }
+            }
+            let end = end?;
+            also.push(val);
+            s = &r[end + 1..];
+        }
+        let _ = s;
+    }
+    let mut crc: Option<String> = None;
+    if let Some(pos) = evidence.find("\"crc\"") {
+        let rest = evidence[pos + 5..].trim_start();
+        let rest = rest.strip_prefix(':')?.trim_start();
+        if rest.starts_with('"') {
+            crc = None;
+        } else {
+            let digits: String =
+                rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                return None;
+            }
+            match rest[digits.len()..].chars().next() {
+                Some(',') | Some('}') | Some(' ') | Some(']') | None => {
+                    crc = Some(format!("{:08x}", digits.parse::<u64>().ok()?));
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some((also, crc))
+}
+
+fn shelf_sort_key_of(g: &ShelfGroupFacts) -> ShelfSortKey {
+    ShelfSortKey {
+        sort_title: g.sort_title.clone(),
+        def_year: g.def_year,
+        play_last: g.play_last.clone(),
+        play_total: g.play_total,
+        def_modified: g.def_modified.clone(),
+        group_key: g.group_key.clone(),
+    }
+}
+
+/// The room's sort orders, at group level (Hyperbase #4):
+/// title = display title; year = the DEFAULT version's year,
+/// newest first, yearless last; recent-played = the group's
+/// newest play; most-played = the group's total plays;
+/// recent-added = the default version's newest file stamp.
+/// Ties fall to title, then group key — a total order, which is
+/// what makes keyset windows exact.
+fn shelf_key_cmp(a: &ShelfSortKey, b: &ShelfSortKey, sort: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let primary = match sort {
+        "year" => b.def_year.unwrap_or(-1).cmp(&a.def_year.unwrap_or(-1)),
+        "recent-played" => b.play_last.cmp(&a.play_last),
+        "most-played" => b.play_total.cmp(&a.play_total),
+        "recent-added" => b.def_modified.cmp(&a.def_modified),
+        _ => Ordering::Equal,
+    };
+    primary
+        .then_with(|| a.sort_title.cmp(&b.sort_title))
+        .then_with(|| a.group_key.cmp(&b.group_key))
+}
+
+/// Effective favorite: the group row rules when it exists (the
+/// compose rule); else any member path's mark (the backfill
+/// invariant makes the two agree wherever state was written
+/// through the app's own doors).
+fn shelf_group_favorite(g: &ShelfGroupFacts) -> bool {
+    g.group_state
+        .as_ref()
+        .map(|s| s.favorite)
+        .unwrap_or(g.any_path_favorite)
+}
+
+fn shelf_group_completed(g: &ShelfGroupFacts) -> bool {
+    g.group_state
+        .as_ref()
+        .map(|s| s.completed)
+        .unwrap_or(g.any_path_completed)
+}
+
+fn shelf_group_rating(g: &ShelfGroupFacts) -> Option<i64> {
+    match &g.group_state {
+        Some(s) => s.rating,
+        None => g.max_path_rating,
+    }
+}
+
+/// The players bucket of a user-supplied players string ("2",
+/// "1-4", "2+"): the bucket names the most players it seats.
+/// Mirrors the UI's playersBucket exactly.
+fn players_bucket(players: &str) -> Option<&'static str> {
+    let mut max: Option<u32> = None;
+    let mut cur = String::new();
+    for ch in players.chars().chain(std::iter::once(' ')) {
+        if ch.is_ascii_digit() {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            if let Ok(n) = cur.parse::<u32>() {
+                max = Some(match max {
+                    Some(m) => m.max(n),
+                    None => n,
+                });
+            }
+            cur.clear();
+        }
+    }
+    match max? {
+        0 | 1 => Some("1"),
+        2 => Some("2"),
+        3 | 4 => Some("3-4"),
+        _ => Some("5+"),
+    }
+}
+
+/// The group's DEFAULT version span (year + newest member
+/// stamp), where "default" is the room's own rule ported: rank
+/// versions by region, status, newest revision, descriptor;
+/// never-default variants (bad dumps, trainers, hacks) yield
+/// while any clean version exists. A version = one distinct
+/// (descriptor, content) pair — content is the real sha1, else
+/// the evidence CRC, else the DAT title (AUDIT §8).
+fn shelf_default_version_span(
+    g: &ShelfGroupFacts,
+) -> (Option<i64>, Option<String>) {
+    use std::collections::HashMap;
+    // Fast path (the common case by far): one member is one
+    // version, and it is the default — its year/mtime ARE the
+    // span. Skipping the version fold here is what keeps a
+    // 100k-group scan cheap; the full path below is exact for
+    // the multi-dump minority and the two agree by construction
+    // (a single version's span is its only member's).
+    if g.members.len() == 1 {
+        let m = &g.members[0];
+        return (m.year, m.modified.clone());
+    }
+    let mut versions: HashMap<
+        String,
+        (ufm_media::romdat::RomVariant, Option<i64>, Option<String>),
+    > = HashMap::new();
+    for m in &g.members {
+        let variant = ufm_media::romdat::variant_of_title(&m.title);
+        let content = match &m.sha1 {
+            Some(s) if s.chars().any(|c| c != '0') => s.clone(),
+            _ => match &m.crc {
+                Some(c) => c.clone(),
+                None => m.title.clone(),
+            },
+        };
+        let key = format!("{}|{}", variant.descriptor, content);
+        let e = versions
+            .entry(key)
+            .or_insert_with(|| (variant, None, None));
+        e.1 = match (e.1, m.year) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        if m.modified.as_deref() > e.2.as_deref() {
+            e.2 = m.modified.clone();
+        }
+    }
+    let mut vs: Vec<(
+        &String,
+        &(ufm_media::romdat::RomVariant, Option<i64>, Option<String>),
+    )> = versions.iter().collect();
+    vs.sort_by(|a, b| {
+        (a.1 .0.region_rank, a.1 .0.status_rank, std::cmp::Reverse(a.1 .0.revision_key))
+            .cmp(&(b.1 .0.region_rank, b.1 .0.status_rank, std::cmp::Reverse(b.1 .0.revision_key)))
+            .then_with(|| a.1 .0.descriptor.cmp(&b.1 .0.descriptor))
+            // Full ties (same descriptor, different content) break
+            // on the version key — HashMap order must never leak
+            // into a sort key two windows compare against.
+            .then_with(|| a.0.cmp(b.0))
+    });
+    let def = vs.iter().find(|v| !v.1 .0.never_default).or_else(|| vs.first());
+    match def {
+        Some(v) => (v.1 .1, v.1 .2.clone()),
+        None => (None, None),
+    }
+}
+
+/// Search membership for one group (Hyperbase #4): any member's
+/// DAT title, the group's display title or genre, any member's
+/// labels, or the primary platform being one whose display name
+/// matched (resolved by the UI into `search_platforms`).
+fn shelf_group_matches_search(
+    g: &ShelfGroupFacts,
+    spec: &RomHomeShelfSpec,
+    scan: &ShelfScan,
+) -> bool {
+    let q = spec
+        .query
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    if spec.search_platforms.iter().any(|p| p == &g.platform) {
+        return true;
+    }
+    if g.display_title.to_lowercase().contains(&q) {
+        return true;
+    }
+    if let Some(genre) = g.group_state.as_ref().and_then(|s| s.genre.as_ref()) {
+        if genre.to_lowercase().contains(&q) {
+            return true;
+        }
+    }
+    for m in &g.members {
+        if m.title.to_lowercase().contains(&q) {
+            return true;
+        }
+        if let Some(pk) = &m.provider_key {
+            if let Some(labels) = scan.labels_by_path.get(pk) {
+                if labels.iter().any(|l| l.to_lowercase().contains(&q)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Does one group belong to the spec's shelf, under its filters?
+/// Judged at GROUP level over the full set (the Ferret lesson:
+/// never over a loaded window). Where the pre-window room judged
+/// a collapsed REPRESENTATIVE and the readings differ, the group
+/// reading is the pinned definition (see the receipt): systems /
+/// starred judge ANY member; unplayed means no copy was played.
+fn shelf_group_matches(
+    g: &ShelfGroupFacts,
+    spec: &RomHomeShelfSpec,
+    scan: &ShelfScan,
+) -> bool {
+    match spec.kind.as_str() {
+        "favorites" => {
+            if !shelf_group_favorite(g) {
+                return false;
+            }
+        }
+        "recent" => {
+            if g.play_last.is_none() {
+                return false;
+            }
+        }
+        "missing" => {
+            if g.has_boxart {
+                return false;
+            }
+        }
+        "system" => {
+            let p = spec.platform.as_deref().unwrap_or("");
+            if g.platform != p && !g.also.iter().any(|a| a == p) {
+                return false;
+            }
+        }
+        "search" => {
+            if !shelf_group_matches_search(g, spec, scan) {
+                return false;
+            }
+        }
+        "list" => {
+            let keys: std::collections::HashSet<&str> = spec
+                .member_keys
+                .as_ref()
+                .map(|v| v.iter().map(|s| s.as_str()).collect())
+                .unwrap_or_default();
+            let hit = g.members.iter().any(|m| {
+                keys.contains(m.item_id.as_str())
+                    || m.provider_key
+                        .as_deref()
+                        .map(|pk| keys.contains(pk))
+                        .unwrap_or(false)
+            });
+            if !hit {
+                return false;
+            }
+        }
+        _ => {}
+    }
+    let f = &spec.filters;
+    if !f.ignore_systems && !f.systems.is_empty() {
+        let hit = f.systems.iter().any(|s| s == &g.platform)
+            || g.also.iter().any(|a| f.systems.contains(a));
+        if !hit {
+            return false;
+        }
+    }
+    if !f.genres.is_empty() {
+        match g.group_state.as_ref().and_then(|s| s.genre.as_ref()) {
+            Some(genre) if f.genres.iter().any(|x| x == genre) => {}
+            _ => return false,
+        }
+    }
+    if !f.players.is_empty() {
+        let bucket = g
+            .group_state
+            .as_ref()
+            .and_then(|s| s.players.as_ref())
+            .and_then(|p| players_bucket(p));
+        match bucket {
+            Some(b) if f.players.iter().any(|x| x == b) => {}
+            _ => return false,
+        }
+    }
+    for m in &f.media {
+        match m.as_str() {
+            "has-art" => {
+                if !g.has_boxart {
+                    return false;
+                }
+            }
+            "missing-art" => {
+                if g.has_boxart {
+                    return false;
+                }
+            }
+            "has-video" => {
+                if !g.has_trailer {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    for fl in &f.flags {
+        match fl.as_str() {
+            "starred" => {
+                if !g.any_starred && shelf_group_rating(g).map(|r| r < 1).unwrap_or(true) {
+                    return false;
+                }
+            }
+            "favorites" => {
+                if !shelf_group_favorite(g) {
+                    return false;
+                }
+            }
+            "completed" => {
+                if !shelf_group_completed(g) {
+                    return false;
+                }
+            }
+            "unplayed" => {
+                if g.play_total > 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// The region named by a DAT title's parenthesized region group —
@@ -4308,6 +4945,15 @@ impl Catalog {
     /// its personal state, and its Auditor flag state, all from the
     /// catalog. Ordered by platform, then title.
     pub fn rom_home_games(&self, platform: Option<&str>) -> Result<Vec<RomHomeGame>> {
+        let raw = self.rom_home_raw_rows(platform)?;
+        self.enrich_rom_home_rows(raw)
+    }
+
+    /// The lean identity+item rows behind every ROM Home query —
+    /// one shape shared by the full fetch (above) and the shelf
+    /// window's member enrichment (Hyperbase #4), so both read the
+    /// same rows the same way.
+    fn rom_home_raw_rows(&self, platform: Option<&str>) -> Result<Vec<RomHomeRawRow>> {
         let mut sql = String::from(
             "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes,
                     i.modified, i.provider_key, mi.title, mi.platform,
@@ -4329,20 +4975,7 @@ impl Catalog {
             .conn
             .prepare(&sql)
             .map_err(|e| UfmError::Database(e.to_string()))?;
-        let raw: Vec<(
-            String,
-            String,
-            String,
-            String,
-            Option<i64>,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-            Option<i64>,
-            Option<String>,
-            String,
-        )> = match platform {
+        let raw: Vec<RomHomeRawRow> = match platform {
             Some(p) => stmt
                 .query_map(params![p], |row| {
                     Ok((
@@ -4385,6 +5018,14 @@ impl Catalog {
                 .map_err(|e| UfmError::Database(e.to_string()))?,
         };
         drop(stmt);
+        Ok(raw)
+    }
+
+    /// Enrich lean rows into shelf rows: media presence, personal
+    /// state (group composed over path), the starred set and the
+    /// open Auditor flags, all batched — never per-row queries
+    /// beyond the label read each row already carried.
+    fn enrich_rom_home_rows(&self, raw: Vec<RomHomeRawRow>) -> Result<Vec<RomHomeGame>> {
         // Batch the side data: media rows per item, personal state
         // per path, the starred set, the open Auditor flag paths.
         let item_ids: Vec<String> = raw.iter().map(|r| r.0.clone()).collect();
@@ -4523,6 +5164,34 @@ impl Catalog {
                 }
             }
         }
+        // Labels batch too — the per-row labels_for_path call
+        // this replaces was the enrich path's last N+1.
+        let mut labels_by_path: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for chunk in paths.chunks(400) {
+            let placeholders: Vec<String> =
+                chunk.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT provider_key, label FROM path_labels
+                 WHERE provider_key IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let values: Vec<rusqlite::types::Value> =
+                chunk.iter().map(|s| rusqlite::types::Value::Text(s.clone())).collect();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                let (pk, label) = r.map_err(|e| UfmError::Database(e.to_string()))?;
+                labels_by_path.entry(pk).or_default().push(label);
+            }
+        }
         let starred = self.starred_paths(&paths).unwrap_or_default();
         let mut flagged: std::collections::HashSet<String> = std::collections::HashSet::new();
         for chunk in paths.chunks(400) {
@@ -4568,26 +5237,17 @@ impl Catalog {
             evidence,
         ) in raw
         {
-            let also_platforms: Vec<String> = serde_json::from_str::<serde_json::Value>(&evidence)
-                .ok()
-                .and_then(|v| v.get("also").cloned())
-                .and_then(|a| serde_json::from_value(a).ok())
+            let (also_platforms, crc) = shelf_evidence(&evidence);
+            let labels = provider_key
+                .as_ref()
+                .and_then(|pk| labels_by_path.get(pk).cloned())
                 .unwrap_or_default();
-            let labels = match &provider_key {
-                Some(pk) => self.labels_for_path(pk).unwrap_or_default(),
-                None => Vec::new(),
-            };
             let is_starred = provider_key
                 .as_ref()
                 .map(|pk| starred.contains(pk))
                 .unwrap_or(false);
             let group_key = ufm_media::romdat::rom_group_key(&platform_s, &title);
             let variant = ufm_media::romdat::variant_of_title(&title);
-            let crc: Option<String> =
-                serde_json::from_str::<serde_json::Value>(&evidence)
-                    .ok()
-                    .and_then(|v| v.get("crc").and_then(|c| c.as_u64()))
-                    .map(|n| format!("{n:08x}"));
             let state = Self::compose_rom_state(
                 state_by_group.get(&group_key),
                 provider_key
@@ -4631,80 +5291,550 @@ impl Catalog {
         Ok(out)
     }
 
+    // --------------------------------------------------------
+    // Hyperbase #4 (2026-10-17): windowed shelf queries. The old
+    // room fetch shipped EVERY identified game to the webview and
+    // let the client sort/filter/collapse the whole set — at
+    // Hyperbase scale (100k+ games) that payload is the freeze.
+    // Now Rust owns the set: one lean scan folds the identified
+    // ROMs into per-GROUP facts (a group = one shelf card), the
+    // spec's shelf + filters + sort are judged over the full set
+    // here, and only a bounded window of whole groups is enriched
+    // and shipped. Windows chain by keyset cursor, so a background
+    // identification pass writing rows mid-browse can neither
+    // duplicate nor skip groups in an open shelf.
+    // --------------------------------------------------------
+
+    /// One window request from the room. `kind` names the shelf
+    /// (all | favorites | recent | missing | system | search |
+    /// smart | list); filters/sort speak the room's own vocabulary
+    /// (SortKey / RoomFilters field values) so the UI sends what it
+    /// already holds.
+    // (types live below the impl, beside RomHomeCounts)
+
+    /// The group-facts scan shared by the window query, the room
+    /// tallies and the missing-media pair builder: they must never
+    /// disagree about what a group is or whether it qualifies.
+    fn rom_home_scan(&self, need_labels: bool) -> Result<ShelfScan> {
+        self.rom_home_scan_mode(need_labels, false)
+    }
+
+    /// `light`: skip per-member storage and the display/span
+    /// pass — the tallies read group aggregates only, and at
+    /// 100k+ groups the member structs are the scan's ballast.
+    fn rom_home_scan_mode(&self, need_labels: bool, light: bool) -> Result<ShelfScan> {
+        use std::collections::{HashMap, HashSet};
+        // Group-scoped personal state (the source of truth for
+        // scoped fields once a group row exists — compose rule).
+        let mut group_state: HashMap<String, RomGameState> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT group_key, rating, favorite, completed,
+                            title_override, genre, players, notes
+                     FROM rom_group_state",
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        RomGameState {
+                            rating: row.get(1)?,
+                            favorite: row.get::<_, i64>(2)? != 0,
+                            completed: row.get::<_, i64>(3)? != 0,
+                            play_count: 0,
+                            last_played: None,
+                            title_override: row.get(4)?,
+                            genre: row.get(5)?,
+                            players: row.get(6)?,
+                            notes: row.get(7)?,
+                        },
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                let (k, s) = r.map_err(|e| UfmError::Database(e.to_string()))?;
+                group_state.insert(k, s);
+            }
+        }
+        // Per-path facts (play history + the pre-group scoped
+        // residue the favorite/completed formulas fall back to).
+        let mut path_facts: HashMap<String, ShelfPathFacts> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT provider_key, rating, favorite, completed,
+                            play_count, last_played FROM rom_game_state",
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        ShelfPathFacts {
+                            rating: row.get(1)?,
+                            favorite: row.get::<_, i64>(2)? != 0,
+                            completed: row.get::<_, i64>(3)? != 0,
+                            play_count: row.get(4)?,
+                            last_played: row.get(5)?,
+                        },
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                let (k, s) = r.map_err(|e| UfmError::Database(e.to_string()))?;
+                path_facts.insert(k, s);
+            }
+        }
+        let mut starred: HashSet<String> = HashSet::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT provider_key FROM path_stars")
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                starred.insert(r.map_err(|e| UfmError::Database(e.to_string()))?);
+            }
+        }
+        // Found-media bits per item (the fetch pair builder reads
+        // the same map, so "missing" can never drift between the
+        // shelf and the fetch it launches).
+        let mut media_found: HashMap<String, u8> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT item_id, media_type FROM rom_media
+                     WHERE status = 'found' AND local_path IS NOT NULL",
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                let (item_id, media_type) =
+                    r.map_err(|e| UfmError::Database(e.to_string()))?;
+                if let Some((_, bit)) = ROM_MEDIA_BIT.iter().find(|(n, _)| *n == media_type) {
+                    *media_found.entry(item_id).or_default() |= bit;
+                }
+            }
+        }
+        let mut labels_by_path: HashMap<String, Vec<String>> = HashMap::new();
+        if need_labels {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT provider_key, label FROM path_labels")
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                let (pk, label) = r.map_err(|e| UfmError::Database(e.to_string()))?;
+                labels_by_path.entry(pk).or_default().push(label);
+            }
+        }
+        // The lean identity stream: no enrichment, no per-row side
+        // queries — fold straight into group facts.
+        let mut groups: HashMap<String, ShelfGroupFacts> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT i.id, i.provider_key, mi.title, mi.platform,
+                            mi.year, mi.sha1, i.modified, mi.match_evidence_json
+                     FROM media_identities AS mi
+                     JOIN items AS i ON i.id = mi.item_id
+                     WHERE mi.media_kind = 'rom' AND mi.title IS NOT NULL
+                       AND mi.platform IS NOT NULL",
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                let (item_id, provider_key, title, platform, year, sha1, modified, evidence) =
+                    r.map_err(|e| UfmError::Database(e.to_string()))?;
+                let group_key = ufm_media::romdat::rom_group_key(&platform, &title);
+                let (also, crc) = shelf_evidence(&evidence);
+                let bits = media_found.get(&item_id).copied().unwrap_or(0);
+                // Borrowed lookup on the hot path — the owned
+                // key is only built for a group's first member.
+                let g = match groups.get_mut(&group_key) {
+                    Some(g) => g,
+                    None => groups
+                        .entry(group_key.clone())
+                        .or_insert_with(|| ShelfGroupFacts {
+                            group_key: group_key.clone(),
+                            platform: platform.clone(),
+                            ..Default::default()
+                        }),
+                };
+                if let Some(pk) = &provider_key {
+                    if let Some(pf) = path_facts.get(pk) {
+                        g.any_path_favorite |= pf.favorite;
+                        g.any_path_completed |= pf.completed;
+                        g.max_path_rating = match (g.max_path_rating, pf.rating) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (a, b) => a.or(b),
+                        };
+                        g.play_total += pf.play_count;
+                        if pf.last_played.as_deref() > g.play_last.as_deref() {
+                            g.play_last = pf.last_played.clone();
+                        }
+                    }
+                    if starred.contains(pk) {
+                        g.any_starred = true;
+                    }
+                }
+                for a in also {
+                    if !g.also.contains(&a) {
+                        g.also.push(a);
+                    }
+                }
+                if bits & 1 != 0 {
+                    g.has_boxart = true;
+                }
+                if bits & 8 != 0 {
+                    g.has_trailer = true;
+                }
+                if !light {
+                    g.members.push(ShelfMemberFacts {
+                        item_id,
+                        provider_key,
+                        title,
+                        sha1,
+                        crc,
+                        year,
+                        modified,
+                    });
+                }
+            }
+        }
+        let mut out: Vec<ShelfGroupFacts> = groups.into_values().collect();
+        for g in &mut out {
+            g.group_state = group_state.get(&g.group_key).cloned();
+            g.also.sort();
+            g.also.dedup();
+            g.also.retain(|a| a != &g.platform);
+            if light {
+                continue;
+            }
+            // Display title: the group's own override wins; else the
+            // parsed base title of the alphabetically-first member
+            // (deterministic — every member shares the base modulo
+            // case, by construction of the group key).
+            let base = g
+                .members
+                .iter()
+                .map(|m| m.title.as_str())
+                .min()
+                .map(ufm_media::romdat::parsed_base_title)
+                .unwrap_or_default();
+            g.display_title = g
+                .group_state
+                .as_ref()
+                .and_then(|s| s.title_override.clone())
+                .unwrap_or(base);
+            g.sort_title = if g.display_title.is_ascii() {
+                g.display_title.to_ascii_lowercase()
+            } else {
+                g.display_title.to_lowercase()
+            };
+            let (dy, dm) = shelf_default_version_span(g);
+            g.def_year = dy;
+            g.def_modified = dm;
+        }
+        Ok(ShelfScan {
+            groups: out,
+            media_found,
+            labels_by_path,
+        })
+    }
+
+    /// One bounded window of a shelf, judged over the full set.
+    /// The window holds WHOLE groups; `total` is the true count of
+    /// qualifying groups; `next_cursor` chains to the next window
+    /// by sort key (never by offset), so concurrent indexing can
+    /// neither duplicate nor skip groups between windows.
+    pub fn rom_home_shelf_window(
+        &self,
+        spec: &RomHomeShelfSpec,
+    ) -> Result<RomHomeShelfPage> {
+        let scan = self.rom_home_scan(spec.kind == "search")?;
+        let mut keyed: Vec<(ShelfSortKey, &ShelfGroupFacts)> = scan
+            .groups
+            .iter()
+            .filter(|g| shelf_group_matches(g, spec, &scan))
+            .map(|g| (shelf_sort_key_of(g), g))
+            .collect();
+        let total = keyed.len() as i64;
+        keyed.sort_by(|a, b| shelf_key_cmp(&a.0, &b.0, &spec.sort));
+        let mut start = 0usize;
+        if let Some(raw_cursor) = &spec.cursor {
+            if let Ok(c) = serde_json::from_str::<ShelfCursor>(raw_cursor) {
+                if c.sort == spec.sort {
+                    let ck = ShelfSortKey {
+                        sort_title: c.sort_title,
+                        def_year: c.def_year,
+                        play_last: c.play_last,
+                        play_total: c.play_total,
+                        def_modified: c.def_modified,
+                        group_key: c.group_key,
+                    };
+                    start = keyed
+                        .iter()
+                        .position(|(k, _)| {
+                            shelf_key_cmp(k, &ck, &spec.sort) == std::cmp::Ordering::Greater
+                        })
+                        .unwrap_or(keyed.len());
+                }
+            }
+        }
+        let limit = spec.limit.clamp(1, 5000) as usize;
+        let end = keyed.len().min(start + limit);
+        let window = &keyed[start..end];
+        let next_cursor = if end < keyed.len() {
+            let (k, _) = &window[window.len() - 1];
+            Some(serde_json::to_string(&ShelfCursor {
+                sort: spec.sort.clone(),
+                sort_title: k.sort_title.clone(),
+                def_year: k.def_year,
+                play_last: k.play_last.clone(),
+                play_total: k.play_total,
+                def_modified: k.def_modified.clone(),
+                group_key: k.group_key.clone(),
+            })
+            .unwrap_or_default())
+        } else {
+            None
+        };
+        // Enrich exactly the window's members, in window order.
+        let mut rank: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut ordered_ids: Vec<String> = Vec::new();
+        for (i, (_, g)) in window.iter().enumerate() {
+            for m in &g.members {
+                rank.insert(m.item_id.clone(), i);
+                ordered_ids.push(m.item_id.clone());
+            }
+        }
+        let mut raw = self.rom_home_raw_rows_for_ids(&ordered_ids)?;
+        raw.sort_by(|a, b| {
+            let ra = rank.get(&a.0).copied().unwrap_or(usize::MAX);
+            let rb = rank.get(&b.0).copied().unwrap_or(usize::MAX);
+            ra.cmp(&rb)
+                .then_with(|| a.7.cmp(&b.7))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let games = self.enrich_rom_home_rows(raw)?;
+        Ok(RomHomeShelfPage {
+            total,
+            games,
+            next_cursor,
+        })
+    }
+
+    /// The missing-media fetch pairs for a whole shelf spec (the
+    /// fetch actions judge the full set here instead of building
+    /// pair lists from a full in-memory game set in the webview).
+    /// Cursor/limit in the spec are ignored — a fetch is total by
+    /// definition; the room confirms the count before starting.
+    pub fn rom_home_missing_pairs(
+        &self,
+        spec: &RomHomeShelfSpec,
+    ) -> Result<Vec<RomHomeMissingPair>> {
+        let scan = self.rom_home_scan(spec.kind == "search")?;
+        let mut groups: Vec<&ShelfGroupFacts> = scan
+            .groups
+            .iter()
+            .filter(|g| shelf_group_matches(g, spec, &scan))
+            .collect();
+        groups.sort_by(|a, b| {
+            a.sort_title
+                .cmp(&b.sort_title)
+                .then_with(|| a.group_key.cmp(&b.group_key))
+        });
+        let mut out = Vec::new();
+        for g in groups {
+            for m in &g.members {
+                let bits = scan.media_found.get(&m.item_id).copied().unwrap_or(0);
+                for (name, bit) in ROM_MEDIA_BIT {
+                    if bits & bit == 0 {
+                        out.push(RomHomeMissingPair {
+                            item_id: m.item_id.clone(),
+                            media_type: name.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Genre facet counts for the room's Filters popover, counted
+    /// in GAMES (group rows carry genre — the backfill invariant
+    /// makes scoped state group-owned). Ordered by count desc,
+    /// then name, like the popover has always presented them.
+    pub fn rom_home_genre_facets(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT genre, COUNT(*) FROM rom_group_state
+                 WHERE genre IS NOT NULL AND genre != ''
+                 GROUP BY genre ORDER BY COUNT(*) DESC, genre ASC",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| UfmError::Database(e.to_string()))
+    }
+
+    /// Lean per-file rows for the per-system tallies the command
+    /// layer finishes (byte totals are primary-platform sums over
+    /// member files; offline truth needs volume badges, which live
+    /// in the session layer — the catalog hands over the rows).
+    pub fn rom_home_system_file_rows(&self) -> Result<Vec<RomHomeSystemFileRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT i.id, i.location_id, i.provider_key, mi.platform,
+                        mi.title, i.size_bytes
+                 FROM media_identities AS mi
+                 JOIN items AS i ON i.id = mi.item_id
+                 WHERE mi.media_kind = 'rom' AND mi.title IS NOT NULL
+                   AND mi.platform IS NOT NULL
+                 ORDER BY mi.platform, mi.title COLLATE NOCASE, i.id",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(RomHomeSystemFileRow {
+                    item_id: row.get(0)?,
+                    location_id: row.get(1)?,
+                    provider_key: row.get(2)?,
+                    platform: row.get(3)?,
+                    title: row.get(4)?,
+                    size_bytes: row.get(5)?,
+                })
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| UfmError::Database(e.to_string()))
+    }
+
+    /// Raw rows for a specific set of item ids (the window's
+    /// members) — the same SELECT shape as `rom_home_raw_rows`,
+    /// chunked for SQLite's parameter comfort.
+    fn rom_home_raw_rows_for_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<Vec<RomHomeRawRow>> {
+        let mut out = Vec::new();
+        for chunk in item_ids.chunks(400) {
+            let placeholders: Vec<String> =
+                chunk.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes,
+                        i.modified, i.provider_key, mi.title, mi.platform,
+                        mi.year, mi.sha1, mi.match_evidence_json
+                 FROM media_identities AS mi
+                 JOIN items AS i ON i.id = mi.item_id
+                 WHERE mi.media_kind = 'rom' AND mi.title IS NOT NULL
+                   AND mi.platform IS NOT NULL AND i.id IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            let values: Vec<rusqlite::types::Value> =
+                chunk.iter().map(|s| rusqlite::types::Value::Text(s.clone())).collect();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                    ))
+                })
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+            for r in rows {
+                out.push(r.map_err(|e| UfmError::Database(e.to_string()))?);
+            }
+        }
+        Ok(out)
+    }
+
     /// The room's tallies, from the catalog alone — counted in
     /// GAMES (Phase 3 groups), not files: total = distinct group
     /// keys; a group counts as missing media when NO member item
     /// has found box art; the per-system split uses the same
     /// membership rule as `rom_home_games` (primary + `also`
     /// platforms), counting each group once per shelf it sits on.
+    /// Hyperbase #4: computed from the shared group scan, which
+    /// also yields the rail's Favorites / Recently Played group
+    /// counts under the same definitions the shelves use.
     pub fn rom_home_counts(&self) -> Result<RomHomeCounts> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT mi.platform, mi.title, mi.match_evidence_json,
-                        EXISTS (SELECT 1 FROM rom_media AS rm
-                                WHERE rm.item_id = mi.item_id
-                                  AND rm.media_type = 'boxart'
-                                  AND rm.status = 'found'
-                                  AND rm.local_path IS NOT NULL)
-                 FROM media_identities AS mi
-                 WHERE mi.media_kind = 'rom' AND mi.title IS NOT NULL
-                   AND mi.platform IS NOT NULL",
-            )
-            .map_err(|e| UfmError::Database(e.to_string()))?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })
-            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let scan = self.rom_home_scan_mode(false, true)?;
         let mut counts = RomHomeCounts::default();
-        // group key -> any member has box art (global, and per shelf).
-        let mut art_by_key: std::collections::HashMap<String, bool> =
+        counts.total = scan.groups.len() as i64;
+        let mut per: std::collections::HashMap<String, (i64, i64)> =
             std::collections::HashMap::new();
-        let mut art_by_shelf: std::collections::HashMap<
-            String,
-            std::collections::HashMap<String, bool>,
-        > = std::collections::HashMap::new();
-        for r in rows {
-            let (platform, title, evidence, has_art) =
-                r.map_err(|e| UfmError::Database(e.to_string()))?;
-            let key = ufm_media::romdat::rom_group_key(&platform, &title);
-            let art = has_art != 0;
-            *art_by_key.entry(key.clone()).or_insert(false) |= art;
-            let mut shelves = vec![platform];
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&evidence) {
-                if let Some(also) = v.get("also").and_then(|a| a.as_array()) {
-                    for a in also {
-                        if let Some(s) = a.as_str() {
-                            if !shelves.iter().any(|x| x == s) {
-                                shelves.push(s.to_string());
-                            }
-                        }
-                    }
+        for g in &scan.groups {
+            if !g.has_boxart {
+                counts.missing_media += 1;
+            }
+            if shelf_group_favorite(g) {
+                counts.favorite_groups += 1;
+            }
+            if g.play_last.is_some() {
+                counts.recent_groups += 1;
+            }
+            for shelf in std::iter::once(&g.platform).chain(g.also.iter()) {
+                let e = per.entry(shelf.clone()).or_default();
+                e.0 += 1;
+                if !g.has_boxart {
+                    e.1 += 1;
                 }
             }
-            for s in shelves {
-                *art_by_shelf
-                    .entry(s)
-                    .or_default()
-                    .entry(key.clone())
-                    .or_insert(false) |= art;
-            }
         }
-        counts.total = art_by_key.len() as i64;
-        counts.missing_media =
-            art_by_key.values().filter(|art| !**art).count() as i64;
-        let mut per_system: Vec<(String, i64, i64)> = art_by_shelf
+        let mut per_system: Vec<(String, i64, i64)> = per
             .into_iter()
-            .map(|(p, keys)| {
-                let missing = keys.values().filter(|art| !**art).count() as i64;
-                (p, keys.len() as i64, missing)
-            })
+            .map(|(p, (n, m))| (p, n, m))
             .collect();
         per_system.sort_by(|a, b| a.0.cmp(&b.0));
         counts.per_system = per_system;
@@ -8773,5 +9903,916 @@ mod rom_home_tests {
         assert_eq!(rep.counts.no_path, 1);
         assert_eq!(rep.counts.identity_written, 1);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --------------------------------------------------------
+    // Hyperbase #4: windowed shelf queries. The fixture: five
+    // groups over three systems — 1942 (art), Chrono Trigger
+    // (art), Klax (two dumps, no art), Metal Slug (arcade, also
+    // Neo Geo, no art), Super Mario World (missing-art row).
+    // --------------------------------------------------------
+
+    fn shelf_spec(kind: &str) -> RomHomeShelfSpec {
+        RomHomeShelfSpec {
+            kind: kind.to_string(),
+            platform: None,
+            query: None,
+            search_platforms: vec![],
+            member_keys: None,
+            filters: RomHomeShelfFilters::default(),
+            sort: "title".to_string(),
+            cursor: None,
+            limit: 240,
+        }
+    }
+
+    fn page_group_keys(page: &RomHomeShelfPage) -> Vec<String> {
+        let mut out: Vec<String> = vec![];
+        for g in &page.games {
+            if !out.contains(&g.group_key) {
+                out.push(g.group_key.clone());
+            }
+        }
+        out
+    }
+
+    struct ShelfSeed {
+        klax_usa: Item,
+        klax_japan: Item,
+        smw: Item,
+        chrono: Item,
+    }
+
+    fn seed_shelf(cat: &Catalog) -> ShelfSeed {
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let mk = |cat: &Catalog, name: &str, pk: &str, title: &str, platform: &str, sha1: &str, evidence: &str| {
+            let it = rom_item(cat, loc, name, pk);
+            cat.upsert_media_identity(
+                &it.id,
+                "rom",
+                Some(title),
+                Some(platform),
+                Some(sha1),
+                evidence,
+            )
+            .unwrap();
+            it
+        };
+        let g1942 = mk(
+            cat,
+            "1942 (JU).nes",
+            "/roms/nes/1942.nes",
+            "1942 (Japan, USA) (En)",
+            "nes",
+            "aaaa",
+            r#"{"matched":true,"also":[]}"#,
+        );
+        cat.upsert_rom_media(
+            &g1942.id.to_string(),
+            "boxart",
+            "found",
+            Some("libretro"),
+            Some("/media/nes/1942.png"),
+            "{}",
+        )
+        .unwrap();
+        let klax_usa = mk(
+            cat,
+            "Klax (USA).nes",
+            "/roms/nes/klax-usa.nes",
+            "Klax (USA)",
+            "nes",
+            "1111",
+            r#"{"matched":true,"also":[],"crc":111}"#,
+        );
+        let klax_japan = mk(
+            cat,
+            "Klax (Japan).nes",
+            "/roms/nes/klax-japan.nes",
+            "Klax (Japan)",
+            "nes",
+            "2222",
+            r#"{"matched":true,"also":[],"crc":222}"#,
+        );
+        let smw = mk(
+            cat,
+            "smw.sfc",
+            "/roms/snes/smw.sfc",
+            "Super Mario World (USA)",
+            "snes",
+            "bbbb",
+            r#"{"matched":true,"also":[]}"#,
+        );
+        cat.upsert_rom_media(
+            &smw.id.to_string(),
+            "boxart",
+            "missing",
+            None,
+            None,
+            "{}",
+        )
+        .unwrap();
+        let chrono = mk(
+            cat,
+            "chrono.sfc",
+            "/roms/snes/chrono.sfc",
+            "Chrono Trigger (USA)",
+            "snes",
+            "dddd",
+            r#"{"matched":true,"also":[]}"#,
+        );
+        cat.upsert_rom_media(
+            &chrono.id.to_string(),
+            "boxart",
+            "found",
+            Some("libretro"),
+            Some("/media/snes/chrono.png"),
+            "{}",
+        )
+        .unwrap();
+        let _metal = mk(
+            cat,
+            "mslug.zip",
+            "/roms/arcade/mslug.zip",
+            "Metal Slug - Super Vehicle-001",
+            "arcade",
+            "cccc",
+            r#"{"matched":true,"also":["neogeo"]}"#,
+        );
+        ShelfSeed {
+            klax_usa,
+            klax_japan,
+            smw,
+            chrono,
+        }
+    }
+
+    fn set_year(cat: &Catalog, item: &Item, year: i64) {
+        cat.conn
+            .execute(
+                "UPDATE media_identities SET year = ?1 WHERE item_id = ?2",
+                rusqlite::params![year, item.id.to_string()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn shelf_window_walks_groups_exactly_once_with_true_totals() {
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_shelf(&cat);
+        let mut spec = shelf_spec("all");
+        spec.limit = 2;
+        let mut seen_groups: Vec<String> = vec![];
+        let mut seen_items: Vec<String> = vec![];
+        let mut pages = 0;
+        loop {
+            let page = cat.rom_home_shelf_window(&spec).unwrap();
+            assert_eq!(page.total, 5, "total is the full set on every window");
+            pages += 1;
+            for k in page_group_keys(&page) {
+                assert!(!seen_groups.contains(&k), "group repeated across windows: {k}");
+                seen_groups.push(k);
+            }
+            for g in &page.games {
+                seen_items.push(g.item.id.to_string());
+            }
+            match page.next_cursor {
+                Some(c) => {
+                    spec.cursor = Some(c);
+                    assert!(pages < 10, "window chain must terminate");
+                }
+                None => break,
+            }
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(seen_groups.len(), 5);
+        // The window walk delivers exactly the full fetch's items.
+        let full = cat.rom_home_games(None).unwrap();
+        let mut full_ids: Vec<String> =
+            full.iter().map(|g| g.item.id.to_string()).collect();
+        full_ids.sort();
+        seen_items.sort();
+        assert_eq!(seen_items, full_ids);
+        // One window big enough returns everything, cursor closed.
+        let mut big = shelf_spec("all");
+        big.limit = 2000;
+        let page = cat.rom_home_shelf_window(&big).unwrap();
+        assert_eq!(page.total, 5);
+        assert_eq!(page.games.len(), 6);
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn shelf_window_groups_never_split_and_keep_title_order() {
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_shelf(&cat);
+        let mut spec = shelf_spec("all");
+        spec.limit = 3;
+        let p1 = cat.rom_home_shelf_window(&spec).unwrap();
+        let keys1 = page_group_keys(&p1);
+        assert_eq!(keys1.len(), 3);
+        // Klax is the third group in title order and arrives whole.
+        let klax_rows = p1
+            .games
+            .iter()
+            .filter(|g| g.title.starts_with("Klax"))
+            .count();
+        assert_eq!(klax_rows, 2, "both Klax dumps ride in one window");
+        spec.cursor = p1.next_cursor.clone();
+        let p2 = cat.rom_home_shelf_window(&spec).unwrap();
+        assert_eq!(page_group_keys(&p2).len(), 2);
+        assert!(p2.next_cursor.is_none());
+        // Title order across the seam: window 1 ends before window 2.
+        let titles: Vec<&str> = p1
+            .games
+            .iter()
+            .map(|g| g.title.as_str())
+            .collect();
+        assert!(titles[0].starts_with("1942"));
+    }
+
+    #[test]
+    fn shelf_window_system_membership_includes_also_platforms() {
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_shelf(&cat);
+        let mut spec = shelf_spec("system");
+        spec.platform = Some("neogeo".to_string());
+        let page = cat.rom_home_shelf_window(&spec).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.games[0].platform, "arcade");
+        spec.platform = Some("nes".to_string());
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 2);
+        spec.platform = Some("snes".to_string());
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 2);
+        spec.platform = Some("genesis".to_string());
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 0);
+    }
+
+    #[test]
+    fn shelf_window_missing_favorites_recent_and_counts_agree() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let seed = seed_shelf(&cat);
+        // Missing = groups with NO member holding found box art.
+        let page = cat.rom_home_shelf_window(&shelf_spec("missing")).unwrap();
+        assert_eq!(page.total, 3, "Klax, Metal Slug, Super Mario World");
+        // Favorite marked on the SMW path lands on its group.
+        cat.rom_game_set_favorite("/roms/snes/smw.sfc", true)
+            .unwrap();
+        let page = cat.rom_home_shelf_window(&shelf_spec("favorites")).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.games[0].item.id, seed.smw.id);
+        // Play on one Klax dump makes the GROUP recent + played.
+        cat.conn
+            .execute(
+                "INSERT OR IGNORE INTO rom_game_state (provider_key, updated_at) VALUES ('/roms/nes/klax-japan.nes', '2026-10-17T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        cat.conn
+            .execute(
+                "UPDATE rom_game_state SET play_count = 2, last_played = '2026-09-01T10:00:00Z' WHERE provider_key = '/roms/nes/klax-japan.nes'",
+                [],
+            )
+            .unwrap();
+        let page = cat.rom_home_shelf_window(&shelf_spec("recent")).unwrap();
+        assert_eq!(page.total, 1);
+        assert!(page.games.iter().all(|g| g.title.starts_with("Klax")));
+        // The tallies speak the same definitions.
+        let counts = cat.rom_home_counts().unwrap();
+        assert_eq!(counts.total, 5);
+        assert_eq!(counts.missing_media, 3);
+        assert_eq!(counts.favorite_groups, 1);
+        assert_eq!(counts.recent_groups, 1);
+        let per: std::collections::HashMap<&str, (i64, i64)> = counts
+            .per_system
+            .iter()
+            .map(|(p, g, m)| (p.as_str(), (*g, *m)))
+            .collect();
+        assert_eq!(per["nes"], (2, 1));
+        assert_eq!(per["snes"], (2, 1));
+        assert_eq!(per["arcade"], (1, 1));
+        assert_eq!(per["neogeo"], (1, 1));
+    }
+
+    #[test]
+    fn shelf_window_genre_players_filters_and_facets() {
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_shelf(&cat);
+        cat.rom_game_set_overrides(
+            "/roms/nes/klax-usa.nes",
+            None,
+            Some("Puzzle"),
+            Some("2"),
+            None,
+        )
+        .unwrap();
+        let facets = cat.rom_home_genre_facets().unwrap();
+        assert_eq!(facets, vec![("Puzzle".to_string(), 1)]);
+        let mut spec = shelf_spec("all");
+        spec.filters.genres = vec!["Puzzle".to_string()];
+        let page = cat.rom_home_shelf_window(&spec).unwrap();
+        assert_eq!(page.total, 1);
+        assert!(page.games.iter().all(|g| g.title.starts_with("Klax")));
+        let mut spec = shelf_spec("all");
+        spec.filters.players = vec!["2".to_string()];
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 1);
+        spec.filters.players = vec!["1".to_string()];
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 0);
+        // Media facet at group level: has-art = any member's art.
+        let mut spec = shelf_spec("all");
+        spec.filters.media = vec!["has-art".to_string()];
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 2);
+        spec.filters.media = vec!["missing-art".to_string()];
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 3);
+    }
+
+    #[test]
+    fn shelf_window_unplayed_means_no_copy_played() {
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_shelf(&cat);
+        let mut spec = shelf_spec("all");
+        spec.filters.flags = vec!["unplayed".to_string()];
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 5);
+        // One dump played: the GAME has been played (pinned group
+        // definition — the old rep-only reading hid this).
+        cat.conn
+            .execute(
+                "INSERT OR IGNORE INTO rom_game_state (provider_key, play_count, updated_at) VALUES ('/roms/nes/klax-usa.nes', 0, '2026-10-17T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        cat.conn
+            .execute(
+                "UPDATE rom_game_state SET play_count = 1 WHERE provider_key = '/roms/nes/klax-usa.nes'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 4);
+    }
+
+    #[test]
+    fn shelf_window_starred_flag_reads_star_or_rating() {
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_shelf(&cat);
+        cat.conn
+            .execute(
+                "INSERT OR IGNORE INTO path_stars (provider_key, starred_at) VALUES ('/roms/snes/chrono.sfc', '2026-10-17T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let mut spec = shelf_spec("all");
+        spec.filters.flags = vec!["starred".to_string()];
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 1);
+        // A rating of 1+ on any path of a group also counts.
+        cat.rom_game_set_rating("/roms/nes/klax-japan.nes", Some(4))
+            .unwrap();
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 2);
+    }
+
+    #[test]
+    fn shelf_window_year_sort_uses_default_version_year() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let seed = seed_shelf(&cat);
+        set_year(&cat, &seed.klax_usa, 1990);
+        set_year(&cat, &seed.klax_japan, 1989);
+        set_year(&cat, &seed.chrono, 1995);
+        set_year(&cat, &seed.smw, 1990);
+        // 1942: find its item through the full fetch to set 1987.
+        let all = cat.rom_home_games(None).unwrap();
+        let g1942 = all.iter().find(|g| g.title.starts_with("1942")).unwrap();
+        cat.conn
+            .execute(
+                "UPDATE media_identities SET year = 1987 WHERE item_id = ?1",
+                rusqlite::params![g1942.item.id.to_string()],
+            )
+            .unwrap();
+        let mut spec = shelf_spec("all");
+        spec.sort = "year".to_string();
+        let page = cat.rom_home_shelf_window(&spec).unwrap();
+        let order: Vec<String> = page_group_keys(&page)
+            .iter()
+            .map(|k| k.rsplit('\u{1}').next().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["chrono trigger", "klax", "super mario world", "1942", "metal slug - super vehicle-001"],
+            "year desc: 1995, then the 1990 pair by title (Klax's DEFAULT version is USA 1990, not Japan 1989), 1987, yearless last"
+        );
+        // Most-played sums across the group's copies.
+        cat.conn
+            .execute(
+                "INSERT OR IGNORE INTO rom_game_state (provider_key, play_count, updated_at) VALUES ('/roms/nes/klax-japan.nes', 0, '2026-10-17T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        cat.conn
+            .execute(
+                "UPDATE rom_game_state SET play_count = 3 WHERE provider_key = '/roms/nes/klax-japan.nes'",
+                [],
+            )
+            .unwrap();
+        cat.conn
+            .execute(
+                "INSERT OR IGNORE INTO rom_game_state (provider_key, play_count, updated_at) VALUES ('/roms/snes/smw.sfc', 0, '2026-10-17T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        cat.conn
+            .execute(
+                "UPDATE rom_game_state SET play_count = 2 WHERE provider_key = '/roms/snes/smw.sfc'",
+                [],
+            )
+            .unwrap();
+        let mut spec = shelf_spec("all");
+        spec.sort = "most-played".to_string();
+        let page = cat.rom_home_shelf_window(&spec).unwrap();
+        let keys = page_group_keys(&page);
+        assert!(keys[0].contains("klax"), "3 plays beats 2");
+        assert!(keys[1].contains("super mario world"));
+    }
+
+    #[test]
+    fn shelf_window_cursor_is_stable_under_concurrent_inserts() {
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_shelf(&cat);
+        let mut spec = shelf_spec("all");
+        spec.limit = 2;
+        let p1 = cat.rom_home_shelf_window(&spec).unwrap();
+        assert_eq!(page_group_keys(&p1).len(), 2);
+        // Identification lands mid-browse: one game sorting BEFORE
+        // the cursor, one after everything.
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let aard = rom_item(&cat, loc, "Aardvark (USA).nes", "/roms/nes/aardvark.nes");
+        cat.upsert_media_identity(
+            &aard.id,
+            "rom",
+            Some("Aardvark (USA)"),
+            Some("nes"),
+            Some("eeee"),
+            r#"{"matched":true,"also":[]}"#,
+        )
+        .unwrap();
+        let zebra = rom_item(&cat, loc, "Zebra (USA).sfc", "/roms/snes/zebra.sfc");
+        cat.upsert_media_identity(
+            &zebra.id,
+            "rom",
+            Some("Zebra (USA)"),
+            Some("snes"),
+            Some("ffff"),
+            r#"{"matched":true,"also":[]}"#,
+        )
+        .unwrap();
+        spec.cursor = p1.next_cursor.clone();
+        let p2 = cat.rom_home_shelf_window(&spec).unwrap();
+        assert_eq!(p2.total, 7, "totals stay honest as the set grows");
+        let k2 = page_group_keys(&p2);
+        assert_eq!(k2.len(), 2);
+        for k in &k2 {
+            assert!(
+                !page_group_keys(&p1).contains(k),
+                "no group repeats after a mid-chain insert"
+            );
+            assert!(!k.contains("aardvark"), "the early insert waits for a refresh");
+        }
+        spec.cursor = p2.next_cursor.clone();
+        let p3 = cat.rom_home_shelf_window(&spec).unwrap();
+        let k3 = page_group_keys(&p3);
+        assert_eq!(k3.len(), 2, "SMW + the late insert close the chain");
+        assert!(k3.iter().any(|k| k.contains("zebra")));
+        assert!(p3.next_cursor.is_none());
+    }
+
+    #[test]
+    fn shelf_missing_pairs_cover_every_member_and_type() {
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_shelf(&cat);
+        let pairs = cat.rom_home_missing_pairs(&shelf_spec("all")).unwrap();
+        // 1942: 3 (has boxart) · Chrono: 3 · Klax dumps: 4+4 ·
+        // SMW: 4 (missing row is not found) · Metal Slug: 4.
+        assert_eq!(pairs.len(), 22);
+        let boxart_pairs = pairs.iter().filter(|p| p.media_type == "boxart").count();
+        assert_eq!(
+            boxart_pairs, 4,
+            "both Klax dumps + SMW + Metal Slug lack box art; 1942 and Chrono hold it"
+        );
+        // Spec-scoped: the missing shelf's pairs exclude art-holders.
+        let pairs = cat
+            .rom_home_missing_pairs(&shelf_spec("missing"))
+            .unwrap();
+        assert_eq!(pairs.len(), 16, "only the three art-less groups' members");
+    }
+
+    #[test]
+    fn shelf_window_search_titles_labels_and_platform_names() {
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_shelf(&cat);
+        let mut spec = shelf_spec("search");
+        spec.query = Some("klax".to_string());
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 1);
+        // Platform display-name match arrives as resolved keys.
+        spec.query = Some("no title matches this".to_string());
+        spec.search_platforms = vec!["snes".to_string()];
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 2);
+        // Labels match through any member's path.
+        cat.conn
+            .execute(
+                "INSERT OR IGNORE INTO path_labels (provider_key, label) VALUES ('/roms/snes/chrono.sfc', 'rpg-classics')",
+                [],
+            )
+            .unwrap();
+        spec.query = Some("rpg-classics".to_string());
+        spec.search_platforms = vec![];
+        let page = cat.rom_home_shelf_window(&spec).unwrap();
+        assert_eq!(page.total, 1);
+        assert!(page.games[0].title.starts_with("Chrono"));
+    }
+
+    #[test]
+    fn shelf_window_list_shelf_restricts_to_members() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let seed = seed_shelf(&cat);
+        let mut spec = shelf_spec("list");
+        // By item id: the whole Klax group joins through one dump.
+        spec.member_keys = Some(vec![seed.klax_japan.id.to_string()]);
+        let page = cat.rom_home_shelf_window(&spec).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.games.len(), 2);
+        // By provider key.
+        spec.member_keys = Some(vec!["/roms/snes/smw.sfc".to_string()]);
+        let page = cat.rom_home_shelf_window(&spec).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.games[0].item.id, seed.smw.id);
+        // Empty list: honestly empty.
+        spec.member_keys = Some(vec![]);
+        assert_eq!(cat.rom_home_shelf_window(&spec).unwrap().total, 0);
+    }
+    // --------------------------------------------------------
+    // Hyperbase #4 SCALE HARNESS (ignored in gates; run with:
+    //   cargo test -p ufm-catalog --release shelf_scale_harness
+    //     -- --ignored --nocapture
+    // Fixture: 103,450 groups over 60 platforms (one platform
+    // holds 12,000), ~8% two-dump groups, ~412k items and
+    // ~212k identities in the catalog. Measures the BEFORE path
+    // (rom_home_games full fetch) against the AFTER path
+    // (windowed shelves) and asserts the window walk is exact.
+    // --------------------------------------------------------
+
+    #[test]
+    #[ignore = "scale harness — run explicitly in release"]
+    fn shelf_scale_harness() {
+        use std::collections::HashSet;
+        use std::time::Instant;
+        let dir = std::env::var("SHELF_SCALE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::temp_dir().join(format!("fable-shelf-scale-{}", std::process::id()))
+            });
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cat = Catalog::open(&dir.join("catalog.db")).unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let loc_s = loc.to_string();
+
+        const PLATFORMS: usize = 60;
+        let groups_for = |p: usize| -> usize { if p == 0 { 12_000 } else { 1_550 } };
+        let total_groups: usize = (0..PLATFORMS).map(&groups_for).sum();
+        assert!(total_groups >= 100_000, "fixture must clear 100k groups: {total_groups}");
+
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 33) as u32
+        };
+
+        let t = Instant::now();
+        {
+            let conn = &cat.conn;
+            conn.execute_batch("BEGIN").unwrap();
+            let mut ins_item = conn
+                .prepare("INSERT INTO items (id, location_id, name, kind, size_bytes, modified, provider_key) VALUES (?1, ?2, ?3, 'file', ?4, ?5, ?6)")
+                .unwrap();
+            let mut ins_ident = conn
+                .prepare("INSERT INTO media_identities (item_id, media_kind, title, year, platform, sha1, match_evidence_json) VALUES (?1, 'rom', ?2, ?3, ?4, ?5, ?6)")
+                .unwrap();
+            let mut ins_media = conn
+                .prepare("INSERT INTO rom_media (item_id, media_type, status, source, local_path, detail_json, checked_at) VALUES (?1, ?2, 'found', 'libretro', ?3, '{}', '2026-01-01T00:00:00Z')")
+                .unwrap();
+            let mut ins_state = conn
+                .prepare("INSERT INTO rom_game_state (provider_key, rating, favorite, completed, play_count, last_played, title_override, genre, players, notes, updated_at) VALUES (?1, ?2, ?3, 0, ?4, ?5, NULL, ?6, ?7, NULL, '2026-01-01T00:00:00Z')")
+                .unwrap();
+            let mut member_seq = 0u64;
+            let mut mk_id = |seq: u64| format!("{:08x}-0000-4000-8000-{:012x}", seq, seq);
+            for p in 0..PLATFORMS {
+                let platform = format!("plat{p:02}");
+                for i in 0..groups_for(p) {
+                    let base = format!("Game {p:02}-{i:05}");
+                    let members: Vec<(String, &str)> = {
+                        let mut v = vec![(format!("{base} (USA)"), "USA")];
+                        if next() % 100 < 8 {
+                            v.push((format!("{base} (Japan)"), "Japan"));
+                        }
+                        v
+                    };
+                    let year = 1985 + (i % 35) as i64;
+                    for (mi, (title, region)) in members.iter().enumerate() {
+                        member_seq += 1;
+                        let id = mk_id(member_seq);
+                        let pk = format!("/roms/{platform}/{base}-{region}.bin");
+                        let modified = format!(
+                            "2026-{:02}-{:02}T00:00:00Z",
+                            (i % 12) + 1,
+                            (i % 28) + 1
+                        );
+                        ins_item
+                            .execute(rusqlite::params![
+                                id,
+                                loc_s,
+                                format!("{base}-{region}.bin"),
+                                1_000_000i64 + (i as i64 % 5000),
+                                modified,
+                                pk,
+                            ])
+                            .unwrap();
+                        let evidence = format!(
+                            "{{\"matched\":true,\"also\":[],\"crc\":{}}}",
+                            10_000 + i
+                        );
+                        ins_ident
+                            .execute(rusqlite::params![
+                                id,
+                                title,
+                                year,
+                                platform,
+                                format!("{:040x}", member_seq),
+                                evidence,
+                            ])
+                            .unwrap();
+                        // Box art on 4 of 5 groups; screenshots on
+                        // 1 of 3 (default member only, like a real
+                        // scrape pass).
+                        if mi == 0 && i % 5 != 0 {
+                            ins_media
+                                .execute(rusqlite::params![
+                                    id,
+                                    "boxart",
+                                    format!("/media/{platform}/{base}.png"),
+                                ])
+                                .unwrap();
+                        }
+                        if mi == 0 && i % 3 == 0 {
+                            ins_media
+                                .execute(rusqlite::params![
+                                    id,
+                                    "screenshot",
+                                    format!("/media/{platform}/{base}-shot.png"),
+                                ])
+                                .unwrap();
+                        }
+                        // Personal state sprinkle (scoped rows on
+                        // the default member's path).
+                        if mi == 0 {
+                            let fav = i % 17 == 0;
+                            let played = i % 7 == 0;
+                            let rated = i % 23 == 0;
+                            if fav || played || rated {
+                                ins_state
+                                    .execute(rusqlite::params![
+                                        pk,
+                                        if rated { Some(4i64) } else { None },
+                                        fav as i64,
+                                        if played { (i % 9 + 1) as i64 } else { 0 },
+                                        if played {
+                                            Some(format!(
+                                                "2026-09-{:02}T20:00:00Z",
+                                                (i % 28) + 1
+                                            ))
+                                        } else {
+                                            None
+                                        },
+                                        if i % 4 == 0 { Some("Action") } else { None },
+                                        if i % 3 == 0 { Some("1-2") } else { None },
+                                    ])
+                                    .unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+            // Catalog ballast: 300k non-ROM files, 100k of them
+            // carrying movie identities — the shelf queries must
+            // not feel them beyond the join they already pay.
+            for i in 0..300_000u64 {
+                member_seq += 1;
+                let id = mk_id(member_seq);
+                ins_item
+                    .execute(rusqlite::params![
+                        id,
+                        loc_s,
+                        format!("pad-{i:06}.bin"),
+                        10i64,
+                        "2026-01-01T00:00:00Z",
+                        format!("/pad/{i:06}.bin"),
+                    ])
+                    .unwrap();
+                if i < 100_000 {
+                    conn.execute(
+                        "INSERT INTO media_identities (item_id, media_kind, title, year, platform, sha1, match_evidence_json) VALUES (?1, 'movie', ?2, 2001, NULL, NULL, '{}')",
+                        rusqlite::params![id, format!("Pad Movie {i:06}")],
+                    )
+                    .unwrap();
+                }
+            }
+            conn.execute_batch("COMMIT").unwrap();
+        }
+        let seed_secs = t.elapsed().as_secs_f64();
+
+        // ---------- BEFORE: the unbounded full fetch ----------
+        if std::env::var("SHELF_SCALE_SEED_ONLY").is_ok() {
+            println!("seed-only: fixture kept at {}", dir.display());
+            return;
+        }
+        let t = Instant::now();
+        let before_all = cat.rom_home_games(None).unwrap();
+        let before_all_ms = t.elapsed().as_millis();
+        let before_all_bytes = serde_json::to_vec(&before_all).unwrap().len();
+        let before_ids: HashSet<String> = before_all
+            .iter()
+            .map(|g| g.item.id.to_string())
+            .collect();
+        let before_groups: HashSet<String> =
+            before_all.iter().map(|g| g.group_key.clone()).collect();
+
+        let t = Instant::now();
+        let before_big = cat.rom_home_games(Some("plat00")).unwrap();
+        let before_big_ms = t.elapsed().as_millis();
+        let before_big_bytes = serde_json::to_vec(&before_big).unwrap().len();
+        let before_big_ids: HashSet<String> = before_big
+            .iter()
+            .map(|g| g.item.id.to_string())
+            .collect();
+
+        let t = Instant::now();
+        let counts = cat.rom_home_counts().unwrap();
+        let counts_ms = t.elapsed().as_millis();
+        assert_eq!(counts.total as usize, before_groups.len());
+
+        // ---------- AFTER: windowed shelves ----------
+        let spec_all = RomHomeShelfSpec {
+            kind: "all".into(),
+            platform: None,
+            query: None,
+            search_platforms: vec![],
+            member_keys: None,
+            filters: RomHomeShelfFilters::default(),
+            sort: "title".into(),
+            cursor: None,
+            limit: 240,
+        };
+        let t = Instant::now();
+        let first = cat.rom_home_shelf_window(&spec_all).unwrap();
+        let first_ms = t.elapsed().as_millis();
+        let first_bytes = serde_json::to_vec(&first.games).unwrap().len();
+        assert_eq!(first.total as usize, before_groups.len());
+        assert_eq!(page_group_keys(&first).len(), 240);
+
+        if std::env::var("SHELF_SCALE_PROBE").is_ok() {
+            println!("probe mode: counts_ms={counts_ms} first_ms={first_ms} first_bytes={first_bytes} before_all_ms={before_all_ms} before_all_bytes={before_all_bytes}");
+            if std::env::var("SHELF_SCALE_DIR").is_err() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            return;
+        }
+        // Full walk of the all-shelf: exact union, stable total.
+        let t = Instant::now();
+        let mut walk_ids: HashSet<String> = HashSet::new();
+        let mut walk_groups: HashSet<String> = HashSet::new();
+        let mut windows = 0usize;
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut spec = spec_all.clone();
+            spec.cursor = cursor.clone();
+            let page = cat.rom_home_shelf_window(&spec).unwrap();
+            assert_eq!(page.total as usize, before_groups.len(), "total drifted mid-walk");
+            windows += 1;
+            for g in &page.games {
+                assert!(walk_ids.insert(g.item.id.to_string()), "duplicate item across windows");
+                walk_groups.insert(g.group_key.clone());
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+            assert!(windows < 10_000, "walk runaway");
+        }
+        let walk_ms = t.elapsed().as_millis();
+        assert_eq!(walk_ids, before_ids, "window union != full set");
+        assert_eq!(walk_groups.len(), before_groups.len());
+
+        // Bulk walk (Show-all shape): 5,000-group windows must
+        // reach the same union far faster in wall time.
+        let t = Instant::now();
+        let mut bulk_ids: HashSet<String> = HashSet::new();
+        let mut bulk_windows = 0usize;
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut spec = spec_all.clone();
+            spec.limit = 5000;
+            spec.cursor = cursor.clone();
+            let page = cat.rom_home_shelf_window(&spec).unwrap();
+            assert_eq!(page.total as usize, before_groups.len());
+            bulk_windows += 1;
+            for g in &page.games {
+                assert!(bulk_ids.insert(g.item.id.to_string()), "bulk dup");
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+            assert!(bulk_windows < 100, "bulk walk runaway");
+        }
+        let bulk_ms = t.elapsed().as_millis();
+        assert_eq!(bulk_ids, before_ids, "bulk union != full set");
+
+        // The 12,000-group platform: 50 windows of 240.
+        let mut spec_big = spec_all.clone();
+        spec_big.kind = "system".into();
+        spec_big.platform = Some("plat00".into());
+        let mut big_ids: HashSet<String> = HashSet::new();
+        let mut big_windows = 0usize;
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut spec = spec_big.clone();
+            spec.cursor = cursor.clone();
+            let page = cat.rom_home_shelf_window(&spec).unwrap();
+            assert_eq!(page.total, 12_000);
+            big_windows += 1;
+            for g in &page.games {
+                assert!(big_ids.insert(g.item.id.to_string()));
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(big_windows, 50);
+        assert_eq!(big_ids, before_big_ids);
+
+        // Filtered totals agree with the tallies.
+        let mut spec_fav = spec_all.clone();
+        spec_fav.kind = "favorites".into();
+        let fav_page = cat.rom_home_shelf_window(&spec_fav).unwrap();
+        assert_eq!(fav_page.total, counts.favorite_groups);
+        assert!(fav_page.total > 1_000, "sprinkle too thin: {}", fav_page.total);
+        let mut spec_missing = spec_all.clone();
+        spec_missing.kind = "missing".into();
+        let missing_page = cat.rom_home_shelf_window(&spec_missing).unwrap();
+        assert_eq!(missing_page.total, counts.missing_media);
+        assert!(missing_page.total > 10_000);
+
+        // Year sort: the first window's default-version years
+        // descend (ties fall to title, so year is non-increasing).
+        let mut spec_year = spec_all.clone();
+        spec_year.sort = "year".into();
+        let year_page = cat.rom_home_shelf_window(&spec_year).unwrap();
+        let years: Vec<i64> = page_group_keys(&year_page)
+            .iter()
+            .map(|gk| {
+                year_page
+                    .games
+                    .iter()
+                    .find(|g| &g.group_key == gk)
+                    .and_then(|g| g.year)
+                    .unwrap_or(-1)
+            })
+            .collect();
+        assert!(
+            years.windows(2).all(|w| w[0] >= w[1]),
+            "year window not descending: {years:?}"
+        );
+
+        println!("\n================ SHELF SCALE (Hyperbase #4) ================");
+        println!("fixture: {total_groups} groups / 60 platforms (big = 12,000), seeded in {seed_secs:.1}s");
+        println!("counts: total={} missing={} favorites={} recent={} ({} ms)",
+            counts.total, counts.missing_media, counts.favorite_groups, counts.recent_groups, counts_ms);
+        println!("BEFORE rom_home_games(None): {} rows, {} bytes JSON, {} ms",
+            before_all.len(), before_all_bytes, before_all_ms);
+        println!("BEFORE rom_home_games(plat00): {} rows, {} bytes JSON, {} ms",
+            before_big.len(), before_big_bytes, before_big_ms);
+        println!("AFTER first window (240 groups): {} member rows, {} bytes JSON, {} ms",
+            first.games.len(), first_bytes, first_ms);
+        println!("AFTER full walk: {} windows, {} ms total (union exact, totals stable)",
+            windows, walk_ms);
+        println!("AFTER bulk walk (5000/window): {} windows, {} ms total (union exact)",
+            bulk_windows, bulk_ms);
+        println!("============================================================\n");
+
+        if std::env::var("SHELF_SCALE_DIR").is_err() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
