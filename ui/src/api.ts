@@ -1103,6 +1103,13 @@ export const api = {
   listPrinters: () => invoke<PrinterInfo[]>("list_printers"),
   printItem: (item: string, printer: string | null, copies: number) =>
     invoke<string>("print_item", { item, printer, copies }),
+  /** Cheat-sheet exports: write base64 bytes to a user-chosen path;
+   * resolves to the number of bytes written. */
+  writeBinaryFile: (path: string, contentsBase64: string) =>
+    invoke<number>("write_binary_file", { path, contentsBase64 }),
+  /** Print an arbitrary file (PDF/JPG) through the CUPS flow. */
+  printFilePath: (path: string, printer: string | null, copies: number) =>
+    invoke<string>("print_file_path", { path, printer, copies }),
   mktorrentStatus: () => invoke<boolean>("mktorrent_status"),
   installMktorrent: () => invoke<void>("install_mktorrent"),
   createTorrent: (

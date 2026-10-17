@@ -638,6 +638,17 @@ export class MusicPlayer {
       this.audio.currentTime = Math.min(this.audio.duration || 0, this.audio.currentTime + 5);
     } else if (e.key === "ArrowLeft") {
       this.audio.currentTime = Math.max(0, this.audio.currentTime - 5);
+    } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+      // Volume (2026-10-16 shortcut suite): same state the slider
+      // drives — audio.volume, the slider position, the saved level.
+      e.preventDefault();
+      const v = Math.min(1, Math.max(0, this.audio.volume + (e.key === "ArrowUp" ? 0.05 : -0.05)));
+      this.audio.volume = v;
+      const slider = this.overlay.querySelector<HTMLInputElement>(".music-vol");
+      if (slider) slider.value = String(Math.round(v * 100));
+      try { localStorage.setItem("ff-music-vol", String(v)); } catch { /* ignore */ }
+    } else if (e.key.toLowerCase() === "m") {
+      this.audio.muted = !this.audio.muted;
     }
   }
 }

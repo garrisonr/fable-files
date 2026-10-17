@@ -2117,8 +2117,11 @@ body[data-layout="tv"] .cell-icon {
   line-height: 1;
 }
 
-/* Preferences + theme gallery + shortcuts (UI round items 1, 2, 3b). */
-.prefs-dialog, .shortcuts-card {
+/* Preferences + theme gallery (UI round items 1, 2). The old
+   static shortcuts card styles are gone with the hand-maintained
+   list they served — the registry overlay styles live at the end
+   of this file (.sc-*). */
+.prefs-dialog {
   background: var(--ufm-surface, var(--ufm-content-canvas));
   color: var(--ufm-text);
   border: 1px solid var(--ufm-border);
@@ -2190,8 +2193,6 @@ body[data-layout="tv"] .cell-icon {
 /* Game Media "Where it comes from" summary lines. */
 .rm-source-line { display: flex; align-items: baseline; gap: 0.75rem; padding: 0.1875rem 0; font-size: 0.875rem; }
 .rm-source-line-name { font-weight: 600; min-width: 8.5rem; }
-.shortcuts-row { display: flex; align-items: baseline; gap: 0.875rem; padding: 0.25rem 0; font-size: 0.875rem; }
-.shortcuts-key { flex: 0 0 11rem; font-family: inherit; font-size: 0.8125rem; font-weight: 600; background: color-mix(in srgb, var(--ufm-text) 8%, transparent); border: 1px solid var(--ufm-border); border-radius: 6px; padding: 0.125rem 0.5rem; text-align: center; }
 
 .about-title {
   margin: 0.625rem 0 0.25rem;
@@ -4792,3 +4793,83 @@ body[data-layout="tv"] .w-glyph svg {
     padding: 4vh 5vw 2vh;
   }
 }
+
+/* ---------------------------------------------------------------
+   Shortcuts overlay (2026-10-16): registry-rendered glass card,
+   live filter, export bar pinned at the foot. All colors are
+   --ufm-* tokens; the one hard color is the Fable amber on the
+   pulled-out book of the mark (the family brand color).
+   --------------------------------------------------------------- */
+.sc-overlay {
+  position: fixed; inset: 0; z-index: 1300;
+  background: rgb(0 0 0 / 0.34);
+  backdrop-filter: blur(8px) saturate(140%);
+  display: flex; align-items: center; justify-content: center;
+}
+.sc-card {
+  background: color-mix(in srgb, var(--ufm-surface, var(--ufm-content-canvas)) 84%, transparent);
+  -webkit-backdrop-filter: blur(24px) saturate(1.5);
+  backdrop-filter: blur(24px) saturate(1.5);
+  color: var(--ufm-text);
+  border: 1px solid var(--ufm-border);
+  border-radius: 20px;
+  box-shadow: 0 24px 70px rgb(0 0 0 / 0.4);
+  width: min(64rem, calc(100vw - 3rem));
+  max-height: calc(100vh - 4rem);
+  display: flex; flex-direction: column;
+  padding: 1.25rem 1.5rem 1rem;
+  will-change: transform, opacity;
+}
+.sc-in-fade { animation: scFade 120ms ease-out; }
+@keyframes scFade { from { opacity: 0; } to { opacity: 1; } }
+.sc-head {
+  display: flex; align-items: center; gap: 1rem;
+  padding-bottom: 0.9rem; border-bottom: 1px solid var(--ufm-border);
+}
+.sc-mark { position: relative; width: 46px; height: 36px; flex: 0 0 auto; display: flex; align-items: flex-end; gap: 2px; }
+.sc-mark span { display: block; width: 6px; height: 22px; border-radius: 2px; background: color-mix(in srgb, var(--ufm-text) 55%, transparent); }
+.sc-mark span:nth-child(2) { height: 28px; }
+.sc-mark span:nth-child(4) { height: 26px; }
+.sc-mark span:nth-child(5) { height: 20px; }
+.sc-mark .sc-book-out { background: #d97706; height: 24px; transform: translateY(-5px) rotate(-10deg); }
+.sc-mark i { position: absolute; left: 0; right: 0; bottom: -3px; height: 3px; border-radius: 2px; background: var(--ufm-text); opacity: 0.7; }
+.sc-title { margin: 0; font-size: clamp(1.3rem, 2.4vw, 1.7rem); font-weight: 800; letter-spacing: -0.02em; white-space: nowrap; }
+.sc-filter {
+  flex: 1 1 auto; min-width: 9rem; font-size: 1rem;
+  padding: 0.5rem 0.95rem; border-radius: 999px;
+  border: 1px solid var(--ufm-border);
+  background: color-mix(in srgb, var(--ufm-text) 6%, transparent);
+  color: var(--ufm-text);
+}
+.sc-body { overflow-y: auto; padding: 1rem 0.25rem; columns: 2; column-gap: 3rem; }
+.sc-group { break-inside: avoid; margin-bottom: 1.15rem; }
+.sc-group-title {
+  margin: 0 0 0.4rem; font-size: 0.92rem; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--ufm-accent-text, var(--ufm-text));
+}
+.sc-row { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; padding: 0.28rem 0; font-size: clamp(0.95rem, 1.35vw, 1.05rem); }
+.sc-row-label { display: flex; flex-direction: column; gap: 0.05rem; }
+.sc-row-ctx { font-size: 0.76em; color: var(--ufm-text-muted); }
+.sc-row-keys { display: flex; gap: 0.3rem; flex: 0 0 auto; }
+.sc-kbd {
+  font-family: inherit; font-size: 0.84em; font-weight: 600; white-space: nowrap;
+  background: color-mix(in srgb, var(--ufm-text) 8%, transparent);
+  border: 1px solid var(--ufm-border); border-bottom-width: 2px;
+  border-radius: 6px; padding: 0.1rem 0.5rem;
+}
+.sc-row-note { font-size: 0.82rem; color: var(--ufm-text-muted); padding: 0.05rem 0 0.3rem; }
+.sc-none { font-size: 1.05rem; color: var(--ufm-text-muted); }
+.sc-foot {
+  display: flex; align-items: center; gap: 0.75rem 1rem; flex-wrap: wrap;
+  padding-top: 0.9rem; border-top: 1px solid var(--ufm-border);
+}
+.sc-note { flex: 1 1 15rem; font-size: 0.85rem; color: var(--ufm-text-muted); }
+.sc-exports { display: flex; gap: 0.5rem; margin-left: auto; }
+.sc-export-btn { font-size: 0.95rem; padding: 0.5rem 1rem; }
+.sc-printrow { flex-basis: 100%; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.sc-printrow[hidden] { display: none; }
+.sc-print-lead { font-weight: 600; }
+.sc-print-none { color: var(--ufm-text-muted); font-size: 0.9rem; }
+@media (max-width: 60rem) { .sc-body { columns: 1; } }
+@media (prefers-reduced-motion: reduce) { .sc-in-fade { animation: none; } }

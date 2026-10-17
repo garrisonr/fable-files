@@ -775,6 +775,8 @@ pub fn run() {
             commands::create_new_file,
             commands::list_printers,
             commands::print_item,
+            commands::write_binary_file,
+            commands::print_file_path,
             commands::mktorrent_status,
             commands::install_mktorrent,
             commands::create_torrent,

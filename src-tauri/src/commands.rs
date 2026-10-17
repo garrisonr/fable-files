@@ -13487,6 +13487,64 @@ pub async fn print_item(
     .map_err(|e| CommandError::from(UfmError::Internal(e)))
 }
 
+/// Write base64-decoded bytes to a user-chosen path. The cheat-sheet
+/// exports pick the path in their save flow; this lands the bytes.
+/// Returns the number of bytes written.
+#[tauri::command]
+pub async fn write_binary_file(path: String, contents_base64: String) -> Cmd<u64> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use base64::Engine;
+        if path.trim().is_empty() {
+            return Err("no destination path".to_string());
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(contents_base64.as_bytes())
+            .map_err(|e| format!("invalid export payload: {e}"))?;
+        std::fs::write(&path, &bytes)
+            .map_err(|e| format!("could not write {path}: {e}"))?;
+        Ok::<u64, String>(bytes.len() as u64)
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("export write task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
+
+/// Print a file at an arbitrary path (the cheat-sheet PDF). The
+/// same CUPS `lp` invocation as print_item, minus the item lookup
+/// and office conversion — PDF and JPEG print as-is.
+#[tauri::command]
+pub async fn print_file_path(
+    path: String,
+    printer: Option<String>,
+    copies: u32,
+) -> Cmd<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::deps::ensure_tool("lpstat", "cups")?;
+        let p = std::path::Path::new(&path);
+        if !p.is_file() {
+            return Err(format!("nothing to print at {path}"));
+        }
+        let mut cmd = std::process::Command::new("lp");
+        if let Some(pr) = &printer {
+            cmd.arg("-d").arg(pr);
+        }
+        if copies > 1 {
+            cmd.arg("-n").arg(copies.to_string());
+        }
+        cmd.arg(p);
+        let out = cmd.output().map_err(|e| format!("lp: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "printing failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok::<String, String>(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("print task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::Internal(e)))
+}
 
 // ---------------------------------------------------------------------------
 // Torrent creation — thin wrappers over the ufm-torrent engine

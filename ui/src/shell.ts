@@ -63,6 +63,16 @@ import { TorrentDialog } from "./torrent";
 import type { MenuItem } from "./contextmenu";
 import { PrintDialog } from "./print";
 import { JobsPanel } from "./jobs";
+import { ShortcutOverlay } from "./shortcutoverlay";
+import {
+  bindingById,
+  formatBinding,
+  isMacPlatform,
+  resolveGlobalAction,
+} from "./shortcuts";
+import type { SheetExportDeps } from "./cheatsheet";
+import { invoke } from "@tauri-apps/api/core";
+import { tempDir } from "@tauri-apps/api/path";
 import {
   canGoBack,
   canGoForward,
@@ -209,8 +219,10 @@ export class Shell {
   private galleryView: GalleryView;
   private aboutDialog = new AboutDialog();
   private preferencesDialog = new PreferencesDialog();
-  /** The Ctrl+? shortcuts overlay element while it is open. */
-  private shortcutsEl: HTMLElement | null = null;
+  /** The shortcuts overlay — rendered from the registry in
+   * shortcuts.ts (the single definition of every binding).
+   * Lazy: built on first open. */
+  private shortcutsOverlay: ShortcutOverlay | null = null;
   private palette = new CommandPalette();
   private menuBtn!: HTMLButtonElement;
   /** Undoable file operations (trash / drag-move), newest last. */
@@ -955,7 +967,7 @@ export class Shell {
     const refreshBtn = document.createElement("button");
     refreshBtn.className = "icon-btn refresh-btn";
     refreshBtn.textContent = "↻";
-    refreshBtn.title = "Refresh (F5)";
+    refreshBtn.title = `Refresh (${formatBinding(bindingById("nav.refresh")!, isMacPlatform()).split(" · ")[0]})`;
     refreshBtn.setAttribute("aria-label", "Refresh current view");
     refreshBtn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -4545,105 +4557,71 @@ export class Shell {
     }, page);
   }
 
-  /** Keyboard shortcuts overlay (UI round item 3b, Ctrl+?): the
-   * app's REAL bindings, read off onGlobalKey and the player key
-   * handlers. If a binding changes there, change it here in the
-   * same commit — an invented shortcut in this list is a lie. */
+  /** Keyboard shortcuts overlay: rendered from the registry in
+   * shortcuts.ts, so it can only ever show bindings this build
+   * actually runs. Doors: "?", Ctrl+/, Ctrl+? (dispatch in
+   * onGlobalKey), the main menu's Help & Feedback item, and the
+   * Preferences row (the showShortcuts hook above). */
   private showShortcuts(): void {
-    this.closeShortcuts();
-    const overlay = document.createElement("div");
-    overlay.className = "props-overlay";
-    overlay.addEventListener("mousedown", (e) => {
-      if (e.target === overlay) this.closeShortcuts();
-    });
-    const card = document.createElement("div");
-    card.className = "shortcuts-card";
-    card.setAttribute("role", "dialog");
-    card.setAttribute("aria-label", "Keyboard shortcuts");
-    const head = document.createElement("div");
-    head.className = "prefs-head";
-    const title = document.createElement("h2");
-    title.className = "prefs-title";
-    title.textContent = "Keyboard Shortcuts";
-    const closeBtn = document.createElement("button");
-    closeBtn.className = "icon-btn prefs-close";
-    closeBtn.textContent = "✕";
-    closeBtn.title = "Close";
-    closeBtn.addEventListener("click", () => this.closeShortcuts());
-    head.append(title, closeBtn);
-    card.appendChild(head);
-    const groups: Array<[string, Array<[string, string]>]> = [
-      [
-        "Files",
-        [
-          ["Ctrl X / Ctrl C", "Cut / copy the selection"],
-          ["Ctrl V", "Paste into the current folder"],
-          ["Ctrl A", "Select all"],
-          ["Delete / Backspace", "Move the selection to Trash"],
-          ["Ctrl Z", "Undo the last trash or move"],
-          ["F2", "Rename"],
-          ["Ctrl E", "Make the selected file executable"],
-        ],
-      ],
-      [
-        "Navigation & windows",
-        [
-          ["F5 / Ctrl R", "Refresh the current view"],
-          ["Ctrl T", "New tab"],
-          ["Ctrl W", "Close tab"],
-          ["Alt ↑", "Up one folder"],
-          ["Space", "Quick Look preview"],
-          ["Esc", "Close menu / Quick Look / this list"],
-          ["Ctrl K", "Command palette"],
-          ["Ctrl `", "Terminal"],
-          ["Ctrl ?", "This list"],
-        ],
-      ],
-      [
-        "View",
-        [
-          ["Ctrl + / Ctrl −", "Text larger / smaller"],
-          ["Ctrl 0", "Reset text size"],
-        ],
-      ],
-      [
-        "Players",
-        [
-          ["Space / K", "Play / pause (video)"],
-          ["← / →", "Seek 5 seconds (video & music)"],
-          ["F", "Fullscreen (video)"],
-          ["M", "Mute (video)"],
-        ],
-      ],
-    ];
-    for (const [name, rows] of groups) {
-      const h = document.createElement("h3");
-      h.className = "prefs-section";
-      h.textContent = name;
-      card.appendChild(h);
-      for (const [key, label] of rows) {
-        const row = document.createElement("div");
-        row.className = "shortcuts-row";
-        const k = document.createElement("kbd");
-        k.className = "shortcuts-key";
-        k.textContent = key;
-        const lab = document.createElement("span");
-        lab.textContent = label;
-        row.append(k, lab);
-        card.appendChild(row);
-      }
-    }
-    overlay.appendChild(card);
-    document.body.appendChild(overlay);
-    this.shortcutsEl = overlay;
-    closeBtn.focus();
+    this.shortcutsOverlayInstance().open();
   }
 
   private closeShortcuts(): void {
-    if (this.shortcutsEl) {
-      this.shortcutsEl.remove();
-      this.shortcutsEl = null;
+    this.shortcutsOverlay?.close();
+  }
+
+  private toggleShortcuts(): void {
+    this.shortcutsOverlayInstance().toggle();
+  }
+
+  private shortcutsOverlayInstance(): ShortcutOverlay {
+    if (!this.shortcutsOverlay) {
+      this.shortcutsOverlay = new ShortcutOverlay(this.sheetExportDeps());
     }
+    return this.shortcutsOverlay;
+  }
+
+  /** Export plumbing for the overlay's cheat-sheet bar. Bytes land
+   * through the backend (write_binary_file). The native save dialog
+   * is tried first; it carries no capability grants in this tree,
+   * so the fail-soft fallback saves into Downloads and says so —
+   * see fable-shortcuts/DESIGN.md \u00a76. */
+  private sheetExportDeps(): SheetExportDeps {
+    return {
+      writeBinaryFile: (path, base64) => api.writeBinaryFile(path, base64),
+      printFilePath: (path, printer, copies) =>
+        api.printFilePath(path, printer, copies),
+      listPrinters: () => api.listPrinters(),
+      saveDialog: async (defaultName, kind) =>
+        invoke<string | null>("plugin:dialog|save", {
+          options: {
+            defaultPath: defaultName,
+            filters: [
+              {
+                name: kind === "pdf" ? "PDF document" : "JPEG image",
+                extensions: [kind],
+              },
+            ],
+          },
+        }),
+      fallbackDir: async () => {
+        const dl = this.locations.find(
+          (l) => l.display_name === "Downloads" && l.path,
+        );
+        if (dl?.path) return dl.path;
+        const home =
+          this.locations.find(
+            (l) => l.display_name.toLowerCase().includes("home") && l.path,
+          ) ?? this.locations.find((l) => l.path);
+        if (home?.path) return `${home.path}/Downloads`;
+        throw new Error(
+          "no Downloads folder could be found for the fallback save",
+        );
+      },
+      tempDir: () => tempDir(),
+      toastSuccess: (m) => Toast.success(m),
+      toastError: (m) => Toast.error(m),
+    };
   }
 
   private openMainMenu(): void {
@@ -4763,12 +4741,17 @@ export class Shell {
           Toast.success(on ? "Roms Collection is on." : "Roms Collection is off. Your systems are kept.");
         },
       },
-      { label: "Terminal", shortcut: "Ctrl `", action: () => void this.toggleTerminal() },
+      { label: "Terminal", shortcut: formatBinding(bindingById("app.terminal")!, isMacPlatform()), action: () => void this.toggleTerminal() },
       { label: "Preferences\u2026", action: () => this.openPreferences() },
       {
         label: "Help & Feedback",
         action: () => {},
         submenu: [
+          {
+            label: "Keyboard Shortcuts",
+            shortcut: "?",
+            action: () => this.showShortcuts(),
+          },
           {
             label: "Report a Bug\u2026",
             action: () =>
@@ -5371,158 +5354,168 @@ export class Shell {
 
   // --------------------------------------------------------------- keyboard
 
+  /**
+   * Global key dispatch: the registry in shortcuts.ts decides what
+   * a keypress MEANS (resolveGlobalAction mirrors the order and
+   * guards this handler used to spell out by hand); the action
+   * table below runs the same bodies it always ran, plus the
+   * 2026-10-16 additions (overlay doors, search/path focus, tab
+   * cycling, duplicate, new folder, print, preferences, history).
+   * Esc keeps its layered chain as the fallback when nothing
+   * resolves: overlay \u2192 menu \u2192 Quick Look (unchanged).
+   */
   private onGlobalKey(e: KeyboardEvent): void {
+    const target = e.target as HTMLElement | null;
     const inField =
-      e.target instanceof HTMLInputElement ||
-      e.target instanceof HTMLTextAreaElement;
-    if ((e.ctrlKey || e.metaKey) && e.key === "?") {
-      // Ctrl+? — the shortcuts cheat sheet (UI round item 3b).
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement;
+    const id = resolveGlobalAction(e, {
+      inField,
+      inEditable: !!target?.isContentEditable,
+      targetTag: target?.tagName ?? "",
+      searchActive: this.searchView.active,
+      romHomeActive: !!this.romHome?.active,
+      hasSelection: this.activeSelectionItems().length > 0,
+      hasTab: !!this.activeTab,
+    });
+    if (id) {
       e.preventDefault();
-      if (this.shortcutsEl) this.closeShortcuts();
-      else this.showShortcuts();
+      this.runGlobalAction(id);
       return;
     }
-    if ((e.ctrlKey || e.metaKey) && e.key.toLocaleLowerCase() === "k") {
-      e.preventDefault();
-      if (this.palette.isOpen) this.palette.close();
-      else void this.openPalette();
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key.toLocaleLowerCase() === "t") {
-      e.preventDefault();
-      const loc = this.activeTab
-        ? this.locations.find((l) => l.id === currentDir(this.activeTab!).locationId)
-        : this.locations[0];
-      if (loc) this.newTab(loc);
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key.toLocaleLowerCase() === "w") {
-      e.preventDefault();
-      if (this.activeTab) this.closeTab(this.activeTab);
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key.toLocaleLowerCase() === "e") {
-      // Ctrl+E: make the selected file executable (chmod +x).
-      e.preventDefault();
-      const sel = this.activeSelected();
-      if (sel) {
-        api.setExecutable(sel.id, true).catch((err) => console.error("chmod +x failed:", err));
-      }
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && (e.key === "=" || e.key === "+")) {
-      // Ctrl+=: increase font size
-      e.preventDefault();
-      this.setFontScale(this.fontScale + 0.1);
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key === "-") {
-      // Ctrl+-: decrease font size
-      e.preventDefault();
-      this.setFontScale(this.fontScale - 0.1);
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key === "0") {
-      // Ctrl+0: reset font size
-      e.preventDefault();
-      this.setFontScale(1.0);
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key.toLocaleLowerCase() === "z" && !e.shiftKey) {
-      // Undo the last trash / move. In text fields, leave text undo alone.
-      if (!inField) {
-        e.preventDefault();
-        void this.undoLast();
-      }
-      return;
-    }
-    if ((e.ctrlKey || e.metaKey) && !inField) {
-      const k = e.key.toLocaleLowerCase();
-      if (k === "x" || k === "c") {
-        const items = this.activeSelectionItems();
-        if (items.length > 0) {
-          e.preventDefault();
-          void this.clipboardSet(items, k === "x");
-          return;
-        }
-      } else if (k === "v") {
-        e.preventDefault();
-        void this.pasteIntoCurrentDir();
-        return;
-      } else if (k === "a") {
-        e.preventDefault();
-        this.fileView.selectAll();
-        return;
-      } else if (k === "`") {
-        e.preventDefault();
-        void this.toggleTerminal();
-        return;
-      }
-    }
-    if (e.key === "F5") {
-      // F5: refresh the current view in place — never a webview
-      // reload. Unbound before 2026-10-16; the instinct is universal,
-      // so the app honors it (Dickles).
-      e.preventDefault();
-      this.refreshCurrentView();
-      return;
-    }
-    if (
-      (e.ctrlKey || e.metaKey) &&
-      e.key.toLocaleLowerCase() === "r" &&
-      !inField
-    ) {
-      // Ctrl+R: the same refresh. Was unbound; nothing is stolen.
-      e.preventDefault();
-      this.refreshCurrentView();
-      return;
-    }
-    if (e.key === "F2" && !inField) {
-      const sel = this.activeSelected();
-      if (sel) {
-        e.preventDefault();
-        this.renameDialog.open(sel, () => this.refreshActiveDir());
-        return;
-      }
-    }
-    if (inField) return;
-    if (e.key === "Delete" || e.key === "Backspace") {
-      // Search results carry their own selection — trash it there.
-      // (Reaching here means focus is NOT in a text field: `if
-      // (inField) return` above keeps Backspace for query editing.)
-      if (this.searchView.active && this.searchView.tryTrashSelection()) {
-        e.preventDefault();
-        return;
-      }
-      // Del AND Backspace move the selection to the Trash. (Dickles'
-      // law, 2026-10-13: Backspace deletes — it NEVER navigates back.)
-      if (!this.searchView.field.contains(document.activeElement)) {
-        const items = this.activeSelectionItems();
-        if (items.length > 0) {
-          e.preventDefault();
-          void this.trashItems(items);
-        }
-      }
-      return;
-    }
-    if (e.key === " " && this.activeTab && !this.searchView.active) {
-      // Space toggles Quick Look — never when typing.
-      const tag = (e.target as HTMLElement).tagName;
-      if (tag !== "BUTTON" && tag !== "INPUT") {
-        e.preventDefault();
-        this.togglePreview();
-      }
-    } else if (e.key === "Escape") {
-      if (this.shortcutsEl) this.closeShortcuts();
+    if (e.key === "Escape" && !inField) {
+      if (this.shortcutsOverlay?.isOpen) this.closeShortcuts();
       else if (!this.menuLayer.hidden) this.closeMenu();
       else if (this.quickLook.isOpen) this.quickLook.close();
-    } else if (e.altKey && e.key === "ArrowUp") {
-      if (this.activeTab) {
-        e.preventDefault();
-        this.goUp();
-      }
     }
   }
+
+  private runGlobalAction(id: string): void {
+    switch (id) {
+      case "app.shortcuts":
+        this.toggleShortcuts();
+        break;
+      case "app.palette":
+        if (this.palette.isOpen) this.palette.close();
+        else void this.openPalette();
+        break;
+      case "app.preferences":
+        this.openPreferences();
+        break;
+      case "files.search":
+        this.searchView.focus();
+        break;
+      case "nav.path":
+        this.editPath();
+        break;
+      case "tabs.new": {
+        const loc = this.activeTab
+          ? this.locations.find(
+              (l) => l.id === currentDir(this.activeTab!).locationId,
+            )
+          : this.locations[0];
+        if (loc) this.newTab(loc);
+        break;
+      }
+      case "tabs.close":
+        if (this.activeTab) this.closeTab(this.activeTab);
+        break;
+      case "tabs.next":
+      case "tabs.prev": {
+        if (this.tabs.length > 1 && this.activeTab) {
+          const i = this.tabs.indexOf(this.activeTab);
+          const step = id === "tabs.next" ? 1 : -1;
+          const n =
+            this.tabs[(i + step + this.tabs.length) % this.tabs.length];
+          if (n) this.activateTab(n);
+        }
+        break;
+      }
+      case "files.makeExecutable": {
+        const sel = this.activeSelected();
+        if (sel) {
+          api
+            .setExecutable(sel.id, true)
+            .catch((err) => console.error("chmod +x failed:", err));
+        }
+        break;
+      }
+      case "app.textBigger":
+        this.setFontScale(this.fontScale + 0.1);
+        break;
+      case "app.textSmaller":
+        this.setFontScale(this.fontScale - 0.1);
+        break;
+      case "app.textReset":
+        this.setFontScale(1.0);
+        break;
+      case "files.undo":
+        void this.undoLast();
+        break;
+      case "files.cut":
+      case "files.copy": {
+        const items = this.activeSelectionItems();
+        if (items.length > 0) void this.clipboardSet(items, id === "files.cut");
+        break;
+      }
+      case "files.paste":
+        void this.pasteIntoCurrentDir();
+        break;
+      case "files.selectAll":
+        this.fileView.selectAll();
+        break;
+      case "app.terminal":
+        void this.toggleTerminal();
+        break;
+      case "files.duplicate": {
+        const items = this.activeSelectionItems();
+        if (items.length > 0) void this.duplicateItems(items);
+        break;
+      }
+      case "files.newFolder":
+        void this.createFolderHere();
+        break;
+      case "files.print": {
+        const sel = this.activeSelected();
+        if (sel) void this.printDialog.open(sel);
+        break;
+      }
+      case "nav.refresh":
+        this.refreshCurrentView();
+        break;
+      case "files.rename": {
+        const sel = this.activeSelected();
+        if (sel) {
+          this.renameDialog.open(sel, () => this.refreshActiveDir());
+        }
+        break;
+      }
+      case "files.trash": {
+        // Search results carry their own selection \u2014 trash it there.
+        if (this.searchView.active && this.searchView.tryTrashSelection()) {
+          break;
+        }
+        if (!this.searchView.field.contains(document.activeElement)) {
+          const items = this.activeSelectionItems();
+          if (items.length > 0) void this.trashItems(items);
+        }
+        break;
+      }
+      case "quicklook.toggle":
+        this.togglePreview();
+        break;
+      case "nav.up":
+        if (this.activeTab) this.goUp();
+        break;
+      case "nav.back":
+        this.goBack();
+        break;
+      case "nav.forward":
+        this.goForward();
+        break;
+    }
+  }
+
 }
 
 // Re-export for main.ts convenience.
