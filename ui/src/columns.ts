@@ -19,6 +19,11 @@ interface Column {
   dirId: string;
   items: Item[];
   selectedId: string | null;
+  /** The column's multi-selection (multi-trash 2): a plain pick
+   * holds exactly the picked item; Ctrl/Cmd+click toggles members
+   * without navigating. selectedId remains the focus row (preview
+   * + keyboard). */
+  selectedIds: Set<string>;
 }
 
 const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff", "ico"];
@@ -59,6 +64,7 @@ export class ColumnsView {
         dirId: dir.dirId,
         items: sortedItems(tab),
         selectedId: null,
+        selectedIds: new Set(),
       },
     ];
     this.selectedItem = null;
@@ -76,7 +82,7 @@ export class ColumnsView {
         row.className =
           "col-row" +
           (item.kind === "folder" ? " is-folder" : "") +
-          (col.selectedId === item.id ? " selected" : "");
+          (col.selectedIds.has(item.id) ? " selected" : "");
         const name = document.createElement("span");
         name.className = "col-name";
         name.textContent = item.name;
@@ -87,15 +93,40 @@ export class ColumnsView {
           chev.textContent = "›";
           row.appendChild(chev);
         }
-        row.addEventListener("click", () => void this.pick(ci, item));
+        row.addEventListener("click", (e) => {
+          // Modifier clicks build the column's multi-selection
+          // WITHOUT navigating (multi-trash 2); a plain click keeps
+          // the Miller behavior — select, and folders open a column.
+          if (e.ctrlKey || e.metaKey) {
+            this.togglePick(ci, item);
+            return;
+          }
+          if (e.shiftKey) {
+            this.rangePick(ci, item);
+            return;
+          }
+          void this.pick(ci, item);
+        });
         row.addEventListener("dblclick", () => {
           if (item.kind !== "folder") this.hooks.onOpen(item);
         });
         row.addEventListener("contextmenu", (e) => {
           e.preventDefault();
           e.stopPropagation();
-          void this.pick(ci, item, true);
-          this.openMenu(e.clientX, e.clientY, item);
+          // Effective targets, FileView's rule: the column's bunch
+          // when the clicked row belongs to it, else the row alone
+          // (picked first, as before).
+          const colNow = this.cols[ci];
+          if (!colNow || !colNow.selectedIds.has(item.id)) {
+            void this.pick(ci, item, true);
+            this.openMenu(e.clientX, e.clientY, item, [item]);
+            return;
+          }
+          const targets =
+            colNow.selectedIds.size > 1
+              ? colNow.items.filter((i) => colNow.selectedIds.has(i.id))
+              : [item];
+          this.openMenu(e.clientX, e.clientY, item, targets);
         });
         colEl.appendChild(row);
       }
@@ -163,6 +194,7 @@ export class ColumnsView {
   private async pick(ci: number, item: Item, quiet = false): Promise<void> {
     const col = this.cols[ci];
     col.selectedId = item.id;
+    col.selectedIds = new Set([item.id]);
     this.selectedItem = item;
     const tab = this.tab();
     tab.selection.clear();
@@ -179,6 +211,7 @@ export class ColumnsView {
           dirId: item.id,
           items: [...items].sort((a, b) => a.name.localeCompare(b.name)),
           selectedId: null,
+          selectedIds: new Set(),
         });
       } catch {
         this.cols.push({
@@ -186,19 +219,68 @@ export class ColumnsView {
           dirId: item.id,
           items: [],
           selectedId: null,
+          selectedIds: new Set(),
         });
       }
     }
     this.render();
   }
 
-  private openMenu(x: number, y: number, item: Item): void {
+  /** Ctrl/Cmd+click: toggle a row in the column's multi-selection.
+   * Never navigates — a folder toggled here is selected, not opened
+   * (multi-trash 2). The tab selection mirrors the column's bunch
+   * so every shared reader sees the same truth. */
+  private togglePick(ci: number, item: Item): void {
+    const col = this.cols[ci];
+    if (!col) return;
+    if (col.selectedIds.has(item.id)) col.selectedIds.delete(item.id);
+    else col.selectedIds.add(item.id);
+    col.selectedId = item.id;
+    this.selectedItem = item;
+    const tab = this.tab();
+    tab.selection = new Set(col.selectedIds);
+    this.hooks.onSelect(item);
+    this.render();
+  }
+
+  /** Shift+click: extend the column's selection over the span from
+   * the focus row to the clicked row (union with what stands). */
+  private rangePick(ci: number, item: Item): void {
+    const col = this.cols[ci];
+    if (!col) return;
+    const anchor = col.items.findIndex((i) => i.id === col.selectedId);
+    const idx = col.items.findIndex((i) => i.id === item.id);
+    if (anchor < 0 || idx < 0) {
+      void this.pick(ci, item);
+      return;
+    }
+    const [a, b] = anchor < idx ? [anchor, idx] : [idx, anchor];
+    for (let i = a; i <= b; i++) col.selectedIds.add(col.items[i].id);
+    col.selectedId = item.id;
+    this.selectedItem = item;
+    const tab = this.tab();
+    tab.selection = new Set(col.selectedIds);
+    this.hooks.onSelect(item);
+    this.render();
+  }
+
+  /** The effective selection of the ACTIVE (last) column — what
+   * the shell's Delete key acts on. Falls back to the focus item. */
+  selectionItems(): Item[] {
+    const col = this.cols[this.cols.length - 1];
+    if (!col) return [];
+    const items = col.items.filter((i) => col.selectedIds.has(i.id));
+    if (items.length > 0) return items;
+    return this.selectedItem ? [this.selectedItem] : [];
+  }
+
+  private openMenu(x: number, y: number, item: Item, targets: Item[] = [item]): void {
     void showItemMenu(
       this.ctxMenu,
       x,
       y,
       item,
-      [item],
+      targets,
       this.hooks,
       (i) => this.openWithDialog.open(i),
     );

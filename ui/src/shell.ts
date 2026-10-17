@@ -73,6 +73,7 @@ import {
   goUp,
   makeTab,
   navigate,
+  sortedItems,
   type DirState,
   type Tab,
   type ViewMode,
@@ -1852,12 +1853,24 @@ export class Shell {
 
   // ------------------------------------------------------- file actions
 
-  /** Selection of the active view as a list (multi when available). */
+  /** Selection of the active view as a list (multi when available).
+   * Multi-trash 2 (2026-10-16): gallery and columns used to fall
+   * through to the single focus item here, so Delete in those views
+   * could only ever trash one file no matter what was selected.
+   * Gallery now carries a real multi-selection on the shared tab
+   * model; columns carries one within the active column. */
   private activeSelectionItems(): Item[] {
     const tab = this.activeTab;
     if (!tab) return [];
     if (tab.view === "grid" || tab.view === "list") {
       return this.fileView.selectionItems();
+    }
+    if (tab.view === "gallery") {
+      const items = sortedItems(tab).filter((i) => tab.selection.has(i.id));
+      if (items.length > 0) return items;
+    }
+    if (tab.view === "columns") {
+      return this.columnsView.selectionItems();
     }
     const sel = this.activeSelected();
     return sel ? [sel] : [];

@@ -11,6 +11,7 @@ import { ContextMenu } from "./contextmenu";
 import { OpenWithDialog } from "./openwith";
 import {
   alternativeToUrl,
+  dragState,
   showItemMenu,
   type FileViewHooks,
 } from "./fileview";
@@ -23,6 +24,8 @@ export class GalleryView {
   private stage: HTMLElement;
   private strip: HTMLElement;
   private selectedItem: Item | null = null;
+  /** Shift-range anchor (index into sortedItems) for strip picks. */
+  private anchorIndex = -1;
   private ctxMenu = new ContextMenu();
   private openWithDialog = new OpenWithDialog();
   private renderToken = 0;
@@ -56,6 +59,11 @@ export class GalleryView {
     // Keep the current selection if it survives; else first item.
     if (!this.selectedItem || !items.some((i) => i.id === this.selectedItem!.id)) {
       this.selectedItem = items[0] ?? null;
+    }
+    // The stage item is always part of the shared selection (a fresh
+    // render after navigation starts from the cleared set).
+    if (this.selectedItem && tab.selection.size === 0) {
+      tab.selection.add(this.selectedItem.id);
     }
     this.renderStage(token);
     this.renderStrip(items);
@@ -124,7 +132,8 @@ export class GalleryView {
     this.strip.innerHTML = "";
     for (const item of items) {
       const cell = document.createElement("button");
-      cell.className = "gallery-cell" + (this.selectedItem?.id === item.id ? " selected" : "");
+      cell.className =
+        "gallery-cell" + (this.tab().selection.has(item.id) ? " selected" : "");
       cell.title = item.name;
       const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
       if (IMAGE_EXTS.includes(ext) && item.kind !== "folder") {
@@ -148,13 +157,40 @@ export class GalleryView {
       label.className = "gallery-cell-name";
       label.textContent = item.name;
       cell.appendChild(label);
-      cell.addEventListener("click", () => this.pick(item));
+      cell.addEventListener("click", (e) => this.pick(item, false, e));
       cell.addEventListener("dblclick", () => this.hooks.onOpen(item));
       cell.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        this.pick(item, true);
-        this.openMenu(e.clientX, e.clientY, item);
+        // The menu acts on the effective selection when the clicked
+        // thumbnail belongs to one (multi-trash 2) — the same targets
+        // rule FileView's menu has always used.
+        const tab = this.tab();
+        if (!tab.selection.has(item.id)) this.pick(item, true);
+        const targets =
+          tab.selection.has(item.id) && tab.selection.size > 1
+            ? sortedItems(tab).filter((i) => tab.selection.has(i.id))
+            : [item];
+        this.openMenu(e.clientX, e.clientY, item, targets);
+      });
+      // Drag source, FileView's payload rule: the whole selection
+      // when the grabbed thumbnail belongs to one.
+      cell.draggable = true;
+      cell.addEventListener("dragstart", (e) => {
+        dragState.item = item;
+        const tab = this.tab();
+        dragState.items =
+          tab.selection.has(item.id) && tab.selection.size > 1
+            ? sortedItems(tab).filter((i) => tab.selection.has(i.id))
+            : [item];
+        if (e.dataTransfer) {
+          e.dataTransfer.effectAllowed = "copyMove";
+          e.dataTransfer.setData("text/plain", item.provider_key ?? item.name);
+        }
+      });
+      cell.addEventListener("dragend", () => {
+        dragState.item = null;
+        dragState.items = null;
       });
       this.strip.appendChild(cell);
       if (this.selectedItem?.id === item.id) {
@@ -165,32 +201,69 @@ export class GalleryView {
     }
   }
 
-  private pick(item: Item, quiet = false): void {
-    this.selectedItem = item;
+  /** Pick a thumbnail. The gallery shares the tab selection model
+   * with every other view (multi-trash 2, 2026-10-16 — pick() used
+   * to clear the selection to the one item unconditionally, so no
+   * gesture here could ever act on more than one file): plain click
+   * sole-selects and stages the item, Ctrl/Cmd+click toggles it in
+   * the bunch, Shift+click extends a range from the anchor. The
+   * STAGE follows the picked item whenever it ends up selected. */
+  private pick(item: Item, quiet = false, e?: MouseEvent): void {
     const tab = this.tab();
-    tab.selection.clear();
-    tab.selection.add(item.id);
+    const items = sortedItems(tab);
+    const idx = items.findIndex((i) => i.id === item.id);
+    const toggle = !!(e && (e.ctrlKey || e.metaKey));
+    const range = !!(e && e.shiftKey);
+    if (range && this.anchorIndex >= 0 && idx >= 0) {
+      const [a, b] =
+        this.anchorIndex < idx
+          ? [this.anchorIndex, idx]
+          : [idx, this.anchorIndex];
+      tab.selection = new Set(items.slice(a, b + 1).map((i) => i.id));
+      this.selectedItem = item;
+    } else if (toggle) {
+      if (tab.selection.has(item.id)) tab.selection.delete(item.id);
+      else tab.selection.add(item.id);
+      // The stage item must stay selected — a gallery with nothing
+      // staged has nothing to show.
+      if (tab.selection.size === 0) tab.selection.add(item.id);
+      this.anchorIndex = idx;
+      this.selectedItem = tab.selection.has(item.id)
+        ? item
+        : (items.find((i) => tab.selection.has(i.id)) ?? item);
+    } else {
+      tab.selection = new Set([item.id]);
+      this.anchorIndex = idx;
+      this.selectedItem = item;
+    }
     if (!quiet) this.hooks.onSelect(item);
     const token = ++this.renderToken;
     this.renderStage(token);
-    this.strip.querySelectorAll(".gallery-cell").forEach((c, i) => {
-      const items = sortedItems(this.tab());
-      c.classList.toggle("selected", items[i]?.id === item.id);
-    });
-    const idx = sortedItems(this.tab()).findIndex((i) => i.id === item.id);
-    const cell = this.strip.children[idx];
+    this.syncStripSelection();
+    const stageIdx = items.findIndex((i) => i.id === this.selectedItem?.id);
+    const cell = this.strip.children[stageIdx >= 0 ? stageIdx : idx];
     if (cell) {
       (cell as HTMLElement).scrollIntoView({ block: "nearest", inline: "center", behavior: "smooth" });
     }
   }
 
-  private openMenu(x: number, y: number, item: Item): void {
+  /** Highlight exactly the thumbnails whose ids are in the shared
+   * selection — what you see selected is what the doors will act on. */
+  private syncStripSelection(): void {
+    const tab = this.tab();
+    const items = sortedItems(tab);
+    this.strip.querySelectorAll(".gallery-cell").forEach((c, i) => {
+      c.classList.toggle("selected", !!items[i] && tab.selection.has(items[i].id));
+    });
+  }
+
+  private openMenu(x: number, y: number, item: Item, targets: Item[] = [item]): void {
     void showItemMenu(
       this.ctxMenu,
       x,
       y,
       item,
-      [item],
+      targets,
       this.hooks,
       (i) => this.openWithDialog.open(i),
     );

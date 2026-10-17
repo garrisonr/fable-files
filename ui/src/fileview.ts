@@ -770,6 +770,9 @@ export class FileView {
     }
     const tab = this.tab();
     this.el.dataset.view = tab.view;
+    // A re-render rebuilds every cell: any press state from the old
+    // cell generation is meaningless now.
+    this.pressDeferred = null;
     if (tab.items.length === 0) {
       // Empty states: a folder that failed to load says so plainly
       // (fix block item 4); a folder that is simply empty says that.
@@ -1071,6 +1074,14 @@ export class FileView {
   }
 
   private namePress: { id: string; wasOnly: boolean; t: number } | null = null;
+  /** A plain press on one member of a multi-selection whose collapse
+   * is DEFERRED (multi-trash 2, 2026-10-16): the press may be the
+   * start of a drag, and dragstart builds its payload from the
+   * selection — collapsing here is what reduced every drag to the
+   * grabbed item alone ("Move 1 item to Trash" xN in Dickles'
+   * journal). Finder semantics: the collapse lands only when the
+   * press completes as a plain click; a drag carries the bunch. */
+  private pressDeferred: { id: string; index: number } | null = null;
   private renameTimer: number | null = null;
 
   private bindCell(cell: HTMLElement, item: Item, index: number): void {
@@ -1083,10 +1094,43 @@ export class FileView {
         wasOnly: tab.selection.size === 1 && tab.selection.has(item.id),
         t: Date.now(),
       };
+      if (
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.shiftKey &&
+        tab.selection.size > 1 &&
+        tab.selection.has(item.id)
+      ) {
+        // Press on one member of a standing multi-selection: do NOT
+        // collapse yet (see pressDeferred). The focus/preview still
+        // follows the pressed item; the bunch itself survives until
+        // we learn whether this press is a click or a drag.
+        this.pressDeferred = { id: item.id, index };
+        this.lastSelected = item;
+        // The anchor DOES move at press time (it is not selection):
+        // the old eager collapse re-anchored as a side effect, and a
+        // shift+click following this press must range from here.
+        tab.anchorIndex = index;
+        this.hooks.onSelect(item);
+        this.el.focus({ preventScroll: true });
+        return;
+      }
+      this.pressDeferred = null;
       this.select(item, index, e);
     });
     cell.addEventListener("click", (e) => {
       e.stopPropagation();
+      // Deferred collapse lands here: the press on a multi-selection
+      // member completed as a plain click (no drag intervened), so
+      // the selection now narrows to just this item — the same end
+      // state the old eager collapse produced, arrived at honestly.
+      const pd = this.pressDeferred;
+      this.pressDeferred = null;
+      if (pd && pd.id === item.id) {
+        this.namePress = null;
+        this.select(item, index);
+        return;
+      }
       // Finder-style rename: a deliberate click on the NAME of the item
       // that was already the sole selection when the press began arms
       // an inline rename; a double-click cancels it and opens instead.
@@ -1148,6 +1192,9 @@ export class FileView {
     cell.addEventListener("dragend", () => {
       dragState.item = null;
       dragState.items = null;
+      // A drag intervened: the deferred collapse is cancelled, the
+      // multi-selection stands exactly as it was.
+      this.pressDeferred = null;
       cell.classList.remove("dragging");
     });
   }
@@ -1304,6 +1351,7 @@ export class FileView {
 
   clearSelection(): void {
     const tab = this.tab();
+    this.pressDeferred = null;
     tab.selection.clear();
     tab.anchorIndex = -1;
     this.lastSelected = null;
