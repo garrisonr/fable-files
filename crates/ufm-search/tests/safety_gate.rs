@@ -418,18 +418,24 @@ fn census_is_read_only_for_the_catalog() {
 fn production_candidate_list_drives_the_filter() {
     let candidates = production_candidates();
     // The formats the census found on the real drive.
-    for ext in ["zip", "7z", "sfc", "smc", "nes", "gba", "chd", "iso", "cue", "adf", "z80", "tzx"] {
+    for ext in ["zip", "7z", "sfc", "smc", "nes", "gba", "chd", "iso", "cue", "adf", "z80", "tzx", "gcz"] {
+        assert!(candidates.contains(ext), "{ext} must be a candidate");
+    }
+    // Switch containers nominate too (Hyperbase #2): no DAT exists
+    // for them in the bundled set, so they are checked and honestly
+    // match nothing — visible, never invented identity.
+    for ext in ["nsp", "xci"] {
         assert!(candidates.contains(ext), "{ext} must be a candidate");
     }
     for ext in ["png", "jpg", "mp4", "txt", "xml", "exe", "pak"] {
         assert!(!candidates.contains(ext), "{ext} must NOT be a candidate");
     }
-    // Known upstream gap (SOLUTIONS.md #2, deliberately not fixed
-    // by this build): GameCube .gcz and Wii .rvz are not yet in the
-    // candidate list, so ROM focus cannot admit them today. When
-    // #2 widens the list, this assertion is the tripwire to update
-    // — and the filter widens automatically with the list.
-    assert!(!candidates.contains("gcz"));
+    // Hyperbase #2 (2026-10-17) widened the list as this tripwire
+    // anticipated: GameCube .gcz is a candidate now and identifies
+    // natively (crate::gcz). Wii .rvz remains a known gap — none
+    // were on the census drive and no reader exists yet — so it
+    // stays as the tripwire for that future build.
+    assert!(candidates.contains("gcz"));
     assert!(!candidates.contains("rvz"));
     // Sizing: the RetroBat census's ROM share, reproduced on the
     // replica — candidates are a minority of the tree (artwork

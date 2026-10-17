@@ -12,12 +12,15 @@
 use serde::{Deserialize, Serialize};
 
 pub mod chd;
+pub mod cso;
+pub mod gcz;
 pub mod lrc;
 pub mod musicid;
 pub mod oshash;
 pub mod romdat;
 pub mod romorg;
 pub mod videoid;
+pub mod wbfs;
 
 // ---------------------------------------------------------------------------
 // MediaIdentity — what the classifier decided a file is, with evidence.

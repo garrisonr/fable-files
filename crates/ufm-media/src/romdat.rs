@@ -18,6 +18,16 @@
 //! identifications (TruRip packs regional variants side by side);
 //! `identify_file_all` returns them all, best variant first.
 //!
+//! Compressed disc containers (2026-10-17, Hyperbase #2): GCZ
+//! (GameCube) and CSO (PSP) images identify natively — the readers
+//! in crate::gcz / crate::cso decompress the stream and the whole
+//! image hashes against the DAT exactly like a loose ISO. WBFS
+//! (Wii) is recognized and validated as a container, but its
+//! scrubbed, encrypted payload cannot honestly reconstruct the
+//! full-ISO hashes the Wii DAT carries, so it never yields a DAT
+//! identification; crate::wbfs exposes its embedded disc-header
+//! identity (game ID + title) as header-derived data only.
+//!
 //! Identification is cheap by construction:
 //!   1. extension → plausible systems (table below),
 //!   2. magic gates reject wrong formats before any hashing
@@ -377,6 +387,7 @@ pub fn systems_for_extension(ext: &str) -> &'static [&'static str] {
         ],
         "ccd" => &[],
         "chd" => &[],
+        "gcz" => &[],
         "cia" | "3ds" => &["n3ds"],
         "ciso" => &["gamecube"],
         "col" | "cv" => &["colecovision"],
@@ -435,7 +446,8 @@ pub fn systems_for_extension(ext: &str) -> &'static [&'static str] {
 
 /// Every extension that can nominate a file for identification
 /// (the union of `systems_for_extension` keys, plus the container and
-/// disc-set anchors: "zip", "7z", "rar", "cue", "ccd", "chd", "gdi").
+/// disc-set anchors: "zip", "7z", "rar", "cue", "ccd", "chd", "gdi",
+/// "gcz").
 /// "md" is deliberately NOT here: it nominates Genesis in
 /// `systems_for_extension`, but on a real disk nearly every .md is a
 /// Markdown document — nomination wrote thousands of junk identities
@@ -445,11 +457,11 @@ pub fn candidate_extensions() -> Vec<&'static str> {
     vec![
         "32x", "3ds", "7z", "a26", "a52", "a78", "adf", "atr", "atx", "bin", "ccd", "cdi", "chd",
         "chf", "cia", "ciso", "col", "cpr", "crt", "cso", "cue", "cv", "d64", "dms", "dsk", "fig",
-        "gb", "gba", "gbc", "gc", "gcm", "gdi", "gen", "gg", "img", "int", "iso", "j64", "jag",
-        "lha", "lnx", "mdf", "mx1", "mx2", "n64", "nds", "neo", "nes", "ngc", "ngp", "pbp", "pce",
+        "gb", "gba", "gbc", "gc", "gcm", "gcz", "gdi", "gen", "gg", "img", "int", "iso", "j64", "jag",
+        "lha", "lnx", "mdf", "mx1", "mx2", "n64", "nds", "neo", "nes", "ngc", "ngp", "nsp", "pbp", "pce",
         "pkg", "prg", "rar", "rom", "rpx", "sfc", "sg", "sgb", "smc", "smd", "sms", "sna", "swc",
         "szx", "t64", "tap", "tgc", "tzx", "unh", "v64", "vb", "vboy", "vec", "vpk", "wad", "wbfs",
-        "ws", "wsc", "wua", "wux", "xbe", "xex", "xfd", "xiso", "z64", "z80", "zip",
+        "ws", "wsc", "wua", "wux", "xbe", "xci", "xex", "xfd", "xiso", "z64", "z80", "zip",
     ]
 }
 
@@ -883,6 +895,18 @@ pub fn identify_file_all(
         // per-track spans out of the compressed hunks (see
         // identify_chd_anchor); DAT rows arbitrate as for cue sets.
         "chd" => Ok(identify_chd_anchor(ds, path, file_size)?.into_iter().collect()),
+        // GCZ identifies natively: the reader in crate::gcz
+        // decompresses the block stream and the whole GameCube
+        // image hashes against the DAT (see identify_gcz_anchor).
+        "gcz" => Ok(identify_gcz_anchor(ds, path, file_size)?.into_iter().collect()),
+        // CSO identifies natively: the reader in crate::cso
+        // decompresses the block stream and the whole PSP ISO
+        // hashes against the DAT (see identify_cso_anchor).
+        "cso" => Ok(identify_cso_anchor(ds, path, file_size)?.into_iter().collect()),
+        // WBFS is a recognized Wii container whose payload cannot
+        // honestly yield a DAT identification (see crate::wbfs);
+        // the arm validates the container and yields no match.
+        "wbfs" => Ok(identify_wbfs_container(path)?.into_iter().collect()),
         _ => Ok(identify_loose(ds, path, file_size, &ext)?.into_iter().collect()),
     }
 }
@@ -1646,6 +1670,105 @@ fn identify_chd_anchor(
             )));
         }
     }
+    Ok(None)
+}
+
+/// Identify a GCZ disc image: open it with the native reader,
+/// gate on the GameCube size table and on the inner disc header's
+/// platform magic, then hash the whole decompressed image — the
+/// GameCube DAT model is a full-ISO hash, so the stream is the
+/// span. A GCZ that cannot be parsed, or whose blocks fail their
+/// stored Adler-32, is an honest Err; a parsed GCZ with no
+/// matching row is Ok(None). The header's own title is never used
+/// as identity — the DAT decides that.
+fn identify_gcz_anchor(
+    ds: &RomDataset,
+    path: &Path,
+    file_size: u64,
+) -> Result<Option<Identification>, String> {
+    let mut gcz = crate::gcz::GczFile::open(path).map_err(|e| e.to_string())?;
+    let Some(gc) = ds.sys_index("gamecube") else {
+        return Ok(None);
+    };
+    let disc_size = gcz.disc_size();
+    if !ds.size_known(gc, disc_size) {
+        return Ok(None);
+    }
+    let head = gcz.disc_header().map_err(|e| e.to_string())?;
+    if !head.is_gamecube {
+        return Ok(None);
+    }
+    let (crc, md5, sha1, actual) = gcz.hash_image().map_err(|e| e.to_string())?;
+    if actual != disc_size {
+        return Ok(None);
+    }
+    let (pref, _cd_syses, all) = cd_pref(ds);
+    let hits = ds.lookup(crc, disc_size, Some(&md5), Some(&sha1), &all);
+    if hits.is_empty() {
+        return Ok(None);
+    }
+    let mut pref2: Vec<&str> = vec!["gamecube"];
+    for k in pref.iter() {
+        if *k != "gamecube" {
+            pref2.push(k);
+        }
+    }
+    Ok(Some(resolve_hits(
+        ds,
+        hits,
+        &pref2,
+        crc,
+        md5,
+        sha1,
+        "gcz",
+        file_size,
+    )))
+}
+
+/// Identify a CSO image: open it with the native reader, gate on
+/// the PSP size table against the header's uncompressed size, then
+/// hash the whole decompressed stream — the PSP DAT model is a
+/// full-ISO hash, exactly as for a loose .iso. An unparseable CSO
+/// is an honest Err; a parsed CSO with no matching row is Ok(None).
+fn identify_cso_anchor(
+    ds: &RomDataset,
+    path: &Path,
+    file_size: u64,
+) -> Result<Option<Identification>, String> {
+    let mut cso = crate::cso::CsoFile::open(path).map_err(|e| e.to_string())?;
+    let Some(psp) = ds.sys_index("psp") else {
+        return Ok(None);
+    };
+    let total = cso.total_bytes();
+    if !ds.size_known(psp, total) {
+        return Ok(None);
+    }
+    let (crc, md5, sha1, actual) = cso.hash_image().map_err(|e| e.to_string())?;
+    if actual != total {
+        return Ok(None);
+    }
+    let hits = ds.lookup(crc, total, Some(&md5), Some(&sha1), &[psp]);
+    if hits.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(resolve_hits(
+        ds,
+        hits,
+        &["psp"],
+        crc,
+        md5,
+        sha1,
+        "cso",
+        file_size,
+    )))
+}
+
+/// WBFS: validate the container and its embedded disc-header copy
+/// (crate::wbfs). The payload is scrubbed and encrypted, so no DAT
+/// identification can honestly follow — a structurally valid
+/// container is Ok(None); a broken one is Err.
+fn identify_wbfs_container(path: &Path) -> Result<Option<Identification>, String> {
+    crate::wbfs::disc_header(path).map_err(|e| e.to_string())?;
     Ok(None)
 }
 
@@ -2727,5 +2850,270 @@ mod chd_tests {
         let r = identify_file_all(&ds, &p);
         std::fs::remove_file(&p).ok();
         assert!(r.is_err());
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Hyperbase #2 tests: GCZ / CSO identification anchors + WBFS
+// container honesty, over synthetic files and a one-row dataset.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod discimg_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// One-system, one-row FABLEDAT1 dataset around (crc, size).
+    fn mini_dataset(sys_key: &str, display: &str, crc: u32, size: u64, name: &str) -> RomDataset {
+        let mut sys_blob: Vec<u8> = Vec::new();
+        sys_blob.push(sys_key.len() as u8);
+        sys_blob.extend_from_slice(sys_key.as_bytes());
+        sys_blob.push(display.len() as u8);
+        sys_blob.extend_from_slice(display.as_bytes());
+        let mut names: Vec<u8> = Vec::new();
+        names.extend_from_slice(name.as_bytes());
+        names.push(0);
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"FABLEDAT");
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // systems
+        out.extend_from_slice(&1u32.to_le_bytes()); // rows
+        out.extend_from_slice(&0u32.to_le_bytes()); // md5s
+        out.extend_from_slice(&0u32.to_le_bytes()); // sha1s
+        out.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(sys_blob.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // sets
+        out.extend_from_slice(&0u32.to_le_bytes()); // set roms
+        out.extend_from_slice(&0u32.to_le_bytes()); // shorts len
+        out.extend_from_slice(&sys_blob);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // name off
+        out.extend_from_slice(&NONE32.to_le_bytes());
+        out.extend_from_slice(&NONE32.to_le_bytes());
+        out.push(0); // sys 0
+        out.extend_from_slice(&[0u8; 3]);
+        out.extend_from_slice(&names);
+        RomDataset::load(out).expect("discimg test dataset loads")
+    }
+
+    fn crc_of(bytes: &[u8]) -> u32 {
+        let mut h = crc32fast::Hasher::new();
+        h.update(bytes);
+        h.finalize()
+    }
+
+    fn write_tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    // -- GCZ ------------------------------------------------------
+
+    fn gc_disc() -> Vec<u8> {
+        let mut disc = vec![0u8; 9216]; // 4.5 blocks of 2048
+        for (i, b) in disc.iter_mut().enumerate() {
+            *b = ((i * 31 + 7) % 251) as u8;
+        }
+        disc[0..6].copy_from_slice(b"GTST01");
+        disc[0x1C..0x20].copy_from_slice(&crate::gcz::GC_MAGIC.to_be_bytes());
+        disc[0x20..0x80].fill(0); // real title fields are NUL-padded
+        disc[0x20..0x20 + 9].copy_from_slice(b"Test Disc");
+        disc
+    }
+
+    fn build_gcz(disc: &[u8], block_size: u32) -> Vec<u8> {
+        let num_blocks = (disc.len() as u64).div_ceil(block_size as u64) as usize;
+        let mut pointers = Vec::new();
+        let mut hashes = Vec::new();
+        let mut data: Vec<u8> = Vec::new();
+        for i in 0..num_blocks {
+            let s = i * block_size as usize;
+            let e = ((i + 1) * block_size as usize).min(disc.len());
+            let mut block = disc[s..e].to_vec();
+            block.resize(block_size as usize, 0);
+            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(&block).unwrap();
+            let stored = enc.finish().unwrap();
+            pointers.push(data.len() as u64);
+            hashes.push(crate::gcz::adler32(&stored));
+            data.extend_from_slice(&stored);
+        }
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(&crate::gcz::GCZ_MAGIC.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(disc.len() as u64).to_le_bytes());
+        out.extend_from_slice(&block_size.to_le_bytes());
+        out.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+        for p in &pointers {
+            out.extend_from_slice(&p.to_le_bytes());
+        }
+        for h in &hashes {
+            out.extend_from_slice(&h.to_le_bytes());
+        }
+        out.extend_from_slice(&data);
+        out
+    }
+
+    #[test]
+    fn identify_gcz_dat_hit() {
+        let disc = gc_disc();
+        let ds = mini_dataset("gamecube", "GameCube", crc_of(&disc), disc.len() as u64, "Test Disc (USA)");
+        let p = write_tmp("fable-romdat-test.gcz", &build_gcz(&disc, 2048));
+        let ids = identify_file_all(&ds, &p).expect("identify runs");
+        std::fs::remove_file(&p).ok();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].sys, "gamecube");
+        assert_eq!(ids[0].dat_name, "Test Disc (USA)");
+        assert_eq!(ids[0].container, "gcz");
+        assert_eq!(ids[0].crc, crc_of(&disc));
+    }
+
+    #[test]
+    fn identify_gcz_wrong_crc_no_match() {
+        let disc = gc_disc();
+        let ds = mini_dataset(
+            "gamecube",
+            "GameCube",
+            crc_of(&disc) ^ 1,
+            disc.len() as u64,
+            "Test Disc (USA)",
+        );
+        let p = write_tmp("fable-romdat-test2.gcz", &build_gcz(&disc, 2048));
+        let ids = identify_file_all(&ds, &p).expect("identify runs");
+        std::fs::remove_file(&p).ok();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn identify_gcz_corrupt_is_err_not_silent() {
+        let disc = gc_disc();
+        let ds = mini_dataset("gamecube", "GameCube", crc_of(&disc), disc.len() as u64, "Test Disc (USA)");
+        let mut bytes = build_gcz(&disc, 2048);
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF; // stored-data corruption: Adler must catch it
+        let p = write_tmp("fable-romdat-bad.gcz", &bytes);
+        let r = identify_file_all(&ds, &p);
+        std::fs::remove_file(&p).ok();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn identify_gcz_non_gamecube_disc_no_match() {
+        // Right container, wrong platform magic: a Wii-flavored
+        // stream in a GCZ is not identified as a GameCube game.
+        let mut disc = gc_disc();
+        disc[0x1C..0x20].copy_from_slice(&[0, 0, 0, 0]);
+        disc[0x18..0x1C].copy_from_slice(&0x5D1C9EA3u32.to_be_bytes());
+        let ds = mini_dataset("gamecube", "GameCube", crc_of(&disc), disc.len() as u64, "Test Disc (USA)");
+        let p = write_tmp("fable-romdat-wii.gcz", &build_gcz(&disc, 2048));
+        let ids = identify_file_all(&ds, &p).expect("identify runs");
+        std::fs::remove_file(&p).ok();
+        assert!(ids.is_empty());
+    }
+
+    // -- CSO ------------------------------------------------------
+
+    fn build_cso(iso: &[u8], block_size: u32) -> Vec<u8> {
+        let num_blocks = (iso.len() as u64).div_ceil(block_size as u64) as usize;
+        let data_start = 24u64 + ((num_blocks + 1) * 4) as u64;
+        let mut index: Vec<u32> = Vec::new();
+        let mut data: Vec<u8> = Vec::new();
+        for i in 0..num_blocks {
+            let s = i * block_size as usize;
+            let e = ((i + 1) * block_size as usize).min(iso.len());
+            index.push((data_start + data.len() as u64) as u32);
+            let mut enc =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+            enc.write_all(&iso[s..e]).unwrap();
+            data.extend_from_slice(&enc.finish().unwrap());
+        }
+        index.push((data_start + data.len() as u64) as u32);
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"CISO");
+        out.extend_from_slice(&0u32.to_le_bytes()); // header_size: the wild quirk
+        out.extend_from_slice(&(iso.len() as u64).to_le_bytes());
+        out.extend_from_slice(&block_size.to_le_bytes());
+        out.push(1);
+        out.push(0);
+        out.extend_from_slice(&[0u8; 2]);
+        for e in &index {
+            out.extend_from_slice(&e.to_le_bytes());
+        }
+        out.extend_from_slice(&data);
+        out
+    }
+
+    #[test]
+    fn identify_cso_dat_hit() {
+        let iso = gc_disc(); // arbitrary bytes serve as the ISO payload
+        let ds = mini_dataset("psp", "PSP", crc_of(&iso), iso.len() as u64, "Test UMD (USA)");
+        let p = write_tmp("fable-romdat-test.cso", &build_cso(&iso, 2048));
+        let ids = identify_file_all(&ds, &p).expect("identify runs");
+        std::fs::remove_file(&p).ok();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].sys, "psp");
+        assert_eq!(ids[0].dat_name, "Test UMD (USA)");
+        assert_eq!(ids[0].container, "cso");
+    }
+
+    #[test]
+    fn identify_cso_corrupt_is_err_not_silent() {
+        let ds = mini_dataset("psp", "PSP", 0, 9216, "Test UMD (USA)");
+        let p = write_tmp("fable-romdat-bad.cso", b"CISO-but-not-really-a-cso-image");
+        let r = identify_file_all(&ds, &p);
+        std::fs::remove_file(&p).ok();
+        assert!(r.is_err());
+    }
+
+    // -- WBFS -----------------------------------------------------
+
+    #[test]
+    fn wbfs_valid_container_yields_no_dat_identification() {
+        // The honesty contract: a perfectly valid WBFS (its disc
+        // header parses — proven in crate::wbfs tests) still yields
+        // NO DAT identification, because its payload cannot
+        // reconstruct the full-ISO hashes the Wii DAT carries.
+        let mut bytes = vec![0u8; 4096];
+        bytes[0..4].copy_from_slice(b"WBFS");
+        bytes[4..8].copy_from_slice(&8000u32.to_be_bytes());
+        bytes[8] = 9;
+        bytes[9] = 21;
+        bytes[12] = 1;
+        bytes[512..518].copy_from_slice(b"SF8E01");
+        bytes[512 + 0x18..512 + 0x1C].copy_from_slice(&crate::wbfs::WII_MAGIC.to_be_bytes());
+        bytes[512 + 0x20..512 + 0x20 + 27].copy_from_slice(b"Donkey Kong Country Returns");
+        let ds = mini_dataset("wii", "Wii", 0, 4699979776, "Anything (USA)");
+        let p = write_tmp("fable-romdat-test.wbfs", &bytes);
+        let ids = identify_file_all(&ds, &p).expect("identify runs");
+        std::fs::remove_file(&p).ok();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn wbfs_garbage_is_err_not_silent() {
+        let ds = mini_dataset("wii", "Wii", 0, 4699979776, "Anything (USA)");
+        let p = write_tmp("fable-romdat-bad.wbfs", b"WBFS-but-truncated");
+        let r = identify_file_all(&ds, &p);
+        std::fs::remove_file(&p).ok();
+        assert!(r.is_err());
+    }
+
+    // -- candidate visibility --------------------------------------
+
+    #[test]
+    fn candidate_extensions_cover_hyperbase_containers() {
+        let exts = candidate_extensions();
+        for e in ["gcz", "nsp", "xci"] {
+            assert!(exts.contains(&e), "{e} must nominate candidates");
+        }
+        // Switch has no DAT in the bundled set: nomination must not
+        // come with invented systems.
+        assert!(systems_for_extension("xci").is_empty());
+        assert!(systems_for_extension("nsp").is_empty());
+        assert!(systems_for_extension("gcz").is_empty()); // container arm, like chd
     }
 }
