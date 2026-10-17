@@ -27,6 +27,7 @@
  * Design + full script: ~/workspace/fable-welcome/DESIGN.md.
  */
 import { api } from "./api";
+import type { EmuBiosAddResult, EmuBiosSystem } from "./api";
 import { reducedMotion } from "./motion";
 import { sectionGlyph } from "./sectionicons";
 import { GameAccountsSection } from "./rommedia";
@@ -623,6 +624,11 @@ class AccountStepper {
     private nameEl: HTMLElement,
     private countEl: HTMLElement,
     private pipsEl: HTMLElement,
+    /** Which rendered blocks count as steps. Account sections
+     * render `.rm-source` / `.mr-tmdb` blocks; the BIOS setup
+     * scene renders its own `.w-bios-unit` blocks — same grammar,
+     * different surface (pass 2). */
+    private blockSelector = ".rm-source, .mr-tmdb",
   ) {}
 
   start(): void {
@@ -652,7 +658,7 @@ class AccountStepper {
     const units: HTMLElement[] = [];
     const names: string[] = [];
     for (const m of [...this.stepsEl.children] as HTMLElement[]) {
-      const blocks = m.querySelectorAll<HTMLElement>(".rm-source, .mr-tmdb");
+      const blocks = m.querySelectorAll<HTMLElement>(this.blockSelector);
       if (blocks.length > 0) {
         blocks.forEach((b) => {
           units.push(b);
@@ -727,6 +733,7 @@ function accountsScene(
   intro: string,
   note: string,
   steps: AccountStep[],
+  blockSelector?: string,
 ): SceneDef {
   return {
     ...meta,
@@ -759,7 +766,13 @@ function accountsScene(
       inner.appendChild(card);
       inner.appendChild(el("p", "w-note w-line", note));
       s.appendChild(inner);
-      const stepper = new AccountStepper(stepsEl, nameEl, countEl, pipsEl);
+      const stepper = new AccountStepper(
+        stepsEl,
+        nameEl,
+        countEl,
+        pipsEl,
+        blockSelector,
+      );
       skip.addEventListener("click", () => {
         if (!stepper.next()) {
           // The last card is skipped: the scene's work is done —
@@ -778,6 +791,239 @@ function accountsScene(
 
 const ACCOUNT_NOTE =
   "Anything you save here stays saved — the tour moving on never undoes it. Everything here also lives in Preferences → Metadata Accounts, whenever you're ready.";
+
+// ---------------------------------------------------------------- bios setup
+
+/** The BIOS step (Dickles, 2026-10-17: "The welcum wagon needs to
+ * ask for bios files too. Whatever is needed for set up it needs
+ * to offer to do."). The Games scene states the law — a BIOS is
+ * yours to bring — and this scene is where he brings it: one
+ * system at a time, in the account stepper's grammar, riding the
+ * very commands Preferences → ROMs (Games) & Emulation → System
+ * files uses (`emu_bios_state` / `emu_bios_add`). Fable never
+ * fetches these files; the Add flow files his own copies where
+ * each emulator looks and reports every file plainly — filed
+ * under its proper name, or not filed, with the reason. The tour
+ * is a third door onto that machinery, never a fork of it. */
+
+function biosNeedWord(need: EmuBiosSystem["need"]): string {
+  // Mirrors ufm_emu::BiosNeed::word — the card's own words.
+  return need === "required"
+    ? "Needed to play"
+    : need === "recommended"
+      ? "Recommended"
+      : "Optional";
+}
+
+function biosNeedRank(need: EmuBiosSystem["need"]): number {
+  return need === "required" ? 0 : need === "recommended" ? 1 : 2;
+}
+
+function biosHomeUnit(home: EmuBiosSystem[]): HTMLElement {
+  const unit = el("div", "w-bios-unit");
+  unit.appendChild(el("h4", "w-bios-title", "Already home"));
+  for (const sys of home) {
+    unit.appendChild(el("p", "w-bios-line", `${sys.title} ✓`));
+  }
+  unit.appendChild(
+    el(
+      "p",
+      "w-bios-note",
+      "These systems already have their files — nothing to do for them here.",
+    ),
+  );
+  return unit;
+}
+
+function biosErrorUnit(): HTMLElement {
+  const unit = el("div", "w-bios-unit");
+  unit.appendChild(el("h4", "w-bios-title", "System files"));
+  unit.appendChild(
+    el("p", "w-bios-line", "Fable couldn't check the shelves just now."),
+  );
+  unit.appendChild(
+    el(
+      "p",
+      "w-bios-note",
+      "Nothing is lost: you can add system files any time in Preferences → ROMs (Games) & Emulation → System files.",
+    ),
+  );
+  return unit;
+}
+
+function renderBiosResult(
+  resultEl: HTMLElement,
+  result: EmuBiosAddResult,
+): void {
+  for (const f of result.filed) {
+    resultEl.appendChild(
+      el(
+        "p",
+        "w-bios-filed",
+        f.picked === f.filedAs
+          ? `✓ ${f.filedAs} — filed`
+          : `✓ ${f.picked} — filed as ${f.filedAs}`,
+      ),
+    );
+  }
+  for (const r of result.rejected) {
+    resultEl.appendChild(
+      el("p", "w-bios-rejected", `${r.picked} — ${r.reason}`),
+    );
+  }
+  if (result.system.satisfied && result.filed.length > 0) {
+    resultEl.appendChild(
+      el(
+        "p",
+        "w-bios-filed",
+        "That's everything this system needs — it's ready to play.",
+      ),
+    );
+  } else if (result.filed.length > 0) {
+    const still = result.system.sets.flatMap((s) => s.missing);
+    if (still.length > 0) {
+      resultEl.appendChild(
+        el("p", "w-bios-line", `Still missing: ${still.join(", ")}.`),
+      );
+    }
+  }
+}
+
+function renderBiosUnit(
+  unit: HTMLElement,
+  sys: EmuBiosSystem,
+  result: EmuBiosAddResult | null,
+  addFailed: boolean,
+): void {
+  unit.replaceChildren();
+  const head = el("div", "w-bios-head");
+  head.appendChild(el("h4", "w-bios-title", sys.title));
+  head.appendChild(
+    sys.satisfied
+      ? el("span", "w-bios-ready", "Ready ✓")
+      : el("span", "w-bios-need", biosNeedWord(sys.need)),
+  );
+  unit.appendChild(head);
+  for (const set of sys.sets) {
+    const names = set.names.join(set.all ? ", " : " or ");
+    unit.appendChild(
+      el(
+        "p",
+        "w-bios-line",
+        set.present ? `${set.what}: ${names} ✓` : `${set.what}: ${names}`,
+      ),
+    );
+  }
+  unit.appendChild(el("p", "w-bios-note", sys.note));
+  const missing = sys.sets.flatMap((s) => s.missing);
+  const add = el(
+    "button",
+    "w-btn w-bios-add",
+    sys.satisfied
+      ? "Add files…"
+      : missing.length > 1
+        ? "Add the files…"
+        : "Add the file…",
+  ) as HTMLButtonElement;
+  unit.appendChild(add);
+  const resultEl = el("div", "w-bios-result");
+  unit.appendChild(resultEl);
+  // The home line is fine print: it goes LAST so the action and its
+  // outcome are never the lines a short window folds away.
+  unit.appendChild(el("p", "w-bios-home", `Files live in ${sys.home}`));
+  if (result) renderBiosResult(resultEl, result);
+  if (addFailed) {
+    resultEl.appendChild(
+      el(
+        "p",
+        "w-bios-rejected",
+        "That didn't work, and nothing was filed. You can try again here, or in Preferences → ROMs (Games) & Emulation → System files.",
+      ),
+    );
+  }
+  add.addEventListener("click", () => {
+    void biosAddFlow(unit, sys, add);
+  });
+}
+
+async function biosAddFlow(
+  unit: HTMLElement,
+  sys: EmuBiosSystem,
+  add: HTMLButtonElement,
+): Promise<void> {
+  add.disabled = true;
+  const label = add.textContent;
+  add.textContent = "Choose the file…";
+  // The picker is a native dialog: focus leaves the webview, and
+  // the tour's hold would idle out and advance the scene under
+  // it. Keep touching the hold zone while it is open. (The filing
+  // itself is durable in Rust either way — a scene that moved on
+  // just doesn't repaint, and Preferences tells the same truth.)
+  const zone = unit.closest<HTMLElement>("[data-hold-zone]");
+  const keepAlive =
+    zone !== null
+      ? window.setInterval(() => zone.dispatchEvent(new Event("input")), 4000)
+      : null;
+  try {
+    const result = await api.emuBiosAdd(sys.systemId);
+    if (!unit.isConnected) return;
+    if (result.cancelled) {
+      add.disabled = false;
+      add.textContent = label;
+      return;
+    }
+    renderBiosUnit(unit, result.system, result, false);
+  } catch {
+    if (!unit.isConnected) return;
+    renderBiosUnit(unit, sys, null, true);
+  } finally {
+    if (keepAlive !== null) window.clearInterval(keepAlive);
+  }
+}
+
+function biosUnit(sys: EmuBiosSystem): HTMLElement {
+  const unit = el("div", "w-bios-unit");
+  renderBiosUnit(unit, sys, null, false);
+  return unit;
+}
+
+/** One mount, many steps — the GameAccountsSection shape. Paints
+ * a checking unit at once (paint first, §Y); the state read
+ * replaces it with the real units when it lands. */
+class BiosSetupSection {
+  mount(host: HTMLElement): void {
+    const loading = el("div", "w-bios-unit");
+    loading.appendChild(el("h4", "w-bios-title", "System files"));
+    loading.appendChild(el("p", "w-bios-line", "Checking the shelves…"));
+    host.appendChild(loading);
+    void api
+      .emuBiosState()
+      .then((systems) => {
+        if (!host.isConnected) return;
+        host.replaceChildren();
+        if (systems.length === 0) {
+          host.appendChild(biosErrorUnit());
+          return;
+        }
+        const home = systems.filter((s) => s.satisfied);
+        const missing = systems
+          .map((s, i) => ({ s, i }))
+          .filter(({ s }) => !s.satisfied)
+          .sort(
+            (a, b) =>
+              biosNeedRank(a.s.need) - biosNeedRank(b.s.need) || a.i - b.i,
+          )
+          .map(({ s }) => s);
+        if (home.length > 0) host.appendChild(biosHomeUnit(home));
+        for (const sys of missing) host.appendChild(biosUnit(sys));
+      })
+      .catch(() => {
+        if (!host.isConnected) return;
+        host.replaceChildren();
+        host.appendChild(biosErrorUnit());
+      });
+  }
+}
 
 function buildScenes(): SceneDef[] {
   return [
@@ -884,12 +1130,28 @@ function buildScenes(): SceneDef[] {
         },
       ],
     ),
+    accountsScene(
+      { id: "bios", dwellMs: 20000, interactive: true },
+      "SETUP · SYSTEM FILES",
+      "One thing only you can bring.",
+      "Some consoles won't wake up without a small file from the machine itself — the BIOS. PlayStation, Saturn, Sega CD, PlayStation 2 and their kin keep the door locked without one. Fable fetches emulators, artwork and subtitles on request — but a BIOS it will **never, ever fetch**. Those come from consoles you own. If yours are handy, hand them over now: Fable files each one where its emulator looks, and says plainly when a file isn't one it knows.",
+      "Skipping costs nothing, and anything you file here stays filed. Every system also waits in Preferences → ROMs (Games) & Emulation → System files — and Play will ask again before any game that needs one.",
+      [
+        {
+          name: "System files",
+          mount: (host) => {
+            new BiosSetupSection().mount(host);
+          },
+        },
+      ],
+      ".w-bios-unit",
+    ),
     textScene(
-      { id: "finale", dwellMs: 9400, interactive: false },
+      { id: "finale", dwellMs: 13600, interactive: false },
       "THAT'S THE HOUSE",
       "Welcome home.",
       [
-        "This welcome never nags: it's gone unless you ask for it. If you ever want the tour again, it's waiting in the menu, the About box, and Preferences.",
+        "This welcome never nags: it's gone unless you ask for it. If you ever want the tour again, it's waiting in the menu, the About box, and Preferences. And when you're ready to feed it, add your folders as Locations in the sidebar — Fable takes it from there.",
         "Now — your library.",
       ],
     ),

@@ -4840,6 +4840,65 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 .w-step-skip {
   margin-left: auto;
 }
+/* --- BIOS setup scene (pass 2): one system at a time, the
+   Preferences System-files row in tour dress --- */
+.w-bios-head {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.w-bios-title {
+  font-size: 19px;
+  font-weight: 650;
+  margin: 0 0 8px;
+}
+.w-bios-need {
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--ufm-text-muted);
+}
+.w-bios-ready {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ufm-accent);
+}
+.w-bios-line {
+  font-size: 15px;
+  line-height: 1.55;
+  margin: 0 0 6px;
+  overflow-wrap: anywhere;
+}
+.w-bios-note {
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--ufm-text-muted);
+  margin: 0 0 6px;
+}
+.w-bios-home {
+  font-size: 12.5px;
+  color: var(--ufm-text-muted);
+  margin: 0 0 12px;
+  overflow-wrap: anywhere;
+}
+.w-bios-result {
+  margin-top: 12px;
+}
+.w-bios-result:empty {
+  margin-top: 0;
+}
+.w-bios-filed {
+  font-size: 14px;
+  line-height: 1.55;
+  margin: 0 0 6px;
+  color: var(--ufm-accent);
+}
+.w-bios-rejected {
+  font-size: 14px;
+  line-height: 1.55;
+  margin: 0 0 6px;
+  color: var(--ufm-danger);
+}
 /* --- Chrome: dots, hold chip, exits --- */
 .w-bottom {
   display: flex;
