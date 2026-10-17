@@ -8,6 +8,7 @@ import {
   api,
   formatBytes,
   onEmuFleetChanged,
+  onLocationsChanged,
   type Item,
   type JobOutcome,
   type JobStart,
@@ -854,6 +855,26 @@ export class Shell {
       lastLocRefresh = now;
       void this.refreshLocations();
     });
+    // Mount hot-plug (backend VolumeMonitor watcher): a phone plugged
+    // in or a drive yanked re-lists locations right away — no focus
+    // change, no relaunch. One plug fires several monitor signals, so
+    // coalesce bursts: refresh at most once a second, with a trailing
+    // refresh so the last signal of a burst is never dropped.
+    let locEventTimer: number | undefined;
+    void onLocationsChanged(() => {
+      const now = Date.now();
+      if (now - lastLocRefresh >= 1000) {
+        lastLocRefresh = now;
+        void this.refreshLocations();
+        return;
+      }
+      if (locEventTimer !== undefined) return;
+      locEventTimer = window.setTimeout(() => {
+        locEventTimer = undefined;
+        lastLocRefresh = Date.now();
+        void this.refreshLocations();
+      }, 1000 - (now - lastLocRefresh));
+    });
     // Label splits (Music/Media, Payroll/Money): assignments follow
     // the renamed defs so nothing loses its filing.
     void migrateLabelAssignments(loadLabelDefs(), api).then((did) => {
@@ -867,12 +888,16 @@ export class Shell {
     }
     // Auto volumes are browsable immediately but are NOT walked at
     // boot (a multi-TB USB drive would stall the chain); Re-index
-    // Library still covers them on demand.
+    // Library still covers them on demand. Devices (phones/cameras)
+    // are not walked either — a phone is a guest, never library
+    // memory, and the backend refuses to index one outright.
     void this.indexTracker.boot(
       this.locations
         // Offline network bookmarks aren't registered for browsing —
         // indexing one would just be refused. They index on Connect.
-        .filter((l) => l.provider !== "volume" && l.online)
+        .filter(
+          (l) => l.provider !== "volume" && l.provider !== "device" && l.online,
+        )
         .map((l) => l.id),
     );
   }
@@ -3746,9 +3771,15 @@ export class Shell {
         prov.textContent = "not connected";
       }
       b.append(main, prov);
-      // Removable volumes get an inline eject (Round 7.2), the way
-      // Nautilus renders it — the right-click Unmount stays as well.
-      if (loc.provider === "volume" && loc.removable && loc.path) {
+      // Removable volumes and devices get an inline eject (Round
+      // 7.2), the way Nautilus renders it — the right-click Unmount
+      // stays as well. Devices eject by GIO root URI: udisks (the
+      // volume path) cannot see a GVfs mount.
+      if (
+        (loc.provider === "volume" || loc.provider === "device") &&
+        loc.removable &&
+        loc.path
+      ) {
         const eject = document.createElement("span");
         eject.className = "side-eject";
         eject.textContent = "⏏";
@@ -3760,7 +3791,11 @@ export class Shell {
           e.preventDefault();
           void (async () => {
             try {
-              await api.unmountPath(loc.path!);
+              if (loc.provider === "device" && loc.uri) {
+                await api.unmountDevice(loc.uri);
+              } else {
+                await api.unmountPath(loc.path!);
+              }
               Toast.success(`Ejected ${loc.display_name}.`);
             } catch (err) {
               Toast.error(`Eject failed: ${errText(err)}`);
@@ -3812,6 +3847,37 @@ export class Shell {
             danger: true,
             action: () => void this.forgetServer(loc),
           });
+          this.ctxMenu.open(e.clientX, e.clientY, items);
+          return;
+        }
+        if (loc.provider === "device") {
+          // Devices get their own short menu: the generic disk menu
+          // below drives udisks, which cannot see a GVfs mount.
+          const items: MenuItem[] = [];
+          items.push({
+            label: "Open in New Tab",
+            action: () => {
+              const t = this.newTab(loc);
+              void this.loadDir(t);
+            },
+          });
+          if (loc.uri) {
+            const uri = loc.uri;
+            items.push({
+              label: "Eject",
+              action: () => {
+                void api
+                  .unmountDevice(uri)
+                  .then(async () => {
+                    Toast.success(`Ejected ${loc.display_name}.`);
+                    await this.refreshLocations();
+                  })
+                  .catch((err) =>
+                    Toast.error(`Eject failed: ${errText(err)}`),
+                  );
+              },
+            });
+          }
           this.ctxMenu.open(e.clientX, e.clientY, items);
           return;
         }
@@ -4383,8 +4449,11 @@ export class Shell {
     if (this.locations.length === 0) return;
     Toast.show("Re-indexing the library…", "info");
     // Offline server bookmarks can't be walked — Connect indexes them.
+    // Devices stay out even here: a phone is never library memory.
     void this.indexTracker.reindexAll(
-      this.locations.filter((l) => l.online).map((l) => l.id),
+      this.locations
+        .filter((l) => l.online && l.provider !== "device")
+        .map((l) => l.id),
     );
   }
 

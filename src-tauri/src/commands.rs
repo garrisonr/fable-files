@@ -726,6 +726,7 @@ pub async fn list_locations(
         .await
         .unwrap_or_default();
     merge_network_locations(&state, &live_net);
+    merge_device_locations(&state, &live_net);
 
     Ok(state.locations.lock().unwrap().clone())
 }
@@ -859,6 +860,60 @@ fn merge_network_locations(state: &AppState, live: &[crate::network::LiveMount])
                 );
             }
         }
+    }
+}
+
+pub(crate) fn device_location_id(root_uri: &str) -> LocationId {
+    LocationId(volume_uuid(&format!("device:{root_uri}")))
+}
+
+fn device_root_item(root_uri: &str) -> ItemId {
+    ItemId(volume_uuid(&format!("device-root:{root_uri}")))
+}
+
+/// Merge GVfs-mounted DEVICES (phones over MTP, cameras, iOS) into
+/// the locations list. Runtime rows like volumes — never persisted,
+/// no bookmark, no catalog sighting: a phone is not library memory
+/// and is NEVER indexed. A device is listed because GVfs has it
+/// mounted right now; when the mount vanishes (unplugged, USB mode
+/// flipped) the row is pruned and its browse root unregistered.
+/// Browsing rides the mount's FUSE root through the local provider,
+/// exactly like a connected server's mount.
+fn merge_device_locations(state: &AppState, live: &[crate::network::LiveMount]) {
+    let devices = crate::network::device_mounts(live);
+    let live_ids: std::collections::HashSet<LocationId> = devices
+        .iter()
+        .map(|m| device_location_id(&m.root_uri))
+        .collect();
+    let stale: Vec<LocationId> = state
+        .locations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.provider == "device" && !live_ids.contains(&l.id))
+        .map(|l| l.id)
+        .collect();
+    for id in stale {
+        unregister_browse_root(state, id);
+        state.locations.lock().unwrap().retain(|l| l.id != id);
+    }
+    for m in &devices {
+        let id = device_location_id(&m.root_uri);
+        let root_item = device_root_item(&m.root_uri);
+        register_browse_root(state, id, root_item, &m.fuse_path);
+        upsert_location_summary(
+            state,
+            LocationSummary {
+                id,
+                provider: "device".into(),
+                display_name: m.name.clone(),
+                root_item,
+                path: Some(m.fuse_path.to_string_lossy().into_owned()),
+                removable: true,
+                uri: Some(m.root_uri.clone()),
+                online: true,
+            },
+        );
     }
 }
 
@@ -1032,6 +1087,20 @@ pub async fn net_disconnect(state: State<'_, AppState>, location: LocationId) ->
         .await
         .unwrap_or_default();
     merge_network_locations(&state, &live);
+    Ok(())
+}
+
+/// Eject a DEVICE location (phone/camera): GIO-unmount its mount by
+/// root URI. The udisks-based `unmount_path` cannot see GVfs mounts,
+/// and the server `unmount` refuses non-server URIs — device rows
+/// eject through here. The row itself is pruned by the next
+/// list_locations (or the mount watcher's locations-changed event).
+#[tauri::command]
+pub async fn unmount_device(uri: String) -> Cmd<()> {
+    tauri::async_runtime::spawn_blocking(move || crate::network::unmount_device(&uri))
+        .await
+        .map_err(|e| CommandError::from(UfmError::Internal(format!("device eject task: {e}"))))?
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
     Ok(())
 }
 
@@ -4556,6 +4625,23 @@ pub async fn start_indexing(
     }
     // The slot is claimed; any early error below must release it, or the
     // indexer would read as running forever.
+    // Devices (phones/cameras over GVfs) are browsable guests, never
+    // library memory: their location rows are runtime-only and must
+    // never be walked into the catalog. Refused here, at the
+    // enforcement point, so no caller — boot chain, Re-index Library,
+    // any future surface — can index one by accident.
+    let is_device = state
+        .locations
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.id == location && l.provider == "device");
+    if is_device {
+        state.index_state.lock().unwrap().running = false;
+        return Err(CommandError::from(UfmError::InvalidInput(format!(
+            "device locations are never indexed ({location})"
+        ))));
+    }
     let root = match state.local_roots.lock().unwrap().get(&location).cloned() {
         Some(root) => root,
         None => {

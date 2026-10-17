@@ -343,6 +343,73 @@ pub fn live_mounts() -> Vec<LiveMount> {
     .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// Device mounts — phones (mtp), cameras (gphoto2), iOS (afc). GVfs
+// citizens exactly like servers: a daemon mounts them and they get a
+// FUSE root to browse. They are NOT servers: no bookmark, no
+// credentials, and they never pass through normalize_server_uri (its
+// scheme gate refuses them on purpose). Discovery is "GVfs has it
+// mounted" — the same evidence Nautilus renders.
+// ---------------------------------------------------------------------------
+
+/// GIO schemes that mean "a device on a cable", not a server.
+pub const DEVICE_SCHEMES: &[&str] = &["mtp", "gphoto2", "afc"];
+
+/// The scheme of a GIO root URI ("mtp://[usb:001,007]/" → "mtp").
+/// Pure string work so it is unit-testable without a monitor.
+pub fn uri_scheme(root_uri: &str) -> &str {
+    root_uri.split("://").next().unwrap_or("").trim()
+}
+
+/// True when a live mount is a device mount (phone / camera), as
+/// opposed to a server mount or a drive's FUSE root.
+pub fn is_device_mount(m: &LiveMount) -> bool {
+    DEVICE_SCHEMES.contains(&uri_scheme(&m.root_uri))
+}
+
+/// The device mounts out of a live-mounts snapshot, in monitor order.
+pub fn device_mounts(mounts: &[LiveMount]) -> Vec<LiveMount> {
+    mounts.iter().filter(|m| is_device_mount(m)).cloned().collect()
+}
+
+/// Own a VolumeMonitor for the life of the app on a dedicated thread
+/// and call `on_change` whenever any mount or volume arrives or
+/// leaves — a phone plugged in, a drive yanked, a server mounted by
+/// another app. The locations list otherwise learns about the world
+/// only when list_locations runs (window focus, in-app ops); this is
+/// the hot-plug signal. The thread parks on its own MainLoop with its
+/// own MainContext as thread-default — the same isolation
+/// on_glib_thread uses, made permanent. GObjects never leave the
+/// thread; the callback receives nothing but the news.
+pub fn spawn_mount_watcher<F>(on_change: F)
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    use gio::prelude::*;
+    let on_change = std::sync::Arc::new(on_change);
+    std::thread::spawn(move || {
+        let ctx = glib::MainContext::new();
+        let _guard = ctx.with_thread_default(|| {
+            let monitor = gio::VolumeMonitor::get();
+            let cb = on_change.clone();
+            monitor.connect_mount_added(move |_, _| cb());
+            let cb = on_change.clone();
+            monitor.connect_mount_removed(move |_, _| cb());
+            let cb = on_change.clone();
+            monitor.connect_volume_added(move |_, _| cb());
+            let cb = on_change;
+            monitor.connect_volume_removed(move |_, _| cb());
+            // Populate before the loop: mounts that predate us are
+            // list_locations' business (it snapshots), but the D-Bus
+            // subscription behind the monitor must be warm before
+            // signals can reach us.
+            pump_context(&ctx, std::time::Duration::from_millis(300));
+            let main_loop = glib::MainLoop::new(Some(&ctx), false);
+            main_loop.run();
+        });
+    });
+}
+
 /// Tolerant URI match for mount lookup: case-insensitive scheme/host,
 /// trailing slash ignored, and an exact-userinfo-insensitive compare
 /// (GIO may root an sftp mount at the home dir URI, or drop/add the
@@ -605,6 +672,60 @@ pub fn unmount(uri: &str) -> Result<(), String> {
     }
 }
 
+/// Unmount a DEVICE mount (phone/camera) by its GIO root URI — the
+/// sidebar Eject on a device row. Unlike `unmount` this never passes
+/// through the server-URI normalizer: a device URI is not a server
+/// address and the normalizer would refuse it. The udisks-based
+/// `unmount_path` can't do this job either — a GVfs mount has no
+/// block device. A device that's already gone is a no-op success:
+/// unmounted is the state the user asked for.
+pub fn unmount_device(root_uri: &str) -> Result<(), String> {
+    let target_uri = root_uri.trim_end_matches('/').to_string();
+    if live_mounts()
+        .iter()
+        .all(|m| m.root_uri.trim_end_matches('/') != target_uri)
+    {
+        return Ok(());
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    on_glib_thread(move |ctx| {
+        use gio::prelude::*;
+        // Same thread-affinity rule as unmount(): the GObject lookup
+        // happens HERE, on the glib thread.
+        pump_context(ctx, std::time::Duration::from_millis(300));
+        let monitor = gio::VolumeMonitor::get();
+        let target = monitor.mounts().into_iter().find(|m| {
+            m.root().uri().to_string().trim_end_matches('/') == target_uri
+        });
+        let target = match target {
+            Some(t) => t,
+            None => {
+                let _ = tx.send(Ok(()));
+                return;
+            }
+        };
+        let main_loop = glib::MainLoop::new(Some(ctx), false);
+        let op = gio::MountOperation::new();
+        let loop_quit = main_loop.clone();
+        target.unmount_with_operation(
+            gio::MountUnmountFlags::NONE,
+            Some(&op),
+            None::<&gio::Cancellable>,
+            move |res| {
+                let out = res.map_err(|e| human_gio_error(&e));
+                let _ = tx.send(out);
+                loop_quit.quit();
+            },
+        );
+        main_loop.run();
+    })?;
+    match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("Ejecting timed out — the device may already be gone.".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,5 +880,42 @@ mod live_tests {
                 &std::env::var("FABLE_NET_DAV_PASS").unwrap_or_default(),
             );
         }
+    }
+
+    fn fake_mount(root_uri: &str) -> LiveMount {
+        LiveMount {
+            root_uri: root_uri.to_string(),
+            fuse_path: std::path::PathBuf::from("/run/user/1000/gvfs/x"),
+            name: "fake".to_string(),
+        }
+    }
+
+    #[test]
+    fn device_schemes_classify() {
+        // The acceptance case: an Android phone over MTP.
+        assert!(is_device_mount(&fake_mount("mtp://[usb:001,007]/")));
+        assert_eq!(uri_scheme("mtp://[usb:001,007]/"), "mtp");
+        // Cameras and iOS ride the same mechanism.
+        assert!(is_device_mount(&fake_mount("gphoto2://[usb:001,009]/")));
+        assert!(is_device_mount(&fake_mount("afc://00008110-000123ABCDEF/")));
+        // Servers are not devices, whatever their transport.
+        assert!(!is_device_mount(&fake_mount("sftp://richard@nas.local/")));
+        assert!(!is_device_mount(&fake_mount("smb://nas.local/photos")));
+        assert!(!is_device_mount(&fake_mount("dav://127.0.0.1:8971/dav")));
+        assert_eq!(uri_scheme("not a uri"), "not a uri");
+    }
+
+    #[test]
+    fn device_mounts_filters_a_mixed_snapshot() {
+        let snap = vec![
+            fake_mount("sftp://richard@nas.local/"),
+            fake_mount("mtp://[usb:001,007]/"),
+            fake_mount("gphoto2://[usb:001,009]/"),
+        ];
+        let devs = device_mounts(&snap);
+        assert_eq!(devs.len(), 2);
+        assert!(devs[0].root_uri.starts_with("mtp://"));
+        assert!(devs[1].root_uri.starts_with("gphoto2://"));
+        assert!(device_mounts(&[]).is_empty());
     }
 }

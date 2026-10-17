@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use ufm_catalog::Catalog;
 use ufm_core::{ItemId, JobId, LocationId};
 use ufm_preview::PreviewRegistry;
@@ -518,6 +518,17 @@ pub fn run() {
             // the daily update check — serialized, checkpointed,
             // never blocking the window.
             emu_prep::spawn_prep_and_check(app.handle().clone());
+            // Mount hot-plug: a VolumeMonitor watcher (network.rs)
+            // notices phones/drives/servers arriving or leaving and
+            // tells the shell to re-list locations — plugging in a
+            // phone must not need a window-focus change or a relaunch
+            // to appear in the sidebar.
+            network::spawn_mount_watcher({
+                let handle = app.handle().clone();
+                move || {
+                    let _ = handle.emit("locations-changed", ());
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -703,6 +714,7 @@ pub fn run() {
             commands::remove_path_location,
             commands::net_connect,
             commands::net_disconnect,
+            commands::unmount_device,
             commands::net_forget,
             commands::term_open,
             commands::term_write,

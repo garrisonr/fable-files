@@ -116,10 +116,13 @@ export interface LocationSummary {
    *  volumes carry it so the sidebar can eject by path). Null for a
    *  network server that isn't connected right now. */
   path: string | null;
-  /** Removable media (USB / SD) — the sidebar offers eject. */
+  /** Removable media (USB / SD) and devices (phone/camera) — the
+   *  sidebar offers eject. */
   removable: boolean;
   /** Network Locations: the normalized server URI (provider
-   *  "network" only; never carries a password). */
+   *  "network"); device locations: the GIO root URI, e.g.
+   *  "mtp://[usb:001,007]/" (provider "device"). Never carries a
+   *  password. */
   uri?: string;
   /** False only for a bookmarked network server that isn't
    *  currently connected — it stays listed (Library Memory) with
@@ -951,6 +954,9 @@ export const api = {
   mountIsoPath: (path: string) =>
     invoke<string>("mount_iso_path", { path }),
   unmountPath: (path: string) => invoke<void>("unmount_path", { path }),
+  /** Eject a device location (phone/camera) by its GIO root URI —
+   * the udisks path above cannot see GVfs mounts. */
+  unmountDevice: (uri: string) => invoke<void>("unmount_device", { uri }),
   listBlockDevices: () =>
     invoke<Array<{ path: string; size: string; model: string; removable: boolean; usb: boolean }>>("list_block_devices"),
   buildIso: (paths: string[], destIso: string, volumeLabel: string) =>
@@ -2117,6 +2123,12 @@ export function onEmuInstallProgress(
  * the ROMs-door pill refreshes off this. */
 export function onEmuFleetChanged(cb: () => void): Promise<UnlistenFn> {
   return listen("emu-fleet-changed", () => cb());
+}
+
+/** A mount arrived or left (phone plugged in, drive yanked, a server
+ * mounted by another app) — the locations list is stale. */
+export function onLocationsChanged(cb: () => void): Promise<UnlistenFn> {
+  return listen("locations-changed", () => cb());
 }
 
 /** A Smart List: a saved filter whose rule renders as a sentence. */
