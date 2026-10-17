@@ -5,6 +5,7 @@ members = [
     "crates/ufm-jobs",
     "crates/ufm-catalog",
     "crates/ufm-search",
+    "crates/ufm-sync",
     "crates/ufm-preview",
     "crates/ufm-themes",
     "crates/ufm-plugins",

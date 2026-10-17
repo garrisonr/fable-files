@@ -486,6 +486,59 @@ export async function onPlayerReturn(
   return listen<PlayerState>("player-return", (e) => cb(e.payload));
 }
 
+export interface SyncPair {
+  id: string;
+  name: string;
+  root_a: string;
+  root_b: string;
+}
+
+export interface SyncPairView {
+  pair: SyncPair;
+  aAvailable: boolean;
+  bAvailable: boolean;
+  lastSummary: string | null;
+}
+
+export interface SyncPlanActionView {
+  kind: string;
+  rel: string;
+  line: string;
+}
+
+export interface SyncConflictNote {
+  rel: string;
+  winner: string;
+  loser_kept: string;
+  reason: string;
+}
+
+export interface SyncPlanView {
+  pairId: string;
+  actions: SyncPlanActionView[];
+  conflicts: SyncConflictNote[];
+  skipped: Array<{ side: string; rel: string; reason: string }>;
+  unchanged: number;
+  copiesAToB: number;
+  copiesBToA: number;
+  deletions: number;
+  summary: string;
+}
+
+export interface SyncReport {
+  pair_id: string;
+  pair_name: string;
+  started: string;
+  finished: string | null;
+  copied_a_to_b: string[];
+  copied_b_to_a: string[];
+  deleted_from_a: string[];
+  deleted_from_b: string[];
+  restored: string[];
+  conflicts: SyncConflictNote[];
+  failures: string[];
+}
+
 export const api = {
   listLocations: () => invoke<LocationSummary[]>("list_locations"),
   /** Durable UI prefs (Round 7.2): backend sidecar, survives where
@@ -1085,6 +1138,19 @@ export const api = {
   saveSyncSchedule: (a: string, b: string, direction: string, intervalMin: number) =>
     invoke<SyncSchedule>("save_sync_schedule", { a, b, direction, intervalMin }),
   deleteSyncSchedule: (id: string) => invoke<void>("delete_sync_schedule", { id }),
+  // Folder Sync pairs (two-way, manifest engine)
+  syncListPairs: () =>
+    invoke<SyncPairView[]>("sync_list_pairs"),
+  syncSavePair: (pair: SyncPair) =>
+    invoke<SyncPairView[]>("sync_save_pair", { pair }),
+  syncDeletePair: (id: string) =>
+    invoke<SyncPairView[]>("sync_delete_pair", { id }),
+  syncPlan: (pairId: string) =>
+    invoke<SyncPlanView>("sync_plan", { pairId }),
+  syncStart: (pairId: string) =>
+    invoke<{ jobId: string; alreadyRunning: boolean }>("sync_start", { pairId }),
+  syncLastReport: (pairId: string) =>
+    invoke<SyncReport | null>("sync_last_report", { pairId }),
   openWithApps: (item: string) =>
     invoke<{ mime: string; apps: Array<{ id: string; name: string; icon: string | null }>; default: string | null }>("open_with_apps", { item }),
   openWithApp: (item: string, desktopId: string) =>

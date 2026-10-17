@@ -7,6 +7,7 @@ import { api } from "./api";
 import type { Item } from "./api";
 import { FolderPicker } from "./picker";
 import { Toast, errText} from "./toast";
+import { SyncPairsPanel } from "./syncpairs";
 
 function fmt(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -179,6 +180,7 @@ export class SyncDialog {
   private schedDir!: HTMLSelectElement;
   private schedEvery!: HTMLSelectElement;
   private schedList!: HTMLDivElement;
+  private pairsPanel!: SyncPairsPanel;
   onDone: (() => void) | null = null;
 
   constructor() {
@@ -205,6 +207,12 @@ export class SyncDialog {
       return input;
     };
     dialog.appendChild(title);
+    this.pairsPanel = new SyncPairsPanel(() => ({
+      a: this.aInput.value.trim(),
+      b: this.bInput.value.trim(),
+    }));
+    this.pairsPanel.onSynced = () => this.onDone?.();
+    dialog.appendChild(this.pairsPanel.element);
     this.aInput = mkPathRow("A");
     this.bInput = mkPathRow("B");
     const cmpRow = document.createElement("div");
@@ -282,6 +290,7 @@ export class SyncDialog {
     this.aInput.value = startPath;
     this.element.hidden = false;
     void this.renderSchedules();
+    void this.pairsPanel.refresh();
   }
 
   private async addSchedule(): Promise<void> {

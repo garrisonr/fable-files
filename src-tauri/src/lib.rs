@@ -18,6 +18,7 @@ pub mod musiccomplete;
 pub mod opensubs;
 pub mod rommedia;
 pub mod romorg;
+pub mod sync;
 pub mod emu;
 pub mod emu_esde;
 pub mod emu_farm;
@@ -784,6 +785,12 @@ pub fn run() {
             commands::list_sync_schedules,
             commands::save_sync_schedule,
             commands::delete_sync_schedule,
+            commands::sync_list_pairs,
+            commands::sync_save_pair,
+            commands::sync_delete_pair,
+            commands::sync_plan,
+            commands::sync_start,
+            commands::sync_last_report,
             commands::secure_empty_trash,
             commands::open_with_apps,
             commands::open_with_app,

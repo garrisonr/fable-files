@@ -3383,6 +3383,9 @@ fn run_packed_pass(
             );
             *bytes_done = fx.bytes_done;
             *committed += 1;
+            if let Some(step) = handle.snapshot().steps.get(&step_id).cloned() {
+                sync_follow_step(handle, &step, "done");
+            }
             if force_emit
                 || last_emit.elapsed() >= std::time::Duration::from_millis(150)
             {
@@ -3674,6 +3677,7 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
             );
             blocked_steps.insert(step_id.clone());
             bytes_done = fx.bytes_done;
+            sync_follow_step(&handle, &step, "skipped");
             emit_from_handle(&app, &handle, bytes_done, None, None);
             continue;
         }
@@ -3701,6 +3705,7 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
                     None,
                 );
                 bytes_done = fx.bytes_done;
+                sync_follow_step(&handle, &step, "skipped");
                 emit_from_handle(&app, &handle, bytes_done, None, None);
                 continue;
             }
@@ -3729,6 +3734,7 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
                 );
                 bytes_done = fx.bytes_done;
                 catalog_follow_completed_step(&catalog, &handle, &step);
+                sync_follow_step(&handle, &step, "done");
                 emit_from_handle(&app, &handle, bytes_done, None, None);
             }
             StepOutcome::Skipped => {
@@ -3742,6 +3748,7 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
                     None,
                 );
                 bytes_done = fx.bytes_done;
+                sync_follow_step(&handle, &step, "skipped");
                 emit_from_handle(&app, &handle, bytes_done, None, None);
             }
             StepOutcome::Failed(msg) => {
@@ -3754,6 +3761,7 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
                     ufm_jobs::StepState::Failed,
                     Some(msg.clone()),
                 );
+                sync_follow_step(&handle, &step, "failed");
                 // Record and KEEP GOING (multi-trash fix, 2026-10-16):
                 // one bad item must not strand the rest of a batch —
                 // the remaining independent steps still run, and the
@@ -17113,6 +17121,431 @@ pub async fn delete_sync_schedule(id: String) -> Cmd<()> {
     remove_sync_units(&id);
     sync_autostart(list.len());
     Ok(())
+}
+
+/// Folder Sync manifest hook: forwards a finished step to the sync
+/// engine's sidecar bookkeeping. No-op for non-sync jobs (the hook
+/// checks for a run sidecar keyed by this job's id and finds none).
+fn sync_follow_step(handle: &JobHandle, step: &ufm_jobs::Step, outcome: &str) {
+    let job_id = handle.snapshot().id.to_string();
+    crate::sync::follow_step(&fable_data_dir(), &job_id, &step.id, outcome);
+}
+
+// ---------------------------------------------------------------------------
+// Folder Sync pairs — two-way sync with memory (ufm-sync engine).
+// The plan function IS the preview: sync_start replans
+// deterministically, so what the user saw is what runs. Design:
+// ~/workspace/fable-sync/DESIGN.md.
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn sync_list_pairs() -> Cmd<Vec<crate::sync::PairView>> {
+    let base = fable_data_dir();
+    Ok(crate::sync::load_pairs(&base)
+        .into_iter()
+        .map(|p| crate::sync::pair_view(&base, p))
+        .collect())
+}
+
+#[tauri::command]
+pub fn sync_save_pair(pair: crate::sync::SyncPair) -> Cmd<Vec<crate::sync::PairView>> {
+    let base = fable_data_dir();
+    if pair.root_a.trim().is_empty() || pair.root_b.trim().is_empty() || pair.root_a == pair.root_b {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "pick two different folders".into(),
+        )));
+    }
+    for root in [&pair.root_a, &pair.root_b] {
+        if !Path::new(root).is_dir() {
+            return Err(CommandError::from(UfmError::InvalidInput(format!(
+                "not a folder: {root}"
+            ))));
+        }
+    }
+    let mut pair = pair;
+    if pair.name.trim().is_empty() {
+        pair.name = format!("{} ↔ {}", pair.root_a, pair.root_b);
+    }
+    let mut list = crate::sync::load_pairs(&base);
+    if pair.id.is_empty() {
+        let mut candidate = format!(
+            "pair-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        while list.iter().any(|p| p.id == candidate) {
+            candidate.push('x');
+        }
+        pair.id = candidate;
+        list.push(pair);
+    } else if let Some(existing) = list.iter_mut().find(|p| p.id == pair.id) {
+        *existing = pair;
+    } else {
+        list.push(pair);
+    }
+    crate::sync::save_pairs(&base, &list)
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    Ok(list
+        .into_iter()
+        .map(|p| crate::sync::pair_view(&base, p))
+        .collect())
+}
+
+#[tauri::command]
+pub fn sync_delete_pair(id: String) -> Cmd<Vec<crate::sync::PairView>> {
+    let base = fable_data_dir();
+    let mut list = crate::sync::load_pairs(&base);
+    list.retain(|p| p.id != id);
+    crate::sync::save_pairs(&base, &list)
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    // The pair's memory goes with it — a re-created pair starts honest.
+    let _ = std::fs::remove_file(crate::sync::manifest_path(&base, &id));
+    let _ = std::fs::remove_file(crate::sync::report_path(&base, &id));
+    Ok(list
+        .into_iter()
+        .map(|p| crate::sync::pair_view(&base, p))
+        .collect())
+}
+
+#[tauri::command]
+pub async fn sync_plan(pair_id: String) -> Cmd<crate::sync::SyncPlanView> {
+    let base = fable_data_dir();
+    let view = tauri::async_runtime::spawn_blocking(move || {
+        let pair = crate::sync::pair_by_id(&base, &pair_id)
+            .ok_or_else(|| "unknown sync pair".to_string())?;
+        let manifest = crate::sync::load_manifest(&base, &pair.id)?;
+        let plan = ufm_sync::plan(
+            Path::new(&pair.root_a),
+            Path::new(&pair.root_b),
+            &manifest,
+            crate::sync::stamp_now(),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok::<_, String>(crate::sync::plan_view(&pair, &plan))
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("sync plan task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    Ok(view)
+}
+
+#[tauri::command]
+pub fn sync_last_report(pair_id: String) -> Cmd<Option<ufm_sync::SyncReport>> {
+    Ok(crate::sync::load_report(&fable_data_dir(), &pair_id))
+}
+
+/// Ensure the folder chain for `dst_parent` under `root` exists as
+/// steps; returns the step a dependent must wait on (None = the whole
+/// chain is already on disk). Mirrors build_organize_job's chain walk,
+/// parameterized by root + location for sync's two-sided plans.
+fn sync_ensure_dir(
+    planner: &mut PathPlanner,
+    dir_steps: &mut std::collections::HashMap<PathBuf, Option<String>>,
+    root: &Path,
+    dst_parent: &Path,
+    location: LocationId,
+) -> Option<String> {
+    let mut dep: Option<String> = None;
+    if let Ok(rel_parent) = dst_parent.strip_prefix(root) {
+        let mut cur = root.to_path_buf();
+        for comp in rel_parent.components() {
+            cur = cur.join(comp.as_os_str());
+            if let Some(existing) = dir_steps.get(&cur) {
+                if existing.is_some() {
+                    dep = existing.clone();
+                }
+                continue;
+            }
+            if cur.is_dir() {
+                dir_steps.insert(cur.clone(), None);
+            } else {
+                let parent = cur.parent().unwrap_or(root).to_path_buf();
+                let id = planner.add_step(
+                    format!("create folder {}", cur.display()),
+                    ufm_jobs::StepOp::Mkdir {
+                        parent: job_item(
+                            ItemId::new(),
+                            location,
+                            &parent,
+                            ItemKind::Folder,
+                            None,
+                        ),
+                        name: comp.as_os_str().to_string_lossy().into_owned(),
+                    },
+                    dep.clone().into_iter().collect(),
+                    false,
+                    None,
+                );
+                dir_steps.insert(cur.clone(), Some(id.clone()));
+                dep = Some(id);
+            }
+        }
+    }
+    dep
+}
+
+/// Build the sync job + its manifest-effect sidecar from a plan.
+fn build_sync_job(
+    state: &AppState,
+    pair: &crate::sync::SyncPair,
+    plan: &ufm_sync::Plan,
+) -> Cmd<(ufm_jobs::Job, crate::sync::RunSidecar)> {
+    let root_a = PathBuf::from(&pair.root_a);
+    let root_b = PathBuf::from(&pair.root_b);
+    let loc_a = location_for_path(state, &root_a);
+    let loc_b = location_for_path(state, &root_b);
+    let view = crate::sync::plan_view(pair, plan);
+    let mut planner = PathPlanner {
+        job: ufm_jobs::Job::new(
+            format!("Sync \"{}\" — {}", pair.name, view.summary),
+            ufm_jobs::JobPreview::default(),
+        ),
+        seq: 0,
+        location: loc_a,
+    };
+    let mut effects: std::collections::HashMap<String, crate::sync::StepEffect> =
+        std::collections::HashMap::new();
+    let mut dir_steps: std::collections::HashMap<PathBuf, Option<String>> =
+        std::collections::HashMap::new();
+    dir_steps.insert(root_a.clone(), None);
+    dir_steps.insert(root_b.clone(), None);
+    // rel → the Preserve step the winning Copy must wait behind.
+    let mut preserve_steps: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+
+    for action in &plan.actions {
+        use ufm_sync::PlanAction as PA;
+        // Copy and Restore are the same motion; only the report
+        // bucket differs.
+        let copy_like: Option<(ufm_sync::Side, &String, &'static str)> = match action {
+            PA::Copy { from, rel } => Some((
+                *from,
+                rel,
+                if *from == ufm_sync::Side::A { "a2b" } else { "b2a" },
+            )),
+            PA::Restore { survivor, rel } => Some((*survivor, rel, "restored")),
+            _ => None,
+        };
+        if let Some((from, rel, bucket)) = copy_like {
+            let (src_root, dst_root, src_loc, dst_loc) = if from == ufm_sync::Side::A {
+                (&root_a, &root_b, loc_a, loc_b)
+            } else {
+                (&root_b, &root_a, loc_b, loc_a)
+            };
+            let src_path = src_root.join(rel);
+            let dst_file = dst_root.join(rel);
+            let dst_parent = dst_file
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| dst_root.clone());
+            let mut deps: Vec<String> = Vec::new();
+            if let Some(d) = sync_ensure_dir(
+                &mut planner,
+                &mut dir_steps,
+                dst_root,
+                &dst_parent,
+                dst_loc,
+            ) {
+                deps.push(d);
+            }
+            if let Some(p) = preserve_steps.get(rel) {
+                deps.push(p.clone());
+            }
+            let size = std::fs::metadata(&src_path).map(|m| m.len()).unwrap_or(0);
+            let new_name = Path::new(rel)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let step_id = planner.add_step(
+                format!("sync {rel}"),
+                ufm_jobs::StepOp::Copy {
+                    src: job_item(ItemId::new(), src_loc, &src_path, ItemKind::File, Some(size)),
+                    dst_parent: job_item(
+                        ItemId::new(),
+                        dst_loc,
+                        &dst_parent,
+                        ItemKind::Folder,
+                        None,
+                    ),
+                    new_name,
+                },
+                deps,
+                false,
+                None,
+            );
+            planner.job.preview.files_affected += 1;
+            planner.job.preview.bytes_to_move += size;
+            effects.insert(
+                step_id,
+                crate::sync::StepEffect {
+                    rel: rel.clone(),
+                    kind: crate::sync::EffectKind::SetEntry,
+                    dest_root: Some(dst_root.to_string_lossy().into_owned()),
+                    bucket: bucket.to_string(),
+                },
+            );
+            continue;
+        }
+        match action {
+            PA::Delete { side, rel } => {
+                let (root, loc) = if *side == ufm_sync::Side::A {
+                    (&root_a, loc_a)
+                } else {
+                    (&root_b, loc_b)
+                };
+                let target_path = root.join(rel);
+                let size = std::fs::metadata(&target_path).map(|m| m.len()).unwrap_or(0);
+                let step_id = planner.add_step(
+                    format!("sync delete {rel}"),
+                    ufm_jobs::StepOp::Delete {
+                        target: job_item(
+                            ItemId::new(),
+                            loc,
+                            &target_path,
+                            ItemKind::File,
+                            Some(size),
+                        ),
+                        use_trash: true,
+                    },
+                    vec![],
+                    false,
+                    None,
+                );
+                effects.insert(
+                    step_id,
+                    crate::sync::StepEffect {
+                        rel: rel.clone(),
+                        kind: crate::sync::EffectKind::RemoveEntry,
+                        dest_root: None,
+                        bucket: if *side == ufm_sync::Side::A {
+                            "del_a".into()
+                        } else {
+                            "del_b".into()
+                        },
+                    },
+                );
+            }
+            PA::Preserve { loser, rel } => {
+                let (root, loc) = if *loser == ufm_sync::Side::A {
+                    (&root_a, loc_a)
+                } else {
+                    (&root_b, loc_b)
+                };
+                let src_path = root.join(rel);
+                let dst_file = ufm_sync::preserved_path(root, &plan.stamp, rel);
+                let dst_parent = dst_file
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| root.clone());
+                let mut deps: Vec<String> = Vec::new();
+                if let Some(d) =
+                    sync_ensure_dir(&mut planner, &mut dir_steps, root, &dst_parent, loc)
+                {
+                    deps.push(d);
+                }
+                let size = std::fs::metadata(&src_path).map(|m| m.len()).unwrap_or(0);
+                let new_name = Path::new(rel)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let step_id = planner.add_step(
+                    format!("preserve conflict loser {rel}"),
+                    ufm_jobs::StepOp::Copy {
+                        src: job_item(ItemId::new(), loc, &src_path, ItemKind::File, Some(size)),
+                        dst_parent: job_item(
+                            ItemId::new(),
+                            loc,
+                            &dst_parent,
+                            ItemKind::Folder,
+                            None,
+                        ),
+                        new_name,
+                    },
+                    deps,
+                    false,
+                    None,
+                );
+                preserve_steps.insert(rel.clone(), step_id.clone());
+                effects.insert(
+                    step_id,
+                    crate::sync::StepEffect {
+                        rel: rel.clone(),
+                        kind: crate::sync::EffectKind::PreserveOnly,
+                        dest_root: None,
+                        bucket: "preserve".into(),
+                    },
+                );
+            }
+            PA::Copy { .. } | PA::Restore { .. } => unreachable!("handled above"),
+        }
+    }
+
+    let sidecar = crate::sync::RunSidecar {
+        pair_id: pair.id.clone(),
+        pair_name: pair.name.clone(),
+        root_a: pair.root_a.clone(),
+        root_b: pair.root_b.clone(),
+        plan: plan.clone(),
+        effects,
+        states: std::collections::HashMap::new(),
+        started: chrono::Utc::now().to_rfc3339(),
+    };
+    Ok((planner.job, sidecar))
+}
+
+#[tauri::command]
+pub async fn sync_start(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    pair_id: String,
+) -> Cmd<JobStart> {
+    let base = fable_data_dir();
+    let base_for_plan = base.clone();
+    let (pair, plan) = tauri::async_runtime::spawn_blocking(move || {
+        let pair = crate::sync::pair_by_id(&base_for_plan, &pair_id)
+            .ok_or_else(|| "unknown sync pair".to_string())?;
+        let mut manifest = crate::sync::load_manifest(&base_for_plan, &pair.id)?;
+        let plan = ufm_sync::plan(
+            Path::new(&pair.root_a),
+            Path::new(&pair.root_b),
+            &manifest,
+            crate::sync::stamp_now(),
+        )
+        .map_err(|e| e.to_string())?;
+        // Absorb pass: agreed-state updates describe hash-verified
+        // current disk truth, so they commit before any byte moves.
+        for rel in &plan.base_removals {
+            manifest.remove(rel);
+        }
+        for (rel, fp) in &plan.base_updates {
+            manifest.set(rel, fp.clone());
+        }
+        crate::sync::save_manifest(&base_for_plan, &pair.id, &manifest)?;
+        Ok::<_, String>((pair, plan))
+    })
+    .await
+    .map_err(|e| CommandError::from(UfmError::Internal(format!("sync task failed: {e}"))))?
+    .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?;
+    if plan.actions.is_empty() {
+        return Err(CommandError::from(UfmError::InvalidInput(
+            "already in sync — nothing to do".into(),
+        )));
+    }
+    crate::sync::governor_checkin(&pair.name)
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    let (job, sidecar) = build_sync_job(&state, &pair, &plan)?;
+    let job_id = job.id.to_string();
+    crate::sync::write_sidecar(&base, &job_id, &sidecar)
+        .map_err(|e| CommandError::from(UfmError::Internal(e)))?;
+    let started = start_job(app, &state, job)?;
+    if started.already_running {
+        // The identical run is already in flight under its own
+        // sidecar; ours would never be consumed.
+        let _ = std::fs::remove_file(crate::sync::sidecar_path(&base, &job_id));
+    }
+    Ok(started)
 }
 
 /// Headless scheduled-sync entry point (`fable-files --run-sync <id>`).

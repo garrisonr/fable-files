@@ -25,6 +25,7 @@ ufm-vfs = { path = "../crates/ufm-vfs" }
 ufm-jobs = { path = "../crates/ufm-jobs" }
 ufm-catalog = { path = "../crates/ufm-catalog" }
 ufm-search = { path = "../crates/ufm-search" }
+ufm-sync = { path = "../crates/ufm-sync" }
 ufm-preview = { path = "../crates/ufm-preview" }
 ufm-themes = { path = "../crates/ufm-themes" }
 ufm-plugins = { path = "../crates/ufm-plugins" }
