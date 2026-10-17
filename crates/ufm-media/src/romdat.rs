@@ -365,6 +365,39 @@ impl RomDataset {
             .get(&(sys, short.to_lowercase()))
             .map(|&i| self.set_at(i))
     }
+
+    /// Every DAT row in the dataset, grouped by system index (dataset
+    /// order preserved within each system). One pass over the row
+    /// table — the completeness engine's raw material (Collection
+    /// Completeness, 2026-10-17).
+    pub fn rows_by_system(&self) -> Vec<Vec<RowHit>> {
+        let mut out: Vec<Vec<RowHit>> = (0..self.systems.len()).map(|_| Vec::new()).collect();
+        for i in 0..self.row_count {
+            let (crc, size, name_off, _, _, sys) = self.row_at(i);
+            if let Some(bucket) = out.get_mut(sys as usize) {
+                bucket.push(RowHit {
+                    sys,
+                    name: self.name_at(name_off),
+                    crc,
+                    size,
+                });
+            }
+        }
+        out
+    }
+
+    /// Every set in the dataset, grouped by system index (dataset
+    /// order preserved). Only the MAME-style systems carry sets.
+    pub fn sets_by_system(&self) -> Vec<Vec<SetView>> {
+        let mut out: Vec<Vec<SetView>> = (0..self.systems.len()).map(|_| Vec::new()).collect();
+        for i in 0..self.set_count {
+            let v = self.set_at(i);
+            if let Some(bucket) = out.get_mut(v.sys as usize) {
+                bucket.push(v);
+            }
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------

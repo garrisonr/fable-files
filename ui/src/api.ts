@@ -866,6 +866,20 @@ export const api = {
     invoke<RomGameState>("rom_home_note_play", { providerKey }),
   romHomeState: (providerKey: string) =>
     invoke<RomGameState>("rom_home_state", { providerKey }),
+  romCompleteness: (formatPrefs: Record<string, string>) =>
+    invoke<RomCompleteness>("rom_completeness", { formatPrefs }),
+  romMissingList: (system: string, formatPrefs: Record<string, string>) =>
+    invoke<RomMissingList>("rom_missing_list", { system, formatPrefs }),
+  romCompletenessExport: (
+    scope: string | null,
+    format: string,
+    formatPrefs: Record<string, string>,
+  ) =>
+    invoke<RomExportResult>("rom_completeness_export", {
+      scope,
+      format,
+      formatPrefs,
+    }),
   romHomeSmartLists: () => invoke<RomSmartList[]>("rom_home_smart_lists"),
   romHomeSaveSmartList: (name: string, queryJson: string) =>
     invoke<string>("rom_home_save_smart_list", { name, queryJson }),
@@ -2249,6 +2263,60 @@ export interface BooksIdentifyReport {
 }
 
 /** ROM Home tallies (the sidebar door + the rail health line). */
+
+// ---------------------------------------------------------------------
+// Collection Completeness (2026-10-17): owned-vs-reference scores,
+// the missing-games list, spreadsheet export.
+// ---------------------------------------------------------------------
+
+export interface RomSystemSummary {
+  key: string;
+  display: string;
+  hasReference: boolean;
+  usesSets: boolean;
+  totalGroups: number;
+  ownedGroups: number;
+  missingGroups: number;
+  totalReleases: number;
+  ownedUnmatched: number;
+}
+
+export interface RomCompleteness {
+  systems: RomSystemSummary[];
+  formats: Record<string, string>;
+  formatPrefs: string[];
+  computedMs: number;
+}
+
+export interface RomRefRelease {
+  name: string;
+  region: string | null;
+  crc: number;
+  size: number;
+  setShort: string | null;
+  notes: string;
+}
+
+export interface RomRefGroup {
+  groupKey: string;
+  baseTitle: string;
+  releases: RomRefRelease[];
+}
+
+export interface RomMissingList {
+  key: string;
+  display: string;
+  format: string;
+  groups: RomRefGroup[];
+}
+
+export interface RomExportResult {
+  cancelled: boolean;
+  path: string | null;
+  rows: number;
+  groups: number;
+}
+
 export interface RomHomeCounts {
   total: number;
   missingMedia: number;

@@ -9349,6 +9349,295 @@ pub fn rom_home_counts(
     })
 }
 
+/// ---------------------------------------------------------------------------
+/// Collection Completeness (2026-10-17, Dickles' ruling): per-system
+/// owned-vs-reference scores, the missing-games list, and the
+/// spreadsheet export. The math lives in ufm_media::completeness;
+/// the catalog supplies owned pairs with shelf-identical semantics;
+/// the reference universe is the bundled rom-dats.bin. Nothing here
+/// reads game files — scores come from stored identities and the
+/// DAT universe only.
+/// ---------------------------------------------------------------------------
+
+fn completeness_index(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<std::sync::Arc<ufm_media::completeness::ReferenceIndex>, CommandError> {
+    if let Some(ix) = state.completeness_index.lock().unwrap().clone() {
+        return Ok(ix);
+    }
+    let ds = rom_dataset(app, state)?;
+    let ix = std::sync::Arc::new(ufm_media::completeness::ReferenceIndex::build(&ds));
+    *state.completeness_index.lock().unwrap() = Some(ix.clone());
+    Ok(ix)
+}
+
+/// The wanted-format suggestion for a system: the container he
+/// collects that media class in. Systems the table doesn't know
+/// fall back to his own dominant file extension, then "Any".
+fn curated_wanted_format(sys: &str) -> Option<&'static str> {
+    Some(match sys {
+        "psx" | "ps2" | "dreamcast" | "saturn" | "segacd" | "3do" | "neogeocd" | "pcfx"
+        | "cdi" | "amigacd32" => "CHD",
+        "gamecube" => "GCZ",
+        "psp" => "CSO",
+        "wii" => "WBFS",
+        "wiiu" => "WUX",
+        "ps3" | "xbox" | "xbox360" => "ISO",
+        "arcade" | "neogeo" => "ZIP",
+        "tg16" | "amiga" | "c64" | "zxspectrum" | "msx" => "Any",
+        _ => return None,
+    })
+}
+
+fn completeness_owned(
+    state: &AppState,
+) -> Result<ufm_media::completeness::OwnedGroups, CommandError> {
+    let catalog =
+        ufm_catalog::Catalog::open(&state.catalog_path).map_err(CommandError::from)?;
+    let pairs = catalog
+        .rom_completeness_owned()
+        .map_err(CommandError::from)?;
+    Ok(ufm_media::completeness::owned_group_keys(&pairs))
+}
+
+/// Effective wanted format per dataset system: his saved
+/// preference wins, then the curated container for the media
+/// class, then his own shelves' dominant file extension.
+fn completeness_formats(
+    state: &AppState,
+    index: &ufm_media::completeness::ReferenceIndex,
+    prefs: &std::collections::HashMap<String, String>,
+) -> Result<std::collections::HashMap<String, String>, CommandError> {
+    let catalog =
+        ufm_catalog::Catalog::open(&state.catalog_path).map_err(CommandError::from)?;
+    let census = catalog
+        .rom_completeness_ext_census()
+        .map_err(CommandError::from)?;
+    let mut dominant: std::collections::HashMap<String, (String, i64)> =
+        std::collections::HashMap::new();
+    for (platform, ext, n) in census {
+        let e = dominant
+            .entry(platform)
+            .or_insert_with(|| (ext.clone(), n));
+        if n > e.1 {
+            *e = (ext, n);
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    for sys in &index.systems {
+        let fmt = prefs
+            .get(&sys.key)
+            .filter(|s| !s.trim().is_empty())
+            .cloned()
+            .or_else(|| curated_wanted_format(&sys.key).map(|s| s.to_string()))
+            .or_else(|| dominant.get(&sys.key).map(|(ext, _)| ext.to_uppercase()))
+            .unwrap_or_else(|| "Any".to_string());
+        out.insert(sys.key.clone(), fmt);
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomCompletenessWire {
+    pub systems: Vec<ufm_media::completeness::SystemSummary>,
+    /// The effective wanted format per system (preference >
+    /// curated container > his dominant extension > "Any") — the
+    /// panel displays these and the export writes them.
+    pub formats: std::collections::HashMap<String, String>,
+    /// Systems whose shown format is his saved preference (the
+    /// panel marks the rest as suggestions he can override).
+    pub format_prefs: Vec<String>,
+    pub computed_ms: u64,
+}
+
+#[tauri::command]
+pub async fn rom_completeness(
+    app: tauri::AppHandle,
+    format_prefs: std::collections::HashMap<String, String>,
+) -> Cmd<RomCompletenessWire> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let guard = app.state::<AppState>();
+        let state: &AppState = &guard;
+        let index = completeness_index(&app, state)?;
+        let owned = completeness_owned(state)?;
+        let systems = ufm_media::completeness::summarize(&index, &owned);
+        let formats = completeness_formats(state, &index, &format_prefs)?;
+        let pref_keys: Vec<String> = formats
+            .keys()
+            .filter(|k| {
+                format_prefs
+                    .get(*k)
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        Ok(RomCompletenessWire {
+            systems,
+            formats,
+            format_prefs: pref_keys,
+            computed_ms: started.elapsed().as_millis() as u64,
+        })
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!(
+            "completeness task failed: {e}"
+        )))
+    })?
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomMissingListWire {
+    pub key: String,
+    pub display: String,
+    /// The wanted format in effect for this system.
+    pub format: String,
+    /// Missing title groups, releases attached, in title order.
+    pub groups: Vec<ufm_media::completeness::RefGroup>,
+}
+
+#[tauri::command]
+pub async fn rom_missing_list(
+    app: tauri::AppHandle,
+    system: String,
+    format_prefs: std::collections::HashMap<String, String>,
+) -> Cmd<RomMissingListWire> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let guard = app.state::<AppState>();
+        let state: &AppState = &guard;
+        let index = completeness_index(&app, state)?;
+        let sys = index.system(&system).ok_or_else(|| {
+            CommandError::from(UfmError::NotFound(format!(
+                "no reference set for {system}"
+            )))
+        })?;
+        let display = sys.display.clone();
+        let owned = completeness_owned(state)?;
+        let formats = completeness_formats(state, &index, &format_prefs)?;
+        let format = formats
+            .get(&system)
+            .cloned()
+            .unwrap_or_else(|| "Any".to_string());
+        let groups = ufm_media::completeness::missing_groups(&index, &owned, &system);
+        Ok(RomMissingListWire {
+            key: system,
+            display,
+            format,
+            groups,
+        })
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!(
+            "missing list task failed: {e}"
+        )))
+    })?
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RomExportWire {
+    pub cancelled: bool,
+    pub path: Option<String>,
+    /// Data rows written (one per missing release).
+    pub rows: usize,
+    /// Missing title groups the rows cover.
+    pub groups: usize,
+}
+
+/// Export the missing list as a spreadsheet. The save dialog is
+/// driven from Rust (the house pattern — see emu_bios_add): the
+/// app defines no capability ACL for plugin commands, and the
+/// Rust side is the trusted side of that line.
+/// `scope` = a system key, or None for every scored system.
+#[tauri::command]
+pub async fn rom_completeness_export(
+    app: tauri::AppHandle,
+    scope: Option<String>,
+    format: String,
+    format_prefs: std::collections::HashMap<String, String>,
+) -> Cmd<RomExportWire> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        let guard = app.state::<AppState>();
+        let state: &AppState = &guard;
+        let is_xlsx = format.eq_ignore_ascii_case("xlsx");
+        let ext = if is_xlsx { "xlsx" } else { "csv" };
+        let default_name = match &scope {
+            Some(s) => format!("missing-games-{s}.{ext}"),
+            None => format!("missing-games.{ext}"),
+        };
+        let picked = app
+            .dialog()
+            .file()
+            .set_title("Save the missing-games list")
+            .set_file_name(&default_name)
+            .add_filter("Spreadsheet", &[ext])
+            .blocking_save_file();
+        let Some(file) = picked else {
+            return Ok(RomExportWire {
+                cancelled: true,
+                path: None,
+                rows: 0,
+                groups: 0,
+            });
+        };
+        let path = file
+            .into_path()
+            .map_err(|e| CommandError::from(UfmError::Internal(format!("picked file: {e}"))))?;
+        let index = completeness_index(&app, state)?;
+        let owned = completeness_owned(state)?;
+        let formats = completeness_formats(state, &index, &format_prefs)?;
+        let rows = ufm_media::completeness::export_rows(
+            &index,
+            &owned,
+            scope.as_deref(),
+            &formats,
+        );
+        let groups: usize = {
+            let mut seen = std::collections::HashSet::new();
+            for sys in &index.systems {
+                if scope.as_deref().map(|s| s != sys.key).unwrap_or(false) {
+                    continue;
+                }
+                for g in ufm_media::completeness::missing_groups(&index, &owned, &sys.key) {
+                    seen.insert(g.group_key);
+                }
+            }
+            seen.len()
+        };
+        let mut f = std::fs::File::create(&path).map_err(|e| {
+            CommandError::from(UfmError::Internal(format!(
+                "create {}: {e}",
+                path.display()
+            )))
+        })?;
+        let written = if is_xlsx {
+            ufm_media::completeness::write_xlsx(&rows, &mut f)
+        } else {
+            ufm_media::completeness::write_csv(&rows, &mut f)
+        }
+        .map_err(|e| CommandError::from(UfmError::Internal(format!("write export: {e}"))))?;
+        Ok(RomExportWire {
+            cancelled: false,
+            path: Some(path.to_string_lossy().into_owned()),
+            rows: written,
+            groups,
+        })
+    })
+    .await
+    .map_err(|e| {
+        CommandError::from(UfmError::Internal(format!(
+            "export task failed: {e}"
+        )))
+    })?
+}
+
 #[tauri::command]
 pub fn rom_home_set_rating(
     state: State<'_, AppState>,

@@ -21,6 +21,9 @@ import {
   type RomHomeGame,
   type RomHomeCounts,
   type RomHomeShelfSpec,
+  type RomCompleteness,
+  type RomMissingList,
+  type RomSystemSummary,
   type RomNeedsIdEntry,
   type RomVariantInfo,
   type RomSmartList,
@@ -3414,6 +3417,383 @@ export class RomHome {
     );
   }
 
+  // ------------------------------------------------------------ collection completeness
+
+  /** Saved wanted-format preferences (ui-prefs completenessFormats). */
+  private ccPrefs: Record<string, string> = {};
+  private ccData: RomCompleteness | null = null;
+  private ccMissing: RomMissingList | null = null;
+  private ccView: { kind: "systems" } | { kind: "missing"; key: string } = { kind: "systems" };
+  private ccExpanded = new Set<string>();
+  private ccShowCount = 300;
+  private ccBody: HTMLElement | null = null;
+
+  private ccNum(n: number): string {
+    return n.toLocaleString("en-US");
+  }
+
+  private async ccLoadPrefs(): Promise<Record<string, string>> {
+    const prefs = await api.getUiPrefs().catch(() => ({}) as Record<string, unknown>);
+    const f = (prefs as Record<string, unknown>).completenessFormats;
+    if (f && typeof f === "object" && !Array.isArray(f)) {
+      return { ...(f as Record<string, string>) };
+    }
+    return {};
+  }
+
+  private async ccSaveFormatPref(key: string, fmt: string): Promise<void> {
+    const prefs = await api.getUiPrefs().catch(() => ({}) as Record<string, unknown>);
+    const cur = { ...this.ccPrefs };
+    if (fmt && fmt !== "Any") cur[key] = fmt;
+    else delete cur[key];
+    this.ccPrefs = cur;
+    await api
+      .setUiPrefs({ ...prefs, completenessFormats: cur })
+      .catch(() => undefined);
+  }
+
+  /** The Collection Completeness sheet: what he owns vs everything
+   * there is to own, per system — with the empty systems stated
+   * plainly and the unscored ones never faked. */
+  private openCompleteness(): void {
+    document.querySelector(".rh-cc-backdrop")?.remove();
+    const backdrop = el("div", "rh-cc-backdrop");
+    const sheet = el("div", "rh-cc-sheet");
+    sheet.setAttribute("role", "dialog");
+    sheet.setAttribute("aria-label", "Collection completeness");
+    const head = el("div", "rh-cc-head");
+    const titleWrap = el("div", "rh-cc-titlewrap");
+    titleWrap.append(
+      el("div", "rh-cc-title", "Collection completeness"),
+      el(
+        "div",
+        "rh-cc-sub",
+        "What you own against everything there is to own — counted the same way your shelves count: one game, every version folded in.",
+      ),
+    );
+    const closeBtn = el("button", "icon-btn rh-cc-close", "✕") as HTMLButtonElement;
+    closeBtn.title = "Close";
+    closeBtn.addEventListener("click", () => backdrop.remove());
+    head.append(titleWrap, closeBtn);
+    const body = el("div", "rh-cc-body");
+    body.append(el("div", "rh-cc-loading", "Counting your shelves…"));
+    sheet.append(head, body);
+    backdrop.append(sheet);
+    backdrop.addEventListener("mousedown", (e) => {
+      if (e.target === backdrop) backdrop.remove();
+    });
+    sheet.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        backdrop.remove();
+      }
+    });
+    this.el.appendChild(backdrop);
+    this.ccBody = body;
+    this.ccView = { kind: "systems" };
+    closeBtn.focus();
+    void this.loadCompleteness();
+  }
+
+  private async loadCompleteness(): Promise<void> {
+    this.ccPrefs = await this.ccLoadPrefs();
+    const data = await api.romCompleteness(this.ccPrefs).catch(() => null);
+    if (!this.ccBody || !document.body.contains(this.ccBody)) return;
+    if (!data) {
+      this.ccBody.replaceChildren(
+        el("div", "rh-cc-loading", "Couldn't count just now — the reference data didn't answer. Try again in a moment."),
+      );
+      return;
+    }
+    this.ccData = data;
+    if (this.ccView.kind === "systems") this.renderCcSystems();
+  }
+
+  private ccFormatSelect(s: RomSystemSummary): HTMLSelectElement {
+    const sel = document.createElement("select");
+    sel.className = "rh-cc-format";
+    sel.title = "The format you collect this system in — exports ask for exactly this";
+    const current = this.ccData?.formats[s.key] ?? "Any";
+    const choices = [
+      current,
+      "CHD", "GCZ", "CSO", "WBFS", "RVZ", "ISO", "BIN/CUE", "ZIP", "Any",
+    ].filter((v, i, a) => a.indexOf(v) === i);
+    for (const c of choices) {
+      const opt = document.createElement("option");
+      opt.value = c;
+      opt.textContent = c;
+      if (c === current) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    sel.addEventListener("change", () => {
+      void this.ccSaveFormatPref(s.key, sel.value).then(() => {
+        if (this.ccData) {
+          this.ccData.formats[s.key] = sel.value;
+          if (sel.value !== "Any" && !this.ccData.formatPrefs.includes(s.key)) {
+            this.ccData.formatPrefs.push(s.key);
+          }
+        }
+        Toast.info(
+          sel.value === "Any"
+            ? `${s.display}: format preference cleared.`
+            : `${s.display}: the want list now asks for ${sel.value}.`,
+        );
+        this.renderCcSystems();
+      });
+    });
+    return sel;
+  }
+
+  private ccExportButtons(scope: string | null): HTMLElement {
+    const wrap = el("span", "rh-cc-export");
+    const mk = (label: string, fmt: string) => {
+      const b = el("button", "pill-btn rh-cc-btn", label) as HTMLButtonElement;
+      b.addEventListener("click", () => {
+        void api
+          .romCompletenessExport(scope, fmt, this.ccPrefs)
+          .then((r) => {
+            if (r.cancelled) return;
+            Toast.info(
+              `Saved ${this.ccNum(r.rows)} releases (${this.ccNum(r.groups)} games) to ${r.path ?? "the file you picked"}.`,
+            );
+          })
+          .catch(() => Toast.info("The export didn't land — try again in a moment."));
+      });
+      return b;
+    };
+    wrap.append(mk("CSV", "csv"), mk("XLSX", "xlsx"));
+    return wrap;
+  }
+
+  private renderCcSystems(): void {
+    if (!this.ccBody || !this.ccData) return;
+    const data = this.ccData;
+    const body = this.ccBody;
+    body.replaceChildren();
+    const scored = data.systems.filter((s) => s.hasReference);
+    const collecting = scored
+      .filter((s) => s.ownedGroups > 0)
+      .sort(
+        (a, b) =>
+          b.ownedGroups / b.totalGroups - a.ownedGroups / a.totalGroups ||
+          a.display.localeCompare(b.display),
+      );
+    const notStarted = scored
+      .filter((s) => s.ownedGroups === 0)
+      .sort((a, b) => a.display.localeCompare(b.display));
+
+    const band = (title: string, hint: string) => {
+      const h = el("div", "rh-cc-band");
+      h.append(el("span", "rh-cc-bandtitle", title), el("span", "rh-cc-bandhint", hint));
+      body.append(h);
+    };
+    const rowFor = (s: RomSystemSummary, empty: boolean) => {
+      const row = el("div", "rh-cc-row");
+      const main = el("div", "rh-cc-main");
+      main.append(el("div", "rh-cc-name", s.display));
+      if (empty) {
+        main.append(
+          el(
+            "div",
+            "rh-cc-line rh-cc-blunt",
+            `You don't own a single one of these yet — all ${this.ccNum(s.totalGroups)} games are missing. Here's the list anyway.`,
+          ),
+        );
+      } else {
+        const pct = s.totalGroups > 0 ? (s.ownedGroups / s.totalGroups) * 100 : 0;
+        const bar = el("div", "rh-cc-bar");
+        const fill = el("div", "rh-cc-fill");
+        fill.style.width = `${Math.max(1.5, pct)}%`;
+        bar.append(fill);
+        main.append(bar);
+        main.append(
+          el(
+            "div",
+            "rh-cc-line",
+            `${this.ccNum(s.ownedGroups)} of ${this.ccNum(s.totalGroups)} games · ${pct.toFixed(1)}% · ${this.ccNum(s.missingGroups)} missing · ${this.ccNum(s.totalReleases)} known releases`,
+          ),
+        );
+        if (s.ownedUnmatched > 0) {
+          main.append(
+            el(
+              "div",
+              "rh-cc-line rh-cc-note",
+              `${this.ccNum(s.ownedUnmatched)} owned ${s.ownedUnmatched === 1 ? "game isn't" : "games aren't"} in this reference set — counted on your shelf, not scored here.`,
+            ),
+          );
+        }
+      }
+      row.append(main);
+      const fmtWrap = el("label", "rh-cc-fmtwrap");
+      fmtWrap.append(el("span", "rh-cc-fmtlab", "Want"));
+      fmtWrap.append(this.ccFormatSelect(s));
+      if (!data.formatPrefs.includes(s.key)) {
+        fmtWrap.append(el("span", "rh-cc-sugg", "suggested"));
+      }
+      row.append(fmtWrap);
+      const listBtn = el(
+        "button",
+        "pill-btn primary rh-cc-btn",
+        empty ? "See the list" : "Missing list",
+      ) as HTMLButtonElement;
+      listBtn.addEventListener("click", () => void this.openCcMissing(s.key));
+      row.append(listBtn);
+      row.append(this.ccExportButtons(s.key));
+      body.append(row);
+    };
+
+    if (collecting.length > 0) {
+      band("On your shelves", "the shelf fills as the collection grows");
+      for (const s of collecting) rowFor(s, false);
+    }
+    if (notStarted.length > 0) {
+      band("Not started yet", "no shame in it — that's what the list is for");
+      for (const s of notStarted) rowFor(s, true);
+    }
+
+    // Can't score yet: dataset systems whose reference set is empty,
+    // plus room systems Fable shelves but the dataset doesn't carry.
+    const unscored: Array<{ name: string; note: string }> = [];
+    for (const s of data.systems) {
+      if (!s.hasReference) {
+        unscored.push({
+          name: s.display,
+          note: "The reference set for this system is empty — Fable won't guess what's missing.",
+        });
+      }
+    }
+    const scoredKeys = new Set(data.systems.map((s) => s.key));
+    const scoredNames = new Set(data.systems.map((s) => s.display));
+    for (const rs of this.systems) {
+      const hasPresence = (rs.count ?? 0) > 0;
+      if (!hasPresence) continue;
+      if (rs.key && scoredKeys.has(rs.key)) continue;
+      if (!rs.key && scoredNames.has(rs.name)) continue;
+      unscored.push({
+        name: rs.name,
+        note: "No reference set loaded for this system yet — Fable can't honestly say what's missing.",
+      });
+    }
+    if (unscored.length > 0) {
+      band("Can't score yet", "no reference set, no invented numbers");
+      for (const u of unscored) {
+        const row = el("div", "rh-cc-row rh-cc-unscored");
+        const main = el("div", "rh-cc-main");
+        main.append(el("div", "rh-cc-name", u.name), el("div", "rh-cc-line", u.note));
+        row.append(main);
+        body.append(row);
+      }
+    }
+
+    const foot = el("div", "rh-cc-foot");
+    foot.append(
+      el("span", "rh-cc-footlab", "Take the whole want list hunting:"),
+      this.ccExportButtons(null),
+    );
+    body.append(foot);
+  }
+
+  private async openCcMissing(key: string): Promise<void> {
+    if (!this.ccBody) return;
+    this.ccView = { kind: "missing", key };
+    this.ccShowCount = 300;
+    this.ccExpanded = new Set();
+    this.ccBody.replaceChildren(el("div", "rh-cc-loading", "Fetching the list…"));
+    const list = await api.romMissingList(key, this.ccPrefs).catch(() => null);
+    if (!this.ccBody || !document.body.contains(this.ccBody)) return;
+    if (!list) {
+      this.ccBody.replaceChildren(
+        el("div", "rh-cc-loading", "That list didn't answer — try again in a moment."),
+      );
+      return;
+    }
+    this.ccMissing = list;
+    this.renderCcMissing();
+  }
+
+  private renderCcMissing(): void {
+    if (!this.ccBody || !this.ccMissing) return;
+    const list = this.ccMissing;
+    const body = this.ccBody;
+    body.replaceChildren();
+    const head = el("div", "rh-cc-listhead");
+    const back = el("button", "pill-btn rh-cc-btn", "← All systems") as HTMLButtonElement;
+    back.addEventListener("click", () => {
+      this.ccView = { kind: "systems" };
+      this.renderCcSystems();
+    });
+    const releases = list.groups.reduce((a, g) => a + g.releases.length, 0);
+    head.append(
+      back,
+      el(
+        "div",
+        "rh-cc-listtitle",
+        `${list.display} — ${this.ccNum(list.groups.length)} missing games · ${this.ccNum(releases)} known releases · hunting format: ${list.format}`,
+      ),
+      this.ccExportButtons(list.key),
+    );
+    body.append(head);
+    if (list.groups.length === 0) {
+      body.append(
+        el("div", "rh-cc-loading", "Nothing missing. Every game in the set is on your shelves. Beautiful."),
+      );
+      return;
+    }
+    const shown = list.groups.slice(0, this.ccShowCount);
+    for (const g of shown) {
+      const row = el("div", "rh-cc-group");
+      const regions = [...new Set(g.releases.map((r) => r.region).filter(Boolean))].join(" · ");
+      const titleLine = el("button", "rh-cc-grouptitle") as HTMLButtonElement;
+      titleLine.append(
+        el("span", "rh-cc-gname", g.baseTitle),
+        el(
+          "span",
+          "rh-cc-gmeta",
+          `${g.releases.length} ${g.releases.length === 1 ? "release" : "releases"}${regions ? ` · ${regions}` : ""}`,
+        ),
+        el("span", "rh-cc-chev", this.ccExpanded.has(g.groupKey) ? "▾" : "▸"),
+      );
+      titleLine.addEventListener("click", () => {
+        if (this.ccExpanded.has(g.groupKey)) this.ccExpanded.delete(g.groupKey);
+        else this.ccExpanded.add(g.groupKey);
+        this.renderCcMissing();
+      });
+      row.append(titleLine);
+      if (this.ccExpanded.has(g.groupKey)) {
+        const relWrap = el("div", "rh-cc-releases");
+        for (const r of g.releases) {
+          const rel = el("div", "rh-cc-release");
+          const bits = [
+            r.region ?? "",
+            r.notes,
+            r.size > 0 ? formatBytes(r.size) : "",
+            r.setShort ? `MAME set ${r.setShort}` : r.crc ? `CRC ${r.crc.toString(16).toUpperCase().padStart(8, "0")}` : "",
+          ].filter(Boolean);
+          rel.append(
+            el("span", "rh-cc-rname", r.name),
+            el("span", "rh-cc-rmeta", bits.join(" · ")),
+          );
+          relWrap.append(rel);
+        }
+        row.append(relWrap);
+      }
+      body.append(row);
+    }
+    if (list.groups.length > shown.length) {
+      const more = el(
+        "button",
+        "pill-btn rh-cc-btn rh-cc-more",
+        `Show more (${this.ccNum(list.groups.length - shown.length)} still below)`,
+      ) as HTMLButtonElement;
+      more.addEventListener("click", () => {
+        this.ccShowCount += 500;
+        this.renderCcMissing();
+      });
+      body.append(more);
+    }
+  }
+
+
   private openMoreMenu(anchor: HTMLElement): void {
     const r = anchor.getBoundingClientRect();
     this.ctxMenu.open(r.right - 220, r.bottom + 4, [
@@ -3498,6 +3878,11 @@ export class RomHome {
             })
             .catch(() => Toast.info("Couldn't gather the missing list — try again in a moment."));
         },
+      },
+      { label: "", separator: true, action: () => undefined },
+      {
+        label: "Collection completeness…",
+        action: () => this.openCompleteness(),
       },
     ]);
   }

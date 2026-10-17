@@ -1756,6 +1756,85 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Collection Completeness (2026-10-17): every owned
+    /// (system, DAT title) pair, membership-expanded exactly like
+    /// the shelf scan — primary platform plus the evidence `also`
+    /// list — ROM identities only (PC games have no DAT universe).
+    /// The completeness engine folds these into owned title groups
+    /// with the shelf's own key, so the score can never contradict
+    /// the shelves.
+    pub fn rom_completeness_owned(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT platform, title, match_evidence_json
+                 FROM media_identities
+                 WHERE media_kind = 'rom' AND title IS NOT NULL AND platform IS NOT NULL",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (platform, title, evidence) =
+                row.map_err(|e| UfmError::Database(e.to_string()))?;
+            out.push((platform.clone(), title.clone()));
+            let (also, _) = shelf_evidence(&evidence);
+            for a in also {
+                if a != platform {
+                    out.push((a, title.clone()));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Collection Completeness: file-extension census over the
+    /// DAT-identified ROM items, per platform — the wanted-format
+    /// suggestion source ("you collect SNES as ZIP" is read off his
+    /// own shelves, never assumed). Returns (platform, extension
+    /// with leading dot, lowercased, item count).
+    pub fn rom_completeness_ext_census(&self) -> Result<Vec<(String, String, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT mi.platform, i.provider_key
+                 FROM media_identities AS mi
+                 JOIN items AS i ON i.id = mi.item_id
+                 WHERE mi.media_kind = 'rom' AND mi.title IS NOT NULL
+                   AND mi.platform IS NOT NULL AND i.provider_key IS NOT NULL",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut counts: std::collections::HashMap<(String, String), i64> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let (platform, pk) = row.map_err(|e| UfmError::Database(e.to_string()))?;
+            let name = pk.rsplit('/').next().unwrap_or(&pk);
+            if let Some(dot) = name.rfind('.') {
+                if dot > 0 && dot + 1 < name.len() {
+                    let ext = name[dot..].to_lowercase();
+                    *counts.entry((platform, ext)).or_default() += 1;
+                }
+            }
+        }
+        let mut out: Vec<(String, String, i64)> =
+            counts.into_iter().map(|((p, e), n)| (p, e, n)).collect();
+        out.sort();
+        Ok(out)
+    }
+
     /// Platforms of identified ROMs for a set of items — the Files
     /// banner's truth source (identities first; extension guesses
     /// only as fallback). Returns (item_id, platform) for the items
@@ -11022,6 +11101,97 @@ mod rom_home_tests {
         let counts = cat.rom_home_counts().unwrap();
         assert_eq!(counts.total, 1);
         assert_eq!(counts.per_system, vec![("nes".to_string(), 1, 1)]);
+    }
+
+    /// Collection Completeness real-catalog census (2026-10-17):
+    /// env-gated diagnostic — runs the SHIPPED engine over a copy
+    /// of the real catalog plus the bundled dataset and prints the
+    /// per-system table. Ignored by default so the gate count is
+    /// untouched; the census run executes it explicitly.
+    #[test]
+    #[ignore]
+    fn completeness_real_catalog_census() {
+        let cat_path = std::env::var("CC_CENSUS_CATALOG").expect("CC_CENSUS_CATALOG set");
+        let dat_path = std::env::var("CC_DATASET").expect("CC_DATASET set");
+        let cat = Catalog::open(std::path::Path::new(&cat_path)).unwrap();
+        let bytes = std::fs::read(&dat_path).unwrap();
+        let ds = ufm_media::romdat::RomDataset::load(bytes).unwrap();
+        let index = ufm_media::completeness::ReferenceIndex::build(&ds);
+        let pairs = cat.rom_completeness_owned().unwrap();
+        let owned = ufm_media::completeness::owned_group_keys(&pairs);
+        let summaries = ufm_media::completeness::summarize(&index, &owned);
+        let ext_census = cat.rom_completeness_ext_census().unwrap();
+        println!("CENSUS pairs={} systems={}", pairs.len(), summaries.len());
+        for s in &summaries {
+            println!(
+                "CENSUS {} owned={} total={} missing={} releases={} unmatched={} hasref={}",
+                s.key, s.owned_groups, s.total_groups, s.missing_groups,
+                s.total_releases, s.owned_unmatched, s.has_reference
+            );
+        }
+        for (p, e, n) in &ext_census {
+            println!("CENSUS-EXT {p} {e} {n}");
+        }
+    }
+
+    #[test]
+    fn completeness_owned_pairs_expand_also_and_census_extensions() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        // A MAME set that is also Neo Geo: one identity, two shelves.
+        let it_set = rom_item(&cat, loc, "alph.zip", "/roms/arcade/alph.zip");
+        cat.upsert_media_identity(
+            &it_set.id, "rom", Some("Alpha Fighters (World)"), Some("arcade"), None,
+            r#"{"matched":true,"also":["neogeo"],"crc":0}"#,
+        )
+        .unwrap();
+        let it_nes = rom_item(&cat, loc, "Klax (USA).nes", "/roms/nes/Klax (USA).nes");
+        cat.upsert_media_identity(
+            &it_nes.id, "rom", Some("Klax (USA)"), Some("nes"), None,
+            r#"{"matched":true,"also":[],"crc":111}"#,
+        )
+        .unwrap();
+        let it_zip = rom_item(&cat, loc, "Klax (Japan).zip", "/roms/nes/Klax (Japan).zip");
+        cat.upsert_media_identity(
+            &it_zip.id, "rom", Some("Klax (Japan)"), Some("nes"), None,
+            r#"{"matched":true,"also":[],"crc":222}"#,
+        )
+        .unwrap();
+        // An unmatched candidate (no title/platform) never appears.
+        let it_un = rom_item(&cat, loc, "Mystery.nes", "/roms/nes/Mystery.nes");
+        cat.upsert_media_identity(
+            &it_un.id, "rom", None, None, None, r#"{"matched":false,"also":[]}"#,
+        )
+        .unwrap();
+        // A PC game never appears — it has no DAT universe.
+        let it_pc = rom_item(&cat, loc, "Game", "/pc/Game");
+        cat.upsert_media_identity(
+            &it_pc.id, "pc-game", Some("Some PC Game"), Some("pc"), None, "{}",
+        )
+        .unwrap();
+
+        let mut pairs = cat.rom_completeness_owned().unwrap();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                ("arcade".to_string(), "Alpha Fighters (World)".to_string()),
+                ("neogeo".to_string(), "Alpha Fighters (World)".to_string()),
+                ("nes".to_string(), "Klax (Japan)".to_string()),
+                ("nes".to_string(), "Klax (USA)".to_string()),
+            ]
+        );
+        let mut census = cat.rom_completeness_ext_census().unwrap();
+        census.sort();
+        assert_eq!(
+            census,
+            vec![
+                ("arcade".to_string(), ".zip".to_string(), 1),
+                ("nes".to_string(), ".nes".to_string(), 1),
+                ("nes".to_string(), ".zip".to_string(), 1),
+            ]
+        );
     }
 
     #[test]

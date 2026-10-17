@@ -140,6 +140,10 @@ pub struct AppState {
     /// The bundled ROM DAT dataset (rom-dats.bin), loaded lazily on the
     /// first identification pass and shared thereafter.
     pub rom_dataset: Mutex<Option<std::sync::Arc<ufm_media::romdat::RomDataset>>>,
+    /// Collection Completeness: the reference index folded from
+    /// the ROM dataset (built lazily alongside it, shared after).
+    pub completeness_index:
+        Mutex<Option<std::sync::Arc<ufm_media::completeness::ReferenceIndex>>>,
     /// True while a ROM identification pass is running (identify_roms
     /// is idempotent — concurrent calls report the running pass).
     pub rom_identify_running: std::sync::atomic::AtomicBool,
@@ -258,6 +262,7 @@ impl AppState {
             transcode_cancels: Mutex::new(std::collections::HashMap::new()),
             jobs: Mutex::new(HashMap::new()),
             rom_dataset: Mutex::new(None),
+            completeness_index: Mutex::new(None),
             rom_identify_running: std::sync::atomic::AtomicBool::new(false),
             emu_mounts_seen: Mutex::new(Vec::new()),
             emu_keeper_running: std::sync::atomic::AtomicBool::new(false),
@@ -642,6 +647,9 @@ pub fn run() {
             commands::rom_home_missing_pairs,
             commands::rom_home_genre_facets,
             commands::rom_home_counts,
+            commands::rom_completeness,
+            commands::rom_missing_list,
+            commands::rom_completeness_export,
             commands::rom_home_set_rating,
             commands::rom_home_set_favorite,
             commands::rom_home_set_completed,

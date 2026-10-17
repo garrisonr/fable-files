@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod chd;
+pub mod completeness;
 pub mod cso;
 pub mod esgamelist;
 pub mod gcz;
