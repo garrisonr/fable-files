@@ -13,3 +13,7 @@ chrono.workspace = true
 crc32fast = "1"
 md5 = "0.7"
 sha1 = "0.10"
+# CHD reader (chd): deflate + raw LZMA1 + FLAC, all pure Rust.
+flate2 = "1"
+lzma-rust = "0.1"
+claxon = "0.4"

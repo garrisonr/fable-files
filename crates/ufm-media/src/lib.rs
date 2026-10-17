@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod chd;
 pub mod lrc;
 pub mod musicid;
 pub mod oshash;

@@ -879,9 +879,10 @@ pub fn identify_file_all(
         "cue" => Ok(identify_cue_anchor(ds, path, file_size)?.into_iter().collect()),
         "ccd" => Ok(identify_ccd_anchor(ds, path, file_size)?.into_iter().collect()),
         "gdi" => Ok(identify_gdi_anchor(ds, path, file_size)?.into_iter().collect()),
-        // CHDs are nominated (so they surface as unidentified and can
-        // be counted) but track slicing out of a CHD is not attempted.
-        "chd" => Ok(Vec::new()),
+        // CHDs identify natively: the reader in crate::chd slices
+        // per-track spans out of the compressed hunks (see
+        // identify_chd_anchor); DAT rows arbitrate as for cue sets.
+        "chd" => Ok(identify_chd_anchor(ds, path, file_size)?.into_iter().collect()),
         _ => Ok(identify_loose(ds, path, file_size, &ext)?.into_iter().collect()),
     }
 }
@@ -1569,6 +1570,80 @@ fn identify_gdi_anchor(
         });
         if id.is_some() {
             return Ok(id);
+        }
+    }
+    Ok(None)
+}
+
+/// Identify a CHD disc image: open it with the native reader, then
+/// for each data track try the candidate span models — the raw
+/// 2352-byte sector span (Redump CD model) and, for cooked MODE1
+/// tracks, the 2048-byte user-data span (the PS2 DVD/ISO model) —
+/// each gated on the dataset knowing the span's size somewhere, all
+/// of it arbitrated by the DAT lookup as everywhere else. A CHD that
+/// cannot be parsed or whose needed hunks cannot be decoded is an
+/// honest Err; a parsed CHD with no matching row is Ok(None).
+fn identify_chd_anchor(
+    ds: &RomDataset,
+    path: &Path,
+    file_size: u64,
+) -> Result<Option<Identification>, String> {
+    let mut chd = crate::chd::ChdFile::open(path).map_err(|e| e.to_string())?;
+    if chd.has_parent() {
+        return Err(
+            "chd: delta image \u{2014} requires its parent CHD, not identified".into(),
+        );
+    }
+    let (pref, _cd_syses, all) = cd_pref(ds);
+    // Preference order: the CD systems with PS2 ranked alongside —
+    // most CHDs in the wild are PS2, Dreamcast, or PSX images.
+    let mut pref2: Vec<&str> = Vec::new();
+    for k in pref.iter() {
+        pref2.push(k);
+        if *k == "psx" {
+            pref2.push("ps2");
+        }
+    }
+    if !pref2.contains(&"ps2") {
+        pref2.insert(0, "ps2");
+    }
+    let tracks: Vec<(u32, bool, bool)> = chd
+        .tracks()
+        .iter()
+        .map(|t| (t.frames, t.is_data(), t.is_cooked()))
+        .collect();
+    for (ti, (frames, is_data, cooked)) in tracks.into_iter().enumerate() {
+        if !is_data {
+            continue;
+        }
+        let mut spans: Vec<(u64, crate::chd::SpanKind)> =
+            vec![(frames as u64 * 2352, crate::chd::SpanKind::Raw2352)];
+        if cooked {
+            spans.insert(0, (frames as u64 * 2048, crate::chd::SpanKind::User2048));
+        }
+        for (len, kind) in spans {
+            if !all.iter().any(|&s| ds.size_known(s, len)) {
+                continue;
+            }
+            let (crc, md5, sha1, actual) =
+                chd.hash_track_span(ti, kind).map_err(|e| e.to_string())?;
+            if actual != len {
+                continue;
+            }
+            let hits = ds.lookup(crc, len, Some(&md5), Some(&sha1), &all);
+            if hits.is_empty() {
+                continue;
+            }
+            return Ok(Some(resolve_hits(
+                ds,
+                hits,
+                &pref2,
+                crc,
+                md5,
+                sha1,
+                "chd",
+                file_size,
+            )));
         }
     }
     Ok(None)
@@ -2521,5 +2596,136 @@ mod tests {
             rom_group_key("nes", "Klax (USA)"),
             rom_group_key("genesis", "Klax (USA)")
         );
+    }
+}
+
+#[cfg(test)]
+mod chd_tests {
+    use super::*;
+
+    /// Minimal valid CHD v4: one cooked MODE1 track of 4 frames,
+    /// one stored (type 2) hunk holding the payload.
+    fn build_v4_chd(track_payload: &[u8]) -> Vec<u8> {
+        assert_eq!(track_payload.len(), 9792);
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"MComprHD");
+        out.extend_from_slice(&108u32.to_be_bytes());
+        out.extend_from_slice(&4u32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes()); // flags
+        out.extend_from_slice(&0u32.to_be_bytes()); // compression: none
+        out.extend_from_slice(&1u32.to_be_bytes()); // total hunks
+        out.extend_from_slice(&9792u64.to_be_bytes()); // logical size
+        let metaoffset_pos = out.len();
+        out.extend_from_slice(&0u64.to_be_bytes()); // patched below
+        out.extend_from_slice(&9792u32.to_be_bytes()); // hunkbytes
+        out.extend_from_slice(&[0u8; 60]); // sha1 + parent + raw sha1
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(track_payload);
+        let crcv = crc.finalize();
+        let map_pos = out.len();
+        out.extend_from_slice(&0u64.to_be_bytes()); // offset (patched)
+        out.extend_from_slice(&crcv.to_be_bytes());
+        out.extend_from_slice(&9792u16.to_be_bytes());
+        out.push(0);
+        out.push(2); // stored
+        let meta_off = out.len() as u64;
+        out[metaoffset_pos..metaoffset_pos + 8].copy_from_slice(&meta_off.to_be_bytes());
+        let text = b"TRACK:1 TYPE:MODE1 SUBTYPE:NONE FRAMES:4 PREGAP:0 PGTYPE:MODE1 PGSUB:NONE POSTGAP:0";
+        out.extend_from_slice(b"CHT2");
+        out.extend_from_slice(&(text.len() as u32).to_be_bytes());
+        out.extend_from_slice(&0u64.to_be_bytes());
+        out.extend_from_slice(text);
+        let data_off = out.len() as u64;
+        out[map_pos..map_pos + 8].copy_from_slice(&data_off.to_be_bytes());
+        out.extend_from_slice(track_payload);
+        out
+    }
+
+    /// One-system (ps2), one-row FABLEDAT1 dataset around (crc, size).
+    fn chd_dataset(crc: u32, size: u64, name: &str) -> RomDataset {
+        let mut sys_blob: Vec<u8> = Vec::new();
+        sys_blob.push(3);
+        sys_blob.extend_from_slice(b"ps2");
+        sys_blob.push(13);
+        sys_blob.extend_from_slice(b"PlayStation 2");
+        let mut names: Vec<u8> = Vec::new();
+        names.extend_from_slice(name.as_bytes());
+        names.push(0);
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"FABLEDAT");
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // systems
+        out.extend_from_slice(&1u32.to_le_bytes()); // rows
+        out.extend_from_slice(&0u32.to_le_bytes()); // md5s
+        out.extend_from_slice(&0u32.to_le_bytes()); // sha1s
+        out.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(sys_blob.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // sets
+        out.extend_from_slice(&0u32.to_le_bytes()); // set roms
+        out.extend_from_slice(&0u32.to_le_bytes()); // shorts len
+        out.extend_from_slice(&sys_blob);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // name off
+        out.extend_from_slice(&NONE32.to_le_bytes());
+        out.extend_from_slice(&NONE32.to_le_bytes());
+        out.push(0); // sys 0
+        out.extend_from_slice(&[0u8; 3]);
+        out.extend_from_slice(&names);
+        RomDataset::load(out).expect("chd test dataset loads")
+    }
+
+    fn cooked_crc(payload: &[u8]) -> u32 {
+        let mut h = crc32fast::Hasher::new();
+        for f in 0..4 {
+            h.update(&payload[f * 2448..f * 2448 + 2048]);
+        }
+        h.finalize()
+    }
+
+    #[test]
+    fn identify_chd_cooked_ps2_span() {
+        let mut payload = vec![0u8; 9792];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let crc = cooked_crc(&payload);
+        let ds = chd_dataset(crc, 4 * 2048, "Test Game (USA)");
+        let dir = std::env::temp_dir();
+        let p = dir.join("fable-romdat-test-game.chd");
+        std::fs::write(&p, build_v4_chd(&payload)).unwrap();
+        let ids = identify_file_all(&ds, &p).expect("identify runs");
+        std::fs::remove_file(&p).ok();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].sys, "ps2");
+        assert_eq!(ids[0].dat_name, "Test Game (USA)");
+        assert_eq!(ids[0].container, "chd");
+        assert_eq!(ids[0].crc, crc);
+    }
+
+    #[test]
+    fn identify_chd_wrong_crc_no_match() {
+        let mut payload = vec![0u8; 9792];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let ds = chd_dataset(cooked_crc(&payload) ^ 1, 4 * 2048, "Test Game (USA)");
+        let dir = std::env::temp_dir();
+        let p = dir.join("fable-romdat-test-game2.chd");
+        std::fs::write(&p, build_v4_chd(&payload)).unwrap();
+        let ids = identify_file_all(&ds, &p).expect("identify runs");
+        std::fs::remove_file(&p).ok();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn identify_chd_corrupt_is_err_not_silent() {
+        let ds = chd_dataset(0, 8192, "Test Game (USA)");
+        let dir = std::env::temp_dir();
+        let p = dir.join("fable-romdat-test-bad.chd");
+        std::fs::write(&p, b"MComprHD-but-not-really-a-chd").unwrap();
+        let r = identify_file_all(&ds, &p);
+        std::fs::remove_file(&p).ok();
+        assert!(r.is_err());
     }
 }
