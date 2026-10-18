@@ -1,0 +1,218 @@
+        Info Looking up installed tauri packages to check mismatched versions...
+warning: variable does not need to be mutable
+   --> crates/ufm-media/src/chd.rs:360:9
+    |
+360 |     let mut reader = lzma_rust::LZMAReader::new(
+    |         ----^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/ufm-media/src/musicid.rs:413:9
+    |
+413 |     let mut assign_title = |out: &mut ParsedMusicName, raw: String| {
+    |         ----^^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/ufm-media/src/romdat.rs:2155:9
+     |
+2155 |     let mut push_flag = |v: &mut RomVariant, token: &str| {
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: `ufm-media` (lib) generated 3 warnings (run `cargo fix --lib -p ufm-media` to apply 3 suggestions)
+   Compiling fable-files v0.1.0 (/home/richard/Downloads/fable-files/src-tauri)
+warning: value assigned to `completed_this_run` is never read
+   --> crates/ufm-search/src/indexer.rs:452:13
+    |
+452 |             completed_this_run += 1;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ufm-search` (lib) generated 1 warning
+warning: use of deprecated method `quick_xml::events::attributes::Attribute::<'a>::unescape_value`: use `Self::normalized_value()`
+  --> crates/ufm-emu/src/es.rs:78:49
+   |
+78 | ...                   if let Ok(v) = attr.unescape_value() {
+   |                                           ^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: `ufm-emu` (lib) generated 1 warning
+warning: unused imports: `SeekFrom`, `Seek`, and `Write`
+    --> src-tauri/src/commands.rs:6011:23
+     |
+6011 |         use std::io::{Seek, SeekFrom, Write};
+     |                       ^^^^  ^^^^^^^^  ^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::os::unix::fs::MetadataExt`
+    --> src-tauri/src/commands.rs:6740:13
+     |
+6740 |         use std::os::unix::fs::MetadataExt;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+    --> src-tauri/src/commands.rs:3368:9
+     |
+3368 |     let mut drain = |journal: &mut ufm_jobs::JobJournal,
+     |         ----^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src-tauri/src/commands.rs:3397:9
+     |
+3397 |     let mut send = |bytes: Vec<u8>| block_tx.send(bytes).is_ok();
+     |         ----^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> src-tauri/src/commands.rs:4558:9
+     |
+4558 |     let mut rows: Vec<(Item, f64)> = rows
+     |         ----^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: value assigned to `scanned` is never read
+   --> src-tauri/src/mediacomplete.rs:682:23
+    |
+682 |     let mut scanned = 0u32;
+    |                       ^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `truncated` is never read
+   --> src-tauri/src/mediacomplete.rs:683:25
+    |
+683 |     let mut truncated = false;
+    |                         ^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: value assigned to `verify_note` is never read
+   --> src-tauri/src/mediares.rs:787:43
+    |
+787 |     let mut verify_note: Option<String> = None;
+    |                                           ^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: variable does not need to be mutable
+   --> src-tauri/src/pcgames.rs:360:9
+    |
+360 |     let mut flush = |cur: &mut String, out: &mut HashSet<String>| {
+    |         ----^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: type `MountedVolume` is more private than the item `home_volume`
+    --> src-tauri/src/emu.rs:1757:1
+     |
+1757 | / pub fn home_volume(
+1758 | |     path: &str,
+1759 | |     mounted: &[crate::commands::MountedVolume],
+1760 | |     volumes: &[ufm_catalog::VolumeRecord],
+1761 | | ) -> Option<HomeVolume> {
+     | |_______________________^ function `home_volume` is reachable at visibility `pub`
+     |
+note: but type `MountedVolume` is only usable at visibility `pub(crate)`
+    --> src-tauri/src/commands.rs:88:1
+     |
+  88 | pub(crate) struct MountedVolume {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `MountedVolume` is more private than the item `best_present_copy`
+    --> src-tauri/src/emu.rs:1811:1
+     |
+1811 | / pub fn best_present_copy<'a>(
+1812 | |     group: &'a GameGroup,
+1813 | |     mounted: &[crate::commands::MountedVolume],
+1814 | |     volumes: &[ufm_catalog::VolumeRecord],
+1815 | |     view_root: &Path,
+1816 | | ) -> Option<&'a ufm_catalog::RomHomeGame> {
+     | |_________________________________________^ function `best_present_copy` is reachable at visibility `pub`
+     |
+note: but type `MountedVolume` is only usable at visibility `pub(crate)`
+    --> src-tauri/src/commands.rs:88:1
+     |
+  88 | pub(crate) struct MountedVolume {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `MountedVolume` is more private than the item `run_keeper_with_mounts`
+   --> src-tauri/src/emu_farm.rs:426:1
+    |
+426 | / pub fn run_keeper_with_mounts(
+427 | |     catalog_path: &Path,
+428 | |     data_base: &Path,
+429 | |     mounted: &[crate::commands::MountedVolume],
+430 | | ) -> KeeperReport {
+    | |_________________^ function `run_keeper_with_mounts` is reachable at visibility `pub`
+    |
+note: but type `MountedVolume` is only usable at visibility `pub(crate)`
+   --> src-tauri/src/commands.rs:88:1
+    |
+ 88 | pub(crate) struct MountedVolume {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `settle_cancelled` is never used
+    --> src-tauri/src/commands.rs:4264:4
+     |
+4264 | fn settle_cancelled(handle: &JobHandle, catalog: &ufm_catalog::Catalog) {
+     |    ^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `fs_label` is never read
+   --> src-tauri/src/pcgames.rs:194:5
+    |
+179 | struct PlannedInstall {
+    |        -------------- field in this struct
+...
+194 |     fs_label: Option<String>,
+    |     ^^^^^^^^
+
+warning: calls to `std::mem::drop` with a value that implements `Copy` does nothing
+    --> src-tauri/src/commands.rs:3456:5
+     |
+3456 |     drop(send);
+     |     ^^^^^----^
+     |          |
+     |          argument has type `{closure@src-tauri/src/commands.rs:3397:20: 3397:36}`
+     |
+     = note: `#[warn(dropping_copy_types)]` on by default
+help: use `let _ = ...` to ignore the expression or result
+     |
+3456 -     drop(send);
+3456 +     let _ = send;
+     |
+
+warning: `fable-files` (lib) generated 15 warnings (run `cargo fix --lib -p fable-files` to apply 5 suggestions)
+    Finished `release` profile [optimized] target(s) in 3m 01s
+       Built application at: /home/richard/Downloads/fable-files/target/release/fable-files
+        Info Patching /home/richard/Downloads/fable-files/target/release/fable-files with bundle type information: deb
+    Bundling Fable Files_0.1.0_amd64.deb (/home/richard/Downloads/fable-files/target/release/bundle/deb/Fable Files_0.1.0_amd64.deb)
+        Info Patching /home/richard/Downloads/fable-files/target/release/fable-files with bundle type information: rpm
+    Bundling Fable Files-0.1.0-1.x86_64.rpm (/home/richard/Downloads/fable-files/target/release/bundle/rpm/Fable Files-0.1.0-1.x86_64.rpm)
+        Info Patching /home/richard/Downloads/fable-files/target/release/fable-files with bundle type information: appimage
+    Bundling Fable Files_0.1.0_amd64.AppImage (/home/richard/Downloads/fable-files/target/release/bundle/appimage/Fable Files_0.1.0_amd64.AppImage)
+    Finished 3 bundles at:
+        /home/richard/Downloads/fable-files/target/release/bundle/deb/Fable Files_0.1.0_amd64.deb (19.10 MiB)
+        /home/richard/Downloads/fable-files/target/release/bundle/rpm/Fable Files-0.1.0-1.x86_64.rpm (19.11 MiB)
+        /home/richard/Downloads/fable-files/target/release/bundle/appimage/Fable Files_0.1.0_amd64.AppImage (95.14 MiB)
+
+RELEASE_EXIT=0

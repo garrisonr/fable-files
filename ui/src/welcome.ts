@@ -1034,7 +1034,7 @@ class BiosSetupSection {
 function finaleScene(): SceneDef {
   return {
     id: "finale",
-    dwellMs: 16000,
+    dwellMs: 17500,
     interactive: false,
     build: () => {
       const s = el("section", "w-scene");
@@ -1078,7 +1078,13 @@ function finaleScene(): SceneDef {
         "And when you're ready to feed it, add your folders as **Locations** in the sidebar — Fable takes it from there.",
       );
       inner.appendChild(feed);
-      inner.appendChild(el("p", "w-body w-finale-last w-line", "Now — your library."));
+      const patience = el("p", "w-body w-line");
+      rich(
+        patience,
+        "Start using it the moment this closes. And leave it open when you can \u2014 the longer it runs, the more of your library it indexes, and the smarter it gets. Patience pays.",
+      );
+      inner.appendChild(patience);
+      inner.appendChild(el("p", "w-body w-finale-last w-line", "Now \u2014 your library."));
       s.appendChild(inner);
       return s;
     },
@@ -1243,6 +1249,8 @@ export class WelcomeTour {
   private fillEl: HTMLElement | null = null;
   private chipEl: HTMLElement | null = null;
   private continueBtn: HTMLButtonElement | null = null;
+  private backBtn: HTMLButtonElement | null = null;
+  private fwdBtn: HTMLButtonElement | null = null;
   private soundBtn: HTMLButtonElement | null = null;
   private score: WelcomeScore;
   private steppers: AccountStepper[] = [];
@@ -1311,6 +1319,20 @@ export class WelcomeTour {
     overlay.appendChild(this.stage);
 
     const bottom = el("div", "w-bottom");
+    // Back / Forward (Dickles, 2026-10-17): the tour was a
+    // one-way street — Skip it or sit through it. The arrows
+    // walk the same linear scene list the dots draw.
+    const nav = el("div", "w-nav");
+    this.backBtn = el("button", "w-btn w-nav-btn", "\u25c0") as HTMLButtonElement;
+    this.backBtn.title = "Back — the previous scene";
+    this.backBtn.setAttribute("aria-label", "Back");
+    this.fwdBtn = el("button", "w-btn w-nav-btn", "\u25b6") as HTMLButtonElement;
+    this.fwdBtn.title = "Forward — the next scene";
+    this.fwdBtn.setAttribute("aria-label", "Forward");
+    this.backBtn.addEventListener("click", () => this.prev());
+    this.fwdBtn.addEventListener("click", () => this.next());
+    nav.append(this.backBtn, this.fwdBtn);
+    bottom.appendChild(nav);
     this.dotsEl = el("div", "w-dots");
     for (let i = 0; i < this.scenes.length; i++) {
       this.dotsEl.appendChild(el("span", "w-dot"));
@@ -1452,6 +1474,7 @@ export class WelcomeTour {
     }
     if (this.fillEl) this.fillEl.style.width = "0%";
     this.setChip("");
+    this.refreshNav();
   }
 
   private setChip(text: string): void {
@@ -1496,6 +1519,29 @@ export class WelcomeTour {
       this.fillEl.style.width = `${Math.min(100, (elapsed / scene.dwellMs) * 100)}%`;
     }
     if (elapsed >= scene.dwellMs) this.advance();
+  }
+
+  /** One scene back. Never gated, never undoes durable state:
+   * account saves and BIOS filings stand — the tour is a show,
+   * and walking it backwards changes nothing it filed. */
+  private prev(): void {
+    if (this.done || this.idx <= 0) return;
+    this.startScene(this.idx - 1);
+  }
+
+  /** One scene forward — the same contract as Continue on an
+   * interactive scene (the human is done here; a stale hold
+   * must not re-trap the show). Disabled on the finale, where
+   * the only way out is the ending itself. */
+  private next(): void {
+    if (this.done || this.idx + 1 >= this.scenes.length) return;
+    this.holdDefeated = true;
+    this.advance();
+  }
+
+  private refreshNav(): void {
+    if (this.backBtn) this.backBtn.disabled = this.idx <= 0;
+    if (this.fwdBtn) this.fwdBtn.disabled = this.idx + 1 >= this.scenes.length;
   }
 
   private advance(): void {
@@ -1553,16 +1599,24 @@ export class WelcomeTour {
             n.style.opacity = "0";
             n.style.transform = "translateY(-6px)";
           });
-        overlay.style.transitionDuration = "1500ms";
-        overlay.style.transitionDelay = "400ms";
+        // The dissolve is a CSS animation on .finale-bye
+        // (Dickles, 2026-10-17: "the fade out when it ends seems
+        // to be missing"): compositor-driven, so it plays even
+        // when the webview throttles JS timers in a covered or
+        // background window — the timeout below is only the
+        // cleanup crew, never the fade's clock.
+        overlay.style.transition = "none";
         fadeMs = 400 + 1500;
       } else if (reason === "finished") {
         // Reduced motion: a plain opacity dissolve, nothing moves.
         overlay.style.transitionDuration = "600ms";
         fadeMs = 600;
       } else {
-        overlay.style.transitionDuration = "180ms";
-        fadeMs = 200;
+        // Skip / Esc end the show at once, but they still FADE
+        // (same 2026-10-17 note): a cut reads as a crash, a fade
+        // reads as a goodbye.
+        overlay.style.transitionDuration = "450ms";
+        fadeMs = 480;
       }
       const kill = (): void => overlay.remove();
       // Removal is cosmetic from here (.bye already released the

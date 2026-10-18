@@ -5017,6 +5017,66 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
   color: var(--ufm-text-muted);
   margin: 18px 0 8px;
 }
+/* --- OpenSubtitles / account-panel rhythm (Dickles, 2026-10-17:
+   the wagon's OpenSubtitles step read cramped and uneven) ---
+   The global reset leaves bare paragraphs marginless and the
+   credential rows carried no spacing at all. One rhythm for every
+   .mr-tmdb account block, in the tour card and Preferences alike:
+   paragraphs breathe, rows align on the shared control height,
+   the check row gets its own air. */
+.mr-tmdb p {
+  margin: 0 0 0.55rem;
+}
+.mr-tmdb .mr-status {
+  display: block;
+  margin: 0 0 0.2rem;
+}
+.mr-keyrow {
+  margin-top: 0.5rem;
+  flex-wrap: nowrap;
+}
+.mr-keyrow .pill-btn {
+  flex: 0 0 auto;
+  height: var(--ufm-control-h, 2rem);
+  padding-top: 0;
+  padding-bottom: 0;
+  display: inline-flex;
+  align-items: center;
+}
+.mr-keyrow .mr-status {
+  display: inline;
+  margin: 0;
+}
+.w-card .mr-tmdb .mc-h {
+  margin-top: 0;
+}
+/* --- Tour Back / Forward (Dickles, 2026-10-17) --- */
+.w-nav {
+  display: flex;
+  gap: 8px;
+}
+.w-nav-btn {
+  min-width: 2.4rem;
+}
+.w-btn:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+.w-btn:disabled:active {
+  transform: none;
+}
+/* --- The natural finish, as an animation (see welcome.ts) --- */
+@keyframes w-finale-out {
+  to {
+    opacity: 0;
+  }
+}
+.welcome-overlay.finale-bye {
+  animation: w-finale-out 1500ms ease 400ms both;
+}
+.welcome-overlay.reduced.finale-bye {
+  animation: none;
+}
 /* --- Chrome: dots, hold chip, exits --- */
 .w-bottom {
   display: flex;
