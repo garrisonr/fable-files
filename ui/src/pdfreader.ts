@@ -31,6 +31,7 @@ function el<K extends keyof HTMLElementTagNameMap>(
 
 class PdfReader {
   private overlay: HTMLElement | null = null;
+  private footEl: HTMLElement | null = null;
   private stageEl: HTMLElement | null = null;
   private imgEl: HTMLImageElement | null = null;
   private msgEl: HTMLElement | null = null;
@@ -77,6 +78,7 @@ class PdfReader {
     this.stageEl.appendChild(wrap);
 
     const foot = el("div", "reader-foot");
+    this.footEl = foot;
     this.prevBtn = el("button", "pill-btn", "← Previous") as HTMLButtonElement;
     this.prevBtn.addEventListener("click", () => void this.go(this.page - 1));
     const pos = el("span", "reader-pos pdf-pos");
@@ -143,18 +145,27 @@ class PdfReader {
       authorEl.textContent = doc.author ?? "";
       this.buildOutline();
       if (doc.note || doc.pageCount === 0) {
-        this.showMessage(
+        this.showDeadEnd(
           doc.note ??
             "This document has no readable pages for the built-in reader. It will still open in your usual reader app.",
         );
-        this.updateChrome();
         return;
       }
       await this.go(doc.startPage, true);
     } catch (err) {
-      this.showMessage(`Couldn't open that document: ${errText(err)}`);
-      this.updateChrome();
+      this.showDeadEnd(`Couldn't open that document: ${errText(err)}`);
     }
+  }
+
+  /** Dead-end state (2026-10-18, crew Dewey): a file that can't
+   * be read as a PDF gets a plain face — the message and Close,
+   * nothing else. The old behavior left the full pager chrome in
+   * place (Previous / page field / zoom / Next, all disabled over
+   * a document with no pages), and the row rendered its Next
+   * button twice at dialog widths. No pages, no pager. */
+  private showDeadEnd(message: string): void {
+    this.showMessage(message);
+    if (this.footEl) this.footEl.style.display = "none";
   }
 
   private keyHandler = (e: KeyboardEvent): void => {
@@ -286,6 +297,7 @@ class PdfReader {
     this.doc = null;
     this.imgEl = null;
     this.stageEl = null;
+    this.footEl = null;
   }
 }
 
