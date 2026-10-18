@@ -2262,6 +2262,83 @@ body[data-layout="tv"] .cell-icon {
   line-height: 1;
 }
 
+/* Credits page (Credits Law, 2026-10-18): the About dialog
+   widened into a reading page — left-aligned, scrollable body,
+   quiet sections, names as links. */
+.credits-dialog {
+  width: min(40rem, calc(100vw - 3rem));
+  text-align: left;
+}
+
+.credits-dialog .about-title,
+.credits-dialog .about-tagline {
+  text-align: center;
+}
+
+.credits-body {
+  max-height: 55vh;
+  overflow-y: auto;
+  margin: 1rem 0;
+  padding-right: 0.35rem;
+}
+
+.credits-head {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ufm-text-muted);
+  margin: 1rem 0 0.4rem;
+}
+
+.credits-section:first-child .credits-head {
+  margin-top: 0;
+}
+
+.credits-row {
+  font-size: 0.85rem;
+  line-height: 1.45;
+  margin-bottom: 0.45rem;
+}
+
+.credits-name {
+  font: inherit;
+  font-weight: 700;
+  color: var(--ufm-accent);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.credits-name:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.credits-license {
+  color: var(--ufm-text-muted);
+}
+
+.credits-licenses {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.credits-reader {
+  white-space: pre-wrap;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  max-height: 48vh;
+  overflow-y: auto;
+  background: var(--ufm-content-canvas);
+  border: 1px solid var(--ufm-border);
+  border-radius: 0.6rem;
+  padding: 0.8rem;
+  margin: 0 0 0.6rem;
+}
+
 /* Preferences + theme gallery (UI round items 1, 2). The old
    static shortcuts card styles are gone with the hand-maintained
    list they served — the registry overlay styles live at the end

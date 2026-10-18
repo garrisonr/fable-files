@@ -5,8 +5,10 @@
  */
 import { api } from "./api";
 import { playWelcomeTour } from "./welcome";
+import { CreditsDialog } from "./credits";
 
 const ISSUES = "https://github.com/garrisonr/fable-files/issues/new";
+const creditsDialog = new CreditsDialog();
 
 export class AboutDialog {
   private el: HTMLElement | null = null;
@@ -72,11 +74,19 @@ export class AboutDialog {
       this.close();
       playWelcomeTour();
     });
+    const credits = document.createElement("button");
+    credits.className = "about-btn";
+    credits.textContent = "Credits";
+    credits.title = "The people and projects Fable stands on";
+    credits.addEventListener("click", () => {
+      this.close();
+      creditsDialog.open();
+    });
     const closeBtn = document.createElement("button");
     closeBtn.className = "about-btn about-close";
     closeBtn.textContent = "Close";
     closeBtn.addEventListener("click", () => this.close());
-    actions.append(bug, feat, tour, closeBtn);
+    actions.append(bug, feat, tour, credits, closeBtn);
 
     dialog.append(bear, title, tagline, version, credit, emuCredit, actions);
     overlay.appendChild(dialog);
