@@ -72,14 +72,11 @@ export interface VideoPlayerOpts {
   onState?: (t: number, playing: boolean) => void;
 }
 
-/** A cast target as the player needs it — structurally the
- * CastDialog's Device (cast.ts), declared here so the player
- * doesn't import the dialog (it lazy-loads it instead). */
-export interface CastDeviceLike {
-  name: string;
-  kind: string;
-  address: string;
-}
+/** A cast target as the player needs it — the shared session's
+ * type (castsession.ts), re-exported for existing importers. */
+export type { CastDeviceLike } from "./castsession";
+import { CastSession, type CastDeviceLike } from "./castsession";
+import type { CastMirror } from "./api";
 
 export class VideoPlayer {
   readonly el: HTMLDivElement;
@@ -115,20 +112,24 @@ export class VideoPlayer {
    * scrubber shows its position (polled every 2 s), and the local
    * element stays paused behind the "Casting to …" badge. */
   private castPicker: ((name: string, video: boolean) => Promise<CastDeviceLike | null>) | null = null;
-  private castDevice: CastDeviceLike | null = null;
+  /** The cast session itself lives in castsession.ts (shared
+   * with the music surfaces since the Glow-Up); this class only
+   * renders its mirror into the badge + seek bar below. */
+  private castSession: CastSession | null = null;
+  private get castDevice(): CastDeviceLike | null {
+    return this.castSession?.device ?? null;
+  }
   private castBtn: HTMLButtonElement | null = null;
   private castBadge: HTMLDivElement | null = null;
   private castBadgeText: HTMLSpanElement | null = null;
-  private castTimer: number | null = null;
   private castPos = 0;
   private castDur = 0;
   private castPlaying = false;
-  private castSawPlaying = false;
   private castScrubbing = false;
   /** Grace window at session start: the receiver may still be
    * loading, so position polls are ignored until the initial
    * seek (to the local position) has had time to land. */
-  private castSeekAt = 0;
+  /** (The seek-grace clock lives in the session now.) */
   /** Gauntlet G1 — playback setup strip: appears when the host
    * GStreamer plugin set is missing (checked once per player:
    * at standalone-open, or at the first playback failure for
@@ -184,10 +185,8 @@ export class VideoPlayer {
     // Player round: never leave a receiver playing from a dead
     // surface — stop the cast session on the way out (no local
     // resume; the surface is gone).
-    if (this.castDevice) {
-      const dev = this.castDevice;
+    if (this.castSession) {
       this.teardownCast();
-      void api.castStop(dev).catch(() => undefined);
     }
     this.stopStateTimer();
     if (this.hideTimer !== null) {
@@ -278,17 +277,20 @@ export class VideoPlayer {
     });
     this.seek.addEventListener("change", () => {
       this.castScrubbing = false;
+      if (this.castSession) this.castSession.scrubbing = false;
       if (this.castDevice && this.castDur > 0) {
         const target = (Number(this.seek.value) / 1000) * this.castDur;
         this.castPos = target;
-        void api.castSeek(this.castDevice, target).catch(() => undefined);
+        void this.castSession?.seekTo(target);
       }
     });
     this.seek.addEventListener("pointerdown", () => {
       this.castScrubbing = true;
+      if (this.castSession) this.castSession.scrubbing = true;
     });
     this.seek.addEventListener("pointerup", () => {
       this.castScrubbing = false;
+      if (this.castSession) this.castSession.scrubbing = false;
     });
 
     this.timeLabel = document.createElement("span");
@@ -552,7 +554,7 @@ export class VideoPlayer {
     } else if (e.key === "ArrowRight") {
       if (this.castDevice) {
         this.castPos = Math.min(this.castDur || 0, this.castPos + 5);
-        void api.castSeek(this.castDevice, this.castPos).catch(() => undefined);
+        void this.castSession?.seekTo(this.castPos);
         this.renderCastProgress();
       } else {
         this.video.currentTime = Math.min(
@@ -563,7 +565,7 @@ export class VideoPlayer {
     } else if (e.key === "ArrowLeft") {
       if (this.castDevice) {
         this.castPos = Math.max(0, this.castPos - 5);
-        void api.castSeek(this.castDevice, this.castPos).catch(() => undefined);
+        void this.castSession?.seekTo(this.castPos);
         this.renderCastProgress();
       } else {
         this.video.currentTime = Math.max(0, this.video.currentTime - 5);
@@ -629,78 +631,60 @@ export class VideoPlayer {
   }
 
   private async startCast(device: CastDeviceLike): Promise<void> {
-    const resumeAt = this.position();
-    try {
-      const url = await api.castRegisterPath(this.path);
-      await api.castPlay(device, url);
-    } catch (err) {
-      Toast.error(`Cast failed: ${errText(err)}`);
+    // The session (castsession.ts) owns the receiver from here:
+    // register + play, the seek-grace, the 2 s poll, the natural-
+    // end handback — this class only renders the mirror.
+    const session = new CastSession({
+      path: () => this.path,
+      localPosition: () => this.position(),
+      localDuration: () => this.video.duration || 0,
+      pauseLocal: () => this.video.pause(),
+      resumeLocal: (at, play) => this.resumeLocal(at, play),
+      onMirror: (m) => this.renderCastMirror(m),
+    });
+    this.castSession = session;
+    await session.start(device);
+    if (!session.active && this.castSession === session) {
+      // Start failed (the session already toasted why).
+      this.castSession = null;
+    }
+  }
+
+  /** Render the session's mirror into the badge + seek bar. */
+  private renderCastMirror(m: CastMirror | null): void {
+    if (!m) {
+      this.castPlaying = false;
+      if (this.castBadge) this.castBadge.hidden = true;
+      if (this.castBtn) this.castBtn.title = "Cast to a device…";
+      this.playBtn.textContent = "▶";
       return;
     }
-    if (this.destroyed) {
-      void api.castStop(device).catch(() => undefined);
-      return;
-    }
-    this.castDevice = device;
-    this.castPos = resumeAt;
-    const d = this.video.duration;
-    this.castDur = isFinite(d) && d > 0 ? d : 0;
-    this.castPlaying = true;
-    this.castSawPlaying = false;
-    this.video.pause();
-    // Receivers start at 0; seek to where local playback was once
-    // the receiver has had a moment to load (polls ignore position
-    // during the grace window so the bar doesn't snap to 0).
-    if (resumeAt > 1) {
-      this.castSeekAt = Date.now() + 2500;
-      window.setTimeout(() => {
-        if (this.castDevice === device) {
-          void api.castSeek(device, resumeAt).catch(() => undefined);
-        }
-      }, 1200);
-    }
+    if (!this.castScrubbing) this.castPos = m.positionSecs;
+    if (m.durationSecs > 0) this.castDur = m.durationSecs;
+    this.castPlaying = m.playing;
     if (this.castBadge && this.castBadgeText) {
-      this.castBadgeText.textContent = `📡 Casting to ${device.name}`;
+      this.castBadgeText.textContent = `📡 Casting to ${m.deviceName}`;
       this.castBadge.hidden = false;
     }
     if (this.castBtn) this.castBtn.title = "Stop casting";
-    this.playBtn.textContent = "⏸";
+    this.playBtn.textContent = this.castPlaying ? "⏸" : "▶";
     this.renderCastProgress();
-    if (this.castTimer !== null) window.clearInterval(this.castTimer);
-    this.castTimer = window.setInterval(() => void this.pollCast(), 2000);
-    void this.pollCast();
-    Toast.success(`Casting to ${device.name}.`);
   }
 
   /** Stop the receiver and (normally) resume locally at the
    * position the receiver had reached — the round trip Dickles
    * asked for: the TV hands the film back where it left off. */
   private async stopCast(resumeLocal: boolean): Promise<void> {
-    const dev = this.castDevice;
-    if (!dev) return;
-    const at = this.castPos;
-    const wasPlaying = this.castPlaying;
-    this.teardownCast();
-    try {
-      await api.castStop(dev);
-    } catch {
-      // The receiver may already be gone; local resume proceeds.
-    }
-    if (resumeLocal && !this.destroyed) {
-      this.resumeLocal(at, wasPlaying);
-      Toast.success(`Back on this device — stopped casting to ${dev.name}.`);
-    }
+    const session = this.castSession;
+    if (!session) return;
+    this.castSession = null;
+    await session.stop(resumeLocal);
   }
 
   private teardownCast(): void {
-    this.castDevice = null;
-    if (this.castTimer !== null) {
-      window.clearInterval(this.castTimer);
-      this.castTimer = null;
-    }
-    if (this.castBadge) this.castBadge.hidden = true;
-    if (this.castBtn) this.castBtn.title = "Cast to a device…";
-    this.playBtn.textContent = "▶";
+    const session = this.castSession;
+    this.castSession = null;
+    session?.destroy();
   }
 
   private resumeLocal(at: number, play: boolean): void {
@@ -716,55 +700,7 @@ export class VideoPlayer {
   }
 
   private async castToggle(): Promise<void> {
-    const dev = this.castDevice;
-    if (!dev) return;
-    try {
-      if (this.castPlaying) {
-        await api.castPause(dev);
-        this.castPlaying = false;
-      } else {
-        await api.castResume(dev);
-        this.castPlaying = true;
-      }
-    } catch {
-      // A failed toggle resyncs on the next poll — no dead end.
-    }
-    this.playBtn.textContent = this.castPlaying ? "⏸" : "▶";
-  }
-
-  private async pollCast(): Promise<void> {
-    const dev = this.castDevice;
-    if (!dev) return;
-    let st: { state: string; position: number; duration: number };
-    try {
-      st = await api.castStatus(dev);
-    } catch {
-      return; // transient — next poll retries
-    }
-    if (this.castDevice !== dev) return; // session changed mid-flight
-    if (st.duration > 0) this.castDur = st.duration;
-    if (st.state === "playing") this.castSawPlaying = true;
-    if (st.state === "playing" || st.state === "paused") {
-      this.castPlaying = st.state === "playing";
-      if (!this.castScrubbing && Date.now() >= this.castSeekAt) {
-        this.castPos = st.position;
-      }
-    } else if (st.state === "idle" && this.castSawPlaying) {
-      // The receiver stopped on its own — the film ended, or
-      // someone stopped it at the TV. End the session here and
-      // hand playback back at the last known position.
-      const at = this.castPos;
-      const wasPlaying = this.castPlaying;
-      const name = dev.name;
-      this.teardownCast();
-      if (!this.destroyed) {
-        this.resumeLocal(at, wasPlaying);
-        Toast.success(`Casting to ${name} ended — back on this device.`);
-      }
-      return;
-    }
-    this.playBtn.textContent = this.castPlaying ? "⏸" : "▶";
-    this.renderCastProgress();
+    await this.castSession?.toggle();
   }
 
   private renderCastProgress(): void {

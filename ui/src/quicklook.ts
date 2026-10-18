@@ -26,9 +26,14 @@ import {
 import { onPlayerClosed, onPlayerReturn, onPlayerState } from "./api";
 import { attachStep, type AttachSnapshot } from "./qlattach";
 import { VideoPlayer, isVideoName } from "./video";
-import type { CastDeviceLike } from "./video";
-import { audioTags, folderArtUrl } from "./audiometa";
-import { parseLrcLines } from "./musiccomplete";
+import type { CastDeviceLike } from "./castsession";
+import { audioBadge, audioProps, audioTags, folderArtUrl } from "./audiometa";
+import {
+  OwnerEngine,
+  PlayerCoreClient,
+  TransportBar,
+} from "./playercore";
+import { LyricsView } from "./lyrics";
 import { fadeTo, reducedMotion, springTo } from "./motion";
 
 const FALLBACK_PANEL_WIDTH = 340;
@@ -65,12 +70,22 @@ export class QuickLook {
    * the pane adopts this item (see qlattach.ts). */
   private followPending: Item | null = null;
   private currentKind: PreviewKind | null = null;
-  /** Live Quick Look audio element (Round 7.1): tracked so playback
-   * can be stopped deterministically — a detached <audio> element
-   * keeps playing in WebKit after its card is replaced. */
-  private audioEl: HTMLAudioElement | null = null;
-  /** Path the live audio element is playing (carry snapshots key
-   * off it — fix batch item 1). */
+  /** The shared transport core, Quick Look arrangement (Music
+   * Glow-Up Phase 2): this pane's client + engine + transport.
+   * The engine sounds only while the core's owner is
+   * "quicklook" — starting a preview anywhere else silences it,
+   * and starting one here silences them. */
+  private core = new PlayerCoreClient();
+  private qlEngine: OwnerEngine | null = null;
+  private qlBar: TransportBar | null = null;
+  private qlLyrics = new LyricsView();
+  private qlStatusEl: HTMLDivElement | null = null;
+  private qlCastDlg: {
+    openPicker: (n: string, v: boolean) => Promise<CastDeviceLike | null>;
+    element: HTMLDivElement;
+  } | null = null;
+  private lastCoreOwner: string | null = null;
+  /** Path the card's audio belongs to (lyrics + detach logic). */
   private audioPath: string | null = null;
   /** Art resolved for the card on screen, per media kind — the
    * detach placeholder and the mini window wear the same face
@@ -85,88 +100,12 @@ export class QuickLook {
   private detachWatch: number | null = null;
 
   private stopAudio(): void {
-    if (!this.audioEl) return;
-    try {
-      this.audioEl.pause();
-      this.audioEl.removeAttribute("src");
-      this.audioEl.load();
-    } catch {
-      // element already detached — nothing left to stop
-    }
-    this.audioEl = null;
+    // The core owns the sound now: leaving the preview stops it
+    // only when the preview owns it (a detached Mini keeps
+    // playing in its own window, exactly as before).
     this.audioPath = null;
-  }
-
-  /** Music Completion: the lyrics pane under the Quick Look audio
-   * player. Synced text (embedded USLT-with-stamps or a .lrc
-   * sidecar) gets line highlighting driven by the live audio
-   * element; plain text renders as-is. Async + guarded: if the
-   * card has moved on to another file, nothing is inserted. */
-  private async buildLyricsPane(
-    path: string,
-    card: HTMLElement,
-    before: HTMLElement,
-  ): Promise<void> {
-    let view;
-    try {
-      view = await api.muLyricsGet(path, false);
-    } catch {
-      return;
-    }
-    if (this.audioPath !== path) return;
-    const syncedText =
-      view.embeddedSynced ??
-      (view.sidecarText && /\[\d+:\d{1,2}[.,]\d+\]/.test(view.sidecarText)
-        ? view.sidecarText
-        : null);
-    const plainText = syncedText
-      ? null
-      : (view.embeddedPlain ?? view.sidecarText);
-    const pane = document.createElement("div");
-    pane.className = "ql-lyrics";
-    const head = document.createElement("div");
-    head.className = "ql-lyrics-head";
-    head.textContent = syncedText ? "Lyrics — synced" : "Lyrics";
-    pane.appendChild(head);
-    if (syncedText) {
-      const lines = parseLrcLines(syncedText);
-      if (!lines.length) return;
-      const lineEls: HTMLElement[] = [];
-      for (const l of lines) {
-        const d = document.createElement("div");
-        d.className = "ql-lrc-line";
-        d.textContent = l.text;
-        pane.appendChild(d);
-        lineEls.push(d);
-      }
-      card.insertBefore(pane, before);
-      const audio = this.audioEl;
-      if (!audio) return;
-      let active = -1;
-      audio.addEventListener("timeupdate", () => {
-        if (this.audioEl !== audio) return;
-        const nowMs = audio.currentTime * 1000;
-        let idx = -1;
-        for (let i = 0; i < lines.length; i++) {
-          if (lines[i].timeMs <= nowMs) idx = i;
-          else break;
-        }
-        if (idx === active) return;
-        if (active >= 0) lineEls[active]?.classList.remove("active");
-        active = idx;
-        if (idx >= 0) {
-          lineEls[idx]?.classList.add("active");
-          lineEls[idx]?.scrollIntoView({ block: "nearest" });
-        }
-      });
-    } else if (plainText) {
-      for (const raw of plainText.split("\n")) {
-        const d = document.createElement("div");
-        d.className = "ql-lrc-line plain";
-        d.textContent = raw;
-        pane.appendChild(d);
-      }
-      card.insertBefore(pane, before);
+    if (this.core.snap?.owner === "quicklook") {
+      void api.playerStop().catch(() => undefined);
     }
   }
 
@@ -255,6 +194,65 @@ export class QuickLook {
     };
     void onPlayerState(cacheState).catch(() => undefined);
     void onPlayerReturn(cacheState).catch(() => undefined);
+    // The shared transport core (Music Glow-Up Phase 2): this
+    // pane's engine sounds only while the core's owner is
+    // "quicklook". Snapshots drive its transport, its lyrics,
+    // and the mini-detach placeholder flip.
+    void this.core.start();
+    this.qlEngine = new OwnerEngine("quicklook", this.core, {
+      castPicker: (n, v) => this.castForPreview(n, v),
+      onSnapshot: (s) => {
+        this.qlBar?.update(s);
+        const cur = s.index !== null ? s.queue[s.index] : null;
+        if (
+          this.audioPath &&
+          cur?.providerKey === this.audioPath &&
+          this.qlLyrics.isSynced
+        ) {
+          this.qlLyrics.setPosition(s.positionSecs * 1000);
+        }
+        if (this.qlStatusEl) {
+          this.qlStatusEl.textContent =
+            s.owner === "panel"
+              ? "Playing in the Music Player — this transport drives it."
+              : s.owner === "stage"
+                ? "On the Stage — this transport drives it."
+                : "";
+        }
+        const owner = s.owner;
+        if (owner !== this.lastCoreOwner) {
+          const was = this.lastCoreOwner;
+          this.lastCoreOwner = owner;
+          if (
+            (owner === "mini" || was === "mini") &&
+            this.openItem &&
+            this.audioPath === this.openItem.provider_key &&
+            cur?.providerKey === this.openItem.provider_key
+          ) {
+            void this.renderCard(this.openItem, this.currentKind);
+          }
+        }
+      },
+    });
+  }
+
+  /** Cast picker for the preview's own engine: the shell's
+   * shared dialog when wired, else a lazily-built one. */
+  private async castForPreview(
+    name: string,
+    video: boolean,
+  ): Promise<CastDeviceLike | null> {
+    if (this.castPicker) return this.castPicker(name, video);
+    if (!this.qlCastDlg) {
+      try {
+        const { CastDialog } = await import("./cast");
+        this.qlCastDlg = new CastDialog();
+        document.body.appendChild(this.qlCastDlg.element);
+      } catch {
+        return null;
+      }
+    }
+    return this.qlCastDlg.openPicker(name, video);
   }
 
   /** The attachment machine's view of this pane, derived fresh
@@ -339,10 +337,11 @@ export class QuickLook {
         t: this.videoPlayer.position(),
         playing: this.videoPlayer.isPlaying(),
       });
-    } else if (this.audioEl && this.audioPath === path) {
+    } else if (this.audioPath === path) {
+      const s = this.core.snap;
       this.detachedState.set(path, {
-        t: this.audioEl.currentTime || 0,
-        playing: !this.audioEl.paused && !this.audioEl.ended,
+        t: s?.positionSecs ?? 0,
+        playing: s?.state === "playing",
       });
     }
     if (isVideoName(item.name)) {
@@ -393,13 +392,16 @@ export class QuickLook {
       this.videoPlayer.togglePlay();
       return true;
     }
-    if (this.audioEl) {
-      if (this.audioEl.paused) {
-        void this.audioEl.play().catch(() => undefined);
-      } else {
-        this.audioEl.pause();
+    if (this.audioPath) {
+      // The preview's track is the core's track: Space drives
+      // the core (whoever owns the element right now).
+      const s = this.core.snap;
+      const cur =
+        s && s.index !== null ? s.queue[s.index] : null;
+      if (cur && cur.providerKey === this.audioPath) {
+        void this.core.toggle().catch(() => undefined);
+        return true;
       }
-      return true;
     }
     return false;
   }
@@ -701,19 +703,25 @@ export class QuickLook {
         t: this.videoPlayer.position(),
         playing: this.videoPlayer.isPlaying(),
       };
-    } else if (this.audioEl && this.audioPath) {
-      carry = {
-        path: this.audioPath,
-        t: this.audioEl.currentTime || 0,
-        playing: !this.audioEl.paused && !this.audioEl.ended,
-      };
+    } else if (this.audioPath) {
+      const s = this.core.snap;
+      if (s) {
+        carry = {
+          path: this.audioPath,
+          t: s.positionSecs,
+          playing: s.state === "playing",
+        };
+      }
     }
     if (carry && carry.path !== item.provider_key) carry = null;
     if (this.cardItemId !== item.id) this.cardArt = null;
     this.cardItemId = item.id;
     // A re-render replaces the card: stop any audio AND video the old
-    // card was playing before its elements are discarded.
-    this.stopAudio();
+    // card was playing before its elements are discarded — except
+    // when the new card IS the audio track the core is holding for
+    // this preview (the core carries it; stopping would kill a
+    // detach trip home).
+    if (this.audioPath !== item.provider_key) this.stopAudio();
     this.stopVideo();
     const body = this.el.querySelector(".ql-body")!;
     body.innerHTML = "";
@@ -829,131 +837,175 @@ export class QuickLook {
           card.insertBefore(detachBtn, dl);
         }
       }
-      // Audio (Round 7.1): cover art + a real player at the top of the
-      // card, mirroring the video treatment — previously audio items
-      // got the metadata card and silence. Art comes from the
-      // thumbnailer (embedded cover art); playback streams over the
-      // same loopback media server as the Music Player.
+      // Audio (Music Glow-Up Phase 2): the preview is an
+      // arrangement of the shared transport core. The card claims
+      // the core for this track — starting this preview stops
+      // whatever played before, on every surface — and renders
+      // the shared compact transport plus the synced lyrics.
+      // Art comes from the shared folder/embedded chain.
       const audioExts = [
         "mp3", "flac", "ogg", "oga", "wav", "m4a", "m4b", "opus", "aac",
         "aif", "aiff", "wma", "dsf", "dff",
       ];
       if (audioExts.includes(ext) && item.provider_key) {
         const apath = item.provider_key;
-        if (this.detachedAudioFor === apath) {
+        this.audioPath = apath;
+        const snap0 = this.core.snap;
+        const cur0 =
+          snap0 && snap0.index !== null ? snap0.queue[snap0.index] : null;
+        const miniOwns =
+          snap0?.owner === "mini" && cur0?.providerKey === apath;
+        if (this.detachedAudioFor === apath || miniOwns) {
           card.insertBefore(this.buildDetachedPlaceholder(item, apath), dl);
         } else {
-        const holder = document.createElement("div");
-        holder.className = "ql-audio";
-        const art = document.createElement("img");
-        art.className = "ql-audio-art";
-        art.alt = "";
-        art.hidden = true;
-        // A failed art load falls back to the glyph (fix block item 5).
-        art.addEventListener("error", () => {
+          const holder = document.createElement("div");
+          holder.className = "ql-audio";
+          const art = document.createElement("img");
+          art.className = "ql-audio-art";
+          art.alt = "";
           art.hidden = true;
-          glyph.hidden = false;
-        });
-        const glyph = document.createElement("div");
-        glyph.className = "ql-audio-glyph";
-        glyph.textContent = "🎵";
-        const audio = document.createElement("audio");
-        audio.className = "ql-audio-player";
-        audio.controls = true;
-        audio.preload = "metadata";
-        holder.append(art, glyph, audio);
-        card.insertBefore(holder, dl);
-        this.audioEl = audio;
-        this.audioPath = apath;
-        // Detach (UI round item 5, media parity): the same
-        // always-on-top mini window the video player gets, with
-        // the same position handoff in both directions.
-        const detachBtn = document.createElement("button");
-        detachBtn.className = "ql-audio-detach";
-        detachBtn.textContent = "⧉ Detach";
-        detachBtn.title = "Play in a detachable mini window";
-        detachBtn.addEventListener("click", () => {
-          const t = audio.currentTime || 0;
-          const playing = !audio.paused && !audio.ended;
-          this.detachedState.set(apath, { t, playing });
-          void api
-            .openPlayerWindow(apath, item.name, {
-              kind: "audio",
-              start: t,
-              autoplay: playing,
-              // Item 3: the mini window wears the same face —
-              // the art this card already resolved rides along.
-              art: this.cardArt,
-            })
-            .then(() => {
-              this.detachedAudioFor = apath;
-              this.startDetachWatch();
-              if (this.openItem === item) {
-                void this.renderCard(item, this.currentKind);
-              }
-            })
-            .catch(() => undefined);
-        });
-        holder.appendChild(detachBtn);
-        void mediaSrc(apath).then((url) => {
-          audio.src = url;
-        });
-        // Start state (fix batch item 1), same priority as video:
-        // detach trip home > same-card carry > fresh open PLAYS.
-        const fromDetach = this.detachedState.get(apath);
-        if (fromDetach) this.detachedState.delete(apath);
-        const startT = fromDetach?.t ?? carry?.t ?? 0;
-        const startPlaying = fromDetach
-          ? fromDetach.playing
-          : carry
-            ? carry.playing
-            : true;
-        audio.addEventListener("loadedmetadata", () => {
-          if (startT > 0) {
+          const glyph = document.createElement("div");
+          glyph.className = "ql-audio-glyph";
+          glyph.textContent = "🎵";
+          art.addEventListener("error", () => {
+            art.hidden = true;
+            glyph.hidden = false;
+          });
+          holder.append(art, glyph);
+          // Art chain: folder art, then the thumbnailer's
+          // embedded art (the shared resolution).
+          void (async () => {
             try {
-              audio.currentTime = Math.min(
-                startT,
-                Math.max(0, audio.duration - 0.25),
-              );
+              const folder = apath.slice(0, apath.lastIndexOf("/"));
+              const url =
+                (await folderArtUrl(item, folder)) ??
+                (await api.getThumbnail(item.id, apath, true));
+              if (url && this.openItem === item) {
+                this.cardArt = url;
+                art.src = url;
+                art.hidden = false;
+                glyph.hidden = true;
+              }
             } catch {
-              // not seekable yet — plays from the top instead
+              // no art anywhere — the glyph stays
             }
+          })();
+          const detachBtn = document.createElement("button");
+          detachBtn.className = "ql-open-with pill-btn";
+          detachBtn.textContent = "⧉ Detach";
+          detachBtn.title = "Pop the player out into its own window";
+          detachBtn.addEventListener("click", () => {
+            this.detachedState.set(apath, {
+              t: this.core.snap?.positionSecs ?? 0,
+              playing: this.core.snap?.state === "playing",
+            });
+            this.detachedAudioFor = apath;
+            this.startDetachWatch();
+            void api.openPlayerWindow(apath, item.name, {
+              kind: "audio",
+              start: this.core.snap?.positionSecs ?? 0,
+              autoplay: this.core.snap?.state === "playing",
+              art: this.cardArt,
+            });
+            void this.renderCard(item, this.currentKind);
+          });
+          const stageBtn = document.createElement("button");
+          stageBtn.className = "ql-open-with pill-btn";
+          stageBtn.textContent = "⤢ Stage";
+          stageBtn.title = "Open the Stage window";
+          stageBtn.addEventListener("click", () => {
+            void api.openPlayerWindow(apath, item.name, {
+              kind: "audio-stage",
+              start: this.core.snap?.positionSecs ?? 0,
+              autoplay: this.core.snap?.state === "playing",
+              art: null,
+            });
+          });
+          holder.appendChild(detachBtn);
+          holder.appendChild(stageBtn);
+          // Claim the core for this preview (or open it fresh).
+          if (cur0?.providerKey === apath) {
+            if (snap0 && snap0.owner !== "quicklook") {
+              void this.core.claim("quicklook");
+            }
+          } else {
+            void this.core.openQueue({
+              owner: "quicklook",
+              entries: [
+                { providerKey: apath, name: item.name, durationSecs: null },
+              ],
+              startIndex: 0,
+              autoplay: true,
+            });
           }
-          if (startPlaying) void audio.play().catch(() => undefined);
-        });
-        void (async () => {
-          // Art order (7.1 design, inc-2 item 9): folder art FIRST
-          // via the shared lookup, then the thumbnailer's embedded
-          // cover art — resolveArt owns the chain now, and the
-          // result is remembered for the detach handoff (item 3).
-          const url = await this.resolveArt(item, apath);
-          if (url) {
-            this.cardArt = url;
-            art.src = url;
-            art.hidden = false;
-            glyph.hidden = true;
+          // The shared transport, compact arrangement.
+          if (!this.qlBar) {
+            this.qlBar = new TransportBar(
+              {
+                onToggle: () => void this.qlEngine?.toggle(),
+                onStep: (d) => void this.core.step(d),
+                onSeek: (s) => void this.qlEngine?.seekTo(s),
+                onRepeat: () => {
+                  const s = this.core.snap;
+                  if (s) {
+                    void this.core.setRepeat(
+                      s.repeat === "off"
+                        ? "all"
+                        : s.repeat === "all"
+                          ? "one"
+                          : "off",
+                    );
+                  }
+                },
+                onShuffle: () => {
+                  const s = this.core.snap;
+                  if (s) void this.core.setShuffle(!s.shuffle);
+                },
+                onVolume: (v) => void this.core.setVolume(v),
+                onMute: () => {
+                  const s = this.core.snap;
+                  if (s) void this.core.setMuted(!s.muted);
+                },
+                onCast: () => void this.qlEngine?.startCastFlow(),
+              },
+              { compact: true },
+            );
           }
-        })();
-        // Headline + subline from embedded tags (inc-2 item 9): the
-        // Title tag headlines, Artist · Album sits beneath; the
-        // filename remains only as the no-tags fallback.
-        void audioTags(item).then((tags) => {
-          if (tags.title) name.textContent = tags.title;
-          const sub = [tags.artist, tags.album]
-            .filter((s): s is string => !!s)
-            .join(" · ");
-          if (sub) {
-            const subEl = document.createElement("div");
-            subEl.className = "ql-sub";
-            subEl.textContent = sub;
-            name.after(subEl);
-          }
-        });
-        // Synced lyrics (Music Completion): timed lyrics —
-        // embedded or in a .lrc sidecar — render under the player
-        // with the sung line lit; plain lyrics render unlit; no
-        // lyrics = no pane.
-        void this.buildLyricsPane(apath, card, dl);
+          const barHost = document.createElement("div");
+          barHost.className = "ql-tbar-host";
+          barHost.appendChild(this.qlBar.el);
+          holder.appendChild(barHost);
+          const s1 = this.core.snap;
+          if (s1) this.qlBar.update(s1);
+          const status = document.createElement("div");
+          status.className = "ql-audio-status";
+          this.qlStatusEl = status;
+          holder.appendChild(status);
+          // Credential line: honest badge + the tag headline.
+          const meta = document.createElement("div");
+          meta.className = "ql-audio-meta";
+          const badge = document.createElement("span");
+          badge.className = "music-badge";
+          badge.textContent = audioBadge(item.name);
+          const tagsLine = document.createElement("span");
+          meta.append(badge, tagsLine);
+          holder.appendChild(meta);
+          void audioTags(item).then((tags) => {
+            const who = [tags.artist, tags.album]
+              .filter((x): x is string => !!x)
+              .join(" · ");
+            if (who && this.openItem === item) tagsLine.textContent = ` ${who}`;
+          });
+          void audioProps(item).then((p) => {
+            if (this.openItem === item) {
+              badge.textContent = audioBadge(item.name, p);
+            }
+          });
+          card.insertBefore(holder, dl);
+          // Synced lyrics — the shared pane, driven by core
+          // snapshots (the subscription lives in the constructor).
+          card.insertBefore(this.qlLyrics.el, dl);
+          void this.qlLyrics.load(apath);
         }
       }
       const imgExts = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tif", "tiff", "ico"];

@@ -181,6 +181,7 @@ export interface FileViewHooks {
   onMediaRename?(items: Item[]): void; // Plex/Kodi/Emby rename
   onMusicComplete?(items: Item[]): void; // Music Completion (tags/art/lyrics)
   onPlayMusic?(items: Item[]): void; // music player
+  onQueueMusic?(items: Item[], next: boolean): void; // queue: play next / append (Glow-Up)
   onRenameInline?(item: Item, newName: string): void;
   onProperties(item: Item): void;
   // Round 4 (Nautilus + Finder parity) — optional so every view can
@@ -475,6 +476,21 @@ export async function showItemMenu(
       label: targets.length === 1 ? "Play" : `Play ${targets.length} Tracks`,
       action: () => hooks.onPlayMusic!(targets),
     });
+  if (
+    hooks.onQueueMusic &&
+    targets.length >= 1 &&
+    targets.every((t) => t.kind !== "folder" && isAudioName(t.name))
+  )
+    items.push(
+      {
+        label: "Play Next",
+        action: () => hooks.onQueueMusic!(targets, true),
+      },
+      {
+        label: "Add to Queue",
+        action: () => hooks.onQueueMusic!(targets, false),
+      },
+    );
   if (
     hooks.onMediaRename &&
     targets.length >= 1 &&

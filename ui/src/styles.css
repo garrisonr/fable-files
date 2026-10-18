@@ -3739,21 +3739,25 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 .music-title { font-weight: 650; font-size: 1.05rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .music-sub { color: var(--ufm-text-muted); font-size: 0.85rem; }
 .music-mode, .music-close { height: 2rem; padding: 0 0.8rem; border-radius: 999px; border: 1px solid var(--ufm-border); background: transparent; color: var(--ufm-text); cursor: pointer; }
-.music-detach { height: 2rem; width: 2rem; padding: 0; border-radius: 999px; border: 1px solid var(--ufm-border); background: transparent; color: var(--ufm-text); cursor: pointer; font-size: 0.95rem; }
-/* Detached state (UI round item 5): transport + queue are inert
-   while the mini window owns playback. */
-.music-card.detached .music-bar, .music-card.detached .music-tracks { opacity: 0.45; pointer-events: none; }
+.music-detach, .music-stage { height: 2rem; width: 2rem; padding: 0; border-radius: 999px; border: 1px solid var(--ufm-border); background: transparent; color: var(--ufm-text); cursor: pointer; font-size: 0.95rem; }
+/* Glow-Up: while a window owns the sound, the panel transport
+   stays LIVE (it drives the core) — a banner says where the
+   sound lives instead of the old greyed-out inert state. */
+.music-banner { display: flex; align-items: center; gap: 0.7rem; font-size: 0.85rem; color: var(--ufm-text-muted); border: 1px solid var(--ufm-border); border-radius: var(--ufm-radius); padding: 0.5rem 0.8rem; background: color-mix(in srgb, var(--ufm-accent) 8%, transparent); }
 .ql-audio-detach, .ql-detach-btn { align-self: flex-start; padding: 0.3rem 0.8rem; border-radius: 999px; border: 1px solid var(--ufm-border); background: transparent; color: var(--ufm-text); cursor: pointer; font: inherit; font-size: 0.8125rem; white-space: nowrap; }
 .ql-audio-detach:hover, .ql-detach-btn:hover { background: color-mix(in srgb, var(--ufm-text) 8%, transparent); }
 /* The audio detach (mini) window body — with its cover art
-   (fix batch item 3): art left, title + transport right. */
-.mini-audio { display: flex; flex-direction: row; align-items: center; gap: 0.9rem; padding: 1rem 1.1rem; height: 100vh; box-sizing: border-box; background: #101014; color: #f5f5f7; }
+   (fix batch item 3): art left, title + transport right.
+   Glow-Up: the mini honors the app theme like every other
+   surface — theme tokens only, no hardcoded black. */
+.mini-audio { display: flex; flex-direction: row; align-items: center; gap: 0.9rem; padding: 1rem 1.1rem; height: 100vh; box-sizing: border-box; background: var(--ufm-surface); color: var(--ufm-text); }
 .mini-audio-art { width: 84px; height: 84px; object-fit: cover; border-radius: 10px; flex: none; }
 .mini-audio-glyph {
   width: 84px; height: 84px; flex: none; border-radius: 10px;
   display: flex; align-items: center; justify-content: center; font-size: 2.2rem;
-  background: rgb(255 255 255 / 0.07);
+  background: color-mix(in srgb, var(--ufm-accent) 14%, transparent);
 }
+.mini-audio-sub { color: var(--ufm-text-muted); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
 .mini-audio-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.6rem; }
 .mini-audio-title { font-weight: 600; font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .mini-audio-bar { display: flex; align-items: center; gap: 0.6rem; }
@@ -3766,17 +3770,90 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 .music-t { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .music-fmt { color: var(--ufm-text-muted); font-size: 0.75rem; letter-spacing: 0.04em; }
 .music-d { color: var(--ufm-text-muted); font-variant-numeric: tabular-nums; font-size: 0.85rem; }
-.music-bar { display: flex; align-items: center; gap: 0.6rem; }
-.music-btn { width: 2.25rem; height: 2.25rem; flex: none; border-radius: 999px; border: 1px solid var(--ufm-border); background: transparent; color: var(--ufm-text); cursor: pointer; font-size: 0.95rem; }
-.music-seek { flex: 1; accent-color: var(--ufm-accent); }
-.music-time { font-variant-numeric: tabular-nums; color: var(--ufm-text-muted); font-size: 0.85rem; white-space: nowrap; }
 .music-badge { border: 1px solid var(--ufm-border); border-radius: 999px; padding: 0.12rem 0.55rem; font-size: 0.75rem; letter-spacing: 0.05em; color: var(--ufm-accent); white-space: nowrap; }
-.music-vol-lab { color: var(--ufm-text-muted); font-size: 0.8rem; }
-.music-vol { width: 6rem; accent-color: var(--ufm-accent); }
+.music-meta-line { color: var(--ufm-text-muted); font-size: 0.8rem; }
 
 .music-row.dragging { opacity: .45; }
 .music-row.drop-before { box-shadow: inset 0 2px 0 var(--ufm-accent); }
 .music-row.drop-after { box-shadow: inset 0 -2px 0 var(--ufm-accent); }
+
+/* — Music Glow-Up Phase 2: the shared transport core's surfaces — */
+/* The one transport bar (Panel / Stage / Mini / Quick Look). */
+.tbar { display: flex; align-items: center; gap: 0.45rem; width: 100%; }
+.tbar-btn { width: 2rem; height: 2rem; flex: none; border-radius: 999px; border: 1px solid transparent; background: transparent; color: var(--ufm-text); cursor: pointer; font-size: 0.95rem; display: flex; align-items: center; justify-content: center; padding: 0; }
+.tbar-btn:hover { background: color-mix(in srgb, var(--ufm-text) 8%, transparent); }
+.tbar-btn.on { color: var(--ufm-accent); border-color: var(--ufm-border); background: color-mix(in srgb, var(--ufm-accent) 12%, transparent); }
+.tbar-play { width: 2.5rem; height: 2.5rem; font-size: 1.05rem; background: var(--ufm-accent); color: var(--ufm-surface); }
+.tbar-play:hover { background: var(--ufm-accent); filter: brightness(1.08); }
+.tbar-seek { position: relative; flex: 1; height: 1.4rem; display: flex; align-items: center; cursor: pointer; touch-action: none; }
+.tbar-seek::before { content: ""; position: absolute; left: 0; right: 0; height: 4px; border-radius: 999px; background: color-mix(in srgb, var(--ufm-text) 14%, transparent); }
+.tbar-seek-buf { position: absolute; left: 0; height: 4px; border-radius: 999px; background: color-mix(in srgb, var(--ufm-text) 22%, transparent); width: 0; }
+.tbar-seek-fill { position: absolute; left: 0; height: 4px; border-radius: 999px; background: var(--ufm-accent); width: 0; }
+.tbar-seek-fill::after { content: ""; position: absolute; right: -6px; top: 50%; transform: translateY(-50%); width: 12px; height: 12px; border-radius: 999px; background: var(--ufm-accent); box-shadow: 0 1px 4px rgb(0 0 0 / 0.25); }
+.tbar-seek-tip { position: absolute; bottom: 1.35rem; transform: translateX(-50%); background: var(--ufm-surface-elevated, var(--ufm-surface)); border: 1px solid var(--ufm-border); color: var(--ufm-text); border-radius: 6px; padding: 0.1rem 0.4rem; font-size: 0.75rem; font-variant-numeric: tabular-nums; pointer-events: none; white-space: nowrap; }
+.tbar-time { font-variant-numeric: tabular-nums; color: var(--ufm-text-muted); font-size: 0.82rem; white-space: nowrap; }
+.tbar-vol { width: 5.2rem; accent-color: var(--ufm-accent); }
+.tbar-compact .tbar-btn { width: 1.7rem; height: 1.7rem; font-size: 0.85rem; }
+.tbar-compact .tbar-play { width: 2.1rem; height: 2.1rem; }
+.tbar-compact .tbar-vol { width: 3.6rem; }
+.tbar-compact .tbar-time { font-size: 0.76rem; }
+
+/* Panel layout: tracks + Up Next rail side by side. */
+.music-card { background: linear-gradient(180deg, color-mix(in srgb, var(--ufm-accent) 5%, var(--ufm-surface)), var(--ufm-surface) 58%); }
+.music-main { display: flex; gap: 0.9rem; min-height: 0; flex: 1; }
+.music-main .music-tracks { flex: 1.6; min-width: 0; }
+.music-card.compact .music-main { flex-direction: column; }
+.music-rail { flex: 1; min-width: 11rem; overflow-y: auto; border: 1px solid var(--ufm-border); border-radius: var(--ufm-radius); padding: 0.5rem 0.6rem; display: flex; flex-direction: column; gap: 0.15rem; }
+.music-card.compact .music-rail { max-height: 12rem; }
+.music-rail-head { display: flex; align-items: center; gap: 0.45rem; font-weight: 650; font-size: 0.82rem; color: var(--ufm-text-muted); margin: 0.25rem 0 0.35rem; }
+.music-rail-head span { flex: 1; }
+.music-rail-btn { border: 1px solid var(--ufm-border); background: transparent; color: var(--ufm-text); border-radius: 999px; padding: 0.12rem 0.55rem; font-size: 0.72rem; cursor: pointer; white-space: nowrap; }
+.music-rail-btn:hover { background: color-mix(in srgb, var(--ufm-accent) 12%, transparent); }
+.music-rail-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.28rem 0.3rem; border-radius: 6px; }
+.music-rail-row:hover { background: color-mix(in srgb, var(--ufm-accent) 10%, transparent); }
+.music-rail-t { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 0.83rem; cursor: pointer; }
+.music-rail-empty { color: var(--ufm-text-muted); font-size: 0.82rem; padding: 0.2rem 0.3rem; }
+.music-row-x { flex: none; width: 1.45rem; height: 1.45rem; border: none; border-radius: 999px; background: transparent; color: var(--ufm-text-muted); cursor: pointer; font-size: 0.72rem; padding: 0; }
+.music-row-x:hover { color: var(--ufm-text); background: color-mix(in srgb, var(--ufm-text) 10%, transparent); }
+.music-bit, .music-sr { color: var(--ufm-text-muted); font-size: 0.75rem; font-variant-numeric: tabular-nums; white-space: nowrap; min-width: 2.6rem; text-align: right; }
+.music-setup { display: flex; align-items: center; gap: 0.7rem; border: 1px solid var(--ufm-border); border-radius: var(--ufm-radius); padding: 0.55rem 0.8rem; font-size: 0.85rem; background: color-mix(in srgb, var(--ufm-accent) 8%, transparent); }
+
+/* Lyrics: the shared pane + the panel's current-line strip. */
+.lyrics-view { text-align: left; }
+.ql-lyrics-head { font-weight: 700; font-size: .82rem; color: var(--ufm-text-muted); margin-bottom: .3rem; }
+.ql-lrc-line { padding: 0.14rem 0.2rem; border-radius: 4px; color: var(--ufm-text-muted); font-size: 0.88rem; line-height: 1.45; }
+.ql-lrc-line.active { color: var(--ufm-text); font-weight: 650; background: color-mix(in srgb, var(--ufm-accent) 12%, transparent); }
+.ql-lrc-line.plain { color: var(--ufm-text); }
+.music-lyrics-strip { text-align: center; font-size: 0.95rem; font-weight: 600; color: var(--ufm-text); padding: 0.35rem 0.6rem; border-radius: var(--ufm-radius); background: color-mix(in srgb, var(--ufm-accent) 9%, transparent); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.music-lyrics-full { max-height: 13rem; overflow-y: auto; padding: 0.3rem 0.4rem; }
+.music-spectrum { display: flex; justify-content: center; }
+.spectrum-canvas { display: block; max-width: 100%; }
+.music-spec-btn.on { color: var(--ufm-accent); }
+
+/* Quick Look audio on the core. */
+.ql-tbar-host { width: 100%; }
+.ql-audio-status { color: var(--ufm-text-muted); font-size: 0.8rem; }
+.ql-audio-status:empty { display: none; }
+.ql-audio-meta { display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; color: var(--ufm-text-muted); }
+.ql-card .lyrics-view { max-height: 200px; overflow-y: auto; margin-bottom: 0.85rem; }
+
+/* The Stage window. */
+.stage-audio { display: flex; flex-direction: column; gap: 0.9rem; height: 100vh; box-sizing: border-box; padding: 1.2rem 1.4rem; background: linear-gradient(180deg, color-mix(in srgb, var(--ufm-accent) 6%, var(--ufm-surface)), var(--ufm-surface) 55%); color: var(--ufm-text); }
+.stage-head { display: flex; align-items: center; gap: 1.1rem; }
+.stage-art { width: 7.5rem; height: 7.5rem; flex: none; border-radius: var(--ufm-radius); background: color-mix(in srgb, var(--ufm-accent) 16%, transparent); display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.stage-art-glyph { font-size: 3rem; color: var(--ufm-accent); }
+.stage-art-img { width: 100%; height: 100%; object-fit: cover; }
+.stage-meta { flex: 1; min-width: 0; }
+.stage-title { font-weight: 700; font-size: 1.45rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stage-sub { color: var(--ufm-text-muted); font-size: 0.9rem; min-height: 1.1em; }
+.stage-badge { border: 1px solid var(--ufm-border); border-radius: 999px; padding: 0.12rem 0.55rem; font-size: 0.75rem; letter-spacing: 0.05em; color: var(--ufm-accent); white-space: nowrap; }
+.stage-banner { font-size: 0.88rem; color: var(--ufm-text-muted); }
+.stage-main { display: flex; gap: 1rem; flex: 1; min-height: 0; }
+.stage-lyrics-host { flex: 1.5; min-width: 0; overflow-y: auto; }
+.stage-lyrics { font-size: 1.02rem; }
+.stage-rail { flex: 1; min-width: 11rem; overflow-y: auto; border: 1px solid var(--ufm-border); border-radius: var(--ufm-radius); padding: 0.5rem 0.6rem; }
+.stage-spectrum { display: flex; justify-content: center; }
+.stage-bar-host { flex: none; }
 
 /* --- ROM media enrichment (Game Media settings + report + art) --- */
 .rm-body { margin-bottom: 0.5rem; }

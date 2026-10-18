@@ -30,6 +30,7 @@ pub mod pcgames;
 pub mod plugins;
 pub mod reader;
 pub mod templates;
+pub mod player;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -120,6 +121,15 @@ pub struct AppState {
     /// travels over the invoke channel, never through the window
     /// URL, and the mini window fetches it via `get_player_art`.
     pub player_art: Mutex<HashMap<String, String>>,
+    /// The shared music transport core (Music Glow-Up Phase 2,
+    /// crew Diva): one playback truth for the Music Player panel,
+    /// the Stage window, the detached Mini, and Quick Look —
+    /// state and the position clock live in Rust, never in a
+    /// webview timer.
+    pub player_core: Mutex<player::Core>,
+    /// The player tick thread (4 Hz snapshots + position
+    /// persistence) starts on the first claim, once per process.
+    pub player_tick_started: std::sync::atomic::AtomicBool,
     /// Cancellation flags for running transcodes, by job id.
     /// Port of the built-in cast media server (started lazily).
     pub media_server_port: Mutex<Option<u16>>,
@@ -255,6 +265,11 @@ impl AppState {
             }),
             terminals: Mutex::new(std::collections::HashMap::new()),
             player_art: Mutex::new(HashMap::new()),
+            player_core: Mutex::new(player::Core::new(
+                player::load_prefs_at(&base).0,
+                player::load_prefs_at(&base).1,
+            )),
+            player_tick_started: std::sync::atomic::AtomicBool::new(false),
             media_server_port: Mutex::new(None),
             media_files: std::sync::Arc::new(Mutex::new(
                 std::collections::HashMap::new(),
@@ -620,6 +635,31 @@ pub fn run() {
             commands::close_player_window,
             commands::player_window_open,
             commands::get_player_art,
+            commands::write_text_file,
+            player::player_open_queue,
+            player::player_claim,
+            player::player_state,
+            player::player_toggle,
+            player::player_step,
+            player::player_play_index,
+            player::player_seek,
+            player::player_set_repeat,
+            player::player_set_shuffle,
+            player::player_set_volume,
+            player::player_set_muted,
+            player::player_enqueue,
+            player::player_remove,
+            player::player_clear_queue,
+            player::player_reorder,
+            player::player_stop,
+            player::player_fact,
+            player::player_detach_gone,
+            player::player_spectrum,
+            player::player_set_cast,
+            player::audio_durations,
+            player::audio_play_state,
+            player::audio_recently_played,
+            player::audio_mark_completed,
             commands::make_alias,
             commands::convert_image,
             commands::rotate_image_left,

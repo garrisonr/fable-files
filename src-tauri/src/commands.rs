@@ -1164,6 +1164,33 @@ pub fn set_ui_prefs(state: State<'_, AppState>, prefs: serde_json::Value) -> Cmd
     Ok(())
 }
 
+/// Write a small text file the user explicitly asked to save
+/// (Music Glow-Up Phase 2: .m3u playlist export). Deliberately
+/// narrow: the path's parent must already exist and the name must
+/// end in .m3u — this is not a general file-write door.
+#[tauri::command]
+pub fn write_text_file(path: String, contents: String) -> Cmd<()> {
+    let p = std::path::PathBuf::from(&path);
+    let ok_ext = p
+        .extension()
+        .map(|e| e.to_string_lossy().eq_ignore_ascii_case("m3u"))
+        .unwrap_or(false);
+    if !ok_ext {
+        return Err(CommandError::from(UfmError::Internal(
+            "write_text_file only writes .m3u files".into(),
+        )));
+    }
+    if !p.parent().map(|d| d.is_dir()).unwrap_or(false) {
+        return Err(CommandError::from(UfmError::NotFound(format!(
+            "no folder for {path}"
+        ))));
+    }
+    std::fs::write(&p, contents).map_err(|e| {
+        CommandError::from(UfmError::Internal(format!("write {path}: {e}")))
+    })?;
+    Ok(())
+}
+
 struct DirEntryInfo {
     path: PathBuf,
     name: String,
@@ -8263,7 +8290,12 @@ pub async fn open_player_window(
     art: Option<String>,
 ) -> Cmd<()> {
     use tauri::{Emitter, Manager};
-    let label = player_label(&path);
+    let stage = kind.as_deref() == Some("audio-stage");
+    let label = if stage {
+        "player-stage".to_string()
+    } else {
+        player_label(&path)
+    };
     // Fix batch item 3: cover art rides the invoke channel (data
     // URLs are far too long for the window URL) and waits in the
     // stash for the mini window to pick up via `get_player_art`.
@@ -8274,16 +8306,26 @@ pub async fn open_player_window(
         let _ = w.set_focus();
         return Ok(());
     }
-    let audio = kind.as_deref() == Some("audio");
+    let audio = stage || kind.as_deref() == Some("audio");
     let url = format!(
         "index.html?mode=player&path={}&name={}&kind={}&start={}&autoplay={}",
         query_encode(&path),
         query_encode(&name),
-        if audio { "audio" } else { "video" },
+        if stage {
+            "audio-stage"
+        } else if audio {
+            "audio"
+        } else {
+            "video"
+        },
         start.unwrap_or(0.0).max(0.0),
         if autoplay.unwrap_or(false) { "1" } else { "0" },
     );
-    let (w, h, min_w, min_h) = if audio {
+    let (w, h, min_w, min_h) = if stage {
+        // The Stage (Music Glow-Up Phase 2): a real window with
+        // room for the big art, the lyrics, and the queue rail.
+        (920.0, 660.0, 680.0, 520.0)
+    } else if audio {
         (460.0, 208.0, 340.0, 170.0)
     } else {
         // Player round (Dickles' Brave screenshot): the detach
@@ -8306,7 +8348,7 @@ pub async fn open_player_window(
         .title(format!("{name} — Fable Files"))
         .inner_size(w, h)
         .min_inner_size(min_w, min_h)
-        .always_on_top(true)
+        .always_on_top(!stage)
         .build()
         .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;
     let app2 = app.clone();
@@ -8337,12 +8379,11 @@ pub fn player_window_open(app: tauri::AppHandle, path: String) -> bool {
 /// (fix batch item 3), or None when the caller had none.
 #[tauri::command]
 pub fn get_player_art(state: State<'_, AppState>, path: String) -> Option<String> {
-    state
-        .player_art
-        .lock()
-        .unwrap()
-        .get(&player_label(&path))
+    let map = state.player_art.lock().unwrap();
+    map.get(&player_label(&path))
         .cloned()
+        // The Stage window's label isn't path-derived (Glow-Up).
+        .or_else(|| map.get("player-stage").cloned())
 }
 
 /// Close a pop-out player window (bring the video back to the preview).
@@ -12498,8 +12539,11 @@ fn serve_media_conn(
         .unwrap_or("")
         .to_string();
     let is_transcode = path_part.starts_with("/transcode/");
+    let is_transcode_audio = path_part.starts_with("/transcode-audio/");
     let token_raw = if is_transcode {
         path_part.trim_start_matches("/transcode/")
+    } else if is_transcode_audio {
+        path_part.trim_start_matches("/transcode-audio/")
     } else {
         path_part.trim_start_matches("/cast/")
     };
@@ -12531,6 +12575,30 @@ fn serve_media_conn(
             );
         } else {
             serve_transcode(stream, &file_path, start);
+        }
+        return;
+    }
+    if is_transcode_audio {
+        // Music Glow-Up Phase 2: live audio transcode stream —
+        // the decode path for formats WebKitGTK cannot play
+        // natively (DSD above all). ?t=<secs> is the input-seek
+        // start offset, same contract as the video route.
+        let start = path_part
+            .split('?')
+            .nth(1)
+            .and_then(|q| {
+                q.split('&').find_map(|kv| {
+                    kv.strip_prefix("t=")
+                        .and_then(|v| v.parse::<u64>().ok())
+                })
+            })
+            .unwrap_or(0);
+        if is_head {
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: audio/flac\r\nContent-Length: 0\r\n\r\n",
+            );
+        } else {
+            serve_transcode_audio(stream, &file_path, start);
         }
         return;
     }
@@ -12785,6 +12853,71 @@ fn serve_transcode(mut stream: std::net::TcpStream, path: &std::path::Path, star
     if stream
         .write_all(
             b"HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        )
+        .is_err()
+    {
+        let _ = child.kill();
+        return;
+    }
+    let mut stdout = child.stdout.take().unwrap();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        match stdout.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if stream.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Stream a live FLAC transcode of an audio file (from `start`
+/// seconds) to the socket (Music Glow-Up Phase 2): the decode
+/// path that makes DSD (DSF/DFF) — and any other format the
+/// webview's GStreamer build cannot handle — actually play, over
+/// the plumbing the video transcode route proved. ffmpeg decodes
+/// DSD to high-rate PCM natively; DSD sources are rendered at
+/// 176.4 kHz (the standard DSD64 PCM rate), everything else
+/// keeps its native rate inside the FLAC wrap. No temp file;
+/// when the client goes away the copy loop breaks and ffmpeg
+/// is killed.
+fn serve_transcode_audio(mut stream: std::net::TcpStream, path: &std::path::Path, start: u64) {
+    use std::io::{Read, Write};
+    let path_str = path.to_string_lossy().to_string();
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let is_dsd = ext == "dsf" || ext == "dff";
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-hide_banner", "-loglevel", "error"]);
+    if start > 0 {
+        cmd.args(["-ss", &start.to_string()]);
+    }
+    cmd.args(["-i", &path_str, "-vn"]);
+    if is_dsd {
+        cmd.args(["-ar", "176400"]);
+    }
+    cmd.args(["-c:a", "flac", "-f", "flac", "pipe:1"]);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = stream.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+            );
+            return;
+        }
+    };
+    if stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: audio/flac\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
         )
         .is_err()
     {

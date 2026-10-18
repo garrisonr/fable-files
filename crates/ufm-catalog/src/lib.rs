@@ -697,6 +697,23 @@ impl Catalog {
                 );",
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
+        // Music Glow-Up Phase 2 (crew Diva, 2026-10-18): per-track
+        // listening state — play history, resume positions, and
+        // completion counts — keyed by provider_key (the file's
+        // path) exactly like rom_game_state, so it survives
+        // re-indexing. Written by the shared player core (player.rs).
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS audio_play_state (
+                    provider_key TEXT PRIMARY KEY,
+                    play_count INTEGER NOT NULL DEFAULT 0,
+                    last_played_at TEXT,
+                    last_position_secs REAL NOT NULL DEFAULT 0,
+                    completed_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
         // Phase 3 grouping: the GAME-scoped half of rom_game_state
         // (rating, favorite, completed, title_override, genre,
         // players, notes) lives here, keyed by group key
@@ -4717,6 +4734,29 @@ pub struct RomGameState {
     pub notes: Option<String>,
 }
 
+/// Per-track listening state (Music Glow-Up Phase 2, crew Diva):
+/// the audio mirror of RomGameState's play history, keyed by
+/// provider_key so it survives re-indexing.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioPlayState {
+    pub play_count: i64,
+    /// RFC 3339 — the last time Play was pressed for this track.
+    pub last_played_at: Option<String>,
+    /// Where the listener left off (the resume offer), seconds.
+    pub last_position_secs: f64,
+    /// Listens that reached the track's natural end.
+    pub completed_count: i64,
+}
+
+/// One row of the Recently Played rail.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentAudio {
+    pub provider_key: String,
+    pub state: AudioPlayState,
+}
+
 /// One game's media presence for one media type (ROM Home inspector
 /// chips): whether the enrichment cascade (or the user, by hand)
 /// landed a file, and where it lives.
@@ -7604,6 +7644,139 @@ impl Catalog {
             )
             .map_err(|e| UfmError::Database(e.to_string()))?;
         self.rom_game_state_for(provider_key)
+    }
+
+    /// Music Glow-Up Phase 2 (crew Diva): note a play for a
+    /// track — the count climbs and last-played lands. Returns the
+    /// new state so the caller can paint truth.
+    pub fn audio_note_play(&self, provider_key: &str) -> Result<AudioPlayState> {
+        let now = ufm_core::now_utc().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO audio_play_state (provider_key, play_count, last_played_at, updated_at)
+                 VALUES (?1, 1, ?2, ?2)
+                 ON CONFLICT(provider_key) DO UPDATE SET
+                     play_count = play_count + 1,
+                     last_played_at = excluded.last_played_at,
+                     updated_at = excluded.updated_at",
+                params![provider_key, now],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        self.audio_play_state_for(provider_key)
+    }
+
+    /// One track's listening state (the default — unplayed — when
+    /// the user has never played it).
+    pub fn audio_play_state_for(&self, provider_key: &str) -> Result<AudioPlayState> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT play_count, last_played_at, last_position_secs, completed_count
+                 FROM audio_play_state WHERE provider_key = ?1",
+                params![provider_key],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, f64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(match row {
+            Some((play_count, last_played_at, last_position_secs, completed_count)) => {
+                AudioPlayState {
+                    play_count,
+                    last_played_at,
+                    last_position_secs,
+                    completed_count,
+                }
+            }
+            None => AudioPlayState::default(),
+        })
+    }
+
+    /// Persist a listening position (the player core's tick saves
+    /// every ~15 s of play; a completed listen also bumps the
+    /// completion count and rewinds the saved position to 0).
+    pub fn audio_set_position(
+        &self,
+        provider_key: &str,
+        secs: f64,
+        completed: bool,
+    ) -> Result<()> {
+        let now = ufm_core::now_utc().to_rfc3339();
+        let stored = if completed { 0.0 } else { secs.max(0.0) };
+        self.conn
+            .execute(
+                "INSERT INTO audio_play_state (provider_key, last_position_secs, completed_count, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(provider_key) DO UPDATE SET
+                     last_position_secs = excluded.last_position_secs,
+                     completed_count = completed_count + ?3,
+                     updated_at = excluded.updated_at",
+                params![provider_key, stored, completed as i64, now],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Cached durations for a batch of paths (the catalog's
+    /// probe-fed `items.duration_secs`), positionally aligned
+    /// with the input. Music surfaces merge these at queue-open
+    /// so durations are known before anything plays.
+    pub fn durations_for_paths(&self, paths: &[String]) -> Result<Vec<Option<f64>>> {
+        use rusqlite::OptionalExtension;
+        let mut out = Vec::with_capacity(paths.len());
+        for p in paths {
+            let d = self
+                .conn
+                .query_row(
+                    "SELECT duration_secs FROM items WHERE provider_key = ?1",
+                    params![p],
+                    |r| r.get::<_, Option<f64>>(0),
+                )
+                .optional()
+                .map_err(|e| UfmError::Database(e.to_string()))?
+                .flatten();
+            out.push(d);
+        }
+        Ok(out)
+    }
+
+    /// The Recently Played rail: most recent listens first.
+    pub fn audio_recently_played(&self, limit: i64) -> Result<Vec<RecentAudio>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT provider_key, play_count, last_played_at, last_position_secs, completed_count
+                 FROM audio_play_state
+                 WHERE last_played_at IS NOT NULL
+                 ORDER BY last_played_at DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit.max(1)], |r| {
+                Ok(RecentAudio {
+                    provider_key: r.get(0)?,
+                    state: AudioPlayState {
+                        play_count: r.get(1)?,
+                        last_played_at: r.get(2)?,
+                        last_position_secs: r.get(3)?,
+                        completed_count: r.get(4)?,
+                    },
+                })
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
     }
 
     /// A Smart List: a saved filter, stored as a smart collection
@@ -11466,6 +11639,40 @@ mod rom_home_tests {
         assert_eq!(games.len(), 1);
         assert!(games[0].state.favorite);
         assert_eq!(games[0].state.play_count, 2);
+    }
+
+    #[test]
+    fn audio_play_state_round_trip() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let pk = "/music/Kind of Blue/So What.flac";
+        // Default state for an untouched track.
+        let st = cat.audio_play_state_for(pk).unwrap();
+        assert_eq!(st.play_count, 0);
+        assert!(st.last_played_at.is_none());
+        assert_eq!(st.completed_count, 0);
+        // Plays accrue; positions persist; completion counts and
+        // rewinds the saved position.
+        let st = cat.audio_note_play(pk).unwrap();
+        assert_eq!(st.play_count, 1);
+        assert!(st.last_played_at.is_some());
+        cat.audio_set_position(pk, 123.5, false).unwrap();
+        let st = cat.audio_play_state_for(pk).unwrap();
+        assert_eq!(st.last_position_secs, 123.5);
+        cat.audio_set_position(pk, 0.0, true).unwrap();
+        let st = cat.audio_play_state_for(pk).unwrap();
+        assert_eq!(st.completed_count, 1);
+        assert_eq!(st.last_position_secs, 0.0);
+        // Idempotent reads: noting another play keeps history sane,
+        // and Recently Played surfaces the track.
+        cat.audio_note_play(pk).unwrap();
+        let recent = cat.audio_recently_played(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].provider_key, pk);
+        assert_eq!(recent[0].state.play_count, 2);
+        // A never-played track never appears in Recently Played.
+        cat.audio_set_position("/music/other.flac", 10.0, false).unwrap();
+        let recent = cat.audio_recently_played(10).unwrap();
+        assert_eq!(recent.len(), 1);
     }
 
     #[test]

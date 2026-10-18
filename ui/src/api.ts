@@ -511,6 +511,28 @@ export async function transcodeSrc(
   }
 }
 
+/**
+ * Streaming audio-transcode URL (Music Glow-Up Phase 2): the media
+ * server's /transcode-audio/<token>?t=<startSecs> route decodes to
+ * FLAC on the fly — the real DSD path (DSF/DFF cannot play
+ * natively in the webview) and the fallback for any audio format
+ * the native pipeline refuses. Returns null when the media server
+ * URL is unavailable.
+ */
+export async function transcodeAudioSrc(
+  path: string,
+  startSecs: number,
+): Promise<string | null> {
+  try {
+    const url = await api.mediaUrlForPath(path);
+    if (!url.includes("/cast/")) return null;
+    const t = Math.max(0, Math.floor(startSecs));
+    return url.replace("/cast/", "/transcode-audio/") + `?t=${t}`;
+  } catch {
+    return null;
+  }
+}
+
 /** Subscribe to pop-out player windows closing. Returns an unlisten fn. */
 export async function onPlayerClosed(
   cb: (path: string) => void,
@@ -540,6 +562,79 @@ export async function onPlayerReturn(
   cb: (s: PlayerState) => void,
 ): Promise<() => void> {
   return listen<PlayerState>("player-return", (e) => cb(e.payload));
+}
+
+// ---------------------------------------------------------------------------
+// The shared music transport core (Music Glow-Up Phase 2, crew Diva).
+// One Rust-owned playback truth for the Music Player panel, the Stage
+// window, the detached Mini, and Quick Look. Surfaces render from
+// PlayerSnapshot and drive their single <audio> element from it;
+// the core's claim is what stops every other surface — previews and
+// full playback share the single owner.
+// ---------------------------------------------------------------------------
+
+export type PlayerOwner = "panel" | "stage" | "mini" | "quicklook";
+export type PlayerPlayState = "stopped" | "playing" | "paused";
+export type PlayerRepeat = "off" | "all" | "one";
+
+export interface QueueEntry {
+  providerKey: string;
+  name: string;
+  durationSecs: number | null;
+}
+
+export interface CastMirror {
+  deviceName: string;
+  playing: boolean;
+  positionSecs: number;
+  durationSecs: number;
+}
+
+export interface PlayerSnapshot {
+  owner: PlayerOwner | null;
+  state: PlayerPlayState;
+  queue: QueueEntry[];
+  order: number[];
+  index: number | null;
+  positionSecs: number;
+  durationSecs: number;
+  repeat: PlayerRepeat;
+  shuffle: boolean;
+  volume: number;
+  muted: boolean;
+  playToken: number;
+  cast: CastMirror | null;
+  lastError: string | null;
+}
+
+export interface AudioPlayState {
+  playCount: number;
+  lastPlayedAt: string | null;
+  lastPositionSecs: number;
+  completedCount: number;
+}
+
+export interface RecentAudio {
+  providerKey: string;
+  state: AudioPlayState;
+}
+
+export async function onPlayerCore(
+  cb: (s: PlayerSnapshot) => void,
+): Promise<() => void> {
+  return listen<PlayerSnapshot>("player-core", (e) => cb(e.payload));
+}
+
+export async function onPlayerRevoked(
+  cb: (s: PlayerSnapshot) => void,
+): Promise<() => void> {
+  return listen<PlayerSnapshot>("player-revoked", (e) => cb(e.payload));
+}
+
+export async function onPlayerSpectrum(
+  cb: (bands: number[]) => void,
+): Promise<() => void> {
+  return listen<number[]>("player-spectrum", (e) => cb(e.payload));
 }
 
 export interface SyncPair {
@@ -635,7 +730,7 @@ export const api = {
     path: string,
     name: string,
     opts?: {
-      kind?: "video" | "audio";
+      kind?: "video" | "audio" | "audio-stage";
       start?: number;
       autoplay?: boolean;
       /** Cover-art data URL (fix batch item 3): stashed backend-
@@ -660,6 +755,9 @@ export const api = {
   /** Artwork stashed for this path's detach window at open time. */
   getPlayerArt: (path: string) =>
     invoke<string | null>("get_player_art", { path }),
+  /** Write a user-saved .m3u playlist file (Music Glow-Up P2). */
+  writeTextFile: (path: string, contents: string) =>
+    invoke<void>("write_text_file", { path, contents }),
   makeAlias: (item: string) => invoke<string>("make_alias", { item }),
   convertImage: (item: string, format: string) =>
     invoke<string>("convert_image", { item, format }),
@@ -948,6 +1046,54 @@ export const api = {
     invoke<RomGameState>("rom_home_note_play", { providerKey }),
   romHomeState: (providerKey: string) =>
     invoke<RomGameState>("rom_home_state", { providerKey }),
+  // -- The shared music transport core (Music Glow-Up Phase 2) --
+  playerOpenQueue: (args: {
+    owner: PlayerOwner;
+    entries: QueueEntry[];
+    startIndex?: number;
+    startPosition?: number;
+    autoplay?: boolean;
+  }) => invoke<PlayerSnapshot>("player_open_queue", { args }),
+  playerClaim: (owner: PlayerOwner) =>
+    invoke<PlayerSnapshot>("player_claim", { owner }),
+  playerState: () => invoke<PlayerSnapshot>("player_state"),
+  playerToggle: () => invoke<PlayerSnapshot>("player_toggle"),
+  playerStep: (dir: number) => invoke<PlayerSnapshot>("player_step", { dir }),
+  playerPlayIndex: (index: number) =>
+    invoke<PlayerSnapshot>("player_play_index", { index }),
+  playerSeek: (secs: number) => invoke<PlayerSnapshot>("player_seek", { secs }),
+  playerSetRepeat: (mode: PlayerRepeat) =>
+    invoke<PlayerSnapshot>("player_set_repeat", { mode }),
+  playerSetShuffle: (on: boolean) =>
+    invoke<PlayerSnapshot>("player_set_shuffle", { on }),
+  playerSetVolume: (volume: number) =>
+    invoke<PlayerSnapshot>("player_set_volume", { volume }),
+  playerSetMuted: (muted: boolean) =>
+    invoke<PlayerSnapshot>("player_set_muted", { muted }),
+  playerEnqueue: (entries: QueueEntry[], next?: boolean) =>
+    invoke<PlayerSnapshot>("player_enqueue", { entries, next }),
+  playerRemove: (index: number) =>
+    invoke<PlayerSnapshot>("player_remove", { index }),
+  playerClearQueue: (keepCurrent?: boolean) =>
+    invoke<PlayerSnapshot>("player_clear_queue", { keepCurrent }),
+  playerReorder: (from: number, to: number) =>
+    invoke<PlayerSnapshot>("player_reorder", { from, to }),
+  playerStop: () => invoke<PlayerSnapshot>("player_stop"),
+  playerFact: (kind: string, value?: number, message?: string) =>
+    invoke<PlayerSnapshot>("player_fact", { kind, value, message }),
+  playerDetachGone: () => invoke<PlayerSnapshot>("player_detach_gone"),
+  playerSpectrum: (bands: number[]) =>
+    invoke<void>("player_spectrum", { bands }),
+  playerSetCast: (cast: CastMirror | null) =>
+    invoke<PlayerSnapshot>("player_set_cast", { cast }),
+  audioDurations: (paths: string[]) =>
+    invoke<(number | null)[]>("audio_durations", { paths }),
+  audioPlayState: (providerKey: string) =>
+    invoke<AudioPlayState>("audio_play_state", { providerKey }),
+  audioRecentlyPlayed: (limit?: number) =>
+    invoke<RecentAudio[]>("audio_recently_played", { limit }),
+  audioMarkCompleted: (providerKey: string) =>
+    invoke<void>("audio_mark_completed", { providerKey }),
   romCompleteness: (formatPrefs: Record<string, string>) =>
     invoke<RomCompleteness>("rom_completeness", { formatPrefs }),
   romMissingList: (system: string, formatPrefs: Record<string, string>) =>

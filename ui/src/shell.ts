@@ -370,6 +370,8 @@ export class Shell {
           this.refreshActiveDir();
         }),
       onPlayMusic: (items: Item[]) => this.musicPlayer.open(items),
+      onQueueMusic: (items: Item[], next: boolean) =>
+        this.musicPlayer.enqueue(items, next),
       onOpen: (item) => this.openItem(item),
       onOpenInNewTab: (item) => void this.openItemInNewTab(item),
       onOpenInRomHome: (item) => {

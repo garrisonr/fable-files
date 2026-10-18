@@ -1,20 +1,43 @@
-// Music Player (Dickles' Music Experience, Round 6 WIP): album/playlist
-// panel over the loopback media server. Plays hi-res FLAC natively through
-// WebKit/GStreamer; DSF/DFF attempt the same path (GStreamer dsdparse —
-// the app self-installs gst-plugins-bad; an ffmpeg decode fallback lands
-// with the backend pass). Queue = the audio items handed in (a selection
-// is an instant playlist). Drag-reorder + .m3u persistence and the
-// dot-matrix spectrum are the next increments.
+// Music Player (Music Glow-Up Phase 2, crew Diva): the Panel
+// arrangement of the one shared transport core (src-tauri
+// player.rs). The panel owns no playback truth of its own — the
+// queue, order, position clock, shuffle/repeat, and the single
+// owner live in Rust; this surface renders snapshots and drives
+// its OwnerEngine's element. Detach hands the sound to the Mini
+// or the Stage by claim, never by copying state, and starting
+// playback anywhere (here, Quick Look, a window) revokes the
+// previous owner — previews can no longer talk over each other.
+//
+// Kept from the Round 6/7 panel, because they were right: tag-led
+// headlines (audiometa), folder/embedded art resolution, saved
+// per-folder row order, drag reorder, Album/Playlist modes.
 
 import {
   api,
-  mediaSrc,
   onPlayerClosed,
-  onPlayerReturn,
-  onPlayerState,
   type Item,
+  type PlayerSnapshot,
+  type QueueEntry,
 } from "./api";
-import { audioTags, folderArtUrl } from "./audiometa";
+import {
+  audioBadge,
+  audioProps,
+  audioTags,
+  folderArtUrl,
+  type AudioProps,
+} from "./audiometa";
+import {
+  OwnerEngine,
+  PlayerCoreClient,
+  SpectrumCanvas,
+  SpectrumFeed,
+  TransportBar,
+  fmtClock,
+  fmtTime,
+  onPlayerSpectrum,
+} from "./playercore";
+import { LyricsView } from "./lyrics";
+import type { CastDeviceLike } from "./castsession";
 import { Toast } from "./toast";
 
 const AUDIO_EXTS = new Set([
@@ -28,247 +51,133 @@ export function isAudioName(name: string): boolean {
   return AUDIO_EXTS.has(name.slice(dot + 1).toLowerCase());
 }
 
-function extOf(name: string): string {
-  const dot = name.lastIndexOf(".");
-  return dot < 0 ? "" : name.slice(dot + 1).toLowerCase();
+function isPlaylistName(name: string): boolean {
+  return name.toLowerCase().endsWith(".m3u");
 }
 
-/** Parent directory of an absolute path; mirrors dirname() in shell.ts
- * (kept local: shell.ts imports this module, so importing back would
- * cycle). Never returns "" — dirname("/foo.mp3") === "/". */
+/** Parent directory of an absolute path; mirrors dirname() in
+ * shell.ts (kept local: shell.ts imports this module). */
 function dirname(path: string): string {
   const idx = path.lastIndexOf("/");
   return idx <= 0 ? "/" : path.slice(0, idx);
 }
 
-function fmtTime(secs: number): string {
-  if (!Number.isFinite(secs) || secs < 0) return "–:––";
-  const m = Math.floor(secs / 60);
-  const s = Math.floor(secs % 60);
-  return `${m}:${String(s).padStart(2, "0")}`;
+function basename(path: string): string {
+  const idx = path.lastIndexOf("/");
+  return idx < 0 ? path : path.slice(idx + 1);
 }
 
 function cleanTitle(name: string): string {
   return name.replace(/\.[^.]+$/, "").replace(/_+/g, " ").trim();
 }
 
-function formatBadge(name: string): string {
-  const e = extOf(name);
-  if (e === "dsf" || e === "dff") return "DSD";
-  return e.toUpperCase();
-}
-
 export class MusicPlayer {
+  private client = new PlayerCoreClient();
+  private engine: OwnerEngine;
   private overlay: HTMLDivElement | null = null;
-  private audio = new Audio();
-  private queue: Item[] = [];
-  private index = 0;
+  /** Items behind the panel's queue, by provider_key. */
+  private itemsByKey = new Map<string, Item>();
+  /** Tag readouts per provider_key (header + MediaSession). */
+  private tagsByKey = new Map<string, { title?: string; artist?: string; album?: string }>();
+  /** Durations learned locally (catalog + props + plays). */
   private durations = new Map<string, number>();
+  private propsByKey = new Map<string, AudioProps>();
+  private bar: TransportBar | null = null;
+  private lyrics = new LyricsView();
+  private lyricsExpanded = false;
+  private lyricsHas = false;
+  private spectrum = new SpectrumCanvas();
+  private feed: SpectrumFeed;
+  private spectrumOn = false;
   private rows: HTMLDivElement[] = [];
   private tracksEl: HTMLDivElement | null = null;
+  private railEl: HTMLDivElement | null = null;
+  private titleEl: HTMLDivElement | null = null;
+  private subEl: HTMLDivElement | null = null;
+  private badgeEl: HTMLSpanElement | null = null;
+  private metaEl: HTMLDivElement | null = null;
+  private bannerEl: HTMLDivElement | null = null;
+  private stripEl: HTMLDivElement | null = null;
+  private setupEl: HTMLDivElement | null = null;
   private dragFrom: number | null = null;
-  /** Id of the item whose src was loaded most recently; a
-   * loadedmetadata event for any other item is stale (Round 7). */
-  private loadingItemId: string | null = null;
-  /** UI round item 5 (detach): the path playing in the detach
-   * window + its latest streamed state. The queue stays loaded
-   * here while detached; the local element stays silent. */
-  private detachedPath: string | null = null;
-  private detachedState: { t: number; playing: boolean } | null = null;
-  /** Tombstone watch (fix batch item 4): while a track is
-   * detached, verify the mini window still exists — if its close
-   * event never lands, the return runs from here instead of the
-   * card sitting inert forever. */
+  /** Structural render key: rebuild rows only when this moves. */
+  private renderKey = "";
+  private lyricsKey = "";
+  private recentKey = "";
+  private castDlg: { openPicker: (n: string, v: boolean) => Promise<CastDeviceLike | null>; element: HTMLDivElement } | null = null;
   private detachWatch: number | null = null;
-  /** A resume position to apply on the next loadedmetadata. */
-  private pendingResume: { t: number; playing: boolean } | null = null;
-  private detachBtn: HTMLButtonElement | null = null;
-  private playBtn!: HTMLButtonElement;
-  private seek!: HTMLInputElement;
-  private timeLabel!: HTMLSpanElement;
-  private badge!: HTMLSpanElement;
-  private titleEl!: HTMLDivElement;
-  private subEl!: HTMLDivElement;
+  private setupChecked = false;
+  private setupBusy = false;
   private onKey = (e: KeyboardEvent): void => this.handleKey(e);
 
   constructor() {
-    this.audio.preload = "metadata";
-    this.audio.addEventListener("timeupdate", () => this.syncProgress());
-    this.audio.addEventListener("loadedmetadata", () => {
-      // Round 7 (Copilot audit): metadata can arrive after a fast skip —
-      // record it only when it belongs to the item loaded most recently,
-      // or track A's duration lands on track B's row.
-      const cur = this.queue[this.index];
-      if (cur && cur.id === this.loadingItemId) {
-        this.durations.set(cur.id, this.audio.duration);
-        this.fillDuration(this.index);
-      }
-      // Detach return: land at the position the mini window
-      // reached, with its play state.
-      const pr = this.pendingResume;
-      if (pr) {
-        this.pendingResume = null;
-        const d = this.audio.duration;
-        if (Number.isFinite(d) && d > 0 && pr.t > 0) {
-          try {
-            this.audio.currentTime = Math.min(pr.t, Math.max(0, d - 0.25));
-          } catch {
-            // not seekable yet — starts at the top instead
-          }
-        }
-        if (!pr.playing) this.audio.pause();
-        this.syncPlayGlyph();
-      }
-      this.syncProgress();
+    void this.client.start();
+    this.engine = new OwnerEngine("panel", this.client, {
+      castPicker: (name, isVideo) => this.castPicker(name, isVideo),
+      onSnapshot: (s) => this.render(s),
+      onError: (m) => Toast.error(m),
     });
-    this.audio.addEventListener("ended", () => this.step(1, true));
-    this.audio.addEventListener("error", () => {
-      // While detached the local element is intentionally src-less.
-      if (this.detachedPath) return;
-      const cur = this.queue[this.index];
-      if (cur && (extOf(cur.name) === "dsf" || extOf(cur.name) === "dff")) {
-        Toast.error("This DSD file could not be played directly — the decode fallback arrives with the next backend pass.");
-      } else {
-        Toast.error("That track could not be played.");
-      }
-    });
+    this.feed = new SpectrumFeed(this.engine, () => this.client.isOwner("panel"));
     try {
-      const v = parseFloat(localStorage.getItem("ff-music-vol") ?? "");
-      if (Number.isFinite(v)) this.audio.volume = Math.min(1, Math.max(0, v));
-    } catch { /* default volume */ }
-    // Detach handoff listeners (UI round item 5): the mini window
-    // streams its state here; its return/close brings playback home.
-    void onPlayerState((s) => {
-      if (s.path === this.detachedPath) {
-        this.detachedState = { t: s.t, playing: s.playing };
-      }
+      this.spectrumOn = localStorage.getItem("ff-music-spectrum") === "1";
+    } catch { /* default off */ }
+    // Media keys + OS now-playing drive the core from here.
+    this.client.installMediaSession(() => {
+      const e = this.client.currentEntry();
+      const tags = e ? this.tagsByKey.get(e.providerKey) : undefined;
+      return {
+        title: tags?.title ?? (e ? cleanTitle(e.name) : "Fable Files"),
+        artist: tags?.artist,
+        album: tags?.album,
+        artwork: this.currentArt ?? undefined,
+      };
+    });
+    // The detached window dying without a return (tombstone
+    // backstop, fix batch item 4): the core lapses ownership and
+    // this panel — when open — claims the sound back.
+    void onPlayerClosed((path) => {
+      const s = this.client.snap;
+      if (!s || (s.owner !== "mini" && s.owner !== "stage")) return;
+      const cur = this.client.currentEntry();
+      if (!cur || cur.providerKey !== path) return;
+      void api.playerDetachGone().then(() => {
+        if (this.overlay) void this.client.claim("panel");
+      }).catch(() => undefined);
     }).catch(() => undefined);
-    void onPlayerReturn((s) => {
-      if (s.path !== this.detachedPath) return;
-      this.detachedState = { t: s.t, playing: s.playing };
-      if (s.ended) {
-        // The mini window played the track out and closed itself:
-        // the queue advances HERE (or stops at the end of it).
-        // player-closed follows, finds detachedPath already null,
-        // and does nothing more.
-        this.detachedPath = null;
-        this.stopDetachWatch();
-        this.paintAttached();
-        if (!this.overlay) return;
-        const next = this.index + 1;
-        if (next < this.queue.length) {
-          void this.resumeAt(next, 0, true);
-        }
-      }
+    void onPlayerSpectrum((bands) => {
+      if (this.overlay && this.spectrumOn) this.spectrum.draw(bands);
     }).catch(() => undefined);
-    void onPlayerClosed((path) => this.handleDetachWindowGone(path)).catch(
-      () => undefined,
-    );
+    this.lyrics.onSeek = (secs) => void this.engine.seekTo(secs);
   }
 
-  /** The detach window is gone — close event or tombstone watch
-   * (fix batch item 4): resume the track here from its last
-   * streamed state. Idempotent: whichever path fires second
-   * finds detachedPath already null and does nothing. */
-  private handleDetachWindowGone(path: string): void {
-    if (path !== this.detachedPath) return;
-    this.detachedPath = null;
-    this.stopDetachWatch();
-    this.paintAttached();
-    if (!this.overlay) return; // the player itself was closed too
-    const st = this.detachedState;
-    this.detachedState = null;
-    void this.resumeAt(this.index, st?.t ?? 0, st?.playing ?? false);
-  }
+  private currentArt: string | null = null;
 
-  private startDetachWatch(): void {
-    if (this.detachWatch !== null) return;
-    this.detachWatch = window.setInterval(() => {
-      const p = this.detachedPath;
-      if (!p) {
-        this.stopDetachWatch();
-        return;
+  private async castPicker(
+    name: string,
+    isVideo: boolean,
+  ): Promise<CastDeviceLike | null> {
+    if (!this.castDlg) {
+      try {
+        const { CastDialog } = await import("./cast");
+        this.castDlg = new CastDialog();
+        document.body.appendChild(this.castDlg.element);
+      } catch {
+        return null;
       }
-      void api
-        .playerWindowOpen(p)
-        .then((open) => {
-          if (!open) this.handleDetachWindowGone(p);
-        })
-        .catch(() => undefined);
-    }, 1200);
-  }
-
-  private stopDetachWatch(): void {
-    if (this.detachWatch !== null) {
-      window.clearInterval(this.detachWatch);
-      this.detachWatch = null;
     }
+    return this.castDlg.openPicker(name, isVideo);
   }
 
-  /** Detach the current track into the always-on-top mini window
-   * (UI round item 5): playback continues there from this exact
-   * position; the local element goes silent. */
-  private detach(): void {
-    const item = this.queue[this.index];
-    if (!item?.provider_key || this.detachedPath) return;
-    const path = item.provider_key;
-    const t = this.audio.currentTime || 0;
-    const playing = !this.audio.paused && !this.audio.ended;
-    this.detachedState = { t, playing };
-    // Item 3: the art this panel is showing rides along to the
-    // mini window (a data URL the backend stashes at open time).
-    const artImg =
-      this.overlay?.querySelector<HTMLImageElement>(".music-art-img");
-    const art =
-      artImg && !artImg.hidden && artImg.src.startsWith("data:")
-        ? artImg.src
-        : null;
-    void api
-      .openPlayerWindow(path, item.name, {
-        kind: "audio",
-        start: t,
-        autoplay: playing,
-        art,
-      })
-      .then(() => {
-        this.detachedPath = path;
-        this.audio.pause();
-        this.loadingItemId = null;
-        this.audio.removeAttribute("src");
-        this.audio.load();
-        this.paintDetached();
-        this.startDetachWatch();
-      })
-      .catch(() => undefined);
-  }
-
-  /** Load queue index i and land at position t with the given play
-   * state — the trip home from the detach window. */
-  private async resumeAt(i: number, t: number, playing: boolean): Promise<void> {
-    if (i < 0 || i >= this.queue.length) return;
-    // Pending even when t is 0: playIndex autoplays, and a paused
-    // return must re-pause once metadata lands.
-    this.pendingResume = { t, playing };
-    await this.playIndex(i);
-    if (!playing && t <= 0) this.audio.pause();
-    this.syncPlayGlyph();
-  }
-
-  private paintDetached(): void {
-    if (!this.overlay) return;
-    this.overlay.querySelector(".music-card")?.classList.add("detached");
-    if (this.subEl) {
-      this.subEl.textContent =
-        "Playing in the detached window — the ⤺ Return button there brings it back here";
-    }
-  }
-
-  private paintAttached(): void {
-    if (!this.overlay) return;
-    this.overlay.querySelector(".music-card")?.classList.remove("detached");
-  }
+  // ---------------------------------------------------------------
+  // Opening
+  // ---------------------------------------------------------------
 
   open(items: Item[]): void {
+    const playlist = items.find((i) => isPlaylistName(i.name));
+    if (playlist?.provider_key) {
+      void this.openPlaylistFile(playlist);
+      return;
+    }
     const audioItems = items
       .filter((i) => i.kind !== "folder" && isAudioName(i.name))
       .sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
@@ -277,96 +186,149 @@ export class MusicPlayer {
       return;
     }
     this.close();
-    this.queue = audioItems;
-    this.applySavedOrder();
-    this.index = 0;
-    this.durations.clear();
-    this.buildPanel();
-    void this.playIndex(0);
+    this.itemsByKey = new Map(
+      audioItems.map((i) => [i.provider_key ?? i.name, i]),
+    );
+    const ordered = this.applySavedOrder([...audioItems]);
+    void (async () => {
+      const entries = await this.buildEntries(ordered);
+      this.buildPanel();
+      await this.client.openQueue({
+        owner: "panel",
+        entries,
+        startIndex: 0,
+        autoplay: true,
+      });
+      void this.checkPlaybackSetup();
+    })();
   }
 
-  /** Folder these items live in, when they all share one (else null). */
-  private queueFolder(): string | null {
-    const first = this.queue[0]?.provider_key;
-    if (!first) return null;
-    const folder = dirname(first);
-    return this.queue.every((i) => dirname(i.provider_key ?? "") === folder)
-      ? folder
-      : null;
+  /** Add to the live queue from a file context action (the shell
+   * routes here): Play next, or append. */
+  enqueue(items: Item[], next: boolean): void {
+    const audioItems = items.filter(
+      (i) => i.kind !== "folder" && isAudioName(i.name),
+    );
+    if (audioItems.length === 0) return;
+    for (const i of audioItems) {
+      this.itemsByKey.set(i.provider_key ?? i.name, i);
+    }
+    void (async () => {
+      const entries = await this.buildEntries(audioItems);
+      await this.client.enqueue(entries, next);
+      Toast.success(
+        next
+          ? `Queued next: ${cleanTitle(audioItems[0].name)}`
+          : `Added ${entries.length} to the queue`,
+      );
+    })();
   }
 
-  // The path→id folder walk that used to live here moved to
-  // audiometa.ts (inc-2 item 9) as listFolderByPath — shared with
-  // Quick Look so folder art resolves identically everywhere.
+  private async buildEntries(items: Item[]): Promise<QueueEntry[]> {
+    const paths = items.map((i) => i.provider_key ?? i.name);
+    let catalogDurs: (number | null)[] = [];
+    try {
+      catalogDurs = await api.audioDurations(paths);
+    } catch {
+      catalogDurs = [];
+    }
+    return items.map((item, i) => {
+      const key = item.provider_key ?? item.name;
+      const d =
+        catalogDurs[i] ?? this.durations.get(item.id) ?? null;
+      if (d) this.durations.set(item.id, d);
+      return {
+        providerKey: key,
+        name: item.name,
+        durationSecs: d,
+      };
+    });
+  }
 
-  /** A saved custom order (drag-reorder) wins over name order.
-   * Round 7: orders persist by item id (`ff-music-order-id:<folder>`);
-   * the legacy provider_key order (`ff-music-order:<folder>`) is read
-   * as a fallback so existing users keep their custom order. */
-  private applySavedOrder(): void {
-    const folder = this.queueFolder();
-    if (!folder) return;
+  /** A saved custom order (drag-reorder) wins over name order —
+   * persisted by item id per folder, exactly as the Round 7
+   * panel had it. */
+  private applySavedOrder(items: Item[]): Item[] {
+    const folder = this.folderOf(items);
+    if (!folder) return items;
     try {
       const rawIds = localStorage.getItem(`ff-music-order-id:${folder}`);
       if (rawIds) {
         const saved = JSON.parse(rawIds) as string[];
-        const ids = new Set(this.queue.map((i) => i.id));
-        if (saved.length === this.queue.length && saved.every((id) => ids.has(id))) {
+        const ids = new Set(items.map((i) => i.id));
+        if (saved.length === items.length && saved.every((id) => ids.has(id))) {
           const rank = new Map(saved.map((id, i) => [id, i]));
-          this.queue.sort((a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0));
+          return [...items].sort(
+            (a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0),
+          );
         }
-        return;
+        return items;
       }
       const raw = localStorage.getItem(`ff-music-order:${folder}`);
-      if (!raw) return;
+      if (!raw) return items;
       const saved = JSON.parse(raw) as string[];
-      const paths = new Set(this.queue.map((i) => i.provider_key));
-      if (saved.length !== this.queue.length || !saved.every((p) => paths.has(p))) return;
+      const paths = new Set(items.map((i) => i.provider_key));
+      if (saved.length !== items.length || !saved.every((p) => paths.has(p))) {
+        return items;
+      }
       const rank = new Map(saved.map((p, i) => [p, i]));
-      this.queue.sort((a, b) => (rank.get(a.provider_key ?? "") ?? 0) - (rank.get(b.provider_key ?? "") ?? 0));
-    } catch { /* name order stands */ }
+      return [...items].sort(
+        (a, b) =>
+          (rank.get(a.provider_key ?? "") ?? 0) -
+          (rank.get(b.provider_key ?? "") ?? 0),
+      );
+    } catch {
+      return items;
+    }
   }
 
-  private persistOrder(): void {
-    const folder = this.queueFolder();
-    if (!folder) return;
+  private folderOf(items: Item[]): string | null {
+    const first = items[0]?.provider_key;
+    if (!first) return null;
+    const folder = dirname(first);
+    return items.every((i) => dirname(i.provider_key ?? "") === folder)
+      ? folder
+      : null;
+  }
+
+  private persistOrder(queue: QueueEntry[]): void {
+    const items = queue
+      .map((e) => this.itemsByKey.get(e.providerKey))
+      .filter((i): i is Item => !!i);
+    const folder = this.folderOf(items);
+    if (!folder || items.length !== queue.length) return;
     try {
       localStorage.setItem(
         `ff-music-order-id:${folder}`,
-        JSON.stringify(this.queue.map((i) => i.id)),
+        JSON.stringify(items.map((i) => i.id)),
       );
     } catch { /* ignore */ }
   }
 
-  private reorder(from: number, to: number): void {
-    if (from === to || from < 0 || to < 0 || from >= this.queue.length || to >= this.queue.length) return;
-    const playing = this.queue[this.index];
-    const [moved] = this.queue.splice(from, 1);
-    this.queue.splice(to, 0, moved);
-    this.index = this.queue.indexOf(playing);
-    this.renderRows();
-    this.persistOrder();
-  }
-
   close(): void {
-    // A detach window outlives the panel: it keeps playing on its
-    // own, but its state stream no longer maps to this queue.
-    this.detachedPath = null;
+    // Closing the panel stops the sound only when the panel owns
+    // it — a detached Mini/Stage keeps playing (its window IS
+    // the surface now), exactly as the old detach contract had it.
+    const s = this.client.snap;
+    if (s && s.owner === "panel") {
+      void this.client.stop().catch(() => undefined);
+    }
     this.stopDetachWatch();
-    this.detachedState = null;
-    this.pendingResume = null;
-    this.audio.pause();
-    this.loadingItemId = null;
-    this.audio.removeAttribute("src");
-    this.audio.load();
     if (this.overlay) {
       this.overlay.remove();
       this.overlay = null;
     }
     this.tracksEl = null;
+    this.railEl = null;
     this.rows = [];
+    this.renderKey = "";
+    this.lyricsKey = "";
     document.removeEventListener("keydown", this.onKey, true);
   }
+
+  // ---------------------------------------------------------------
+  // Panel construction
+  // ---------------------------------------------------------------
 
   private buildPanel(): void {
     const overlay = document.createElement("div");
@@ -374,8 +336,6 @@ export class MusicPlayer {
     const compact = (() => {
       try { return localStorage.getItem("ff-music-mode") === "playlist"; } catch { return false; }
     })();
-    const first = this.queue[0];
-    const folder = dirname(first?.provider_key ?? "").split("/").pop() ?? "";
     overlay.innerHTML = `
       <div class="music-card${compact ? " compact" : ""}" role="dialog" aria-label="Music player">
         <div class="music-head">
@@ -383,94 +343,82 @@ export class MusicPlayer {
           <div class="music-meta">
             <div class="music-title"></div>
             <div class="music-sub"></div>
+            <div class="music-meta-line"></div>
           </div>
+          <span class="music-badge"></span>
           <button class="music-mode" title="Toggle Album / Playlist view">${compact ? "Playlist" : "Album"}</button>
+          <button class="music-stage" title="Open the Stage window">⤢</button>
           <button class="music-detach" title="Detach into a mini window">⧉</button>
           <button class="music-close" title="Close (Esc)">✕</button>
         </div>
-        <div class="music-tracks"></div>
-        <div class="music-bar">
-          <button class="music-btn music-prev" title="Previous">⏮</button>
-          <button class="music-btn music-play" title="Play / pause (Space)">▶</button>
-          <button class="music-btn music-next" title="Next">⏭</button>
-          <input class="music-seek" type="range" min="0" max="1000" value="0" />
-          <span class="music-time">0:00 / –:––</span>
-          <span class="music-badge"></span>
-          <span class="music-vol-lab">Vol</span>
-          <input class="music-vol" type="range" min="0" max="100" />
+        <div class="music-setup" hidden></div>
+        <div class="music-banner" hidden></div>
+        <div class="music-main">
+          <div class="music-tracks"></div>
+          <div class="music-rail"></div>
         </div>
+        <div class="music-lyrics-strip" title="Show lyrics"></div>
+        <div class="music-spectrum" hidden></div>
+        <div class="music-bar-host"></div>
       </div>`;
     document.body.appendChild(overlay);
     this.overlay = overlay;
-    const q = <T extends HTMLElement>(sel: string) => overlay.querySelector(sel) as T;
+    const q = <T extends HTMLElement>(sel: string) =>
+      overlay.querySelector(sel) as T;
     this.titleEl = q<HTMLDivElement>(".music-title");
-    this.titleEl.textContent = folder || "Music";
     this.subEl = q<HTMLDivElement>(".music-sub");
-    this.subEl.textContent =
-      `${this.queue.length} track${this.queue.length === 1 ? "" : "s"} · drag rows to reorder`;
-    this.playBtn = q<HTMLButtonElement>(".music-play");
-    this.seek = q<HTMLInputElement>(".music-seek");
-    this.timeLabel = q<HTMLSpanElement>(".music-time");
-    this.badge = q<HTMLSpanElement>(".music-badge");
-    q<HTMLInputElement>(".music-vol").value = String(Math.round(this.audio.volume * 100));
-
-    // Album art: folder art (folder.jpg / cover.jpg / front.jpg …) wins;
-    // otherwise the thumbnailer extracts embedded cover art for audio.
-    const img = q<HTMLImageElement>(".music-art-img");
-    // A failed art load must fall back to the glyph, never a broken
-    // image box (fix block item 5).
-    img.addEventListener("error", () => {
-      img.hidden = true;
-      q<HTMLSpanElement>(".music-art-glyph").hidden = false;
-    });
-    if (first) {
-      void (async () => {
-        const show = (url: string) => {
-          img.src = url;
-          img.hidden = false;
-          q<HTMLSpanElement>(".music-art-glyph").hidden = true;
-        };
-        try {
-          const folder = this.queueFolder();
-          if (folder) {
-            // Shared with Quick Look (inc-2 item 9): audiometa's
-            // folderArtUrl owns the art-name set + path→id walk.
-            const url = await folderArtUrl(first, folder);
-            if (url) {
-              show(url);
-              return;
-            }
-          }
-        } catch { /* fall through to embedded art */ }
-        try {
-          const url = await api.getThumbnail(first.id, first.provider_key, true);
-          if (url) show(url);
-        } catch { /* glyph stays */ }
-      })();
-    }
-
+    this.metaEl = q<HTMLDivElement>(".music-meta-line");
+    this.badgeEl = q<HTMLSpanElement>(".music-badge");
+    this.bannerEl = q<HTMLDivElement>(".music-banner");
+    this.setupEl = q<HTMLDivElement>(".music-setup");
     this.tracksEl = q<HTMLDivElement>(".music-tracks");
-    this.renderRows();
-
-    this.detachBtn = q<HTMLButtonElement>(".music-detach");
-    this.detachBtn.addEventListener("click", () => this.detach());
+    this.railEl = q<HTMLDivElement>(".music-rail");
+    this.stripEl = q<HTMLDivElement>(".music-lyrics-strip");
+    const spectrumHost = q<HTMLDivElement>(".music-spectrum");
+    spectrumHost.appendChild(this.spectrum.el);
+    spectrumHost.hidden = !this.spectrumOn;
+    // Lyrics full view lives under the strip, collapsed by default.
+    this.lyrics.el.classList.add("music-lyrics-full");
+    this.lyrics.el.hidden = true;
+    overlay
+      .querySelector(".music-card")
+      ?.insertBefore(this.lyrics.el, q<HTMLDivElement>(".music-bar-host"));
+    this.stripEl.addEventListener("click", () => {
+      this.lyricsExpanded = !this.lyricsExpanded;
+      this.lyrics.el.hidden = !this.lyricsExpanded;
+    });
+    // The one transport.
+    this.bar = new TransportBar(
+      {
+        onToggle: () => void this.engine.toggle(),
+        onStep: (d) => void this.client.step(d),
+        onSeek: (s) => void this.engine.seekTo(s),
+        onRepeat: () => void this.cycleRepeat(),
+        onShuffle: () => {
+          const s = this.client.snap;
+          if (s) void this.client.setShuffle(!s.shuffle);
+        },
+        onVolume: (v) => void this.client.setVolume(v),
+        onMute: () => {
+          const s = this.client.snap;
+          if (s) void this.client.setMuted(!s.muted);
+        },
+        onCast: () => void this.engine.startCastFlow(),
+      },
+      {},
+    );
+    const barHost = q<HTMLDivElement>(".music-bar-host");
+    barHost.appendChild(this.bar.el);
+    const specBtn = document.createElement("button");
+    specBtn.className = "tbar-btn music-spec-btn" + (this.spectrumOn ? " on" : "");
+    specBtn.textContent = "▦";
+    specBtn.title = "Dot-matrix spectrum";
+    specBtn.addEventListener("click", () => this.toggleSpectrum(specBtn, spectrumHost));
+    this.bar.el.appendChild(specBtn);
+    // Header buttons.
     q<HTMLButtonElement>(".music-close").addEventListener("click", () => this.close());
     overlay.addEventListener("pointerdown", (e) => {
       if (e.target === overlay) this.close();
-    });
-    this.playBtn.addEventListener("click", () => this.toggle());
-    q<HTMLButtonElement>(".music-prev").addEventListener("click", () => this.step(-1, true));
-    q<HTMLButtonElement>(".music-next").addEventListener("click", () => this.step(1, true));
-    this.seek.addEventListener("input", () => {
-      const d = this.audio.duration;
-      if (Number.isFinite(d) && d > 0) {
-        this.audio.currentTime = (Number(this.seek.value) / 1000) * d;
-      }
-    });
-    q<HTMLInputElement>(".music-vol").addEventListener("input", (e) => {
-      const v = Number((e.target as HTMLInputElement).value) / 100;
-      this.audio.volume = v;
-      try { localStorage.setItem("ff-music-vol", String(v)); } catch { /* ignore */ }
     });
     q<HTMLButtonElement>(".music-mode").addEventListener("click", (e) => {
       const card = q<HTMLDivElement>(".music-card");
@@ -478,113 +426,203 @@ export class MusicPlayer {
       (e.target as HTMLButtonElement).textContent = nowCompact ? "Playlist" : "Album";
       try { localStorage.setItem("ff-music-mode", nowCompact ? "playlist" : "album"); } catch { /* ignore */ }
     });
+    q<HTMLButtonElement>(".music-detach").addEventListener("click", () => this.detach());
+    q<HTMLButtonElement>(".music-stage").addEventListener("click", () => this.openStage());
     document.addEventListener("keydown", this.onKey, true);
+    // Album art for the folder (shared resolution with Quick Look).
+    void this.resolveFolderArt();
+    const s = this.client.snap;
+    if (s) this.render(s);
   }
 
-  private async playIndex(i: number): Promise<void> {
-    // While a track is detached, the mini window owns playback —
-    // row clicks and transport keys must not start a second stream.
-    if (this.detachedPath) return;
-    if (i < 0 || i >= this.queue.length) return;
-    this.index = i;
-    const item = this.queue[i];
-    this.loadingItemId = item.id;
-    const path = item.provider_key ?? item.name;
-    this.badge.textContent = formatBadge(item.name);
-    // Headline + subline from embedded tags (inc-2 item 9): the
-    // Title tag is the headline, Artist · Album the subline; the
-    // cleaned filename is only the fallback.
-    this.titleEl.textContent = cleanTitle(item.name);
-    void audioTags(item).then((tags) => {
-      if (this.index !== i) return;
-      if (tags.title) this.titleEl.textContent = tags.title;
-      const sub = [tags.artist, tags.album]
-        .filter((s): s is string => !!s)
-        .join(" · ");
-      if (sub && this.subEl) this.subEl.textContent = sub;
+  private async resolveFolderArt(): Promise<void> {
+    const first = [...this.itemsByKey.values()][0];
+    if (!first) return;
+    const img = this.overlay?.querySelector<HTMLImageElement>(".music-art-img");
+    const glyph = this.overlay?.querySelector<HTMLSpanElement>(".music-art-glyph");
+    if (!img || !glyph) return;
+    img.addEventListener("error", () => {
+      img.hidden = true;
+      glyph.hidden = false;
+      this.currentArt = null;
     });
-    this.rows.forEach((r, j) => r.classList.toggle("playing", j === i));
+    const show = (url: string) => {
+      img.src = url;
+      img.hidden = false;
+      glyph.hidden = true;
+      this.currentArt = url;
+    };
     try {
-      this.audio.src = await mediaSrc(path);
-      await this.audio.play();
-    } catch {
-      // error event / toast path handles messaging
-    }
-    this.syncPlayGlyph();
+      const folder = this.folderOf([...this.itemsByKey.values()]);
+      if (folder) {
+        const url = await folderArtUrl(first, folder);
+        if (url) {
+          show(url);
+          return;
+        }
+      }
+    } catch { /* fall through to embedded art */ }
+    try {
+      const url = await api.getThumbnail(first.id, first.provider_key, true);
+      if (url) show(url);
+    } catch { /* glyph stays */ }
   }
 
-  private step(dir: 1 | -1, autoplay: boolean): void {
-    const next = this.index + dir;
-    if (next < 0 || next >= this.queue.length) {
-      if (dir === 1) this.audio.pause();
-      return;
+  // ---------------------------------------------------------------
+  // Rendering from snapshots
+  // ---------------------------------------------------------------
+
+  private render(s: PlayerSnapshot): void {
+    if (!this.overlay) return;
+    this.bar?.update(s);
+    // Lyrics follow the position clock; the strip shows the line
+    // being sung right now (tap it for the full pane).
+    if (this.lyrics.isSynced) {
+      this.lyrics.setPosition(s.positionSecs * 1000);
     }
-    void this.playIndex(next).then(() => {
-      if (!autoplay) this.audio.pause();
-    });
+    if (this.stripEl) {
+      const has = this.lyricsHas;
+      this.stripEl.hidden = !has;
+      this.stripEl.textContent = has
+        ? (this.lyrics.activeText() ?? "Lyrics")
+        : "";
+    }
+    // Header meta for the current entry.
+    const entry = s.index !== null ? s.queue[s.index] : null;
+    if (entry && this.titleEl && this.subEl && this.badgeEl && this.metaEl) {
+      const item = this.itemsByKey.get(entry.providerKey);
+      this.titleEl.textContent = cleanTitle(entry.name);
+      this.badgeEl.textContent = audioBadge(
+        entry.name,
+        this.propsByKey.get(entry.providerKey),
+      );
+      if (item) {
+        void audioTags(item).then((tags) => {
+          this.tagsByKey.set(entry.providerKey, tags);
+          if (this.client.currentEntry()?.providerKey !== entry.providerKey) return;
+          if (!this.titleEl || !this.subEl || !this.metaEl) return;
+          if (tags.title) this.titleEl.textContent = tags.title;
+          const sub = [tags.artist, tags.album]
+            .filter((x): x is string => !!x)
+            .join(" · ");
+          if (sub) this.subEl.textContent = sub;
+          const meta = [tags.year, tags.genre]
+            .filter((x): x is string => !!x)
+            .join(" · ");
+          this.metaEl.textContent = meta;
+        });
+        void audioProps(item).then((props) => {
+          this.propsByKey.set(entry.providerKey, props);
+          if (props.durationSecs && !this.durations.has(item.id)) {
+            this.durations.set(item.id, props.durationSecs);
+          }
+          if (this.badgeEl && this.client.currentEntry()?.providerKey === entry.providerKey) {
+            this.badgeEl.textContent = audioBadge(entry.name, props);
+          }
+          this.renderKey = ""; // let rows pick up props/durations
+          const fresh = this.client.snap;
+          if (fresh) this.renderRows(fresh);
+        });
+      }
+    }
+    // Banner: the sound lives in another window.
+    if (this.bannerEl) {
+      if (s.owner === "mini" || s.owner === "stage") {
+        this.bannerEl.hidden = false;
+        this.bannerEl.innerHTML = "";
+        const span = document.createElement("span");
+        span.textContent =
+          s.owner === "mini"
+            ? "Playing in the detached mini window — the transport here drives it too."
+            : "Playing on the Stage — the transport here drives it too.";
+        const btn = document.createElement("button");
+        btn.className = "pill-btn";
+        btn.textContent = "Bring it back here";
+        btn.addEventListener("click", () => {
+          void this.client.claim("panel");
+          if (entry) void api.closePlayerWindow(entry.providerKey).catch(() => undefined);
+        });
+        this.bannerEl.append(span, btn);
+      } else {
+        this.bannerEl.hidden = true;
+      }
+    }
+    // Lyrics load per entry.
+    const lkey = entry ? `${entry.providerKey}:${s.playToken}` : "";
+    if (entry && lkey !== this.lyricsKey) {
+      this.lyricsKey = lkey;
+      const wasExpanded = this.lyricsExpanded;
+      void this.lyrics.load(entry.providerKey).then((has) => {
+        this.lyricsHas = has;
+        if (this.stripEl) this.stripEl.hidden = !has;
+        this.lyrics.el.hidden = !(has && wasExpanded);
+      });
+    }
+    // Detached tombstone watch runs while a window owns the sound.
+    if (s.owner === "mini" || s.owner === "stage") this.startDetachWatch();
+    else this.stopDetachWatch();
+    this.renderRows(s);
+    this.renderRail(s);
   }
 
-  private toggle(): void {
-    if (this.detachedPath) return; // playback lives in the mini window
-    if (this.audio.paused) void this.audio.play().then(() => this.syncPlayGlyph());
-    else {
-      this.audio.pause();
-      this.syncPlayGlyph();
-    }
-  }
-
-  private syncPlayGlyph(): void {
-    if (this.playBtn) this.playBtn.textContent = this.audio.paused ? "▶" : "❚❚";
-  }
-
-  private syncProgress(): void {
-    const d = this.audio.duration;
-    const c = this.audio.currentTime;
-    if (this.seek && Number.isFinite(d) && d > 0) {
-      this.seek.value = String(Math.round((c / d) * 1000));
-    }
-    if (this.timeLabel) {
-      this.timeLabel.textContent = `${fmtTime(c)} / ${fmtTime(d)}`;
-    }
-    this.syncPlayGlyph();
-  }
-
-  private fillDuration(i: number): void {
-    const row = this.rows[i];
-    const item = this.queue[i];
-    const d = item ? this.durations.get(item.id) : undefined;
-    if (row && d) {
-      (row.querySelector(".music-d") as HTMLSpanElement).textContent = fmtTime(d);
-    }
-  }
-
-  /** (Re)build the track rows — used on open and after a drag-reorder. */
-  private renderRows(): void {
+  private renderRows(s: PlayerSnapshot): void {
     if (!this.tracksEl) return;
+    const key = [
+      s.queue.map((e) => e.providerKey).join("|"),
+      s.order.join(","),
+      s.index ?? -1,
+      s.owner ?? "",
+    ].join("::");
+    if (key === this.renderKey) return;
+    this.renderKey = key;
     this.tracksEl.innerHTML = "";
-    this.rows = this.queue.map((item, i) => {
+    this.rows = s.queue.map((entry, i) => {
       const row = document.createElement("div");
-      row.className = "music-row" + (i === this.index ? " playing" : "");
+      row.className = "music-row" + (i === s.index ? " playing" : "");
       row.draggable = true;
+      const item = this.itemsByKey.get(entry.providerKey);
+      const props = this.propsByKey.get(entry.providerKey);
+      const dur =
+        entry.durationSecs ??
+        (item ? this.durations.get(item.id) : undefined) ??
+        props?.durationSecs;
       row.innerHTML = `
         <span class="music-n">${i + 1}</span>
         <span class="music-t"></span>
         <span class="music-fmt"></span>
-        <span class="music-d">–:––</span>`;
-      (row.querySelector(".music-t") as HTMLSpanElement).textContent = cleanTitle(item.name);
-      // Embedded Title tag replaces the filename when present
-      // (inc-2 item 9); reads are cached per item in audiometa.
-      void audioTags(item).then((tags) => {
-        if (!tags.title) return;
-        const t = row.querySelector(".music-t") as HTMLSpanElement | null;
-        if (t) t.textContent = tags.title;
-      });
-      (row.querySelector(".music-fmt") as HTMLSpanElement).textContent = formatBadge(item.name);
-      const known = this.durations.get(item.id);
-      if (known) {
-        (row.querySelector(".music-d") as HTMLSpanElement).textContent = fmtTime(known);
+        <span class="music-bit"></span>
+        <span class="music-sr"></span>
+        <span class="music-d">${dur ? fmtTime(dur) : "–:––"}</span>
+        <button class="music-row-x" title="Remove from queue">✕</button>`;
+      const t = row.querySelector(".music-t") as HTMLSpanElement;
+      t.textContent = cleanTitle(entry.name);
+      (row.querySelector(".music-fmt") as HTMLSpanElement).textContent =
+        audioBadge(entry.name, props);
+      (row.querySelector(".music-bit") as HTMLSpanElement).textContent =
+        props?.bitsPerSample ? `${props.bitsPerSample}-bit` : "";
+      (row.querySelector(".music-sr") as HTMLSpanElement).textContent =
+        props?.sampleRate ? `${(props.sampleRate / 1000).toFixed(props.sampleRate % 1000 === 0 ? 0 : 1)} kHz` : "";
+      if (item) {
+        void audioTags(item).then((tags) => {
+          if (tags.title) t.textContent = tags.title;
+        });
+        if (!props) {
+          void audioProps(item).then((p) => {
+            this.propsByKey.set(entry.providerKey, p);
+            this.renderKey = "";
+            const cur = this.client.snap;
+            if (cur) this.renderRows(cur);
+          });
+        }
       }
-      row.addEventListener("click", () => void this.playIndex(i));
+      row.addEventListener("click", (e) => {
+        if ((e.target as HTMLElement).closest(".music-row-x")) return;
+        void this.playRow(i, entry);
+      });
+      (row.querySelector(".music-row-x") as HTMLButtonElement).addEventListener(
+        "click",
+        () => void this.client.remove(i),
+      );
       row.addEventListener("dragstart", (e) => {
         this.dragFrom = i;
         row.classList.add("dragging");
@@ -612,43 +650,490 @@ export class MusicPlayer {
         const after = e.clientY > rect.top + rect.height / 2;
         let to = i + (after ? 1 : 0);
         if (to > this.dragFrom) to -= 1;
-        // Clamp into range: dropping after the last row moves the item
-        // to the end instead of silently doing nothing (Round 7).
-        to = Math.max(0, Math.min(this.queue.length - 1, to));
+        to = Math.max(0, Math.min(s.queue.length - 1, to));
         const from = this.dragFrom;
         this.dragFrom = null;
-        this.reorder(from, to);
+        void this.client.reorder(from, to).then((snap) => {
+          this.persistOrder(snap.queue);
+        });
       });
       this.tracksEl!.appendChild(row);
       return row;
     });
   }
 
+  /** Row click: a saved long-form position resumes (the pinned
+   * rule lives in the core glue; an explicit start position
+   * here simply honors what the row offered). */
+  private async playRow(i: number, entry: QueueEntry): Promise<void> {
+    try {
+      const st = await api.audioPlayState(entry.providerKey);
+      const dur = entry.durationSecs ?? undefined;
+      const longForm =
+        (dur !== undefined && dur >= 600) ||
+        entry.name.toLowerCase().endsWith(".m4b");
+      if (
+        longForm &&
+        st.lastPositionSecs > 5 &&
+        (dur === undefined || st.lastPositionSecs < dur - 10)
+      ) {
+        const s = this.client.snap;
+        if (s) {
+          await this.client.openQueue({
+            owner: "panel",
+            entries: s.queue,
+            startIndex: i,
+            startPosition: st.lastPositionSecs,
+            autoplay: true,
+          });
+          return;
+        }
+      }
+    } catch { /* fall through to the plain play */ }
+    await this.client.playIndex(i);
+  }
+
+  private renderRail(s: PlayerSnapshot): void {
+    if (!this.railEl) return;
+    const currentPos = s.index !== null ? s.order.indexOf(s.index) : -1;
+    const upNext = s.order
+      .slice(currentPos + 1)
+      .map((qi) => ({ qi, entry: s.queue[qi] }))
+      .filter((x) => !!x.entry);
+    const key =
+      "rail:" +
+      upNext.map((x) => x.qi).join(",") +
+      ":" +
+      (s.index ?? -1);
+    if (key === this.recentKey) return;
+    this.recentKey = key;
+    this.railEl.innerHTML = "";
+    const head = document.createElement("div");
+    head.className = "music-rail-head";
+    const h = document.createElement("span");
+    h.textContent = "Up Next";
+    head.appendChild(h);
+    const save = document.createElement("button");
+    save.className = "music-rail-btn";
+    save.textContent = "Save .m3u";
+    save.title = "Save this queue as an .m3u beside the album";
+    save.addEventListener("click", () => void this.saveM3u(s));
+    const load = document.createElement("button");
+    load.className = "music-rail-btn";
+    load.textContent = "Load .m3u";
+    load.title = "Load an .m3u from this folder as the queue";
+    load.addEventListener("click", () => void this.loadM3u());
+    const clear = document.createElement("button");
+    clear.className = "music-rail-btn";
+    clear.textContent = "Clear";
+    clear.title = "Clear everything after the current track";
+    clear.addEventListener("click", () =>
+      void this.client.clearQueue(true),
+    );
+    head.append(save, load, clear);
+    this.railEl.appendChild(head);
+    if (upNext.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "music-rail-empty";
+      empty.textContent = "Nothing queued after this.";
+      this.railEl.appendChild(empty);
+    }
+    for (const { qi, entry } of upNext.slice(0, 30)) {
+      const row = document.createElement("div");
+      row.className = "music-rail-row";
+      const t = document.createElement("span");
+      t.className = "music-rail-t";
+      t.textContent = cleanTitle(entry.name);
+      t.addEventListener("click", () => void this.client.playIndex(qi));
+      const x = document.createElement("button");
+      x.className = "music-row-x";
+      x.textContent = "✕";
+      x.title = "Remove from queue";
+      x.addEventListener("click", () => void this.client.remove(qi));
+      row.append(t, x);
+      this.railEl.appendChild(row);
+    }
+    // Recently Played (the history hook's face).
+    void api
+      .audioRecentlyPlayed(10)
+      .then((recent) => {
+        if (!this.railEl || !recent.length) return;
+        const h2 = document.createElement("div");
+        h2.className = "music-rail-head";
+        h2.innerHTML = "<span>Recently Played</span>";
+        this.railEl.appendChild(h2);
+        for (const r of recent) {
+          if (s.queue.some((e) => e.providerKey === r.providerKey)) continue;
+          const row = document.createElement("div");
+          row.className = "music-rail-row recent";
+          const t = document.createElement("span");
+          t.className = "music-rail-t";
+          const resume =
+            r.state.lastPositionSecs > 5
+              ? ` · resume at ${fmtClock(r.state.lastPositionSecs)}`
+              : "";
+          t.textContent = `${cleanTitle(basename(r.providerKey))} — played ${r.state.playCount}×${resume}`;
+          t.title = "Queue this next";
+          t.addEventListener("click", () => {
+            void this.client.enqueue(
+              [
+                {
+                  providerKey: r.providerKey,
+                  name: basename(r.providerKey),
+                  durationSecs: null,
+                },
+              ],
+              true,
+            );
+            Toast.success("Queued next.");
+          });
+          row.appendChild(t);
+          this.railEl.appendChild(row);
+        }
+      })
+      .catch(() => undefined);
+  }
+
+  // ---------------------------------------------------------------
+  // Detach / Stage / tombstone
+  // ---------------------------------------------------------------
+
+  /** Detach the current track into the Mini window: the window
+   * boots from the core's snapshot and claims ownership — the
+   * sound moves, nothing restarts. */
+  private detach(): void {
+    const s = this.client.snap;
+    const entry = this.client.currentEntry();
+    if (!entry) return;
+    if (s?.owner === "mini") {
+      // Already there: the button brings it home instead.
+      void this.client.claim("panel");
+      void api.closePlayerWindow(entry.providerKey).catch(() => undefined);
+      return;
+    }
+    const artImg =
+      this.overlay?.querySelector<HTMLImageElement>(".music-art-img");
+    const art =
+      artImg && !artImg.hidden && artImg.src.startsWith("data:")
+        ? artImg.src
+        : null;
+    void api
+      .openPlayerWindow(entry.providerKey, entry.name, {
+        kind: "audio",
+        start: s?.positionSecs ?? 0,
+        autoplay: s?.state === "playing",
+        art,
+      })
+      .catch(() => undefined);
+  }
+
+  private openStage(): void {
+    const entry = this.client.currentEntry();
+    if (!entry) return;
+    void api
+      .openPlayerWindow(entry.providerKey, entry.name, {
+        kind: "audio-stage",
+        start: this.client.snap?.positionSecs ?? 0,
+        autoplay: this.client.snap?.state === "playing",
+        art: null,
+      })
+      .catch(() => undefined);
+  }
+
+  private startDetachWatch(): void {
+    if (this.detachWatch !== null) return;
+    this.detachWatch = window.setInterval(() => {
+      const s = this.client.snap;
+      const cur = this.client.currentEntry();
+      if (!s || (s.owner !== "mini" && s.owner !== "stage") || !cur) {
+        this.stopDetachWatch();
+        return;
+      }
+      if (s.owner === "stage") return; // the stage has its own close path
+      void api
+        .playerWindowOpen(cur.providerKey)
+        .then((open) => {
+          if (!open) {
+            void api.playerDetachGone().then(() => {
+              if (this.overlay) void this.client.claim("panel");
+            });
+          }
+        })
+        .catch(() => undefined);
+    }, 1200);
+  }
+
+  private stopDetachWatch(): void {
+    if (this.detachWatch !== null) {
+      window.clearInterval(this.detachWatch);
+      this.detachWatch = null;
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Spectrum toggle
+  // ---------------------------------------------------------------
+
+  private toggleSpectrum(btn: HTMLButtonElement, host: HTMLDivElement): void {
+    this.spectrumOn = !this.spectrumOn;
+    try {
+      localStorage.setItem("ff-music-spectrum", this.spectrumOn ? "1" : "0");
+    } catch { /* ignore */ }
+    btn.classList.toggle("on", this.spectrumOn);
+    host.hidden = !this.spectrumOn;
+    if (this.spectrumOn) {
+      if (!this.feed.enable()) {
+        // The spike's honest gate: if the WebAudio tap misbehaves
+        // on this stack, the toggle says so instead of faking it.
+        Toast.error(
+          this.feed.failed ?? "The spectrum is unavailable on this system.",
+        );
+        this.spectrumOn = false;
+        btn.classList.remove("on");
+        host.hidden = true;
+      }
+    } else {
+      this.feed.disable();
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Repeat cycling
+  // ---------------------------------------------------------------
+
+  private cycleRepeat(): void {
+    const s = this.client.snap;
+    if (!s) return;
+    const next =
+      s.repeat === "off" ? "all" : s.repeat === "all" ? "one" : "off";
+    void this.client.setRepeat(next);
+  }
+
+  // ---------------------------------------------------------------
+  // Playback setup (the audio twin of the video player's strip)
+  // ---------------------------------------------------------------
+
+  private async checkPlaybackSetup(): Promise<void> {
+    if (this.setupChecked) return;
+    this.setupChecked = true;
+    try {
+      const st = await api.playbackSetupStatus();
+      if (!this.overlay || st.pluginsPresent) return;
+      this.renderSetupStrip(
+        "This system is missing the pieces that let Fable play music.",
+        "Set up playback",
+        false,
+      );
+    } catch {
+      // A failed probe is not a playback error.
+    }
+  }
+
+  private renderSetupStrip(text: string, btnLabel: string, withRepo: boolean): void {
+    const strip = this.setupEl;
+    if (!strip) return;
+    strip.replaceChildren();
+    const span = document.createElement("span");
+    span.className = "vp-setup-text";
+    span.textContent = text;
+    const btn = document.createElement("button");
+    btn.className = "vp-setup-btn";
+    btn.textContent = btnLabel;
+    btn.addEventListener("click", () => void this.runSetupInstall(withRepo, btn));
+    strip.append(span, btn);
+    strip.hidden = false;
+  }
+
+  private async runSetupInstall(withRepo: boolean, btn: HTMLButtonElement): Promise<void> {
+    if (this.setupBusy) return;
+    this.setupBusy = true;
+    btn.disabled = true;
+    btn.textContent = "Setting up…";
+    try {
+      const st = await api.playbackSetupInstall(withRepo);
+      this.setupBusy = false;
+      if (!this.overlay) return;
+      if (st.pluginsPresent) {
+        this.renderSetupStrip(
+          "Playback is set up — if a track already gave up, play it again and it will sound.",
+          "Done",
+          false,
+        );
+        const strip = this.setupEl;
+        window.setTimeout(() => {
+          if (strip) strip.hidden = true;
+        }, 6000);
+      } else if (st.repoName && !st.repoEnabled) {
+        this.renderSetupStrip(
+          `The full playback set on this system lives in the ${st.repoName} source, which isn't enabled yet. Fable can add it — the system will ask for your password.`,
+          `Add ${st.repoName} and finish setup`,
+          true,
+        );
+      } else {
+        this.renderSetupStrip(
+          "Playback setup finished, but the pieces still aren't landing on this system.",
+          "Try again",
+          withRepo,
+        );
+      }
+    } catch (e) {
+      this.setupBusy = false;
+      if (!this.overlay) return;
+      this.renderSetupStrip(
+        e instanceof Error ? e.message : String(e),
+        "Try again",
+        withRepo,
+      );
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // .m3u save / load
+  // ---------------------------------------------------------------
+
+  private async saveM3u(s: PlayerSnapshot): Promise<void> {
+    if (s.queue.length === 0) return;
+    const folder = dirname(s.queue[0].providerKey);
+    const firstItem = this.itemsByKey.get(s.queue[0].providerKey);
+    const albumName =
+      (firstItem ? cleanTitle(firstItem.name) : null) || "playlist";
+    const folderName = basename(folder) || albumName;
+    const fileName = `${folderName.replace(/[\\/:*?"<>|]/g, "_")}.m3u`;
+    const lines = ["#EXTM3U"];
+    for (const e of s.queue) {
+      const dur = e.durationSecs ? Math.round(e.durationSecs) : -1;
+      lines.push(`#EXTINF:${dur},${cleanTitle(e.name)}`);
+      lines.push(e.providerKey);
+    }
+    try {
+      await api.writeTextFile(`${folder}/${fileName}`, lines.join("\n") + "\n");
+      Toast.success(`Saved ${fileName} beside the album.`);
+    } catch (e) {
+      Toast.error(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /** Load: the .m3u files in the current folder. One → load it;
+   * several → the first (the toast names it); none → say so. */
+  private async loadM3u(): Promise<void> {
+    const first = [...this.itemsByKey.values()][0];
+    if (!first?.provider_key) return;
+    const folder = dirname(first.provider_key);
+    try {
+      const { listFolderByPath } = await import("./audiometa");
+      const entries = await listFolderByPath(first, folder);
+      const playlists = (entries ?? []).filter((e) => isPlaylistName(e.name));
+      if (playlists.length === 0) {
+        Toast.error("No .m3u playlist in this folder.");
+        return;
+      }
+      await this.openPlaylistFile(playlists[0]);
+    } catch {
+      Toast.error("That playlist could not be read.");
+    }
+  }
+
+  /** Open an .m3u as the queue: relative paths resolve against
+   * the playlist's folder; missing files are skipped and counted
+   * in the toast (never silently dropped). */
+  private async openPlaylistFile(item: Item): Promise<void> {
+    if (!item.provider_key) return;
+    const folder = dirname(item.provider_key);
+    let text: { lines: string[]; truncated: boolean };
+    try {
+      text = await api.previewText(item.id, 10000);
+    } catch {
+      Toast.error("That playlist could not be read.");
+      return;
+    }
+    const wanted: QueueEntry[] = [];
+    for (const raw of text.lines) {
+      const line = raw.trim();
+      if (!line || line.startsWith("#")) continue;
+      const path = line.startsWith("/") ? line : `${folder}/${line}`;
+      wanted.push({
+        providerKey: path,
+        name: basename(path),
+        durationSecs: null,
+      });
+    }
+    // Existence is probed through the path-registration door
+    // (it refuses files that aren't there): missing files are
+    // skipped and COUNTED, never silently dropped.
+    const entries: QueueEntry[] = [];
+    let missing = 0;
+    for (const e of wanted) {
+      try {
+        await api.castRegisterPath(e.providerKey);
+        entries.push(e);
+      } catch {
+        missing++;
+      }
+    }
+    if (entries.length === 0) {
+      Toast.error(
+        missing > 0
+          ? `That playlist's ${missing} track${missing === 1 ? " is" : "s are"} gone.`
+          : "That playlist names no tracks.",
+      );
+      return;
+    }
+    if (missing > 0) {
+      Toast.error(
+        `${missing} track${missing === 1 ? " was" : "s were"} missing and skipped.`,
+      );
+    }
+    this.close();
+    this.itemsByKey = new Map();
+    this.buildPanel();
+    if (this.titleEl) this.titleEl.textContent = cleanTitle(item.name);
+    await this.client.openQueue({
+      owner: "panel",
+      entries,
+      startIndex: 0,
+      autoplay: true,
+    });
+    if (text.truncated) {
+      Toast.error("That playlist is very long — only its first part was loaded.");
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Keyboard
+  // ---------------------------------------------------------------
+
   private handleKey(e: KeyboardEvent): void {
     if (!this.overlay) return;
     const target = e.target as HTMLElement;
-    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA") && !target.classList.contains("music-seek") && !target.classList.contains("music-vol")) return;
+    if (
+      target &&
+      (target.tagName === "INPUT" || target.tagName === "TEXTAREA") &&
+      !target.classList.contains("tbar-vol")
+    ) {
+      return;
+    }
+    const s = this.client.snap;
+    if (!s) return;
     if (e.key === "Escape") {
       e.preventDefault();
       this.close();
     } else if (e.key === " ") {
       e.preventDefault();
-      this.toggle();
+      void this.engine.toggle();
     } else if (e.key === "ArrowRight") {
-      this.audio.currentTime = Math.min(this.audio.duration || 0, this.audio.currentTime + 5);
+      void this.engine.seekTo(Math.min(s.durationSecs || 0, s.positionSecs + 5));
     } else if (e.key === "ArrowLeft") {
-      this.audio.currentTime = Math.max(0, this.audio.currentTime - 5);
+      void this.engine.seekTo(Math.max(0, s.positionSecs - 5));
     } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
-      // Volume (2026-10-16 shortcut suite): same state the slider
-      // drives — audio.volume, the slider position, the saved level.
       e.preventDefault();
-      const v = Math.min(1, Math.max(0, this.audio.volume + (e.key === "ArrowUp" ? 0.05 : -0.05)));
-      this.audio.volume = v;
-      const slider = this.overlay.querySelector<HTMLInputElement>(".music-vol");
-      if (slider) slider.value = String(Math.round(v * 100));
-      try { localStorage.setItem("ff-music-vol", String(v)); } catch { /* ignore */ }
+      const v = Math.min(
+        1,
+        Math.max(0, s.volume + (e.key === "ArrowUp" ? 0.05 : -0.05)),
+      );
+      void this.client.setVolume(v);
     } else if (e.key.toLowerCase() === "m") {
-      this.audio.muted = !this.audio.muted;
+      void this.client.setMuted(!s.muted);
     }
   }
 }
+

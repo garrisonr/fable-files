@@ -16,6 +16,9 @@ export interface AudioTags {
   title?: string;
   artist?: string;
   album?: string;
+  /** Release year (first 4 digits of the Year/Date tag). */
+  year?: string;
+  genre?: string;
 }
 
 /** exiftool group priority when several tag families carry the same
@@ -52,10 +55,13 @@ export function audioTags(item: Item): Promise<AudioTags> {
         }
         return best?.value;
       };
+      const yearRaw = pick(["Year", "Date", "OriginalYear", "ReleaseDate"]);
       return {
         title: pick(["Title"]),
         artist: pick(["Artist"]),
         album: pick(["Album"]),
+        year: yearRaw ? yearRaw.slice(0, 4) : undefined,
+        genre: pick(["Genre"]),
       };
     } catch {
       return {};
@@ -111,6 +117,109 @@ export async function listFolderByPath(
     curDirId = next.id;
   }
   return api.listDir(loc.id, curDirId);
+}
+
+/** Technical credentials for one audio file (Music Glow-Up
+ * Phase 2): the hi-res truth behind the honest badge — sample
+ * rate, bit depth, bitrate — read through the same exiftool path
+ * as the tags and cached per item. */
+export interface AudioProps {
+  sampleRate?: number;
+  bitsPerSample?: number;
+  /** kbps, for lossy formats (the badge's "MP3 320"). */
+  bitrateKbps?: number;
+  durationSecs?: number;
+}
+
+const propsCache = new Map<string, Promise<AudioProps>>();
+
+function parseNumberish(v: string | undefined): number | undefined {
+  if (!v) return undefined;
+  const m = v.replace(/,/g, "").match(/-?\d+(?:\.\d+)?/);
+  if (!m) return undefined;
+  const n = parseFloat(m[0]);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** exiftool prints Duration as seconds ("217.06"), "3:37", or
+ * "0:03:37" depending on the format family — accept all three. */
+function parseDuration(v: string | undefined): number | undefined {
+  if (!v) return undefined;
+  const t = v.trim();
+  if (/^\d+(?:\.\d+)?$/.test(t)) return parseFloat(t);
+  const parts = t.split(":").map((p) => parseFloat(p));
+  if (parts.length >= 2 && parts.every((n) => Number.isFinite(n))) {
+    return parts.reduce((acc, n) => acc * 60 + n, 0);
+  }
+  return undefined;
+}
+
+export function audioProps(item: Item): Promise<AudioProps> {
+  const hit = propsCache.get(item.id);
+  if (hit) return hit;
+  const p = (async (): Promise<AudioProps> => {
+    try {
+      const tags = await api.readMetadata(item.id);
+      const pick = (names: string[]): string | undefined => {
+        let best: { rank: number; value: string } | null = null;
+        for (const t of tags) {
+          if (!names.includes(t.tag)) continue;
+          const v = (t.value ?? "").trim();
+          if (!v) continue;
+          const rank = GROUP_PRIORITY.indexOf(t.group);
+          const r = rank === -1 ? GROUP_PRIORITY.length : rank;
+          if (!best || r < best.rank) best = { rank: r, value: v };
+        }
+        return best?.value;
+      };
+      const brRaw = parseNumberish(
+        pick(["AudioBitrate", "Bitrate", "NominalBitrate"]),
+      );
+      return {
+        sampleRate: parseNumberish(pick(["SampleRate", "SamplingRate"])),
+        bitsPerSample: parseNumberish(
+          pick(["BitsPerSample", "BitDepth", "BitsPerSampleId3"]),
+        ),
+        // exiftool reports bitrate in bps for some families and
+        // kbps for others; normalize anything implausibly large.
+        bitrateKbps: brRaw
+          ? brRaw > 10000
+            ? Math.round(brRaw / 1000)
+            : Math.round(brRaw)
+          : undefined,
+        durationSecs: parseDuration(pick(["Duration"])),
+      };
+    } catch {
+      return {};
+    }
+  })();
+  propsCache.set(item.id, p);
+  return p;
+}
+
+/** The honest badge: never a bare "FLAC" when the credentials
+ * are known — "FLAC 24/192", "DSD128", "MP3 320". Falls back to
+ * the plain format (or "DSD") while props are still loading. */
+export function audioBadge(name: string, props?: AudioProps): string {
+  const dot = name.lastIndexOf(".");
+  const ext = dot < 0 ? "" : name.slice(dot + 1).toLowerCase();
+  if (ext === "dsf" || ext === "dff") {
+    // DSD rates are multiples of 44.1 kHz: 2,822,400 = DSD64,
+    // 5,644,800 = DSD128, 11,289,600 = DSD256.
+    const n = props?.sampleRate ? Math.round(props.sampleRate / 44100) : 0;
+    return n >= 64 ? `DSD${n}` : "DSD";
+  }
+  const base = ext.toUpperCase();
+  if (!props) return base;
+  if (props.bitsPerSample && props.sampleRate) {
+    const khz = props.sampleRate / 1000;
+    const khzText = Number.isInteger(khz) ? String(khz) : khz.toFixed(1);
+    return `${base} ${props.bitsPerSample}/${khzText}`;
+  }
+  if (props.bitrateKbps && !props.bitsPerSample) {
+    return `${base} ${props.bitrateKbps}`;
+  }
+  return base;
 }
 
 const artCache = new Map<string, Promise<string | null>>();
