@@ -1998,9 +1998,9 @@ impl Catalog {
     /// items named like a candidate extension that either have no ROM
     /// identity row at all or a title-less (matched:false) one.
     /// Extension filtering mirrors `rule_candidates`. Returns
-    /// (item, has_identity_row). ROM-context scoping (which folders
-    /// count as ROM territory) is the caller's job — it needs path
-    /// evidence, applied in commands.rs with `rom_identified_folders`.
+    /// (item, has_identity_row). Membership scoping (which of these
+    /// the shelf actually shows) lives in `rom_needs_id_scoped`
+    /// below — it needs the path evidence of `rom_identified_folders`.
     pub fn rom_needs_id_candidates(
         &self,
         extensions: &[String],
@@ -2027,6 +2027,7 @@ impl Catalog {
                ON mi.item_id = i.id AND mi.media_kind = 'rom'
              WHERE ({like_clause})
                AND (mi.item_id IS NULL OR mi.title IS NULL)
+               AND i.kind = 'file'
              ORDER BY i.name COLLATE NOCASE"
         );
         let mut stmt = self
@@ -2110,6 +2111,61 @@ impl Catalog {
             }
         }
         Ok(out)
+    }
+
+    /// The Needs-ID shelf's membership rule (Bouncer, 2026-10-18),
+    /// applied over `rom_needs_id_candidates`: a candidate that HAS
+    /// a title-less ROM identity row was already judged ROM-kind by
+    /// an identification pass — that judgment is its territory
+    /// evidence, so it lists wherever it lives (the Klax audio
+    /// evidence dumps sat in no honest surface at all: not ROM
+    /// territory by path, yet dressed as games by the extension
+    /// gather). A never-scanned candidate (no identity row) still
+    /// needs ROM territory — a folder holding an identified game,
+    /// or a path segment naming a collection — so the raw
+    /// matched-nothing bucket (~75% non-ROM noise) stays shut.
+    pub fn rom_needs_id_scoped(
+        &self,
+        extensions: &[String],
+    ) -> Result<Vec<(ufm_vfs::Item, bool)>> {
+        let rows = self.rom_needs_id_candidates(extensions)?;
+        let identified_folders = self.rom_identified_folders()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(item, has_row)| {
+                if *has_row {
+                    return true;
+                }
+                match &item.provider_key {
+                    Some(pk) => Self::rom_context_path(pk, &identified_folders),
+                    None => false,
+                }
+            })
+            .collect())
+    }
+
+    /// Is this path in ROM territory? Either its folder already
+    /// holds an identified game (data-driven), or some path segment
+    /// names a ROM collection outright. PC-game data files and
+    /// documentation trees that merely share an extension with a
+    /// ROM format never qualify on their own — they arrive here
+    /// only when an identification pass judged them ROM-kind (the
+    /// `has_row` door in `rom_needs_id_scoped`).
+    fn rom_context_path(
+        provider_key: &str,
+        identified_folders: &std::collections::HashSet<String>,
+    ) -> bool {
+        if let Some((parent, _)) = provider_key.rsplit_once('/') {
+            if identified_folders.contains(parent) {
+                return true;
+            }
+        }
+        provider_key.split('/').any(|seg| {
+            matches!(
+                seg.to_ascii_lowercase().as_str(),
+                "roms" | "rom" | "games" | "game"
+            )
+        })
     }
 
     /// Reset the ROM collection: delete every ROM identity and every
@@ -11570,6 +11626,87 @@ mod rom_home_tests {
         )
         .unwrap();
         (nes, snes, mame)
+    }
+
+    #[test]
+    fn needs_id_scoped_surfaces_scanned_files_and_keeps_the_noise_gate() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        // An identified game: its folder becomes ROM territory.
+        let nes = rom_item(&cat, loc, "1942 (JU).nes", "/roms/nes/1942.nes");
+        cat.upsert_media_identity(
+            &nes.id,
+            "rom",
+            Some("1942 (Japan, USA) (En)"),
+            Some("nes"),
+            Some("aaaa"),
+            r#"{"matched":true,"also":[]}"#,
+        )
+        .unwrap();
+        // Scanned-and-failed .bin in a random folder (the Klax
+        // evidence shape): judged ROM-kind, matched nothing. It
+        // must surface in Needs Identification — by path it is in
+        // no ROM territory at all.
+        let song = rom_item(
+            &cat,
+            loc,
+            "song-167.bin",
+            "/home/user/klax/evidence/audio/song-167.bin",
+        );
+        cat.upsert_media_identity(
+            &song.id,
+            "rom",
+            None,
+            None,
+            None,
+            r#"{"matched":false,"also":[]}"#,
+        )
+        .unwrap();
+        // Never-scanned .bin in a random folder: stays out — the
+        // noise gate for files no pass has ever judged.
+        let _stray = rom_item(&cat, loc, "stray.bin", "/home/user/random/stray.bin");
+        // Never-scanned .bin inside ROM territory: lists.
+        let _loose = rom_item(&cat, loc, "loose.bin", "/roms/loose.bin");
+        // A FOLDER named like a ROM file, identity row and all:
+        // the candidates query only takes files.
+        let mut folder = named_item(loc, "fake.bin", ItemKind::Folder);
+        folder.provider_key = Some("/home/user/klax/evidence/audio/fake.bin".into());
+        cat.insert_item(&folder).unwrap();
+        cat.upsert_media_identity(
+            &folder.id,
+            "rom",
+            None,
+            None,
+            None,
+            r#"{"matched":false,"also":[]}"#,
+        )
+        .unwrap();
+
+        let exts = vec!["bin".to_string(), "nes".to_string()];
+        let scoped = cat.rom_needs_id_scoped(&exts).unwrap();
+        let keys: Vec<&str> = scoped
+            .iter()
+            .filter_map(|(i, _)| i.provider_key.as_deref())
+            .collect();
+        assert!(keys.contains(&"/home/user/klax/evidence/audio/song-167.bin"));
+        assert!(keys.contains(&"/roms/loose.bin"));
+        assert!(!keys.contains(&"/home/user/random/stray.bin"));
+        assert!(!keys.contains(&"/home/user/klax/evidence/audio/fake.bin"));
+        assert!(!keys.contains(&"/roms/nes/1942.nes"));
+        // The scanned flag rides through: the song was scanned,
+        // the loose file was not.
+        let flag = |pk: &str| {
+            scoped
+                .iter()
+                .find(|(i, _)| i.provider_key.as_deref() == Some(pk))
+                .map(|(_, h)| *h)
+        };
+        assert_eq!(
+            flag("/home/user/klax/evidence/audio/song-167.bin"),
+            Some(true)
+        );
+        assert_eq!(flag("/roms/loose.bin"), Some(false));
     }
 
     #[test]

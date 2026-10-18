@@ -107,6 +107,33 @@ export function romSystemKey(sys: RomSystem): string | null {
   return ROM_SYSTEM_KEYS[sys.name] ?? null;
 }
 
+/** Extension claims (Bouncer, 2026-10-18): the extensions each
+ * system may gather files by — an extension speaks for a system
+ * only when that system is its SOLE claimant in the whole list.
+ * An extension several systems list (.bin is listed by sixteen)
+ * can never honestly assign a file to one of them, so it claims
+ * nothing: those files wait for a hash identification (and sit
+ * in Needs Identification meanwhile) instead of being dressed
+ * as whichever system happens to sort first. */
+export function soleClaimExtensions(
+  systems: RomSystem[],
+): Map<string, string[]> {
+  const counts = new Map<string, number>();
+  for (const s of systems) {
+    for (const e of new Set(s.extensions.map((x) => x.toLowerCase()))) {
+      counts.set(e, (counts.get(e) ?? 0) + 1);
+    }
+  }
+  const out = new Map<string, string[]>();
+  for (const s of systems) {
+    out.set(
+      s.name,
+      s.extensions.filter((e) => counts.get(e.toLowerCase()) === 1),
+    );
+  }
+  return out;
+}
+
 /** Placeholder systems make no identification promises — every
  * surface (collection view, media fetch, editor) checks this. */
 export function isRomPlaceholder(sys: RomSystem): boolean {

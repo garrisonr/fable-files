@@ -34,6 +34,7 @@ import {
 import {
   loadRomSystems,
   romSystemKey,
+  soleClaimExtensions,
   romScopeOf,
   isRomPlaceholder,
   romDivisions,
@@ -981,18 +982,26 @@ export class RomHome {
 
   /** Extension-rule systems gather through the rule store (the smart
    * folder machinery): their games join All Games + their shelf with
-   * file-name titles and no media identity. */
+   * file-name titles and no media identity. Gathering is by
+   * sole-claim extensions only (soleClaimExtensions in roms.ts):
+   * an extension several systems list assigns NOTHING — the files
+   * it names wait for a hash identification in Needs
+   * Identification instead of wearing a fabricated platform. */
   private async loadExtSystems(): Promise<void> {
+    const soleClaims = soleClaimExtensions(this.systems.map((x) => x.sys));
     for (const s of this.systems) {
       if (s.key !== null || s.placeholder || this.extLoaded.has(s.name)) continue;
       this.extLoaded.add(s.name);
+      const claimExts = soleClaims.get(s.name) ?? [];
+      if (claimExts.length === 0) continue;
       try {
-        const res = await api.ruleItems(s.sys.extensions, null, 100000, 0);
+        const res = await api.ruleItems(claimExts, null, 100000, 0);
         if (!this.active && !this.loaded) return;
         const scoped = this.scopeExtItems(res.items, s.sys);
         const badgeById = new Map((res.badges ?? []).map((b) => [b.item_id, b]));
         let changed = false;
         for (const item of scoped) {
+          if (item.kind !== "file") continue;
           const key = item.provider_key ?? item.id;
           if (this.gamesByKey.has(key)) continue;
           const b = badgeById.get(item.id);

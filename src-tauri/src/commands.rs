@@ -9626,28 +9626,6 @@ pub async fn rom_identity_map(
         .collect())
 }
 
-/// Is this path in ROM territory? Either its folder already holds an
-/// identified game (data-driven), or some path segment names a ROM
-/// collection outright. Keeps the Needs-ID shelf honest: PC-game
-/// data files and documentation trees that merely share an
-/// extension with a ROM format never qualify on their own.
-fn rom_context_path(
-    provider_key: &str,
-    identified_folders: &std::collections::HashSet<String>,
-) -> bool {
-    if let Some((parent, _)) = provider_key.rsplit_once('/') {
-        if identified_folders.contains(parent) {
-            return true;
-        }
-    }
-    provider_key.split('/').any(|seg| {
-        matches!(
-            seg.to_ascii_lowercase().as_str(),
-            "roms" | "rom" | "games" | "game"
-        )
-    })
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RomNeedsIdEntry {
@@ -9662,10 +9640,13 @@ pub struct RomNeedsIdEntry {
     pub scanned: bool,
 }
 
-/// The ROM Home "Needs identification" shelf: ROM candidates in ROM
-/// territory that no DAT claims — grouped by parsed filename in the
-/// UI. Scoped hard (see rom_context_path): the raw matched-nothing
-/// bucket is ~75% non-ROM noise and is NOT what this returns.
+/// The ROM Home "Needs identification" shelf: ROM candidates no
+/// DAT claims — grouped by parsed filename in the UI. Membership
+/// is scoped in the catalog (`rom_needs_id_scoped`): a candidate
+/// an identification pass already judged ROM-kind lists wherever
+/// it lives; a never-scanned candidate still needs ROM territory,
+/// so the raw matched-nothing bucket (~75% non-ROM noise) stays
+/// shut.
 #[tauri::command]
 pub async fn rom_home_needs_id(
     state: State<'_, AppState>,
@@ -9677,19 +9658,13 @@ pub async fn rom_home_needs_id(
         .map(|s| s.to_string())
         .collect();
     let rows = catalog
-        .rom_needs_id_candidates(&exts)
-        .map_err(CommandError::from)?;
-    let identified_folders = catalog
-        .rom_identified_folders()
+        .rom_needs_id_scoped(&exts)
         .map_err(CommandError::from)?;
     let mut out = Vec::new();
     for (item, has_row) in rows {
         let Some(pk) = item.provider_key.clone() else {
             continue;
         };
-        if !rom_context_path(&pk, &identified_folders) {
-            continue;
-        }
         let name = item.name.clone();
         let remapped = remap_session_items(state.inner(), vec![item]);
         let Some(it) = remapped.into_iter().next() else {
