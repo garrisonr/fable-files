@@ -118,6 +118,13 @@ export class MusicPlayer {
       onError: (m) => Toast.error(m),
     });
     this.feed = new SpectrumFeed(this.engine, () => this.client.isOwner("panel"));
+    // The panel draws its own matrix straight from the tap when it
+    // owns the sound (the event feed below covers remote-owned
+    // playback); the tap's cross-window broadcast can't be the only
+    // road to the owner's own canvas.
+    this.feed.onBands = (bands) => {
+      if (this.spectrumOn && this.overlay) this.spectrum.draw(bands);
+    };
     try {
       this.spectrumOn = localStorage.getItem("ff-music-spectrum") === "1";
     } catch { /* default off */ }

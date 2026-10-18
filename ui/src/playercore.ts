@@ -749,6 +749,11 @@ export class SpectrumFeed {
   private timer: number | null = null;
   private freq: Uint8Array | null = null;
   failed: string | null = null;
+  /** Local band consumer: the owning surface draws its own canvas
+   * straight from the tap, so the matrix is alive even when the
+   * cross-window event channel is slow or unavailable. The Rust
+   * broadcast still fires for remote surfaces. */
+  onBands: ((bands: number[]) => void) | null = null;
 
   constructor(
     private engine: OwnerEngine,
@@ -821,6 +826,9 @@ export class SpectrumFeed {
         let peak = 0;
         for (let i = i0; i < i1; i++) peak = Math.max(peak, this.freq[i]);
         bands[b] = peak / 255;
+      }
+      if (this.onBands) {
+        try { this.onBands(bands); } catch { /* a bad draw must not kill the tap */ }
       }
       void api.playerSpectrum(bands).catch(() => undefined);
     }, 50);

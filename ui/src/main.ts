@@ -465,6 +465,11 @@ function bootStagePlayer(params: URLSearchParams): void {
     });
     eng.e = engine;
     const feed = new pc.SpectrumFeed(engine, () => client.isOwner("stage"));
+    // Local draw from the tap, same reasoning as the panel: the
+    // owner's own canvas must not depend on the event channel.
+    feed.onBands = (bands) => {
+      if (spectrumOn) spectrum.draw(bands);
+    };
     if (spectrumOn) {
       if (!feed.enable()) specHost.hidden = true;
     }
