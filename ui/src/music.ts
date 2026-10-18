@@ -420,6 +420,16 @@ export class MusicPlayer {
     specBtn.className = "tbar-btn music-spec-btn" + (this.spectrumOn ? " on" : "");
     specBtn.textContent = "▦";
     specBtn.title = "Dot-matrix spectrum";
+    // A restored ON preference must actually start the tap (the
+    // stage window does the same at boot); until this ran, the
+    // matrix only woke after an off→on toggle. A tap that refuses
+    // turns the preference back off honestly, same as the toggle.
+    if (this.spectrumOn && !this.feed.enable()) {
+      this.spectrumOn = false;
+      specBtn.classList.remove("on");
+      spectrumHost.hidden = true;
+      try { localStorage.setItem("ff-music-spectrum", "0"); } catch { /* ignore */ }
+    }
     specBtn.addEventListener("click", () => this.toggleSpectrum(specBtn, spectrumHost));
     this.bar.el.appendChild(specBtn);
     // Header buttons.
