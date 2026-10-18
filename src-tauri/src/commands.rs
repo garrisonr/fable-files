@@ -1803,7 +1803,7 @@ impl CopyPlanner {
             outcome: false,
             outcome_path: None,
         });
-        let mut deps = vec![verify_id];
+        let mut deps = vec![verify_id.clone()];
         if let Some(m) = mkdir_dep {
             deps.push(m);
         }
