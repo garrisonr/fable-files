@@ -3020,9 +3020,12 @@ export class Shell {
     if (this.labelChevEl) {
       this.labelChevEl.style.transform = labels ? "rotate(-90deg)" : "";
     }
-    const roms = this.romsCollapsedPref();
-    this.romsList.hidden = roms;
+    // Grand Pass: the Games door is a standard sidebar row now
+    // (the Books grammar) — the old collapse pref no longer hides
+    // its list, or a profile that had Games "collapsed" under the
+    // old head grammar would lose the door entirely.
     if (this.romsChevEl) {
+      const roms = this.romsCollapsedPref();
       this.romsChevEl.style.transform = roms ? "rotate(-90deg)" : "";
     }
     const collections = this.prefCollapsed("ff-collections-collapsed");
@@ -5652,15 +5655,17 @@ export class Shell {
   }
 
   /** The door's render: no tree anymore — just the visibility gate
-   * (Preferences ▸ Sidebar) and the live tallies. */
+   * (Preferences ▸ Sidebar) and the live tallies. Since the
+   * Grand Pass unified the door INTO romsList as a standard row,
+   * the list is never wiped or force-hidden here — it IS the
+   * door's home now (the Books grammar exactly). Wiping it was
+   * the r1 bug that ate the Games row. */
   private renderRomsSection(): void {
     if (!this.romsHead) return;
-    this.romsHead.hidden = !romsEnabled();
-    if (this.romsList) {
-      this.romsList.innerHTML = "";
-      this.romsList.hidden = true;
-    }
-    if (romsEnabled()) void this.refreshRomDoor();
+    const on = romsEnabled();
+    this.romsHead.hidden = !on;
+    if (this.romsList) this.romsList.hidden = !on;
+    if (on) void this.refreshRomDoor();
   }
 
   /** Add or edit a Roms Collection system. Built-in systems are
