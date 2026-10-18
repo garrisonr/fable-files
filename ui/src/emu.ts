@@ -21,6 +21,7 @@ import {
   type EmuViewState,
 } from "./api";
 import { Toast, errText } from "./toast";
+import { biosPathBlock } from "./biosview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 export type EmuSheetResult =
@@ -545,11 +546,40 @@ export class EmuSection {
       el(
         "p",
         "prefs-note",
-        "Some systems need a small file from the console itself before their games can play. These files come from consoles you own — Fable never downloads them. If you have one, add it here and Fable files it where the emulator looks.",
+        "Some systems need a small file from the console itself before their games can play. These files come from consoles you own — Fable never downloads them. If you have one, add it here and Fable files it where the emulator looks. The name is the whole test — a file with the right name in the right folder counts — so each row below shows the names to look for, and the folder they'll live in, drawn out.",
       ),
     );
-    for (const bios of this.prefs.bios) {
-      this.body.appendChild(this.biosRow(bios));
+    // Grouped by how much each system needs its files (Dickles,
+    // 2026-10-17: the flat stack of ~21 rows "feels
+    // disorganized"). Presentation only — same rows, same order
+    // inside each group as the table's.
+    const biosGroups: {
+      label: string;
+      test: (b: EmuPrefs["bios"][number]) => boolean;
+    }[] = [
+      {
+        label: "Needed to play",
+        test: (b) => !b.satisfied && b.need === "required",
+      },
+      {
+        label: "Recommended",
+        test: (b) => !b.satisfied && b.need === "recommended",
+      },
+      {
+        label: "Optional",
+        test: (b) => !b.satisfied && b.need === "optional",
+      },
+      { label: "Ready", test: (b) => b.satisfied },
+    ];
+    for (const group of biosGroups) {
+      const rows = this.prefs.bios.filter(group.test);
+      if (rows.length === 0) continue;
+      this.body.appendChild(
+        el("h4", "emu-bios-group", `${group.label} · ${rows.length}`),
+      );
+      for (const bios of rows) {
+        this.body.appendChild(this.biosRow(bios));
+      }
     }
     // ---- Unified view card
     const h = el("h3", "prefs-section", "Unified view");
@@ -966,14 +996,10 @@ export class EmuSection {
       ),
     );
     row.appendChild(head);
-    for (const set of bios.sets) {
-      const names = set.names.join(set.all ? ", " : " or ");
-      const line = set.present
-        ? `${set.what}: ${names} ✓`
-        : `${set.what}: ${names}`;
-      row.appendChild(el("p", "emu-sys-verdict", line));
-    }
     row.appendChild(el("p", "emu-sys-verdict", bios.note));
+    // The path, not the pile (Dickles, 2026-10-17) — the shared
+    // biosview the welcome tour's setup scene renders too.
+    row.appendChild(biosPathBlock(bios));
     const actions = el("div", "emu-bios-actions");
     const add = el(
       "button",

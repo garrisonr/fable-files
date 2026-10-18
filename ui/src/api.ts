@@ -2523,6 +2523,8 @@ export interface EmuBiosSet {
   names: string[];
   /** True when every name is needed (vs any one of them). */
   all: boolean;
+  /** The set's corner of the system folder ("" = the folder itself). */
+  subdir: string;
   present: boolean;
   missing: string[];
 }

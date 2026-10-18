@@ -275,7 +275,7 @@ export class PreferencesDialog {
     const welcomeNote = document.createElement("p");
     welcomeNote.className = "prefs-note";
     welcomeNote.textContent =
-      "The first-run welcome — the philosophy, the honest weight, the rooms, the introductions. It plays by itself and never nags; besides the About box, this is the only door back to it.";
+      "The first-run welcome — the philosophy, the honest weight, the rooms, the introductions. It plays by itself and never nags. There are three doors back to it: this button, the Welcome Tour button in the About box, and Welcome Tour in the \u2630 menu.";
     page.appendChild(welcomeNote);
     const replay = document.createElement("button");
     replay.className = "pill-btn";

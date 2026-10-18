@@ -4924,6 +4924,99 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
   margin: 0 0 6px;
   color: var(--ufm-danger);
 }
+/* --- Finale: the way back, drawn as three doors (2026-10-17) --- */
+.w-finale-card {
+  background: var(--ufm-surface);
+  border: 1px solid var(--ufm-border);
+  border-radius: var(--ufm-radius-md);
+  padding: 18px 22px;
+  margin: 26px auto 22px;
+  max-width: 56ch;
+  text-align: left;
+}
+.w-finale-head {
+  font-size: 15.5px;
+  font-weight: 600;
+  margin: 0 0 8px;
+}
+.w-finale-row {
+  display: flex;
+  gap: 14px;
+  align-items: baseline;
+  padding: 8px 0;
+}
+.w-finale-row + .w-finale-row {
+  border-top: 1px solid
+    color-mix(in srgb, var(--ufm-border) 55%, transparent);
+}
+.w-finale-place {
+  flex: 0 0 42%;
+  font-weight: 600;
+  font-size: 15px;
+}
+.w-finale-how {
+  font-size: 15px;
+  color: var(--ufm-text-muted);
+}
+.w-finale-how strong {
+  color: var(--ufm-text);
+}
+.w-finale-last {
+  color: var(--ufm-text-muted);
+}
+/* --- System files: what to bring + what home looks like
+   (biosview.ts, shared by the tour scene and Preferences) --- */
+.bios-path {
+  margin: 2px 0 8px;
+}
+.bios-block-label {
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--ufm-text-muted);
+  margin: 12px 0 6px;
+}
+.bios-set-head {
+  font-size: 14.5px;
+  line-height: 1.5;
+  margin: 0 0 2px;
+}
+.bios-names {
+  font-family: var(--ufm-font-mono);
+  font-size: 13.5px;
+  line-height: 1.55;
+  margin: 0 0 6px;
+  overflow-wrap: anywhere;
+}
+.bios-tree {
+  background: color-mix(in srgb, var(--ufm-text) 5%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ufm-border) 60%, transparent);
+  border-radius: calc(var(--ufm-radius-md) / 2);
+  padding: 10px 14px;
+  margin: 0 0 6px;
+}
+.bios-tree-line {
+  font-family: var(--ufm-font-mono);
+  font-size: 13.5px;
+  line-height: 1.6;
+  margin: 0;
+  white-space: pre;
+  overflow-wrap: anywhere;
+}
+.bios-tree-note {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--ufm-text-muted);
+  margin: 4px 0 0;
+}
+/* Preferences \u2192 ROMs: System-files group heads */
+.emu-bios-group {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--ufm-text-muted);
+  margin: 18px 0 8px;
+}
 /* --- Chrome: dots, hold chip, exits --- */
 .w-bottom {
   display: flex;

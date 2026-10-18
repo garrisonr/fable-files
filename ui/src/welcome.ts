@@ -33,6 +33,7 @@ import { sectionGlyph } from "./sectionicons";
 import { GameAccountsSection } from "./rommedia";
 import { TmdbAccountSection } from "./mediares";
 import { OpenSubtitlesAccountSection } from "./mediacomplete";
+import { biosPathBlock } from "./biosview";
 
 // ---------------------------------------------------------------- store
 
@@ -904,17 +905,11 @@ function renderBiosUnit(
       : el("span", "w-bios-need", biosNeedWord(sys.need)),
   );
   unit.appendChild(head);
-  for (const set of sys.sets) {
-    const names = set.names.join(set.all ? ", " : " or ");
-    unit.appendChild(
-      el(
-        "p",
-        "w-bios-line",
-        set.present ? `${set.what}: ${names} ✓` : `${set.what}: ${names}`,
-      ),
-    );
-  }
   unit.appendChild(el("p", "w-bios-note", sys.note));
+  // The path, not the pile (Dickles, 2026-10-17): what to bring,
+  // then what the folder looks like once it's home — the shared
+  // biosview the Preferences card renders too.
+  unit.appendChild(biosPathBlock(sys));
   const missing = sys.sets.flatMap((s) => s.missing);
   const add = el(
     "button",
@@ -1023,6 +1018,71 @@ class BiosSetupSection {
         host.appendChild(biosErrorUnit());
       });
   }
+}
+
+
+/** The finale (Dickles, 2026-10-17: the old closing paragraph —
+ * the tour's whereabouts crammed into one breath with the
+ * Locations sentence — "was messy — make it prettier and easier
+ * to understand"). One idea per line, and the way back drawn as
+ * what it is: three doors, each named by the place and the exact
+ * words on its controls, so a man who skipped everything can
+ * re-find the orientation from this scene alone, first try. The
+ * doors are the code's own: the \u2630 menu's "Welcome Tour" item,
+ * the About box's "Welcome Tour" button, and Preferences \u2192
+ * Appearance's "Show the welcome again". */
+function finaleScene(): SceneDef {
+  return {
+    id: "finale",
+    dwellMs: 16000,
+    interactive: false,
+    build: () => {
+      const s = el("section", "w-scene");
+      const inner = el("div", "w-inner");
+      inner.appendChild(el("p", "w-eyebrow w-line", "THAT'S THE HOUSE"));
+      inner.appendChild(el("h1", "w-title w-line", "Welcome home."));
+      const body = el("p", "w-body w-line");
+      rich(
+        body,
+        "This welcome never nags — it plays only when you ask for it.",
+      );
+      inner.appendChild(body);
+      const card = el("div", "w-finale-card w-line");
+      card.appendChild(
+        el(
+          "p",
+          "w-finale-head",
+          "Want the orientation again? Three doors back in:",
+        ),
+      );
+      const doors: [string, string][] = [
+        ["The \u2630 menu", "choose **Welcome Tour**"],
+        ["About Fable Files", "press the **Welcome Tour** button"],
+        [
+          "Preferences \u2192 Appearance",
+          "press **Show the welcome again**",
+        ],
+      ];
+      for (const [place, how] of doors) {
+        const row = el("div", "w-finale-row");
+        row.appendChild(el("span", "w-finale-place", place));
+        const howEl = el("span", "w-finale-how");
+        rich(howEl, how);
+        row.appendChild(howEl);
+        card.appendChild(row);
+      }
+      inner.appendChild(card);
+      const feed = el("p", "w-body w-line");
+      rich(
+        feed,
+        "And when you're ready to feed it, add your folders as **Locations** in the sidebar — Fable takes it from there.",
+      );
+      inner.appendChild(feed);
+      inner.appendChild(el("p", "w-body w-finale-last w-line", "Now — your library."));
+      s.appendChild(inner);
+      return s;
+    },
+  };
 }
 
 function buildScenes(): SceneDef[] {
@@ -1134,7 +1194,7 @@ function buildScenes(): SceneDef[] {
       { id: "bios", dwellMs: 20000, interactive: true },
       "SETUP · SYSTEM FILES",
       "One thing only you can bring.",
-      "Some consoles won't wake up without a small file from the machine itself — the BIOS. PlayStation, Saturn, Sega CD, PlayStation 2 and their kin keep the door locked without one. Fable fetches emulators, artwork and subtitles on request — but a BIOS it will **never, ever fetch**. Those come from consoles you own. If yours are handy, hand them over now: Fable files each one where its emulator looks, and says plainly when a file isn't one it knows.",
+      "Some consoles won't wake up without a small file from the machine itself — the BIOS. PlayStation, Saturn, Sega CD, PlayStation 2 and their kin keep the door locked without one. Fable fetches emulators, artwork and subtitles on request — but a BIOS it will **never, ever fetch**. Those come from consoles you own. If yours are handy, hand them over now: Fable files each one where its emulator looks, and says plainly when a file isn't one it knows. Each card below shows exactly what to bring — and what the folder looks like once it's home, so you can hold yours up against the picture.",
       "Skipping costs nothing, and anything you file here stays filed. Every system also waits in Preferences → ROMs (Games) & Emulation → System files — and Play will ask again before any game that needs one.",
       [
         {
@@ -1146,15 +1206,7 @@ function buildScenes(): SceneDef[] {
       ],
       ".w-bios-unit",
     ),
-    textScene(
-      { id: "finale", dwellMs: 13600, interactive: false },
-      "THAT'S THE HOUSE",
-      "Welcome home.",
-      [
-        "This welcome never nags: it's gone unless you ask for it. If you ever want the tour again, it's waiting in the menu, the About box, and Preferences. And when you're ready to feed it, add your folders as Locations in the sidebar — Fable takes it from there.",
-        "Now — your library.",
-      ],
-    ),
+    finaleScene(),
   ];
 }
 

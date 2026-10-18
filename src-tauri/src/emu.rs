@@ -678,6 +678,12 @@ pub struct BiosSetWire {
     pub names: Vec<String>,
     /// True when every name is needed (vs any one of them).
     pub all: bool,
+    /// The set's corner of the system folder ("" = the folder
+    /// itself, "dc" = Dreamcast's, "fbneo" = FinalBurn Neo's).
+    /// Carried so the card can DRAW the folder the way it should
+    /// look when the files are home (Dickles, 2026-10-17: "What
+    /// does the format look like? Help them.").
+    pub subdir: String,
     pub present: bool,
     pub missing: Vec<String>,
 }
@@ -715,6 +721,7 @@ pub fn bios_system_wire(req: &ufm_emu::BiosRequirement, system_root: &Path) -> B
                 what: set.what.to_string(),
                 names: set.display_names(),
                 all: set.all,
+                subdir: set.subdir.to_string(),
                 present: set.satisfied_by(&listing),
                 missing: set.missing_names(&listing),
             }
