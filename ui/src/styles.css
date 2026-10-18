@@ -5952,3 +5952,71 @@ body[data-layout="tv"] .w-glyph svg {
 .rh-cc-rmeta { opacity: 0.6; font-size: 0.84rem; }
 .rh-cc-more { margin: 16px auto 4px; display: block; }
 .rh-cc-unscored .rh-cc-line { opacity: 0.65; }
+
+/* ------------------------------------------------------------------
+   Ebook P3 — the Public Domain Shelf + Listen (2026-10-18).
+   ------------------------------------------------------------------ */
+.bh-pd-note {
+  color: var(--ufm-text-muted); font-size: 0.82rem; line-height: 1.5;
+  max-width: 44rem; margin: 6px 0 2px;
+}
+.bh-pd-group {
+  margin: 14px 0 0; font-size: 0.82rem; font-weight: 600;
+  color: var(--ufm-text-muted); text-transform: capitalize;
+}
+.bh-pd-card { cursor: default; }
+.bh-pd-card .bh-card-title { cursor: inherit; }
+.bh-pd-state { font-size: 0.75rem; color: var(--ufm-text-muted); padding: 2px 0; }
+.bh-pd-possibly { font-size: 0.75rem; color: var(--ufm-accent-text); margin-top: 4px; line-height: 1.4; }
+.bh-pd-failure {
+  font-size: 0.75rem; line-height: 1.45; margin-top: 4px;
+  color: var(--ufm-text); opacity: 0.85;
+}
+.bh-pd-row-note { font-style: italic; }
+
+/* The Listen bar: under the page, above the chapter footer. */
+.listen-wrap { border-top: 1px solid var(--ufm-border); }
+.listen-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 0.6rem 1.25rem;
+}
+.listen-toggle { font-weight: 600; }
+.listen-btn { font-size: 0.8rem; }
+.listen-sel { font-size: 0.8rem; max-width: 11rem; }
+.listen-status {
+  color: var(--ufm-text-muted); font-size: 0.82rem; margin-left: auto;
+}
+.listen-model {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 0 1.25rem 0.7rem;
+}
+.listen-model-msg { font-size: 0.85rem; line-height: 1.5; max-width: 40rem; }
+
+/* The spoken sentence, marked on the page. Theme-honest: it
+   derives from the accent, never a hardcoded highlighter yellow. */
+.tts-mark {
+  background: color-mix(in srgb, var(--ufm-accent, var(--accent)) 26%, transparent);
+  color: inherit; border-radius: 3px; padding: 0 1px;
+}
+
+/* Now Playing: the shell strip for narration that outlives the
+   reader. Fixed to the bottom, calm, gone when nothing plays. */
+.now-playing {
+  position: fixed; left: 50%; transform: translateX(-50%);
+  bottom: 14px; z-index: 900;
+  display: flex; align-items: center; gap: 14px;
+  max-width: min(640px, calc(100vw - 32px));
+  padding: 10px 14px;
+  background: var(--ufm-surface);
+  border: 1px solid var(--ufm-border);
+  border-radius: 999px;
+  box-shadow: 0 10px 30px color-mix(in srgb, var(--ufm-text) 24%, transparent);
+}
+.now-playing[hidden] { display: none; }
+.np-text { min-width: 0; }
+.np-title {
+  font-weight: 600; font-size: 0.9rem; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; max-width: 320px;
+}
+.np-sub { color: var(--ufm-text-muted); font-size: 0.78rem; white-space: nowrap; }
+.np-btn { flex: none; }

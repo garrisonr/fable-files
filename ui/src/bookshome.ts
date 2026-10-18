@@ -22,6 +22,8 @@ import {
   type BookCard,
   type BookContinueRow,
   type BooksHomePayload,
+  type PdRow,
+  type PdShelf,
 } from "./api";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { openReader } from "./reader";
@@ -60,6 +62,8 @@ export class BooksHome {
   private bodyEl!: HTMLElement;
   private subEl!: HTMLElement;
   private unlisten: UnlistenFn | null = null;
+  private unlistenPd: UnlistenFn | null = null;
+  private unlistenPdDone: UnlistenFn | null = null;
   private refreshQueued = false;
   private kickedAutoIdentify = false;
 
@@ -135,6 +139,27 @@ export class BooksHome {
         this.unlisten = un;
       });
     }
+    if (!this.unlistenPd) {
+      // The Public Domain Shelf changes as books land: each pull
+      // event repaints from the payload (the shelf's truth is
+      // file presence — the repaint simply re-reads it).
+      const onPull = () => {
+        if (this.refreshQueued) return;
+        this.refreshQueued = true;
+        window.setTimeout(() => {
+          this.refreshQueued = false;
+          if (this.active) void this.refresh(false);
+        }, 300);
+      };
+      void listen("pd-pull-progress", onPull).then((un) => {
+        this.unlistenPd = un;
+      });
+      void listen("pd-pull-finished", () => {
+        if (this.active) void this.refresh(false);
+      }).then((un) => {
+        this.unlistenPdDone = un;
+      });
+    }
     // First visit with unsorted books waiting: start the pass —
     // the room tidies itself while he watches.
     if (
@@ -152,6 +177,14 @@ export class BooksHome {
     if (this.unlisten) {
       this.unlisten();
       this.unlisten = null;
+    }
+    if (this.unlistenPd) {
+      this.unlistenPd();
+      this.unlistenPd = null;
+    }
+    if (this.unlistenPdDone) {
+      this.unlistenPdDone();
+      this.unlistenPdDone = null;
     }
   }
 
@@ -208,6 +241,9 @@ export class BooksHome {
           "No books yet. Add a folder of ebooks as a location and they'll shelve themselves here — by series, by author, gaps and all.",
         ),
       );
+      // Even an empty library gets the shelf: it's the one
+      // collection that needs nothing from him but a tap.
+      body.appendChild(this.pdSection(p.pdShelf));
       return;
     }
 
@@ -225,6 +261,11 @@ export class BooksHome {
         this.shelf("Recently Added", recent.map((b) => this.bookCard(b))),
       );
     }
+
+    // The Public Domain Shelf — the bundled library offer. It
+    // isn't filtered by his shelf marks: it isn't his shelves,
+    // it's the shelf he can take from.
+    body.appendChild(this.pdSection(p.pdShelf));
 
     for (const s of p.series) {
       const books = s.books.filter((b) => this.passes(b));
@@ -283,6 +324,130 @@ export class BooksHome {
         ),
       );
     }
+  }
+
+  // ------------------------------------------------------------ the Public Domain Shelf
+
+  private pdSection(shelf: PdShelf): HTMLElement {
+    const section = el("section", "bh-shelf bh-pd");
+    const head = el("div", "bh-shelf-head");
+    head.appendChild(el("h2", "bh-shelf-title", shelf.shelfName));
+    const progress = shelf.pull.running
+      ? `Adding… ${shelf.pull.done} of ${shelf.pull.total}${
+          shelf.pull.current ? ` — ${shelf.pull.current}` : ""
+        }`
+      : `${shelf.onShelf} of ${shelf.totalWorks} on the shelf`;
+    head.appendChild(el("span", "bh-shelf-note", progress));
+    if (!shelf.pull.running && shelf.onShelf < shelf.totalWorks) {
+      const all = el(
+        "button",
+        "bh-mini-btn bh-pd-all",
+        "Add the whole shelf",
+      ) as HTMLButtonElement;
+      all.title =
+        "Pull every book that isn't already yours — one at a time, in order (48 books · a few minutes)";
+      all.addEventListener("click", () => {
+        void api
+          .pdPull()
+          .then(() => this.refresh(false))
+          .catch(() => {});
+      });
+      head.appendChild(all);
+    }
+    section.appendChild(head);
+    section.appendChild(el("p", "bh-pd-note", shelf.headerNote));
+    // Grouped by the manifest's own sections, in manifest order.
+    const groups = new Map<string, PdRow[]>();
+    for (const row of shelf.rows) {
+      const g = groups.get(row.section);
+      if (g) g.push(row);
+      else groups.set(row.section, [row]);
+    }
+    for (const [name, rows] of groups) {
+      section.appendChild(el("h3", "bh-pd-group", name));
+      const rail = el("div", "bh-rail");
+      for (const row of rows) {
+        const card = this.pdCard(row);
+        rail.appendChild(card);
+        this.settleIn(card);
+      }
+      section.appendChild(rail);
+    }
+    return section;
+  }
+
+  private openPath(path: string): void {
+    if (path.toLowerCase().endsWith(".pdf")) openPdfReader(path);
+    else openReader(path);
+  }
+
+  private pdCard(row: PdRow): HTMLElement {
+    const root = el("div", "bh-card bh-pd-card");
+    const title = el("div", "bh-card-title", row.title);
+    title.title = row.title;
+    root.appendChild(title);
+    if (row.authorLine) {
+      root.appendChild(el("div", "bh-card-sub", row.authorLine));
+    }
+    if (row.note) {
+      root.appendChild(el("div", "bh-card-sub bh-pd-row-note", row.note));
+    }
+    const actions = el("div", "bh-card-actions");
+    if (row.failure) {
+      // The ledger's confession, on the row, with its way back.
+      root.appendChild(el("div", "bh-pd-failure", row.failure));
+      const retry = el("button", "bh-mini-btn", "Retry") as HTMLButtonElement;
+      retry.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void api
+          .pdPull([row.id])
+          .then(() => this.refresh(false))
+          .catch(() => {});
+      });
+      actions.appendChild(retry);
+    } else if (row.state === "on_shelf") {
+      actions.appendChild(el("span", "bh-pd-state", "On the shelf"));
+      if (row.shelfPath) {
+        root.addEventListener("click", () => this.openPath(row.shelfPath!));
+        root.title = `${row.title} — open in the reader`;
+      }
+    } else if (row.state === "owned") {
+      actions.appendChild(el("span", "bh-pd-state", "On your shelves"));
+      if (row.ownedPath) {
+        root.addEventListener("click", () => this.openPath(row.ownedPath!));
+        root.title = `${row.title} — your copy: ${row.ownedTitle ?? ""}`;
+      }
+    } else {
+      if (row.state === "possibly" && row.ownedTitle) {
+        root.appendChild(
+          el("div", "bh-pd-possibly", `Possibly already yours — ${row.ownedTitle}`),
+        );
+      }
+      if (row.totalFiles > 1 && row.presentFiles > 0) {
+        root.appendChild(
+          el(
+            "div",
+            "bh-card-sub",
+            `${row.presentFiles} of ${row.totalFiles} volumes here`,
+          ),
+        );
+      }
+      const add = el(
+        "button",
+        "bh-mini-btn",
+        row.presentFiles > 0 ? "Add the rest" : "Add",
+      ) as HTMLButtonElement;
+      add.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void api
+          .pdPull([row.id])
+          .then(() => this.refresh(false))
+          .catch(() => {});
+      });
+      actions.appendChild(add);
+    }
+    root.appendChild(actions);
+    return root;
   }
 
   private shelf(

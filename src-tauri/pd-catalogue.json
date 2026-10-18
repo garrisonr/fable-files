@@ -1,0 +1,994 @@
+{
+  "manifest_version": 1,
+  "shelf_name": "Public Domain Shelf",
+  "frozen_by": "Page Turner — Fable Ebook P3 Phase 1 freeze (2026-10-18); draft by Loud Mouth, reconciliation verified",
+  "reconciliation": "Annex counts line claims 47 verified (45 SE + 2 PG); the annex's own Tier-1 tables enumerate 48 works (46 SE + 2 PG) = 49 files (M. R. James row carries two volumes). Tables win: each row carries fetched-page evidence. Frozen: 48 works, 49 files.",
+  "works": [
+    {
+      "id": "h-p-lovecraft/at-the-mountains-of-madness",
+      "title": "At the Mountains of Madness",
+      "authors": [
+        "H. P. Lovecraft"
+      ],
+      "section": "The weird & the gothic",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/h-p-lovecraft/at-the-mountains-of-madness"
+      },
+      "files": [
+        {
+          "filename": "h-p-lovecraft_at-the-mountains-of-madness.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "h-p-lovecraft/the-case-of-charles-dexter-ward",
+      "title": "The Case of Charles Dexter Ward",
+      "authors": [
+        "H. P. Lovecraft"
+      ],
+      "section": "The weird & the gothic",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/h-p-lovecraft/the-case-of-charles-dexter-ward"
+      },
+      "files": [
+        {
+          "filename": "h-p-lovecraft_the-case-of-charles-dexter-ward.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "robert-w-chambers/the-king-in-yellow",
+      "title": "The King in Yellow",
+      "authors": [
+        "Robert W. Chambers"
+      ],
+      "section": "The weird & the gothic",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/robert-w-chambers/the-king-in-yellow"
+      },
+      "files": [
+        {
+          "filename": "robert-w-chambers_the-king-in-yellow.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "arthur-machen/short-fiction",
+      "title": "Short Fiction",
+      "authors": [
+        "Arthur Machen"
+      ],
+      "section": "The weird & the gothic",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/arthur-machen/short-fiction"
+      },
+      "files": [
+        {
+          "filename": "arthur-machen_short-fiction.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null,
+      "note": "Includes The Great God Pan and The White People."
+    },
+    {
+      "id": "william-hope-hodgson/the-house-on-the-borderland",
+      "title": "The House on the Borderland",
+      "authors": [
+        "William Hope Hodgson"
+      ],
+      "section": "The weird & the gothic",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/william-hope-hodgson/the-house-on-the-borderland"
+      },
+      "files": [
+        {
+          "filename": "william-hope-hodgson_the-house-on-the-borderland.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "edgar-allan-poe/short-fiction",
+      "title": "Short Fiction",
+      "authors": [
+        "Edgar Allan Poe"
+      ],
+      "section": "The weird & the gothic",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/edgar-allan-poe/short-fiction"
+      },
+      "files": [
+        {
+          "filename": "edgar-allan-poe_short-fiction.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null,
+      "note": "The complete tales."
+    },
+    {
+      "id": "bram-stoker/dracula",
+      "title": "Dracula",
+      "authors": [
+        "Bram Stoker"
+      ],
+      "section": "The weird & the gothic",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/bram-stoker/dracula"
+      },
+      "files": [
+        {
+          "filename": "bram-stoker_dracula.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "mary-shelley/frankenstein",
+      "title": "Frankenstein",
+      "authors": [
+        "Mary Shelley"
+      ],
+      "section": "The weird & the gothic",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/mary-shelley/frankenstein"
+      },
+      "files": [
+        {
+          "filename": "mary-shelley_frankenstein.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null,
+      "note": "The 1831 revised edition."
+    },
+    {
+      "id": "oscar-wilde/the-picture-of-dorian-gray",
+      "title": "The Picture of Dorian Gray",
+      "authors": [
+        "Oscar Wilde"
+      ],
+      "section": "The weird & the gothic",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/oscar-wilde/the-picture-of-dorian-gray"
+      },
+      "files": [
+        {
+          "filename": "oscar-wilde_the-picture-of-dorian-gray.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "robert-louis-stevenson/the-strange-case-of-dr-jekyll-and-mr-hyde",
+      "title": "The Strange Case of Dr. Jekyll and Mr. Hyde",
+      "authors": [
+        "Robert Louis Stevenson"
+      ],
+      "section": "The weird & the gothic",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/robert-louis-stevenson/the-strange-case-of-dr-jekyll-and-mr-hyde"
+      },
+      "files": [
+        {
+          "filename": "robert-louis-stevenson_the-strange-case-of-dr-jekyll-and-mr-hyde.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "henry-james/the-turn-of-the-screw",
+      "title": "The Turn of the Screw",
+      "authors": [
+        "Henry James"
+      ],
+      "section": "The weird & the gothic",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/henry-james/the-turn-of-the-screw"
+      },
+      "files": [
+        {
+          "filename": "henry-james_the-turn-of-the-screw.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "david-park-barnitz/the-book-of-jade",
+      "title": "The Book of Jade",
+      "authors": [
+        "David Park Barnitz"
+      ],
+      "section": "The weird & the gothic",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/david-park-barnitz/the-book-of-jade"
+      },
+      "files": [
+        {
+          "filename": "david-park-barnitz_the-book-of-jade.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "pg-8486",
+      "title": "Ghost Stories of an Antiquary",
+      "authors": [
+        "M. R. James"
+      ],
+      "section": "The weird & the gothic",
+      "source": {
+        "kind": "gutenberg",
+        "url": "https://www.gutenberg.org/ebooks/8486",
+        "gutenberg_id": 8486
+      },
+      "files": [
+        {
+          "filename": "m-r-james_ghost-stories-of-an-antiquary.epub",
+          "sha256": null,
+          "size_bytes": null,
+          "gutenberg_id": 8486
+        },
+        {
+          "filename": "m-r-james_more-ghost-stories.epub",
+          "sha256": null,
+          "size_bytes": null,
+          "gutenberg_id": 9629
+        }
+      ],
+      "librivox": null,
+      "note": "Two volumes: Ghost Stories of an Antiquary (PG #8486) and More Ghost Stories (PG #9629). Project Gutenberg — Standard Ebooks does not carry this title."
+    },
+    {
+      "id": "h-g-wells/the-time-machine",
+      "title": "The Time Machine",
+      "authors": [
+        "H. G. Wells"
+      ],
+      "section": "Early SF & adventure",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/h-g-wells/the-time-machine"
+      },
+      "files": [
+        {
+          "filename": "h-g-wells_the-time-machine.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "h-g-wells/the-war-of-the-worlds",
+      "title": "The War of the Worlds",
+      "authors": [
+        "H. G. Wells"
+      ],
+      "section": "Early SF & adventure",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/h-g-wells/the-war-of-the-worlds"
+      },
+      "files": [
+        {
+          "filename": "h-g-wells_the-war-of-the-worlds.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "h-g-wells/the-invisible-man",
+      "title": "The Invisible Man",
+      "authors": [
+        "H. G. Wells"
+      ],
+      "section": "Early SF & adventure",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/h-g-wells/the-invisible-man"
+      },
+      "files": [
+        {
+          "filename": "h-g-wells_the-invisible-man.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "jules-verne/around-the-world-in-eighty-days",
+      "title": "Around the World in Eighty Days",
+      "authors": [
+        "Jules Verne"
+      ],
+      "section": "Early SF & adventure",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/jules-verne/around-the-world-in-eighty-days"
+      },
+      "files": [
+        {
+          "filename": "jules-verne_around-the-world-in-eighty-days.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null,
+      "note": "Translated by George Makepeace Towle."
+    },
+    {
+      "id": "pg-164",
+      "title": "Twenty Thousand Leagues Under the Sea",
+      "authors": [
+        "Jules Verne"
+      ],
+      "section": "Early SF & adventure",
+      "source": {
+        "kind": "gutenberg",
+        "url": "https://www.gutenberg.org/ebooks/164",
+        "gutenberg_id": 164
+      },
+      "files": [
+        {
+          "filename": "jules-verne_twenty-thousand-leagues.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null,
+      "note": "Project Gutenberg #164. NEVER the Standard Ebooks edition: SE keys to the 1966 Walter James Miller translation (US public domain 2062).",
+      "alternate": {
+        "kind": "gutenberg",
+        "gutenberg_id": 2488,
+        "note": "Illustrated edition."
+      }
+    },
+    {
+      "id": "robert-louis-stevenson/treasure-island",
+      "title": "Treasure Island",
+      "authors": [
+        "Robert Louis Stevenson"
+      ],
+      "section": "Early SF & adventure",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/robert-louis-stevenson/treasure-island"
+      },
+      "files": [
+        {
+          "filename": "robert-louis-stevenson_treasure-island.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "alexandre-dumas/the-count-of-monte-cristo",
+      "title": "The Count of Monte Cristo",
+      "authors": [
+        "Alexandre Dumas"
+      ],
+      "section": "Early SF & adventure",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/alexandre-dumas/the-count-of-monte-cristo"
+      },
+      "files": [
+        {
+          "filename": "alexandre-dumas_the-count-of-monte-cristo.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null,
+      "note": "The Chapman & Hall translation."
+    },
+    {
+      "id": "joseph-conrad/heart-of-darkness",
+      "title": "Heart of Darkness",
+      "authors": [
+        "Joseph Conrad"
+      ],
+      "section": "Early SF & adventure",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/joseph-conrad/heart-of-darkness"
+      },
+      "files": [
+        {
+          "filename": "joseph-conrad_heart-of-darkness.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "jack-london/the-call-of-the-wild",
+      "title": "The Call of the Wild",
+      "authors": [
+        "Jack London"
+      ],
+      "section": "Early SF & adventure",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/jack-london/the-call-of-the-wild"
+      },
+      "files": [
+        {
+          "filename": "jack-london_the-call-of-the-wild.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "jane-austen/pride-and-prejudice",
+      "title": "Pride and Prejudice",
+      "authors": [
+        "Jane Austen"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/jane-austen/pride-and-prejudice"
+      },
+      "files": [
+        {
+          "filename": "jane-austen_pride-and-prejudice.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "jane-austen/emma",
+      "title": "Emma",
+      "authors": [
+        "Jane Austen"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/jane-austen/emma"
+      },
+      "files": [
+        {
+          "filename": "jane-austen_emma.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "jane-austen/sense-and-sensibility",
+      "title": "Sense and Sensibility",
+      "authors": [
+        "Jane Austen"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/jane-austen/sense-and-sensibility"
+      },
+      "files": [
+        {
+          "filename": "jane-austen_sense-and-sensibility.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "charlotte-bronte/jane-eyre",
+      "title": "Jane Eyre",
+      "authors": [
+        "Charlotte Brontë"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/charlotte-bronte/jane-eyre"
+      },
+      "files": [
+        {
+          "filename": "charlotte-bronte_jane-eyre.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "emily-bronte/wuthering-heights",
+      "title": "Wuthering Heights",
+      "authors": [
+        "Emily Brontë"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/emily-bronte/wuthering-heights"
+      },
+      "files": [
+        {
+          "filename": "emily-bronte_wuthering-heights.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "george-eliot/middlemarch",
+      "title": "Middlemarch",
+      "authors": [
+        "George Eliot"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/george-eliot/middlemarch"
+      },
+      "files": [
+        {
+          "filename": "george-eliot_middlemarch.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "charles-dickens/great-expectations",
+      "title": "Great Expectations",
+      "authors": [
+        "Charles Dickens"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/charles-dickens/great-expectations"
+      },
+      "files": [
+        {
+          "filename": "charles-dickens_great-expectations.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "charles-dickens/a-tale-of-two-cities",
+      "title": "A Tale of Two Cities",
+      "authors": [
+        "Charles Dickens"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/charles-dickens/a-tale-of-two-cities"
+      },
+      "files": [
+        {
+          "filename": "charles-dickens_a-tale-of-two-cities.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "charles-dickens/a-christmas-carol",
+      "title": "A Christmas Carol",
+      "authors": [
+        "Charles Dickens"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/charles-dickens/a-christmas-carol"
+      },
+      "files": [
+        {
+          "filename": "charles-dickens_a-christmas-carol.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "charles-dickens/oliver-twist",
+      "title": "Oliver Twist",
+      "authors": [
+        "Charles Dickens"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/charles-dickens/oliver-twist"
+      },
+      "files": [
+        {
+          "filename": "charles-dickens_oliver-twist.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "victor-hugo/les-miserables",
+      "title": "Les Misérables",
+      "authors": [
+        "Victor Hugo"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/victor-hugo/les-miserables"
+      },
+      "files": [
+        {
+          "filename": "victor-hugo_les-miserables.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null,
+      "note": "Translated by Isabel F. Hapgood."
+    },
+    {
+      "id": "fyodor-dostoevsky/crime-and-punishment",
+      "title": "Crime and Punishment",
+      "authors": [
+        "Fyodor Dostoevsky"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/fyodor-dostoevsky/crime-and-punishment"
+      },
+      "files": [
+        {
+          "filename": "fyodor-dostoevsky_crime-and-punishment.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null,
+      "note": "Translated by Constance Garnett (1914)."
+    },
+    {
+      "id": "leo-tolstoy/war-and-peace",
+      "title": "War and Peace",
+      "authors": [
+        "Leo Tolstoy"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/leo-tolstoy/war-and-peace"
+      },
+      "files": [
+        {
+          "filename": "leo-tolstoy_war-and-peace.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null,
+      "note": "Translated by Louise and Aylmer Maude."
+    },
+    {
+      "id": "herman-melville/moby-dick",
+      "title": "Moby Dick",
+      "authors": [
+        "Herman Melville"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/herman-melville/moby-dick"
+      },
+      "files": [
+        {
+          "filename": "herman-melville_moby-dick.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "nathaniel-hawthorne/the-scarlet-letter",
+      "title": "The Scarlet Letter",
+      "authors": [
+        "Nathaniel Hawthorne"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/nathaniel-hawthorne/the-scarlet-letter"
+      },
+      "files": [
+        {
+          "filename": "nathaniel-hawthorne_the-scarlet-letter.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "mark-twain/the-adventures-of-tom-sawyer",
+      "title": "The Adventures of Tom Sawyer",
+      "authors": [
+        "Mark Twain"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/mark-twain/the-adventures-of-tom-sawyer"
+      },
+      "files": [
+        {
+          "filename": "mark-twain_the-adventures-of-tom-sawyer.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "mark-twain/the-adventures-of-huckleberry-finn",
+      "title": "The Adventures of Huckleberry Finn",
+      "authors": [
+        "Mark Twain"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/mark-twain/the-adventures-of-huckleberry-finn"
+      },
+      "files": [
+        {
+          "filename": "mark-twain_the-adventures-of-huckleberry-finn.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "arthur-conan-doyle/a-study-in-scarlet",
+      "title": "A Study in Scarlet",
+      "authors": [
+        "Arthur Conan Doyle"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/arthur-conan-doyle/a-study-in-scarlet"
+      },
+      "files": [
+        {
+          "filename": "arthur-conan-doyle_a-study-in-scarlet.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "arthur-conan-doyle/the-adventures-of-sherlock-holmes",
+      "title": "The Adventures of Sherlock Holmes",
+      "authors": [
+        "Arthur Conan Doyle"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/arthur-conan-doyle/the-adventures-of-sherlock-holmes"
+      },
+      "files": [
+        {
+          "filename": "arthur-conan-doyle_the-adventures-of-sherlock-holmes.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "arthur-conan-doyle/the-hound-of-the-baskervilles",
+      "title": "The Hound of the Baskervilles",
+      "authors": [
+        "Arthur Conan Doyle"
+      ],
+      "section": "The canon spine",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/arthur-conan-doyle/the-hound-of-the-baskervilles"
+      },
+      "files": [
+        {
+          "filename": "arthur-conan-doyle_the-hound-of-the-baskervilles.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "lewis-carroll/alices-adventures-in-wonderland",
+      "title": "Alice's Adventures in Wonderland",
+      "authors": [
+        "Lewis Carroll"
+      ],
+      "section": "For the house",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/lewis-carroll/alices-adventures-in-wonderland"
+      },
+      "files": [
+        {
+          "filename": "lewis-carroll_alices-adventures-in-wonderland.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null,
+      "note": "Illustrated by John Tenniel."
+    },
+    {
+      "id": "l-frank-baum/the-wonderful-wizard-of-oz",
+      "title": "The Wonderful Wizard of Oz",
+      "authors": [
+        "L. Frank Baum"
+      ],
+      "section": "For the house",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/l-frank-baum/the-wonderful-wizard-of-oz"
+      },
+      "files": [
+        {
+          "filename": "l-frank-baum_the-wonderful-wizard-of-oz.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "a-a-milne/winnie-the-pooh",
+      "title": "Winnie-the-Pooh",
+      "authors": [
+        "A. A. Milne"
+      ],
+      "section": "For the house",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/a-a-milne/winnie-the-pooh"
+      },
+      "files": [
+        {
+          "filename": "a-a-milne_winnie-the-pooh.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null,
+      "note": "Public domain in the United States (published 1926); still in copyright in life+70 countries."
+    },
+    {
+      "id": "kenneth-grahame/the-wind-in-the-willows",
+      "title": "The Wind in the Willows",
+      "authors": [
+        "Kenneth Grahame"
+      ],
+      "section": "For the house",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/kenneth-grahame/the-wind-in-the-willows"
+      },
+      "files": [
+        {
+          "filename": "kenneth-grahame_the-wind-in-the-willows.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "frances-hodgson-burnett/the-secret-garden",
+      "title": "The Secret Garden",
+      "authors": [
+        "Frances Hodgson Burnett"
+      ],
+      "section": "For the house",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/frances-hodgson-burnett/the-secret-garden"
+      },
+      "files": [
+        {
+          "filename": "frances-hodgson-burnett_the-secret-garden.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    },
+    {
+      "id": "louisa-may-alcott/little-women",
+      "title": "Little Women",
+      "authors": [
+        "Louisa May Alcott"
+      ],
+      "section": "For the house",
+      "source": {
+        "kind": "standardebooks",
+        "url": "https://standardebooks.org/ebooks/louisa-may-alcott/little-women"
+      },
+      "files": [
+        {
+          "filename": "louisa-may-alcott_little-women.epub",
+          "sha256": null,
+          "size_bytes": null
+        }
+      ],
+      "librivox": null
+    }
+  ]
+}

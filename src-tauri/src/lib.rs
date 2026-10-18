@@ -29,6 +29,8 @@ pub mod books;
 pub mod pcgames;
 pub mod plugins;
 pub mod reader;
+pub mod pd;
+pub mod tts;
 pub mod templates;
 pub mod player;
 
@@ -528,12 +530,19 @@ pub fn run() {
         .with_env_filter("ufm=debug")
         .init();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| -> Result<(), Box<dyn std::error::Error>> {
             let state = AppState::build(app).map_err(|e| format!("state init: {e}"))?;
             app.manage(state);
+            // Ebook P3: the Public Domain Shelf hub (single-flight
+            // pull state) and the Listen engine (its thread owns
+            // the narrator; the hub is the mailbox). The engine
+            // saves the ear mark when its channel disconnects at
+            // app exit.
+            app.manage(pd::PdHub::new());
+            app.manage(tts::TtsHub::start(app.handle().clone()));
             // Emulation: reconcile the unified view (~/ROMs farm
             // + RetroArch playlists) against the volumes Library
             // Memory sees mounted right now.
@@ -887,10 +896,36 @@ pub fn run() {
             reader::open_book,
             reader::read_chapter,
             reader::set_reading_progress,
+            pd::pd_pull,
+            tts::tts_snapshot,
+            tts::tts_play,
+            tts::tts_pause,
+            tts::tts_resume,
+            tts::tts_stop,
+            tts::tts_next_sentence,
+            tts::tts_prev_sentence,
+            tts::tts_next_chapter,
+            tts::tts_prev_chapter,
+            tts::tts_set_voice,
+            tts::tts_set_speed,
+            tts::tts_set_sleep,
+            tts::tts_model_status,
+            tts::tts_model_download,
             reader::open_pdf,
             reader::read_pdf_page,
             reader::set_pdf_progress,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("failed to run Fable Files");
+    app.run(|handle, event| {
+        // Ebook P3: on exit, tell the Listen engine to save the
+        // ear mark and put the narrator away — its channel alone
+        // never disconnects because the synthesis thread holds a
+        // sender clone.
+        if let tauri::RunEvent::Exit = event {
+            if let Some(hub) = handle.try_state::<tts::TtsHub>() {
+                hub.shutdown();
+            }
+        }
+    });
 }

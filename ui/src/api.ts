@@ -310,6 +310,10 @@ export interface BookOpen {
   chapterTitles: (string | null)[];
   /** Ebook P2 — saved within-chapter place for startChapter. */
   startScrollFrac: number | null;
+  /** Ebook P3 — the ear mark: where Listen left off, when this
+   * book has been listened to. Independent of the eye mark. */
+  listenChapter: number | null;
+  listenSentence: number | null;
 }
 
 export interface ChapterView {
@@ -321,6 +325,9 @@ export interface ChapterView {
   /** Ebook P2 — scoped publisher CSS for the chapter. */
   css: string | null;
   chapterCount: number;
+  /** Ebook P3 — sentence ranges (char ranges into `text`) from
+   * the same segmenter the narrator consumes. */
+  sentences: Array<{ start: number; end: number }>;
 }
 
 /** PDF Reader — the opening handshake for one document. */
@@ -1538,6 +1545,35 @@ export const api = {
     scrollFrac?: number,
   ) =>
     invoke<void>("set_reading_progress", { path, chapter, fontScale, scrollFrac }),
+  /** Ebook P3 — pull Public Domain Shelf works (all missing when
+   * no ids are given). Returns the running pull snapshot; progress
+   * arrives on pd-pull-progress / pd-pull-finished events. */
+  pdPull: (workIds?: string[]) =>
+    invoke<PdPull>("pd_pull", { workIds: workIds ?? null }),
+  /** Ebook P3 — Listen. Every verb returns the engine's fresh
+   * snapshot; the caller adopts it wholesale (§AW). */
+  ttsSnapshot: () => invoke<TtsSnapshot>("tts_snapshot"),
+  ttsPlay: (path: string, chapter?: number, sentence?: number) =>
+    invoke<TtsSnapshot>("tts_play", {
+      path,
+      chapter: chapter ?? null,
+      sentence: sentence ?? null,
+    }),
+  ttsPause: () => invoke<TtsSnapshot>("tts_pause"),
+  ttsResume: () => invoke<TtsSnapshot>("tts_resume"),
+  ttsStop: () => invoke<TtsSnapshot>("tts_stop"),
+  ttsNextSentence: () => invoke<TtsSnapshot>("tts_next_sentence"),
+  ttsPrevSentence: () => invoke<TtsSnapshot>("tts_prev_sentence"),
+  ttsNextChapter: () => invoke<TtsSnapshot>("tts_next_chapter"),
+  ttsPrevChapter: () => invoke<TtsSnapshot>("tts_prev_chapter"),
+  ttsSetVoice: (voice: string) =>
+    invoke<TtsSnapshot>("tts_set_voice", { voice }),
+  ttsSetSpeed: (speed: number) =>
+    invoke<TtsSnapshot>("tts_set_speed", { speed }),
+  ttsSetSleep: (mode: string) =>
+    invoke<TtsSnapshot>("tts_set_sleep", { mode }),
+  ttsModelStatus: () => invoke<ModelSnapshot>("tts_model_status"),
+  ttsModelDownload: () => invoke<ModelSnapshot>("tts_model_download"),
   /** PDF Reader — paginated documents in the same shell. */
   openPdf: (path: string) => invoke<PdfOpen>("open_pdf", { path }),
   readPdfPage: (path: string, page: number, widthPx: number) =>
@@ -2499,6 +2535,74 @@ export interface BooksHomePayload {
   all: BookCard[];
   unsorted: Array<{ path: string; name: string }>;
   unsortedTotal: number;
+  /** Ebook P3 — the Public Domain Shelf, composed server-side. */
+  pdShelf: PdShelf;
+}
+
+/** Ebook P3 — one Public Domain Shelf row. */
+export interface PdRow {
+  id: string;
+  title: string;
+  authorLine: string;
+  section: string;
+  note: string | null;
+  /** on_shelf | owned | possibly | add */
+  state: string;
+  ownedTitle: string | null;
+  ownedPath: string | null;
+  shelfPath: string | null;
+  presentFiles: number;
+  totalFiles: number;
+  /** The pull ledger's confession for this row, when it failed. */
+  failure: string | null;
+}
+
+export interface PdPull {
+  running: boolean;
+  done: number;
+  total: number;
+  current: string | null;
+  failures: number;
+}
+
+export interface PdShelf {
+  shelfName: string;
+  dir: string;
+  headerNote: string;
+  totalWorks: number;
+  onShelf: number;
+  rows: PdRow[];
+  pull: PdPull;
+}
+
+/** Ebook P3 — the Listen engine's snapshot. The UI adopts these
+ * wholesale; playback truth lives in Rust, never in JS timers. */
+export interface TtsSnapshot {
+  version: number;
+  /** idle | loading | playing | paused | stopped | error */
+  state: string;
+  path: string | null;
+  title: string | null;
+  chapter: number | null;
+  chapterCount: number;
+  sentence: number | null;
+  sentenceCount: number;
+  buffered: number;
+  stalls: number;
+  voice: string;
+  speed: number;
+  /** off | 15 | 30 | 45 | 60 | chapter */
+  sleep: string;
+  message: string | null;
+}
+
+/** Ebook P3 — the narrator model's state. */
+export interface ModelSnapshot {
+  /** ready | missing | downloading | verifying | extracting | error */
+  state: string;
+  downloaded: number;
+  total: number;
+  message: string | null;
 }
 
 export interface BooksIdentifyReport {

@@ -33,6 +33,18 @@ ufm-mcp = { path = "../crates/ufm-mcp" }
 ufm-media = { path = "../crates/ufm-media" }
 ufm-emu = { path = "../crates/ufm-emu" }
 ufm-torrent = { path = "../crates/ufm-torrent" }
+# Ebook P3: the narration seam (segmenter, voices, model pins,
+# helper-process client). LIB ONLY in the app — the sherpa-linked
+# helper binary lives behind the crate's `engine` feature and
+# ships as a bundled resource, so the app binary never links the
+# TTS runtime and a missing runtime degrades to a plain sentence.
+ufm-tts = { path = "../crates/ufm-tts" }
+# Ebook P3: narration playback (the queue IS the playback clock).
+rodio = "0.21"
+# Ebook P3: the narrator model archive (download, hash-verify,
+# unpack) — versions already in the workspace lock via zip tooling.
+tar = "0.4"
+bzip2 = "0.4"
 tracing.workspace = true
 base64 = "0.22"
 ureq = "2"

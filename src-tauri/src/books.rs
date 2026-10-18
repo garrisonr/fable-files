@@ -135,6 +135,11 @@ pub struct BooksHomePayload {
     pub all: Vec<BookCard>,
     pub unsorted: Vec<UnsortedCard>,
     pub unsorted_total: u64,
+    /// The Public Domain Shelf (Ebook P3): the frozen 48-work
+    /// manifest composed against the live library — every row
+    /// knows whether it's on the shelf, already his under
+    /// another edition, or waiting to be added.
+    pub pd_shelf: crate::pd::PdShelfWire,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -498,7 +503,10 @@ fn progress_math(
 /// and the unsorted pile — so the UI never assembles a half-true
 /// picture from racing queries.
 #[tauri::command]
-pub fn books_home(state: tauri::State<'_, AppState>) -> Cmd<BooksHomePayload> {
+pub fn books_home(
+    state: tauri::State<'_, AppState>,
+    pd_hub: tauri::State<'_, crate::pd::PdHub>,
+) -> Cmd<BooksHomePayload> {
     let catalog = state.catalog.lock().unwrap();
     let counts = catalog.books_counts().map_err(CommandError::from)?;
     let all_rows = catalog.books_all().map_err(CommandError::from)?;
@@ -583,6 +591,19 @@ pub fn books_home(state: tauri::State<'_, AppState>) -> Cmd<BooksHomePayload> {
     });
     let recently_added: Vec<BookCard> = by_recency.iter().take(24).map(card).collect();
 
+    // The Public Domain Shelf, composed from the same rows the
+    // room shows — one library truth, two surfaces.
+    let pd_library: Vec<crate::pd::LibraryBook> = all_rows
+        .iter()
+        .map(|r| crate::pd::LibraryBook {
+            title: r.meta.title.clone().unwrap_or_default(),
+            authors: r.meta.authors.clone(),
+            path: r.meta.provider_key.clone(),
+        })
+        .collect();
+    let pd_pull_status = pd_hub.status.lock().unwrap().clone();
+    let pd_shelf = crate::pd::compose_shelf(&pd_library, &pd_pull_status);
+
     Ok(BooksHomePayload {
         counts: BooksCountsWire {
             identified: counts.identified,
@@ -622,6 +643,7 @@ pub fn books_home(state: tauri::State<'_, AppState>) -> Cmd<BooksHomePayload> {
             })
             .collect(),
         unsorted_total: counts.unsorted,
+        pd_shelf,
     })
 }
 

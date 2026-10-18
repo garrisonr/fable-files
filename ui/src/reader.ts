@@ -19,7 +19,14 @@
  * still arrives on every ChapterView beside the rich form — the
  * fallback today, the read-aloud path tomorrow.
  */
-import { api, type BookOpen, type ChapterView } from "./api";
+import {
+  api,
+  type BookOpen,
+  type ChapterView,
+  type ModelSnapshot,
+  type TtsSnapshot,
+} from "./api";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Toast, errText } from "./toast";
 
 function el<K extends keyof HTMLElementTagNameMap>(
@@ -40,7 +47,26 @@ interface ReaderSettings {
   lineHeight: number;
   measure: "narrow" | "normal" | "wide";
   theme: "light" | "sepia" | "dark";
+  /** Ebook P3 — Listen defaults: the narrator he chose last. */
+  ttsVoice: string;
+  ttsSpeed: number;
+  ttsSleep: string;
 }
+
+/** The seven narrators of the Kokoro v1_0 cast (the crate's
+ * inventory, mirrored: ids + labels must agree with ufm-tts). */
+const TTS_VOICES: Array<{ id: string; label: string }> = [
+  { id: "af_heart", label: "Heart · US, female" },
+  { id: "af_bella", label: "Bella · US, female" },
+  { id: "am_adam", label: "Adam · US, male" },
+  { id: "am_michael", label: "Michael · US, male" },
+  { id: "bf_emma", label: "Emma · British, female" },
+  { id: "bm_george", label: "George · British, male" },
+  { id: "bm_fable", label: "Fable · British, male" },
+];
+
+const TTS_SPEEDS = [0.75, 1, 1.25, 1.5, 1.75, 2];
+const TTS_SLEEPS = ["off", "15", "30", "45", "60", "chapter"];
 
 const READER_DEFAULTS: ReaderSettings = {
   fontFamily: "serif",
@@ -48,6 +74,9 @@ const READER_DEFAULTS: ReaderSettings = {
   lineHeight: 1.65,
   measure: "normal",
   theme: "dark",
+  ttsVoice: "af_heart",
+  ttsSpeed: 1,
+  ttsSleep: "off",
 };
 
 const FONT_STACKS: Record<ReaderSettings["fontFamily"], string> = {
@@ -85,6 +114,14 @@ function normalizeSettings(raw: unknown, legacyScale?: number): ReaderSettings {
     s.measure = r.measure;
   if (r.theme === "light" || r.theme === "sepia" || r.theme === "dark")
     s.theme = r.theme;
+  // Listen defaults (P3): additive — a prefs blob written by P2
+  // parses to exactly the same settings it always did.
+  if (typeof r.ttsVoice === "string" && TTS_VOICES.some((v) => v.id === r.ttsVoice))
+    s.ttsVoice = r.ttsVoice;
+  if (typeof r.ttsSpeed === "number" && TTS_SPEEDS.includes(r.ttsSpeed))
+    s.ttsSpeed = r.ttsSpeed;
+  if (typeof r.ttsSleep === "string" && TTS_SLEEPS.includes(r.ttsSleep))
+    s.ttsSleep = r.ttsSleep;
   return s;
 }
 
@@ -92,6 +129,10 @@ interface GoOpts {
   first?: boolean;
   frac?: number;
   frag?: string;
+  /** A narration-driven chapter turn: the view follows the ear,
+   * but the EYE mark is not saved — reading position and
+   * listening position never write each other's stores. */
+  narration?: boolean;
 }
 
 class Reader {
@@ -112,6 +153,29 @@ class Reader {
   private settings: ReaderSettings = { ...READER_DEFAULTS };
   private currentFrac = 0;
   private lastScrollSave = 0;
+  // -- Listen (Ebook P3) ------------------------------------------
+  // Playback truth lives in Rust; this class only paints the
+  // engine's snapshots and sentence events. The highlight follows
+  // the ear only after he has touched Listen in this session —
+  // opening a book to READ while narration plays elsewhere must
+  // never yank the page away from his eyes.
+  private listenToggle: HTMLButtonElement | null = null;
+  private listenStatus: HTMLElement | null = null;
+  private voiceSel: HTMLSelectElement | null = null;
+  private speedSel: HTMLSelectElement | null = null;
+  private sleepSel: HTMLSelectElement | null = null;
+  private modelEl: HTMLElement | null = null;
+  private modelMsg: HTMLElement | null = null;
+  private tts: TtsSnapshot | null = null;
+  private view: ChapterView | null = null;
+  private followEar = false;
+  private ttsWired = false;
+  private markEl: HTMLElement | null = null;
+  private hlKey = "";
+  private hlStream: { text: string; nodes: Text[]; offs: number[] } | null =
+    null;
+  private hlPtr = 0;
+  private hlSentence = -1;
 
   async open(path: string): Promise<void> {
     this.close();
@@ -159,7 +223,7 @@ class Reader {
     this.nextBtn = el("button", "pill-btn", "Next →") as HTMLButtonElement;
     this.nextBtn.addEventListener("click", () => void this.go(this.chapter + 1));
     foot.append(this.prevBtn, this.posEl, this.selectEl, this.nextBtn);
-    shell.append(head, this.bodyEl, this.settingsEl, foot);
+    shell.append(head, this.bodyEl, this.settingsEl, this.buildListenBar(), foot);
     overlay.appendChild(shell);
     overlay.addEventListener("pointerdown", (e) => {
       if (e.target === overlay) this.close();
@@ -171,6 +235,9 @@ class Reader {
       )
         this.settingsEl.style.display = "none";
     });
+    // The Now Playing strip reads this to yield while the
+    // reader for the same book is open.
+    overlay.dataset.bookPath = path;
     document.body.appendChild(overlay);
     this.overlay = overlay;
     document.addEventListener("keydown", this.keyHandler);
@@ -186,6 +253,10 @@ class Reader {
         this.prefs.readerSettings === undefined ? book.fontScale : undefined,
       );
       this.applySettings();
+      this.followEar = false;
+      this.syncListenControls();
+      this.wireTtsEvents();
+      void this.refreshTts();
       titleEl.textContent = book.title ?? path.split("/").pop() ?? "Book";
       authorEl.textContent = book.author ?? "";
       if (book.drmProtected || book.chapterCount === 0) {
@@ -454,19 +525,30 @@ class Reader {
     try {
       const view = await api.readChapter(this.path, target);
       this.chapter = view.index;
+      this.view = view;
       this.renderChapter(view);
       this.updateChrome();
+      // A new chapter on the page: the highlight machinery
+      // starts from a clean slate.
+      this.markEl = null;
+      this.hlKey = "";
+      this.hlPtr = 0;
+      this.hlSentence = -1;
       // Position after paint: a fragment target wins, then a
       // saved place, else the chapter top. The progress save
       // follows the positioning, so what lands on disk is the
-      // place the reader actually sees.
+      // place the reader actually sees. Narration-driven turns
+      // never save: the ear is not the eye.
+      const save = (): void => {
+        if (!opts.narration) this.saveProgress();
+      };
       this.currentFrac = 0;
       if (this.bodyEl) this.bodyEl.scrollTop = 0;
       if (opts.frag) {
         requestAnimationFrame(() =>
           requestAnimationFrame(() => {
             this.scrollToFrag(opts.frag!);
-            this.saveProgress();
+            save();
           }),
         );
       } else if (opts.frac !== undefined && opts.frac > 0) {
@@ -474,11 +556,11 @@ class Reader {
         requestAnimationFrame(() =>
           requestAnimationFrame(() => {
             this.restoreFrac(frac);
-            this.saveProgress();
+            save();
           }),
         );
       } else {
-        this.saveProgress();
+        save();
       }
     } catch (err) {
       Toast.error(`Couldn't load that chapter: ${errText(err)}`);
@@ -555,6 +637,386 @@ class Reader {
     }
   }
 
+  // -- Listen: the bar ------------------------------------------------
+
+  private buildListenBar(): HTMLElement {
+    const bar = el("div", "listen-bar");
+    this.listenToggle = el(
+      "button",
+      "pill-btn listen-toggle",
+      "▶ Listen",
+    ) as HTMLButtonElement;
+    this.listenToggle.title = "Listen to this book";
+    this.listenToggle.addEventListener("click", () => void this.toggleListen());
+    const stop = el("button", "pill-btn listen-btn", "■") as HTMLButtonElement;
+    stop.title = "Stop listening";
+    stop.addEventListener("click", () => {
+      this.followEar = false;
+      void this.adoptCmd(api.ttsStop());
+    });
+    const prevS = el("button", "pill-btn listen-btn", "‹ Sentence") as HTMLButtonElement;
+    prevS.title = "Previous sentence";
+    prevS.addEventListener("click", () => void this.adoptCmd(api.ttsPrevSentence()));
+    const nextS = el("button", "pill-btn listen-btn", "Sentence ›") as HTMLButtonElement;
+    nextS.title = "Next sentence";
+    nextS.addEventListener("click", () => void this.adoptCmd(api.ttsNextSentence()));
+    const prevC = el("button", "pill-btn listen-btn", "« Chapter") as HTMLButtonElement;
+    prevC.title = "Previous chapter";
+    prevC.addEventListener("click", () => void this.adoptCmd(api.ttsPrevChapter()));
+    const nextC = el("button", "pill-btn listen-btn", "Chapter »") as HTMLButtonElement;
+    nextC.title = "Next chapter";
+    nextC.addEventListener("click", () => void this.adoptCmd(api.ttsNextChapter()));
+
+    this.voiceSel = el("select", "reader-select listen-sel") as HTMLSelectElement;
+    this.voiceSel.title = "Narrator";
+    for (const v of TTS_VOICES) {
+      const o = document.createElement("option");
+      o.value = v.id;
+      o.textContent = v.label;
+      this.voiceSel.appendChild(o);
+    }
+    this.voiceSel.addEventListener("change", () => {
+      this.settings.ttsVoice = this.voiceSel!.value;
+      this.persistSettings();
+      if (this.tts?.path === this.path)
+        void this.adoptCmd(api.ttsSetVoice(this.settings.ttsVoice));
+    });
+
+    this.speedSel = el("select", "reader-select listen-sel") as HTMLSelectElement;
+    this.speedSel.title = "Narration speed";
+    for (const s of TTS_SPEEDS) {
+      const o = document.createElement("option");
+      o.value = String(s);
+      o.textContent = `${s}×`;
+      this.speedSel.appendChild(o);
+    }
+    this.speedSel.addEventListener("change", () => {
+      this.settings.ttsSpeed = Number(this.speedSel!.value);
+      this.persistSettings();
+      if (this.tts?.path === this.path)
+        void this.adoptCmd(api.ttsSetSpeed(this.settings.ttsSpeed));
+    });
+
+    this.sleepSel = el("select", "reader-select listen-sel") as HTMLSelectElement;
+    this.sleepSel.title = "Sleep timer";
+    const sleepLabels: Record<string, string> = {
+      off: "Sleep: off",
+      "15": "Sleep: 15 min",
+      "30": "Sleep: 30 min",
+      "45": "Sleep: 45 min",
+      "60": "Sleep: 60 min",
+      chapter: "Sleep: end of chapter",
+    };
+    for (const s of TTS_SLEEPS) {
+      const o = document.createElement("option");
+      o.value = s;
+      o.textContent = sleepLabels[s];
+      this.sleepSel.appendChild(o);
+    }
+    this.sleepSel.addEventListener("change", () => {
+      this.settings.ttsSleep = this.sleepSel!.value;
+      this.persistSettings();
+      void this.adoptCmd(api.ttsSetSleep(this.settings.ttsSleep));
+    });
+
+    this.listenStatus = el("span", "listen-status");
+    bar.append(
+      this.listenToggle,
+      stop,
+      prevS,
+      nextS,
+      prevC,
+      nextC,
+      this.voiceSel,
+      this.speedSel,
+      this.sleepSel,
+      this.listenStatus,
+    );
+
+    // The model disclosure: shown when the narrator's voice
+    // hasn't been downloaded yet — size up front, his tap.
+    this.modelEl = el("div", "listen-model");
+    this.modelEl.style.display = "none";
+    this.modelMsg = el("span", "listen-model-msg");
+    const dl = el("button", "pill-btn", "Download the voice") as HTMLButtonElement;
+    dl.addEventListener("click", () => {
+      void api
+        .ttsModelDownload()
+        .then((m) => this.showModel(m))
+        .catch(() => {});
+    });
+    this.modelEl.append(this.modelMsg, dl);
+    const wrap = el("div", "listen-wrap");
+    wrap.append(bar, this.modelEl);
+    return wrap;
+  }
+
+  private syncListenControls(): void {
+    if (this.voiceSel) this.voiceSel.value = this.settings.ttsVoice;
+    if (this.speedSel) this.speedSel.value = String(this.settings.ttsSpeed);
+    if (this.sleepSel) this.sleepSel.value = this.settings.ttsSleep;
+  }
+
+  // -- Listen: engine conversation -------------------------------------
+
+  private wireTtsEvents(): void {
+    if (this.ttsWired) return;
+    this.ttsWired = true;
+    void listen<TtsSnapshot>("tts-state", (e) => this.adopt(e.payload)).catch(
+      () => {},
+    );
+    void listen<{ path: string | null; chapter: number; sentence: number }>(
+      "tts-sentence",
+      (e) => {
+        const p = e.payload;
+        if (!this.overlay || !this.followEar) return;
+        if (!p.path || p.path !== this.path) return;
+        if (p.chapter !== this.chapter) {
+          void this.go(p.chapter, { narration: true }).then(() =>
+            this.applyHighlight(p.sentence),
+          );
+        } else {
+          this.applyHighlight(p.sentence);
+        }
+      },
+    ).catch(() => {});
+    void listen<ModelSnapshot>("tts-model", (e) =>
+      this.showModel(e.payload),
+    ).catch(() => {});
+  }
+
+  private async refreshTts(): Promise<void> {
+    const snap = await api.ttsSnapshot().catch(() => null);
+    if (snap) this.adopt(snap);
+  }
+
+  private async adoptCmd(p: Promise<TtsSnapshot>): Promise<void> {
+    const snap = await p.catch(() => null);
+    if (snap) this.adopt(snap);
+  }
+
+  /** Adopt a snapshot wholesale — the engine's word is the UI. */
+  private adopt(snap: TtsSnapshot): void {
+    this.tts = snap;
+    if (!this.listenToggle || !this.listenStatus) return;
+    const mine = snap.path !== null && snap.path === this.path;
+    if (mine && (snap.state === "playing" || snap.state === "loading")) {
+      this.listenToggle.textContent =
+        snap.state === "playing" ? "❚❚ Pause" : "Loading…";
+    } else if (mine && snap.state === "paused") {
+      this.listenToggle.textContent = "▶ Resume";
+    } else {
+      this.listenToggle.textContent = "▶ Listen";
+    }
+    if (snap.state === "stopped" || snap.state === "idle") {
+      this.followEar = false;
+      this.clearHighlight();
+    }
+    if (mine) {
+      if (this.voiceSel) this.voiceSel.value = snap.voice;
+      if (this.speedSel) this.speedSel.value = String(snap.speed);
+      if (this.sleepSel) this.sleepSel.value = snap.sleep;
+    }
+    let status = "";
+    if (snap.message && (mine || snap.state === "error")) {
+      status = snap.message;
+    } else if (
+      mine &&
+      (snap.state === "playing" || snap.state === "paused" || snap.state === "loading")
+    ) {
+      status =
+        `Chapter ${(snap.chapter ?? 0) + 1} of ${snap.chapterCount}` +
+        (snap.sentenceCount > 0
+          ? ` · sentence ${(snap.sentence ?? 0) + 1} of ${snap.sentenceCount}`
+          : "");
+    } else if (!mine && snap.path && snap.state !== "idle" && snap.state !== "stopped") {
+      status = "The narrator is reading another book";
+    } else if (this.book?.listenChapter != null) {
+      status = `Continue listening — Chapter ${this.book.listenChapter + 1}`;
+    }
+    this.listenStatus.textContent = status;
+  }
+
+  private async toggleListen(): Promise<void> {
+    const snap = this.tts ?? (await api.ttsSnapshot().catch(() => null));
+    if (snap && snap.path === this.path) {
+      if (snap.state === "playing") {
+        await this.adoptCmd(api.ttsPause());
+        return;
+      }
+      if (snap.state === "paused") {
+        this.followEar = true;
+        await this.adoptCmd(api.ttsResume());
+        return;
+      }
+      if (snap.state === "loading") {
+        this.followEar = false;
+        await this.adoptCmd(api.ttsStop());
+        return;
+      }
+    }
+    await this.startListen();
+  }
+
+  private async startListen(): Promise<void> {
+    const m = await api.ttsModelStatus().catch(() => null);
+    if (!m || m.state !== "ready") {
+      this.showModel(m);
+      return;
+    }
+    if (this.modelEl) this.modelEl.style.display = "none";
+    await this.pushDefaults();
+    this.followEar = true;
+    await this.adoptCmd(api.ttsPlay(this.path));
+  }
+
+  /** His saved narrator choices become the engine's, before a
+   * fresh start (a resume keeps whatever the engine holds). */
+  private async pushDefaults(): Promise<void> {
+    const snap = this.tts ?? (await api.ttsSnapshot().catch(() => null));
+    if (!snap) return;
+    if (snap.voice !== this.settings.ttsVoice)
+      await this.adoptCmd(api.ttsSetVoice(this.settings.ttsVoice));
+    if (Math.abs(snap.speed - this.settings.ttsSpeed) > 0.001)
+      await this.adoptCmd(api.ttsSetSpeed(this.settings.ttsSpeed));
+    if (snap.sleep !== this.settings.ttsSleep)
+      await this.adoptCmd(api.ttsSetSleep(this.settings.ttsSleep));
+  }
+
+  private showModel(m: ModelSnapshot | null): void {
+    if (!this.modelEl || !this.modelMsg) return;
+    if (m && m.state === "ready") {
+      this.modelEl.style.display = "none";
+      // He asked to listen; the voice just landed — begin.
+      if (this.overlay) void this.startListen();
+      return;
+    }
+    this.modelEl.style.display = "";
+    if (!m) {
+      this.modelMsg.textContent =
+        "The narrator's voice isn't here yet. It downloads once — 334 MB — then it's yours, offline. Deleting it later is just deleting a folder.";
+      return;
+    }
+    if (m.state === "downloading") {
+      const pct =
+        m.total > 0 ? Math.floor((m.downloaded / m.total) * 100) : 0;
+      this.modelMsg.textContent = `Downloading the narrator's voice… ${pct}%`;
+    } else if (m.state === "verifying") {
+      this.modelMsg.textContent = "Downloaded — checking it against its fingerprint…";
+    } else if (m.state === "extracting") {
+      this.modelMsg.textContent = "Unpacking the voice…";
+    } else if (m.state === "error") {
+      this.modelMsg.textContent =
+        m.message ?? "The download didn't finish — try again.";
+    } else {
+      this.modelMsg.textContent =
+        "The narrator's voice isn't here yet. It downloads once — 334 MB — then it's yours, offline. Deleting it later is just deleting a folder.";
+    }
+  }
+
+  // -- Listen: the sentence highlight -----------------------------------
+  // The rendered page is not the chapter text: rich HTML has its
+  // own whitespace. So the search runs on a whitespace-collapsed
+  // stream of the page's text nodes, mapped back to (node,
+  // offset) pairs, and moves FORWARD from the last find —
+  // repeated sentences land in order. A sentence that can't be
+  // found gets no mark; a wrong mark is worse than none.
+
+  private static normWs(s: string): string {
+    return s.replace(/\s+/g, " ");
+  }
+
+  private streamFor(view: ChapterView): {
+    text: string;
+    nodes: Text[];
+    offs: number[];
+  } {
+    const key = `${view.index}:${view.text.length}`;
+    if (this.hlStream && this.hlKey === key) return this.hlStream;
+    const chars: string[] = [];
+    const nodes: Text[] = [];
+    const offs: number[] = [];
+    if (this.pageEl) {
+      const walker = document.createTreeWalker(
+        this.pageEl,
+        NodeFilter.SHOW_TEXT,
+      );
+      let node: Node | null;
+      let lastWasSpace = true; // trims the stream's leading edge
+      while ((node = walker.nextNode())) {
+        const parent = node.parentElement;
+        if (!parent) continue;
+        if (parent.closest("style, script, .reader-chapter-title")) continue;
+        const text = node as Text;
+        const data = text.data;
+        for (let i = 0; i < data.length; i++) {
+          const ch = data[i];
+          if (/\s/.test(ch)) {
+            if (lastWasSpace) continue;
+            chars.push(" ");
+            nodes.push(text);
+            offs.push(i);
+            lastWasSpace = true;
+          } else {
+            chars.push(ch);
+            nodes.push(text);
+            offs.push(i);
+            lastWasSpace = false;
+          }
+        }
+      }
+    }
+    this.hlStream = { text: chars.join(""), nodes, offs };
+    this.hlKey = key;
+    return this.hlStream;
+  }
+
+  private clearHighlight(): void {
+    if (this.markEl) {
+      const m = this.markEl;
+      m.replaceWith(...Array.from(m.childNodes));
+      this.markEl = null;
+      this.pageEl?.normalize();
+      // The DOM just changed shape; the cached stream is stale.
+      this.hlKey = "";
+    }
+    this.hlSentence = -1;
+  }
+
+  private applyHighlight(idx: number): void {
+    if (!this.pageEl || !this.bodyEl || !this.view) return;
+    if (idx === this.hlSentence && this.markEl) return;
+    this.clearHighlight();
+    const view = this.view;
+    const range = view.sentences[idx];
+    if (!range) return;
+    const needle = Reader.normWs(view.text.slice(range.start, range.end)).trim();
+    if (!needle) return;
+    const stream = this.streamFor(view);
+    let at = stream.text.indexOf(needle, this.hlPtr);
+    if (at < 0 && this.hlPtr > 0) at = stream.text.indexOf(needle);
+    if (at < 0) return; // silent no-op — no mark beats a wrong mark
+    const endAt = at + needle.length;
+    try {
+      const r = document.createRange();
+      r.setStart(stream.nodes[at], stream.offs[at]);
+      r.setEnd(stream.nodes[endAt - 1], stream.offs[endAt - 1] + 1);
+      const mark = el("mark", "tts-mark");
+      mark.appendChild(r.extractContents());
+      r.insertNode(mark);
+      this.markEl = mark;
+      this.hlSentence = idx;
+      this.hlPtr = endAt;
+      const mr = mark.getBoundingClientRect();
+      const br = this.bodyEl.getBoundingClientRect();
+      if (mr.top < br.top || mr.bottom > br.bottom) {
+        mark.scrollIntoView({ block: "nearest" });
+      }
+    } catch {
+      // A range that won't wrap cleanly leaves the page as it was.
+    }
+  }
+
   close(): void {
     if (this.overlay) {
       this.saveProgress();
@@ -562,7 +1024,12 @@ class Reader {
       this.overlay = null;
       document.removeEventListener("keydown", this.keyHandler);
     }
+    // Closing the reader never stops the narrator — playback
+    // lives in Rust and survives the room (the Now Playing
+    // strip in the shell takes over the display).
     this.book = null;
+    this.view = null;
+    this.markEl = null;
     this.pageEl = null;
     this.bodyEl = null;
     this.shellEl = null;

@@ -1,0 +1,25 @@
+[package]
+name = "ufm-tts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Fable read-aloud: sentence segmentation, the TTS engine trait, and the Kokoro helper process (Ebook P3)."
+
+[features]
+default = []
+# The sherpa-onnx binding lives ONLY behind this feature, and only the
+# fable-tts helper binary requires it — the Fable shell links the lib
+# (segmentation + protocol + client) and never links sherpa itself,
+# so a missing voice runtime is a plain-language error in the app,
+# never a launch failure.
+engine = ["dep:sherpa-rs"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sherpa-rs = { version = "=0.6.8", optional = true }
+
+[[bin]]
+name = "fable-tts"
+path = "src/bin/fable_tts.rs"
+required-features = ["engine"]

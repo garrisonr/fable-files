@@ -44,7 +44,7 @@ use ufm_preview::epub::{decode_epub_book, decode_epub_book_rich};
 /// long, memory-hungry decode.
 const MAX_BOOK_BYTES: u64 = 200 * 1024 * 1024;
 
-fn data_dir() -> PathBuf {
+pub fn data_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     PathBuf::from(home).join(".local/share/fable-files")
 }
@@ -138,12 +138,19 @@ pub struct BookOpenView {
     /// The saved within-chapter place for `start_chapter` (P2),
     /// when the progress entry carries one.
     pub start_scroll_frac: Option<f64>,
+    /// The ear mark (Ebook P3): where Listen left off, when this
+    /// book has been listened to. Separate from the eye mark
+    /// above — reading position and listening position coexist
+    /// and neither overwrites the other.
+    pub listen_chapter: Option<usize>,
+    pub listen_sentence: Option<usize>,
 }
 
 #[tauri::command]
 pub async fn open_book(path: String) -> Result<BookOpenView, String> {
     let progress = load_progress();
     let entry = progress.books.get(&path).cloned();
+    let ear_mark = listening_position(&path);
     tauri::async_runtime::spawn_blocking(move || {
         let bytes = read_book_bytes(Path::new(&path))?;
         let book = decode_epub_book(&bytes);
@@ -166,6 +173,8 @@ pub async fn open_book(path: String) -> Result<BookOpenView, String> {
                 .clamp(0.7, 2.2),
             chapter_titles: book.chapters.iter().map(|c| c.title.clone()).collect(),
             start_scroll_frac: entry.as_ref().and_then(|e| e.scroll_frac),
+            listen_chapter: ear_mark.map(|(c, _)| c),
+            listen_sentence: ear_mark.map(|(_, s)| s),
         })
     })
     .await
@@ -187,6 +196,11 @@ pub struct ChapterView {
     /// chapter uses no stylesheets or style blocks.
     pub css: Option<String>,
     pub chapter_count: usize,
+    /// The chapter's sentence ranges (Ebook P3): char ranges
+    /// into `text`, from the one segmenter the TTS engine also
+    /// consumes — the highlighter and the narrator can never
+    /// disagree about where a sentence is.
+    pub sentences: Vec<ufm_tts::SentenceRange>,
 }
 
 #[tauri::command]
@@ -205,6 +219,7 @@ pub async fn read_chapter(path: String, index: usize) -> Result<ChapterView, Str
             .into_iter()
             .nth(index)
             .ok_or_else(|| "That chapter doesn't exist in this book.".to_string())?;
+        let sentences = ufm_tts::segment_chapter(&chapter.text);
         Ok(ChapterView {
             index,
             title: chapter.title,
@@ -212,10 +227,95 @@ pub async fn read_chapter(path: String, index: usize) -> Result<ChapterView, Str
             html,
             css,
             chapter_count,
+            sentences,
         })
     })
     .await
     .map_err(|e| format!("reader task failed: {e}"))?
+}
+
+/// One chapter's plain text for the narrator (Ebook P3): the
+/// same spine-order extraction the reader renders from — Listen
+/// never re-parses a book its own way. Returns (text, chapter
+/// count, book title).
+pub fn chapter_text(
+    path: &str,
+    index: usize,
+) -> Result<(String, usize, Option<String>), String> {
+    let bytes = read_book_bytes(Path::new(path))?;
+    let book = decode_epub_book(&bytes);
+    let chapter_count = book.chapters.len();
+    let chapter = book
+        .chapters
+        .into_iter()
+        .nth(index)
+        .ok_or_else(|| "That chapter doesn't exist in this book.".to_string())?;
+    Ok((chapter.text, chapter_count, book.title))
+}
+
+// ---------------------------------------------------------------------------
+// Listening position (Ebook P3): the ear mark, in its own sidecar.
+// Position only — chapter + sentence. No listening-time stats
+// exist by design (SPEC §B.4); the reading store above is never
+// touched by listening, and this store is never touched by
+// reading.
+// ---------------------------------------------------------------------------
+
+fn listening_path() -> PathBuf {
+    data_dir().join("listening-progress.json")
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ListeningEntry {
+    chapter: usize,
+    sentence: usize,
+    #[serde(default)]
+    updated: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ListeningProgress {
+    #[serde(default)]
+    books: HashMap<String, ListeningEntry>,
+}
+
+fn load_listening() -> ListeningProgress {
+    std::fs::read_to_string(listening_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// The saved ear mark for a book: (chapter, sentence), 0-based.
+pub fn listening_position(path: &str) -> Option<(usize, usize)> {
+    load_listening()
+        .books
+        .get(path)
+        .map(|e| (e.chapter, e.sentence))
+}
+
+/// Persist the ear mark. Temp-file + rename, the same discipline
+/// as the reading store — a crash mid-write never corrupts it.
+pub fn save_listening_position(path: &str, chapter: usize, sentence: usize) {
+    let mut store = load_listening();
+    store.books.insert(
+        path.to_string(),
+        ListeningEntry {
+            chapter,
+            sentence,
+            updated: chrono::Utc::now().to_rfc3339(),
+        },
+    );
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let tmp = dir.join("listening-progress.json.tmp");
+    if let Ok(text) = serde_json::to_string_pretty(&store) {
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, listening_path());
+        }
+    }
 }
 
 /// Persist the reading position (and optionally the type scale and

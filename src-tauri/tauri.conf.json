@@ -38,7 +38,8 @@
     "targets": "all",
     "resources": [
       "../themes",
-      "resources/rom-dats.bin"
+      "resources/rom-dats.bin",
+      "resources/tts-runtime"
     ]
   },
   "identifier": "com.garrisonr.fablefiles",

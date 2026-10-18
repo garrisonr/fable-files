@@ -116,6 +116,46 @@ const CONTAINS: Credit[] = [
     license: "SCOWL License (permissive)",
     holder: "Kevin Atkinson and contributors",
   },
+  {
+    name: "sherpa-onnx",
+    url: "https://github.com/k2-fsa/sherpa-onnx",
+    gives:
+      "The speech engine inside Listen — it runs the narrator entirely on this machine, no cloud, no account, your books read aloud in your own house.",
+    license: "Apache License 2.0",
+    holder: "The k2-fsa contributors",
+  },
+  {
+    name: "ONNX Runtime",
+    url: "https://onnxruntime.ai",
+    gives:
+      "The neural-network runtime sherpa-onnx speaks through — the quiet arithmetic under every narrated sentence.",
+    license: "MIT License",
+    holder: "Microsoft and the ONNX Runtime contributors",
+  },
+  {
+    name: "Kokoro-82M",
+    url: "https://huggingface.co/hexgrad/Kokoro-82M",
+    gives:
+      "The narrator's voice itself — a small, gifted text-to-speech model whose seven English voices read the Public Domain Shelf aloud.",
+    license: "Apache License 2.0",
+    holder: "hexgrad",
+  },
+  {
+    name: "espeak-ng",
+    url: "https://github.com/espeak-ng/espeak-ng",
+    gives:
+      "The phoneme data that teaches the narrator how written words sound — Listen's pronunciation dictionary, bundled with the voice.",
+    license: "GNU General Public License 3.0 (data and program)",
+    holder: "The espeak-ng contributors",
+  },
+  {
+    name: "rodio",
+    url: "https://github.com/RustAudio/rodio",
+    gives:
+      "The playback queue Listen speaks through — its clock is the narration's clock, steady even when the window is hidden.",
+    license: "MIT License OR Apache License 2.0",
+    holder: "The RustAudio contributors",
+  },
 ];
 
 const BUILT_WITH: Credit[] = [
@@ -158,6 +198,22 @@ const DATA: Credit[] = [
       "The fingerprint lookup that names an unknown track from its sound alone (fingerprints computed by Chromaprint, LGPL 2.1).",
     license: "AcoustID terms",
     holder: "Lukáš Lalinský",
+  },
+  {
+    name: "Standard Ebooks",
+    url: "https://standardebooks.org",
+    gives:
+      "The beautifully made editions on the Public Domain Shelf — volunteers who take public-domain texts and produce ebooks worthy of them, then give the work to everyone, forever.",
+    license: "CC0 1.0 Universal (public domain dedication)",
+    holder: "Standard Ebooks and its volunteers",
+  },
+  {
+    name: "Project Gutenberg",
+    url: "https://www.gutenberg.org",
+    gives:
+      "The original library of the internet — tens of thousands of public-domain books, freely given since 1971; a few of the Shelf's volumes come from its shelves.",
+    license: "Public domain works; Project Gutenberg terms for its editions",
+    holder: "Project Gutenberg Literary Archive Foundation",
   },
 ];
 

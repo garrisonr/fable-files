@@ -32,6 +32,7 @@ import { showPluginRunDialog } from "./plugins";
 import { SearchView, fmtDay } from "./search";
 import { RomHome } from "./romhome";
 import { BooksHome } from "./bookshome";
+import { mountNowPlaying } from "./nowplaying";
 import { HomeView, type PinnedDoor } from "./homeview";
 import { MediaResDialog } from "./mediares";
 import { RomOrganizeDialog } from "./romorg";
@@ -755,6 +756,9 @@ export class Shell {
     this.booksHome = new BooksHome({
       onExit: () => this.exitBooksHome(),
     });
+    // Ebook P3: the Now Playing strip — narration outlives the
+    // reader, and the shell shows it.
+    mountNowPlaying();
     void this.refreshBooksDoor();
     this.homeView = new HomeView({
       onExit: () => this.exitHomeBase(),
