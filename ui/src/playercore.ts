@@ -76,20 +76,21 @@ export class PlayerCoreClient {
   async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
+    // Listeners FIRST (nothing can slip between the initial fetch
+    // and the subscription), and both adopt through the same path
+    // as command returns.
     try {
-      this.snap = await api.playerState();
-      this.emitLocal();
+      await onPlayerCore((s) => this.adopt(s));
     } catch {
-      // core unreachable — surfaces render their empty state
+      // event channel unavailable — command adoption + the
+      // reconciler still keep the surface honest
     }
-    void onPlayerCore((s) => {
-      this.snap = s;
-      this.emitLocal();
-    }).catch(() => undefined);
-    void onPlayerRevoked((s) => {
-      this.snap = s;
-      this.emitLocal();
-    }).catch(() => undefined);
+    try {
+      await onPlayerRevoked((s) => this.adopt(s));
+    } catch {
+      // same
+    }
+    await this.refresh();
   }
 
   onSnapshot(cb: (s: PlayerSnapshot) => void): () => void {
@@ -101,6 +102,31 @@ export class PlayerCoreClient {
   private emitLocal(): void {
     if (!this.snap) return;
     for (const cb of [...this.listeners]) cb(this.snap);
+  }
+
+  /** Adopt a snapshot learned from a command return (or a manual
+   * refresh), not just from the event channel: every interaction
+   * self-heals the surface even if a webview's listener was
+   * starved (covered/parked webviews throttle delivery — the
+   * house law's reconciler clause). Truth stays in Rust; this
+   * only ever copies Rust's own snapshot. */
+  adopt(s: PlayerSnapshot): void {
+    this.snap = s;
+    this.emitLocal();
+  }
+
+  async refresh(): Promise<void> {
+    try {
+      this.adopt(await api.playerState());
+    } catch {
+      // core unreachable — keep the last snapshot
+    }
+  }
+
+  private async run(p: Promise<PlayerSnapshot>): Promise<PlayerSnapshot> {
+    const s = await p;
+    this.adopt(s);
+    return s;
   }
 
   isOwner(kind: PlayerOwner): boolean {
@@ -120,52 +146,55 @@ export class PlayerCoreClient {
     startPosition?: number;
     autoplay?: boolean;
   }): Promise<PlayerSnapshot> {
-    return api.playerOpenQueue(args);
+    return this.run(api.playerOpenQueue(args));
   }
   claim(owner: PlayerOwner): Promise<PlayerSnapshot> {
-    return api.playerClaim(owner);
+    return this.run(api.playerClaim(owner));
   }
   toggle(): Promise<PlayerSnapshot> {
-    return api.playerToggle();
+    return this.run(api.playerToggle());
   }
   step(dir: number): Promise<PlayerSnapshot> {
-    return api.playerStep(dir);
+    return this.run(api.playerStep(dir));
   }
   playIndex(index: number): Promise<PlayerSnapshot> {
-    return api.playerPlayIndex(index);
+    return this.run(api.playerPlayIndex(index));
   }
   seek(secs: number): Promise<PlayerSnapshot> {
-    return api.playerSeek(secs);
+    return this.run(api.playerSeek(secs));
   }
   setRepeat(mode: PlayerSnapshot["repeat"]): Promise<PlayerSnapshot> {
-    return api.playerSetRepeat(mode);
+    return this.run(api.playerSetRepeat(mode));
   }
   setShuffle(on: boolean): Promise<PlayerSnapshot> {
-    return api.playerSetShuffle(on);
+    return this.run(api.playerSetShuffle(on));
   }
   setVolume(v: number): Promise<PlayerSnapshot> {
-    return api.playerSetVolume(v);
+    return this.run(api.playerSetVolume(v));
   }
   setMuted(m: boolean): Promise<PlayerSnapshot> {
-    return api.playerSetMuted(m);
+    return this.run(api.playerSetMuted(m));
   }
   enqueue(entries: QueueEntry[], next?: boolean): Promise<PlayerSnapshot> {
-    return api.playerEnqueue(entries, next);
+    return this.run(api.playerEnqueue(entries, next));
   }
   remove(index: number): Promise<PlayerSnapshot> {
-    return api.playerRemove(index);
+    return this.run(api.playerRemove(index));
   }
   clearQueue(keepCurrent?: boolean): Promise<PlayerSnapshot> {
-    return api.playerClearQueue(keepCurrent);
+    return this.run(api.playerClearQueue(keepCurrent));
   }
   reorder(from: number, to: number): Promise<PlayerSnapshot> {
-    return api.playerReorder(from, to);
+    return this.run(api.playerReorder(from, to));
   }
   stop(): Promise<PlayerSnapshot> {
-    return api.playerStop();
+    return this.run(api.playerStop());
   }
   fact(kind: string, value?: number, message?: string): void {
-    void api.playerFact(kind, value, message).catch(() => undefined);
+    void api
+      .playerFact(kind, value, message)
+      .then((s) => this.adopt(s))
+      .catch(() => undefined);
   }
 
   /** MediaSession: OS media keys + the desktop's now-playing
@@ -246,6 +275,7 @@ export class OwnerEngine {
   private retried = false;
   private lastFactSent = 0;
   private destroyed = false;
+  private reconcileTimer = 0;
   /** A cast session ended naturally: re-cast the next entry to
    * this device when its load lands. */
   private recastDevice: CastDeviceLike | null = null;
@@ -295,6 +325,13 @@ export class OwnerEngine {
     });
     this.wireElement();
     this.client.onSnapshot((s) => this.apply(s));
+    // Reconciler (house law: JS timers may reconcile; the truth
+    // lives in Rust): if the event channel was throttled or a
+    // listener starved, the surface still converges within a
+    // second. Cheap: one lock + clone per surface per second.
+    this.reconcileTimer = window.setInterval(() => {
+      if (!this.destroyed) void this.client.refresh();
+    }, 1000);
   }
 
   private wireElement(): void {
@@ -520,6 +557,7 @@ export class OwnerEngine {
 
   destroy(): void {
     this.destroyed = true;
+    window.clearInterval(this.reconcileTimer);
     if (this.cast.active) this.cast.destroy();
     this.el.pause();
     this.el.removeAttribute("src");
