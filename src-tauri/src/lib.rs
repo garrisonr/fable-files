@@ -680,6 +680,7 @@ pub fn run() {
             emu_esde::emu_esde_install,
             emu_esde::emu_esde_open,
             esimport::es_import,
+            esimport::es_art_sheet,
             books::books_identify,
             books::books_home,
             books::books_set_state,

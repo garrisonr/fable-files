@@ -875,6 +875,11 @@ export const api = {
     invoke<PcScanReport>("pc_scan_folder", { root }),
   pcGameSheet: (providerKey: string) =>
     invoke<PcGameSheet | null>("pc_game_sheet", { providerKey }),
+  /** ES artwork display (2026-10-18): the marquee / fanart /
+   * manual refs the ES import stored for one game, or null when
+   * the game has no es_metadata row. */
+  esArtSheet: (providerKey: string) =>
+    invoke<EsArtSheet | null>("es_art_sheet", { providerKey }),
   pcSetLaunchBadge: (providerKey: string, badge: string, note?: string) =>
     invoke<boolean>("pc_set_launch_badge", {
       providerKey,
@@ -2203,6 +2208,14 @@ export interface PcInstallRow {
 }
 
 /** The game sheet's PC sections (PC Games P1). */
+/** ES artwork refs for one game (es_metadata); each field is
+ * null when the gamelist never carried that ref. */
+export interface EsArtSheet {
+  marquee: string | null;
+  fanart: string | null;
+  manual: string | null;
+}
+
 export interface PcGameSheet {
   providerKey: string;
   title: string;

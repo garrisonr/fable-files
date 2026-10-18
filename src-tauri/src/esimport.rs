@@ -145,3 +145,82 @@ pub async fn es_import(
         )))),
     }
 }
+
+/// The stored ES artwork for one game (ES artwork display — Peep
+/// Show, 2026-10-18): the display half of the Hyperbase #5 import.
+/// `es_metadata` has held marquee / fanart / manual paths since the
+/// import shipped, with no surface reading them; the Games Home
+/// inspector reads them through here. Paths only — the webview
+/// loads the files itself, and a game with no ES row, or a gamelist
+/// that never carried a ref, comes back with None fields, never an
+/// error: absence renders as the inspector always has.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EsArtSheet {
+    pub marquee: Option<String>,
+    pub fanart: Option<String>,
+    pub manual: Option<String>,
+}
+
+fn art_sheet_from_row(row: &ufm_catalog::EsMetadataRow) -> EsArtSheet {
+    EsArtSheet {
+        marquee: row.marquee_path.clone(),
+        fanart: row.fanart_path.clone(),
+        manual: row.manual_path.clone(),
+    }
+}
+
+#[tauri::command]
+pub fn es_art_sheet(
+    state: tauri::State<'_, AppState>,
+    provider_key: String,
+) -> Cmd<Option<EsArtSheet>> {
+    let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
+        .map_err(CommandError::from)?;
+    let row = catalog
+        .es_metadata_for(&provider_key)
+        .map_err(CommandError::from)?;
+    Ok(row.map(|r| art_sheet_from_row(&r)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn art_sheet_carries_all_three_refs() {
+        let row = ufm_catalog::EsMetadataRow {
+            marquee_path: Some("/roms/psx/images/Ape Escape-marquee.png".into()),
+            fanart_path: Some("/roms/psx/images/Ape Escape-fanart.jpg".into()),
+            manual_path: Some("/roms/psx/manuals/Ape Escape.pdf".into()),
+            ..Default::default()
+        };
+        let sheet = art_sheet_from_row(&row);
+        assert_eq!(
+            sheet.marquee.as_deref(),
+            Some("/roms/psx/images/Ape Escape-marquee.png")
+        );
+        assert_eq!(
+            sheet.fanart.as_deref(),
+            Some("/roms/psx/images/Ape Escape-fanart.jpg")
+        );
+        assert_eq!(
+            sheet.manual.as_deref(),
+            Some("/roms/psx/manuals/Ape Escape.pdf")
+        );
+    }
+
+    #[test]
+    fn art_sheet_keeps_absence_absent() {
+        // A gamelist that carried only a marquee: the other two
+        // stay None — the UI must never see a placeholder path.
+        let row = ufm_catalog::EsMetadataRow {
+            marquee_path: Some("/roms/gc/images/1080-marquee.png".into()),
+            ..Default::default()
+        };
+        let sheet = art_sheet_from_row(&row);
+        assert!(sheet.marquee.is_some());
+        assert!(sheet.fanart.is_none());
+        assert!(sheet.manual.is_none());
+    }
+}

@@ -29,6 +29,7 @@ import {
   type RomSmartList,
   type PcGameCard,
   type PcGameSheet,
+  type EsArtSheet,
 } from "./api";
 import {
   loadRomSystems,
@@ -4296,6 +4297,7 @@ export class RomHome {
       img.alt = "";
       img.src = fileSrc(stillPath);
       img.addEventListener("error", () => {
+        if (hero.dataset.artTaken) return;
         img.remove();
         hero.appendChild(this.placeholderEl(g));
       });
@@ -4346,10 +4348,12 @@ export class RomHome {
     // launch through, and the ladder that will run them is a
     // later phase — the badge + the manual mark are what's true
     // today.
+    let romPlayRow: HTMLElement | null = null;
     if (g.pc) {
       this.buildPcInspector(insp, g);
     } else {
       const playRow = el("div", "rh-play-row");
+      romPlayRow = playRow;
       const play = el("button", "pill-btn primary rh-play", "▶ Play") as HTMLButtonElement;
       if (g.offline) {
         play.disabled = true;
@@ -4532,6 +4536,83 @@ export class RomHome {
     }
     fileBox.appendChild(fileActions);
     insp.appendChild(fileBox);
+
+    // ---- ES artwork (2026-10-18): the marquee / fanart / manual
+    // refs the ES import stored in es_metadata, fetched after
+    // first paint (Forge §Y). Until art actually arrives — most
+    // games have none — this inspector is exactly the one that
+    // shipped before the surface existed.
+    if (!g.pc) {
+      const pk = g.item.provider_key;
+      if (pk) {
+        void api
+          .esArtSheet(pk)
+          .then((sheet) => {
+            if (!sheet || !insp.isConnected) return;
+            this.applyEsArt(insp, hero, titleRow, romPlayRow, sheet, g);
+          })
+          .catch(() => undefined);
+      }
+    }
+  }
+
+  /** ES artwork arrival: fanart takes the hero (cover treatment),
+   * the marquee becomes the title treatment, and a stored manual
+   * earns a button beside Play. Every piece is independently
+   * optional, and a failed image load removes only itself — the
+   * surface it would have replaced stays exactly as it was. */
+  private applyEsArt(
+    insp: HTMLElement,
+    hero: HTMLElement,
+    titleRow: HTMLElement,
+    playRow: HTMLElement | null,
+    sheet: EsArtSheet,
+    g: RoomGame,
+  ): void {
+    if (sheet.fanart) {
+      const img = document.createElement("img");
+      img.className = "rh-hero-img rh-hero-fanart";
+      img.alt = "";
+      img.src = fileSrc(sheet.fanart);
+      img.addEventListener("load", () => {
+        if (!hero.isConnected) return;
+        hero.dataset.artTaken = "1";
+        hero
+          .querySelectorAll(".rh-hero-img, .rh-placeholder")
+          .forEach((n) => n.remove());
+        hero.prepend(img);
+      });
+      img.addEventListener("error", () => img.remove());
+    }
+    if (sheet.marquee) {
+      const img = document.createElement("img");
+      img.className = "rh-insp-marquee";
+      img.alt = g.title;
+      img.src = fileSrc(sheet.marquee);
+      img.addEventListener("load", () => {
+        if (!insp.isConnected) return;
+        titleRow.before(img);
+        titleRow.classList.add("rh-has-marquee");
+      });
+      img.addEventListener("error", () => img.remove());
+    }
+    if (sheet.manual && playRow) {
+      const manualPath = sheet.manual;
+      const btn = el(
+        "button",
+        "pill-btn rh-manual-btn",
+        "📖 Manual",
+      ) as HTMLButtonElement;
+      btn.title = "Open the manual";
+      btn.addEventListener("click", () => {
+        void api
+          .openPath(manualPath)
+          .catch((err) =>
+            Toast.error(`Couldn't open the manual: ${errText(err)}`),
+          );
+      });
+      playRow.appendChild(btn);
+    }
   }
 
   /** A still (or the trailer) at full size — media is the point. */

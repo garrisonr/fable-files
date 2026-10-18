@@ -1268,7 +1268,23 @@ export class Shell {
     this.booksList = document.createElement("div");
     this.booksList.className = "side-list";
     this.booksList.appendChild(booksHead);
+    // Home base door (steal 1): the very first row of the
+    // sidebar — one standard side-item above Favorites, opening
+    // the Recent / Frequent / Pinned room.
+    const homeList = document.createElement("div");
+    homeList.className = "side-list";
+    const homeDoor = document.createElement("button");
+    homeDoor.className = "side-item home-door";
+    const homeLabel = document.createElement("span");
+    homeLabel.textContent = "Home";
+    homeDoor.append(sectionGlyph("home"), homeLabel);
+    homeDoor.title = "Home base — recent files, frequent folders, your pins";
+    homeDoor.addEventListener("click", () => this.enterHomeBase());
+    this.homeDoorEl = homeDoor;
+    homeList.appendChild(homeDoor);
+
     sidebar.append(
+      homeList,
       favHead,
       this.favList,
       labelHead,
