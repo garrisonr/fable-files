@@ -1865,7 +1865,7 @@ export class RomHome {
       el(
         "p",
         "rh-needsid-intro",
-        "These files live in ROM territory, but no DAT set claims them — hacks, fan translations, bad dumps, homebrew, and sets Fable can't read yet. Identifying again is cheap: files already scanned are skipped by size and date.",
+        "No DAT set claims these files — hacks, fan translations, bad dumps, homebrew, sets Fable can't read yet, and files that were never games at all. Identifying again is cheap: files already scanned are skipped by size and date.",
       ),
     );
     const run = el(
