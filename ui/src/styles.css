@@ -1041,6 +1041,7 @@ td.muted {
   max-width: 85%;
   z-index: 20;
   background: var(--ufm-surface-elevated, var(--ufm-surface));
+  background: rgb(from var(--ufm-surface-elevated, var(--ufm-surface)) r g b / 1);
   border-left: 1px solid var(--ufm-border);
   box-shadow: -1rem 0 2rem color-mix(in srgb, var(--ufm-text) 12%, transparent);
   display: flex;
@@ -1303,9 +1304,18 @@ body[data-layout="tv"] .cell-icon {
     backdrop-filter: none;
   }
 
-  .quicklook,
   .theme-menu {
     background: var(--ufm-surface-elevated);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  /* The pane wears its opacified ground here too (see .quicklook):
+   * under a distro engine the bare token is undefined, and an
+   * undefined var() would leave this surface transparent. */
+  .quicklook {
+    background: var(--ufm-surface-elevated, var(--ufm-surface));
+    background: rgb(from var(--ufm-surface-elevated, var(--ufm-surface)) r g b / 1);
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
   }
@@ -1342,6 +1352,14 @@ body[data-layout="tv"] .cell-icon {
   .theme-item.active {
     outline: 2px solid var(--ufm-focus-ring);
     outline-offset: -2px;
+  }
+
+  /* The pane's ground stays opacified in high contrast too: the
+   * grouped rule above points it at --ufm-surface, which carries
+   * alpha under every distro engine. */
+  .quicklook {
+    background: var(--ufm-surface-elevated, var(--ufm-surface));
+    background: rgb(from var(--ufm-surface-elevated, var(--ufm-surface)) r g b / 1);
   }
 }
 
@@ -1416,6 +1434,7 @@ body[data-layout="tv"] .cell-icon {
   margin-top: 0.75rem;
   padding: 0.75rem 0.875rem;
   background: color-mix(in srgb, var(--ufm-text) 5%, var(--ufm-surface-elevated, var(--ufm-surface)));
+  background: color-mix(in srgb, var(--ufm-text) 5%, rgb(from var(--ufm-surface-elevated, var(--ufm-surface)) r g b / 1));
   border: 1px solid var(--ufm-border);
   border-radius: 6px;
   font-family: ui-monospace, monospace;
