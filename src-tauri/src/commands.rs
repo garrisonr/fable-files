@@ -1828,7 +1828,7 @@ impl CopyPlanner {
             outcome: false,
             outcome_path: None,
         });
-        if collided {
+        if collided && self.policy == ufm_jobs::CollisionPolicy::AskMe {
             // Steal 6 (AskMe): park BOTH steps of the pair — the
             // executor waits in front of the verify, so nothing
             // about this file has happened when the user decides.
@@ -2176,7 +2176,7 @@ impl PathPlanner {
             false,
             None,
         );
-        if collided {
+        if collided && self.policy == ufm_jobs::CollisionPolicy::AskMe {
             // Steal 6 (AskMe): park the pair — the Delete companion
             // is NOT marked: it may only ever run after the Copy
             // resolves and lands (its dependency enforces that).
@@ -2433,7 +2433,7 @@ fn plan_move_job_with(
                 true,
                 None,
             );
-            if collided {
+            if collided && planner.policy == ufm_jobs::CollisionPolicy::AskMe {
                 // Steal 6 (AskMe): the rename parks for the user's
                 // call. (A same-device DIRECTORY move asks too —
                 // Replace there means the existing tree goes away,
@@ -18111,6 +18111,22 @@ mod tests {
         }
         // The preview still reports the collision honestly.
         assert_eq!(job.preview.conflicts.len(), 1);
+        // The founding default on the same fixture: renamed,
+        // recorded — and ZERO parks. (Regression guard: the first
+        // gates run caught the move planner parking AutoRename
+        // jobs; the copy planner shared the shape.)
+        let auto = plan_copy_job_paths(
+            &[src_dir.join("collide.txt"), src_dir.join("plain.txt")],
+            &dst,
+            LocationId::default(),
+            ufm_jobs::CollisionPolicy::AutoRename,
+        )
+        .expect("auto-rename control plan");
+        assert!(auto.collision_marks.is_empty());
+        assert!(auto.steps.values().any(|s| matches!(
+            &s.op,
+            ufm_jobs::StepOp::Copy { new_name, .. } if new_name == "collide.txt 2"
+        )));
         let _ = std::fs::remove_dir_all(&base);
     }
 
