@@ -630,6 +630,7 @@ export class QuickLook {
     }
     if (doc.title && doc.title !== item.name) {
       name.textContent = doc.title;
+      name.title = doc.title;
     }
     if (doc.author) {
       const subEl = document.createElement("div");
@@ -736,6 +737,7 @@ export class QuickLook {
     const name = document.createElement("h2");
     name.className = "ql-name";
     name.textContent = item.name;
+    name.title = item.name;
     card.appendChild(name);
 
     const rows: Array<[string, string]> = [
@@ -753,7 +755,19 @@ export class QuickLook {
       const dt = document.createElement("dt");
       dt.textContent = k;
       const dd = document.createElement("dd");
-      dd.textContent = v;
+      if (k === "Path") {
+        dd.className = "ql-path";
+        dd.title = v;
+        v.split("/").forEach((seg, i) => {
+          if (i > 0) {
+            dd.append("/");
+            dd.appendChild(document.createElement("wbr"));
+          }
+          if (seg) dd.append(seg);
+        });
+      } else {
+        dd.textContent = v;
+      }
       dl.appendChild(dt);
       dl.appendChild(dd);
     }
