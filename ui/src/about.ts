@@ -26,9 +26,12 @@ export class AboutDialog {
     dialog.setAttribute("role", "dialog");
     dialog.setAttribute("aria-label", "About Fable Files");
 
-    const bear = document.createElement("div");
-    bear.className = "about-bear";
-    bear.textContent = "🐻";
+    const mark = document.createElement("img");
+    mark.className = "about-mark";
+    mark.src = "/fable-mark.png";
+    mark.alt = "";
+    mark.setAttribute("aria-hidden", "true");
+    mark.draggable = false;
 
     const title = document.createElement("h2");
     title.className = "about-title";
@@ -88,7 +91,7 @@ export class AboutDialog {
     closeBtn.addEventListener("click", () => this.close());
     actions.append(bug, feat, tour, credits, closeBtn);
 
-    dialog.append(bear, title, tagline, version, credit, emuCredit, actions);
+    dialog.append(mark, title, tagline, version, credit, emuCredit, actions);
     overlay.appendChild(dialog);
     document.body.appendChild(overlay);
     this.el = overlay;
