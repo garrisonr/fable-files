@@ -966,6 +966,8 @@ export const api = {
     }),
   /** The whole Books Home room in one payload. */
   booksHome: () => invoke<BooksHomePayload>("books_home"),
+  /** The door badge: one COUNT, never the full room payload. */
+  booksDoorCount: () => invoke<number>("books_door_count"),
   /** Set a book's reading state (want | reading | read); null clears. */
   booksSetState: (path: string, bookState: string | null) =>
     invoke<void>("books_set_state", { path, bookState }),
@@ -2551,6 +2553,9 @@ export interface PdRow {
   ownedTitle: string | null;
   ownedPath: string | null;
   shelfPath: string | null;
+  /** The source's cover art, fetched once into app-owned local
+   * files by the background cover pass; null until it lands. */
+  coverPath: string | null;
   presentFiles: number;
   totalFiles: number;
   /** The pull ledger's confession for this row, when it failed. */

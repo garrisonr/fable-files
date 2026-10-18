@@ -9205,14 +9205,62 @@ impl Catalog {
     /// source 'filename' — so unsorted always means "not yet
     /// identified", never "identified but thin".)
     pub fn book_unsorted_items(&self) -> Result<Vec<ufm_vfs::Item>> {
+        // Books-fix (2026-10-18): the room renders at most 60 of
+        // these; the SQL cap keeps a million-row library from
+        // materializing the whole unsorted pile into memory on
+        // every room paint. The honest total still comes from
+        // books_counts(). (The scan itself is priced in the
+        // incident diagnosis: an unindexed suffix LIKE over the
+        // items table — bounded here, and the caller now composes
+        // off the UI thread.)
         self.query_items(
             "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes, i.modified, i.provider_key
              FROM items i LEFT JOIN book_metadata bm ON bm.item_id = i.id
              WHERE bm.item_id IS NULL AND i.provider_key IS NOT NULL
                AND (lower(i.name) LIKE '%.epub' OR lower(i.name) LIKE '%.pdf')
-             ORDER BY i.name",
+             ORDER BY i.name
+             LIMIT 240",
             None,
         )
+    }
+
+    /// The sidebar door count: identified books only. One indexed
+    /// COUNT — NOT the full books payload (the door once paid for
+    /// the whole room compose, unsorted scan included, just to
+    /// render a badge number; Books incident, 2026-10-18).
+    pub fn books_identified_count(&self) -> Result<u64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM book_metadata", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|c| c as u64)
+            .map_err(|e| UfmError::Database(e.to_string()))
+    }
+
+    /// Write batching for the indexer's private catalog instance:
+    /// BEGIN IMMEDIATE … COMMIT around a run of insert_item calls
+    /// so a census pays one commit fsync per batch instead of one
+    /// per file. Same execute_batch shape as the purge path below.
+    /// Only safe where the caller owns the connection outright
+    /// (the Indexer does); app-side catalogs never batch.
+    pub fn begin_write_batch(&self) -> Result<()> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| UfmError::Database(e.to_string()))
+    }
+
+    /// Commit a batch opened by [`Catalog::begin_write_batch`].
+    pub fn commit_write_batch(&self) -> Result<()> {
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(|e| UfmError::Database(e.to_string()))
+    }
+
+    /// Best-effort rollback of an open batch (error paths; the
+    /// connection's close would roll back anyway, this just keeps
+    /// the state honest if the instance lives on).
+    pub fn rollback_write_batch(&self) {
+        let _ = self.conn.execute_batch("ROLLBACK");
     }
 
     fn book_shelf_rows_inner(&self, only_item: Option<&str>) -> Result<Vec<BookShelfRow>> {

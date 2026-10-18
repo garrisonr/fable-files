@@ -330,6 +330,19 @@ impl Indexer {
         // A dir is complete once walk depth drops back below its own depth.
         let mut dir_stack: Vec<(String, usize)> = vec![(canon_s.clone(), 0)];
 
+        // Books incident (2026-10-18): the walk used to run start
+        // to finish without ever yielding — one blocking thread
+        // doing per-file autocommit inserts while the app tried to
+        // paint around it. Two disciplines now: (1) the walk yields
+        // periodically (a breath every 256 entries, a short sleep
+        // every 8192) so a 130k-file first census stays a
+        // background citizen; (2) inserts batch into transactions
+        // of 1000 on this Indexer's private catalog connection —
+        // one commit fsync per batch instead of one per file.
+        let mut entries_seen: u64 = 0;
+        let mut batch_open = false;
+        let mut batch_count: u32 = 0;
+
         // The prune closure owns its copies: it cannot borrow the
         // scope, the candidate set, or the root while the loop below
         // needs `&mut self`.
@@ -368,6 +381,12 @@ impl Indexer {
                 Ok(e) => e,
                 Err(_) => continue, // unreadable dir or entry: skip, keep going
             };
+            entries_seen += 1;
+            if entries_seen % 8192 == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            } else if entries_seen % 256 == 0 {
+                std::thread::yield_now();
+            }
             if entry.depth() == 0 {
                 continue; // root already indexed above
             }
@@ -421,7 +440,17 @@ impl Indexer {
                         stats.files_updated += 1;
                         self.files_updated += 1;
                     }
+                    if !batch_open {
+                        self.catalog.begin_write_batch()?;
+                        batch_open = true;
+                    }
                     self.catalog.insert_item(&item)?;
+                    batch_count += 1;
+                    if batch_count >= 1000 {
+                        self.catalog.commit_write_batch()?;
+                        batch_open = false;
+                        batch_count = 0;
+                    }
                     if is_dir {
                         dir_stack.push((path.to_string_lossy().into_owned(), depth));
                         stats.dirs_done += 1;
@@ -450,6 +479,11 @@ impl Indexer {
         while let Some((done, _)) = dir_stack.pop() {
             self.completed_dirs.insert(done);
             completed_this_run += 1;
+        }
+        // Settle the last insert batch before the reconcile:
+        // delete_unseen runs its own transaction.
+        if batch_open {
+            self.catalog.commit_write_batch()?;
         }
         if fresh_walk {
             // The walk saw everything the scope admits: rows for

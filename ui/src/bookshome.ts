@@ -64,7 +64,15 @@ export class BooksHome {
   private unlisten: UnlistenFn | null = null;
   private unlistenPd: UnlistenFn | null = null;
   private unlistenPdDone: UnlistenFn | null = null;
+  private unlistenCovers: UnlistenFn | null = null;
   private refreshQueued = false;
+  /** Books incident (2026-10-18): repaints must never stack. A
+   * refresh requested while one is in flight becomes ONE trailing
+   * refresh, never a queue — the room's event coalesce (300 ms)
+   * was shorter than one compose under census load, so composes
+   * piled up on the main thread until the window froze. */
+  private refreshRunning = false;
+  private refreshAgain = false;
   private kickedAutoIdentify = false;
 
   constructor(hooks: BooksHomeHooks) {
@@ -128,13 +136,15 @@ export class BooksHome {
         failed: number;
       }>("books-identify-progress", () => {
         // The shelves keep themselves: each resolved book moves
-        // the room. Coalesce bursts into one repaint per frame-ish.
+        // the room. Coalesce bursts into one repaint a second —
+        // and the refresh guard underneath guarantees repaints
+        // can never stack even if events outrun the compose.
         if (this.refreshQueued) return;
         this.refreshQueued = true;
         window.setTimeout(() => {
           this.refreshQueued = false;
           if (this.active) void this.refresh(false);
-        }, 300);
+        }, 1000);
       }).then((un) => {
         this.unlisten = un;
       });
@@ -149,7 +159,7 @@ export class BooksHome {
         window.setTimeout(() => {
           this.refreshQueued = false;
           if (this.active) void this.refresh(false);
-        }, 300);
+        }, 1000);
       };
       void listen("pd-pull-progress", onPull).then((un) => {
         this.unlistenPd = un;
@@ -158,6 +168,15 @@ export class BooksHome {
         if (this.active) void this.refresh(false);
       }).then((un) => {
         this.unlistenPdDone = un;
+      });
+    }
+    if (!this.unlistenCovers) {
+      // Shelf covers land in the background; when they do, the
+      // room repaints dressed (through the same guarded refresh).
+      void listen("pd-covers-changed", () => {
+        if (this.active) void this.refresh(false);
+      }).then((un) => {
+        this.unlistenCovers = un;
       });
     }
     // First visit with unsorted books waiting: start the pass —
@@ -186,13 +205,17 @@ export class BooksHome {
       this.unlistenPdDone();
       this.unlistenPdDone = null;
     }
+    if (this.unlistenCovers) {
+      this.unlistenCovers();
+      this.unlistenCovers = null;
+    }
   }
 
-  /** Sidebar door counts: identified books, straight from the
-   * payload endpoint (cheap COUNT queries — no scan). */
+  /** Sidebar door count: identified books, from the dedicated
+   * COUNT-only command — the badge never pays for the room. */
   async doorCount(): Promise<number> {
-    const p = await api.booksHome().catch(() => null);
-    return p ? p.counts.identified : 0;
+    const n = await api.booksDoorCount().catch(() => null);
+    return n ?? 0;
   }
 
   private async tidy(): Promise<void> {
@@ -203,17 +226,33 @@ export class BooksHome {
   }
 
   private async refresh(announce: boolean): Promise<void> {
-    const p = await api.booksHome().catch(() => null);
-    if (!p) {
-      if (announce) {
-        this.bodyEl.replaceChildren(
-          el("p", "bh-empty", "The library couldn't be read just now."),
-        );
-      }
+    // In-flight guard: a slow compose (index running, big
+    // library) turns concurrent refresh requests into ONE
+    // trailing refresh — repaints serialize, never stack.
+    if (this.refreshRunning) {
+      this.refreshAgain = true;
       return;
     }
-    this.payload = p;
-    this.render();
+    this.refreshRunning = true;
+    try {
+      const p = await api.booksHome().catch(() => null);
+      if (!p) {
+        if (announce) {
+          this.bodyEl.replaceChildren(
+            el("p", "bh-empty", "The library couldn't be read just now."),
+          );
+        }
+        return;
+      }
+      this.payload = p;
+      this.render();
+    } finally {
+      this.refreshRunning = false;
+      if (this.refreshAgain) {
+        this.refreshAgain = false;
+        if (this.active) void this.refresh(false);
+      }
+    }
   }
 
   // ------------------------------------------------------------ render
@@ -381,8 +420,38 @@ export class BooksHome {
     else openReader(path);
   }
 
+  /** A shelf row's face: the source's own cover art when it has
+   * landed (Dickles' directive — Standard Ebooks' beautiful
+   * covers; Gutenberg's for the two PG rows), otherwise the
+   * typographic binding — designed, never a bare-text row among
+   * covered neighbors. */
+  private pdCoverEl(row: PdRow): HTMLElement {
+    if (row.coverPath) {
+      const img = document.createElement("img");
+      img.className = "bh-cover";
+      img.alt = "";
+      img.loading = "lazy";
+      img.src = fileSrc(row.coverPath);
+      img.addEventListener("error", () => {
+        img.replaceWith(this.pdSpineEl(row));
+      });
+      return img;
+    }
+    return this.pdSpineEl(row);
+  }
+
+  private pdSpineEl(row: PdRow): HTMLElement {
+    const spine = el("div", "bh-spine bh-pd-spine");
+    spine.append(
+      el("span", "bh-spine-title", row.title),
+      el("span", "bh-spine-author", row.authorLine),
+    );
+    return spine;
+  }
+
   private pdCard(row: PdRow): HTMLElement {
     const root = el("div", "bh-card bh-pd-card");
+    root.appendChild(this.pdCoverEl(row));
     const title = el("div", "bh-card-title", row.title);
     title.title = row.title;
     root.appendChild(title);

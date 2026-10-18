@@ -732,6 +732,7 @@ pub fn run() {
             esimport::es_art_sheet,
             books::books_identify,
             books::books_home,
+            books::books_door_count,
             books::books_set_state,
             pcgames::pc_import_preview,
             pcgames::pc_import_playnite,

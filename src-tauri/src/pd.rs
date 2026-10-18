@@ -202,6 +202,12 @@ pub struct PdRowWire {
     pub owned_path: Option<String>,
     /// The shelf copy's path when any file is present.
     pub shelf_path: Option<String>,
+    /// The work's cover art (Standard Ebooks' cover, or Project
+    /// Gutenberg's for the two PG rows), fetched once into the
+    /// app-owned pd-covers folder by the background cover pass.
+    /// None until it lands — the card renders its typographic
+    /// binding meanwhile, never a broken image.
+    pub cover_path: Option<String>,
     pub present_files: usize,
     pub total_files: usize,
     /// The ledger's confession for this row, when the last pull
@@ -312,6 +318,7 @@ pub fn compose_shelf(library: &[LibraryBook], pull: &PdPullWire) -> PdShelfWire 
             owned_title,
             owned_path,
             shelf_path: first_present,
+            cover_path: cover_path_for(work),
             present_files: present.len(),
             total_files: work.files.len(),
             failure: ledger.get(&work.id).cloned(),
@@ -611,6 +618,162 @@ fn adopt_bytes(_work: &Work, file: &WorkFile, dir: &Path, bytes: Vec<u8>) -> Res
 }
 
 // ---------------------------------------------------------------------------
+// Covers (Dickles' directive, 2026-10-18: "use Standard Ebooks
+// with beautiful covers to impress users"). Every shelf row wears
+// its source's cover art: Standard Ebooks crafts a cover for each
+// of its editions (from public-domain art), and Project Gutenberg
+// serves one for the two rows SE can't lawfully carry. Covers are
+// fetched ONCE, in the background, into the app-owned pd-covers
+// folder — a shelf row never waits on the network to paint, and a
+// missing cover renders as the typographic binding, not a hole.
+// ---------------------------------------------------------------------------
+
+fn covers_dir() -> PathBuf {
+    crate::reader::data_dir().join("pd-covers")
+}
+
+/// One file per work; manifest ids contain '/' (author/title),
+/// which flattens to '_'.
+fn cover_filename(work: &Work) -> String {
+    format!("{}.jpg", work.id.replace('/', "_"))
+}
+
+/// The local cover's path when it has landed. Pure read — safe
+/// on every room paint (compose uses it).
+fn cover_path_for(work: &Work) -> Option<String> {
+    let p = covers_dir().join(cover_filename(work));
+    p.is_file().then(|| p.to_string_lossy().into_owned())
+}
+
+/// Every img src value in a page, in document order.
+fn img_srcs(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    while let Some(pos) = rest.find("src=\"") {
+        let after = &rest[pos + 5..];
+        match after.find('"') {
+            Some(end) => {
+                out.push(after[..end].to_string());
+                rest = &after[end..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// The content of the page's og:image meta tag, when present.
+/// (Project Gutenberg serves its cover art exactly there.)
+fn og_image(html: &str) -> Option<String> {
+    let pos = html.find("og:image")?;
+    let after = &html[pos..];
+    let start = after.find("content=\"")? + "content=\"".len();
+    let rest = &after[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// A Standard Ebooks cover URL from its book page: the page's
+/// cover <img> (…/images/covers/<work>/<hash>/cover.jpg). The
+/// larger "hero" treatment is deliberately not picked — the
+/// card wants the cover itself.
+pub fn se_cover_url(page_url: &str) -> Result<String, String> {
+    let html = http_text(page_url)?;
+    for src in img_srcs(&html) {
+        let clean = src.split('?').next().unwrap_or("");
+        if clean.contains("/images/covers/") && clean.ends_with("/cover.jpg") {
+            return Ok(absolutize(&src, page_url));
+        }
+    }
+    Err("Standard Ebooks' page didn't show a cover".into())
+}
+
+/// A Project Gutenberg cover URL from its ebook page (og:image).
+pub fn pg_cover_url(gutenberg_id: u32) -> Result<String, String> {
+    let page = format!("https://www.gutenberg.org/ebooks/{gutenberg_id}");
+    let html = http_text(&page)?;
+    og_image(&html).ok_or_else(|| "Project Gutenberg's page didn't show a cover".to_string())
+}
+
+fn cover_url_for(work: &Work) -> Result<String, String> {
+    match work.source.kind.as_str() {
+        "standardebooks" => se_cover_url(&work.source.url),
+        "gutenberg" => {
+            // The row's face is its first volume (James: #8486).
+            let id = work
+                .files
+                .first()
+                .and_then(|f| f.gutenberg_id)
+                .or(work.source.gutenberg_id)
+                .ok_or_else(|| format!("{} has no Gutenberg id", work.title))?;
+            pg_cover_url(id)
+        }
+        other => Err(format!("unknown source kind {other}")),
+    }
+}
+
+/// Magic-byte sniff: the cover bytes must actually be an image
+/// before they may land (validate-then-adopt, same as the books).
+fn is_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xD8, 0xFF]) // JPEG
+        || bytes.starts_with(&[0x89, b'P', b'N', b'G']) // PNG
+        || bytes.starts_with(b"GIF8") // GIF
+        || (bytes.len() > 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+}
+
+static COVERS_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// The background cover pass: single-flight, sequential, polite —
+/// the pull pipeline's manners. Fetches only covers that aren't
+/// on disk yet; a source having a bad day just leaves that row on
+/// its binding until the next launch retries. Emits
+/// `pd-covers-changed` when anything landed so an open Books
+/// room can repaint the shelf dressed.
+pub fn ensure_covers(app: tauri::AppHandle) {
+    if COVERS_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        use tauri::Emitter;
+        let dir = covers_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let mut landed = 0usize;
+        for work in &manifest().works {
+            let target = dir.join(cover_filename(work));
+            if target.is_file() {
+                continue;
+            }
+            let fetched = cover_url_for(work)
+                .and_then(|url| http_bytes(&url))
+                .and_then(|bytes| {
+                    if is_image(&bytes) {
+                        Ok(bytes)
+                    } else {
+                        Err("what arrived isn't a cover image".to_string())
+                    }
+                });
+            if let Ok(bytes) = fetched {
+                let part = dir.join(format!("{}.part", cover_filename(work)));
+                if std::fs::write(&part, &bytes).is_ok()
+                    && std::fs::rename(&part, &target).is_ok()
+                {
+                    landed += 1;
+                } else {
+                    let _ = std::fs::remove_file(&part);
+                }
+            }
+            // One at a time, with a breath — the sources are
+            // charities, not CDNs.
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+        COVERS_RUNNING.store(false, Ordering::SeqCst);
+        if landed > 0 {
+            let _ = app.emit("pd-covers-changed", landed);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // The pull job: single-flight, sequential, polite intervals, every
 // failure confessed to the ledger with its reason.
 // ---------------------------------------------------------------------------
@@ -872,6 +1035,36 @@ mod tests {
             match_work(&w, &lib2),
             Some(Owned::Exact { .. })
         ));
+    }
+
+    #[test]
+    fn cover_extraction_and_sniffing() {
+        // SE shape (verified live 2026-10-18): the cover is an
+        // <img> under /images/covers/…/cover.jpg; the hero
+        // treatment shares the folder and must not be picked.
+        let se = r#"<img src="/images/covers/a_b/0123/hero@2x.jpg"/><img src="/images/covers/a_b/0123/cover.jpg"/>"#;
+        assert_eq!(
+            img_srcs(se),
+            vec!["/images/covers/a_b/0123/hero@2x.jpg", "/images/covers/a_b/0123/cover.jpg"]
+        );
+        // PG shape (verified live): og:image carries the cover.
+        let pg = r#"<meta property="og:image" content="https://www.gutenberg.org/cache/epub/164/pg164.cover.medium.jpg"/>"#;
+        assert_eq!(
+            og_image(pg).as_deref(),
+            Some("https://www.gutenberg.org/cache/epub/164/pg164.cover.medium.jpg")
+        );
+        assert!(og_image("<html>nothing</html>").is_none());
+        // Filename flattening + the image sniff.
+        let mut leagues = work("Twenty Thousand Leagues Under the Sea", &["Jules Verne"]);
+        leagues.id = "jules-verne/twenty-thousand-leagues".into();
+        assert_eq!(
+            cover_filename(&leagues),
+            "jules-verne_twenty-thousand-leagues.jpg"
+        );
+        assert!(is_image(&[0xFF, 0xD8, 0xFF, 0xE0]));
+        assert!(is_image(&[0x89, b'P', b'N', b'G', 0x0D]));
+        assert!(!is_image(b"<html>nope</html>"));
+        assert!(!is_image(&[]));
     }
 
     #[test]

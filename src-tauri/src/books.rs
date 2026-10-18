@@ -499,13 +499,67 @@ fn progress_math(
     (None, false)
 }
 
+/// The Books room payload — composed OFF the UI thread, always.
+///
+/// Books incident (2026-10-18): this used to be a synchronous
+/// command, so the compose — including the unsorted pile's scan
+/// over the whole items table — ran on the window's main thread.
+/// Open the room while a library census was writing and the
+/// composes queued back-to-back until GNOME declared the app
+/// "not responding". Forge §Y: rooms paint data first, and the
+/// paint never blocks on work. The compose now runs in
+/// spawn_blocking (the books_identify pattern); the window stays
+/// responsive no matter what the catalog is doing, and the room
+/// shows the catalog exactly as it stands — an in-progress index
+/// never gates the shelves.
+#[tauri::command]
+pub async fn books_home(app: tauri::AppHandle) -> Cmd<BooksHomePayload> {
+    let app2 = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = app2.state::<AppState>();
+        let pd_hub = app2.state::<crate::pd::PdHub>();
+        compose_books_home(&state, &pd_hub)
+    })
+    .await;
+    match result {
+        Ok(payload) => {
+            // The room painted from the catalog; shelf covers
+            // land in the background (single-flight) and the room
+            // repaints dressed when they arrive.
+            crate::pd::ensure_covers(app);
+            payload
+        }
+        Err(e) => Err(CommandError::from(UfmError::Internal(format!(
+            "books home task failed: {e}"
+        )))),
+    }
+}
+
+/// The sidebar door badge: the identified-books count and
+/// nothing else. (It once invoked the full books_home payload —
+/// compose, scans and all — to render one number.)
+#[tauri::command]
+pub async fn books_door_count(app: tauri::AppHandle) -> Cmd<u64> {
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let catalog = state.catalog.lock().unwrap();
+        catalog.books_identified_count().map_err(CommandError::from)
+    })
+    .await;
+    match result {
+        Ok(r) => r,
+        Err(e) => Err(CommandError::from(UfmError::Internal(format!(
+            "books door count task failed: {e}"
+        )))),
+    }
+}
+
 /// Compose the whole room in one call — the counts, the shelves,
 /// and the unsorted pile — so the UI never assembles a half-true
 /// picture from racing queries.
-#[tauri::command]
-pub fn books_home(
-    state: tauri::State<'_, AppState>,
-    pd_hub: tauri::State<'_, crate::pd::PdHub>,
+fn compose_books_home(
+    state: &AppState,
+    pd_hub: &crate::pd::PdHub,
 ) -> Cmd<BooksHomePayload> {
     let catalog = state.catalog.lock().unwrap();
     let counts = catalog.books_counts().map_err(CommandError::from)?;
