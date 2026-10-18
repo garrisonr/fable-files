@@ -16,7 +16,33 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { springTo, reducedMotion } from "./motion";
-import { api, formatBytes, type JobSummary } from "./api";
+import { api, formatBytes, formatDate, type JobSummary, type PendingConflict } from "./api";
+import { fileTypeGlyph } from "./sectionicons";
+
+/** Steal 6: the standing name-collision policy, chosen in this
+ * panel's header and read by the shell at every job start.
+ * "auto_rename" (the founding default: never overwrite, the
+ * incoming file lands as "name 2") or "ask_me" (the job parks on
+ * each collision for a per-item decision). */
+export type CollisionPolicyPref = "auto_rename" | "ask_me";
+
+export function loadCollisionPolicy(): CollisionPolicyPref {
+  try {
+    return localStorage.getItem("ff-collision-policy") === "ask_me"
+      ? "ask_me"
+      : "auto_rename";
+  } catch {
+    return "auto_rename";
+  }
+}
+
+export function saveCollisionPolicy(p: CollisionPolicyPref): void {
+  try {
+    localStorage.setItem("ff-collision-policy", p);
+  } catch {
+    // session-only is an acceptable fallback
+  }
+}
 
 interface JobRow {
   root: HTMLDivElement;
@@ -27,6 +53,7 @@ interface JobRow {
   cancel: HTMLButtonElement;
   pause?: HTMLButtonElement;
   copy?: HTMLButtonElement;
+  conflicts: HTMLDivElement;
   paused: boolean;
   failed: boolean;
 }
@@ -43,6 +70,8 @@ interface JobProgress {
   /** UI round (packed transfer): the engine streamed this job. */
   packed?: boolean;
   current: string | null;
+  /** Steal 6: collisions this job is parked on. */
+  pending_collisions?: PendingConflict[];
   done: boolean;
   error: string | null;
 }
@@ -81,7 +110,32 @@ export class JobsPanel {
     this.el.hidden = true;
     const head = document.createElement("div");
     head.className = "jobs-head";
-    head.textContent = "⚙ Working…";
+    const headLabel = document.createElement("span");
+    headLabel.textContent = "⚙ Working…";
+    // Steal 6: the standing collision policy lives where the
+    // collisions land. It applies to every job started from now
+    // on; a parked job keeps the policy it was born with.
+    const policyWrap = document.createElement("label");
+    policyWrap.className = "jobs-policy";
+    const policyText = document.createElement("span");
+    policyText.textContent = "Name collisions:";
+    const policySel = document.createElement("select");
+    policySel.className = "jobs-policy-select";
+    const optAuto = document.createElement("option");
+    optAuto.value = "auto_rename";
+    optAuto.textContent = "Keep both (rename)";
+    const optAsk = document.createElement("option");
+    optAsk.value = "ask_me";
+    optAsk.textContent = "Ask me";
+    policySel.append(optAuto, optAsk);
+    policySel.value = loadCollisionPolicy();
+    policySel.title =
+      "What to do when a copied or moved file's name is already taken at the destination";
+    policySel.addEventListener("change", () => {
+      saveCollisionPolicy(policySel.value === "ask_me" ? "ask_me" : "auto_rename");
+    });
+    policyWrap.append(policyText, policySel);
+    head.append(headLabel, policyWrap);
     this.list = document.createElement("div");
     this.list.className = "jobs-list";
     this.el.append(head, this.list);
@@ -223,6 +277,7 @@ export class JobsPanel {
             ? (j.steps_done / j.steps_total) * 100
             : 0;
       this.paintRow(row, pct, j.state, JobsPanel.progressDetail(j));
+      this.paintConflicts(row, jobId, j.pending_conflicts);
     }
   }
 
@@ -279,6 +334,7 @@ export class JobsPanel {
               ? (j.steps_done / j.steps_total) * 100
               : 0;
         this.paintRow(row, pct, j.state, JobsPanel.progressDetail(j));
+        this.paintConflicts(row, j.job_id, j.pending_conflicts);
       }
     }
   }
@@ -304,20 +360,137 @@ export class JobsPanel {
     cancel.className = "icon-btn job-cancel";
     cancel.textContent = "✕";
     cancel.title = "Cancel";
+    const conflicts = document.createElement("div");
+    conflicts.className = "job-conflicts";
     let pause: HTMLButtonElement | undefined;
     if (transfer) {
       pause = document.createElement("button");
       pause.className = "icon-btn job-pause";
       pause.textContent = "⏸";
       pause.title = "Pause";
-      root.append(name, detail, track, pct, pause, cancel);
+      root.append(name, detail, track, pct, pause, cancel, conflicts);
     } else {
-      root.append(name, detail, track, pct, cancel);
+      root.append(name, detail, track, pct, cancel, conflicts);
     }
     this.list.appendChild(root);
-    const row: JobRow = { root, name, detail, bar, pct, cancel, pause, paused: false, failed: false };
+    const row: JobRow = { root, name, detail, bar, pct, cancel, pause, conflicts, paused: false, failed: false };
     this.rows.set(id, row);
     return row;
+  }
+
+  /** Steal 6: (re)paint a row's collision cards. Rebuilt only
+   * when the SET of waiting steps changes — progress emits arrive
+   * constantly and must not churn the buttons under the cursor. */
+  private paintConflicts(
+    row: JobRow,
+    jobId: string,
+    conflicts: PendingConflict[] | undefined,
+  ): void {
+    const ids = (conflicts ?? []).map((c) => c.step_id).join(",");
+    if (row.root.dataset.conflicts === ids) return;
+    row.root.dataset.conflicts = ids;
+    row.conflicts.innerHTML = "";
+    for (const c of conflicts ?? []) {
+      row.conflicts.appendChild(this.conflictCard(jobId, c));
+    }
+  }
+
+  /** The Ask-me card: both files, side by side, in plain talk —
+   * the incoming one on the left, the one already there on the
+   * right — and the only three answers there are. Replace is the
+   * app's ONLY overwrite, and it exists only here, per item, by
+   * an explicit press. */
+  private conflictCard(jobId: string, c: PendingConflict): HTMLDivElement {
+    const card = document.createElement("div");
+    card.className = "job-conflict";
+    const title = document.createElement("div");
+    title.className = "job-conflict-title";
+    title.textContent = `“${c.name}” is already there`;
+    card.appendChild(title);
+
+    const sides = document.createElement("div");
+    sides.className = "job-conflict-sides";
+    sides.append(
+      this.conflictSide("Coming in", c.name, c.src_size, c.src_modified),
+      this.conflictSide("Already there", c.name, c.dst_size, c.dst_modified),
+    );
+    card.appendChild(sides);
+
+    const verdict = document.createElement("div");
+    verdict.className = "job-conflict-verdict";
+    const sT = c.src_modified ? Date.parse(c.src_modified) : NaN;
+    const dT = c.dst_modified ? Date.parse(c.dst_modified) : NaN;
+    if (!Number.isNaN(sT) && !Number.isNaN(dT) && sT !== dT) {
+      verdict.textContent =
+        sT > dT
+          ? "The one coming in is newer."
+          : "The one already there is newer.";
+    } else if (
+      c.src_size !== null &&
+      c.src_size === c.dst_size &&
+      !Number.isNaN(sT) &&
+      sT === dT
+    ) {
+      verdict.textContent = "They look identical from here.";
+    } else {
+      verdict.textContent = "Too close to call — your pick.";
+    }
+    card.appendChild(verdict);
+
+    const where = document.createElement("div");
+    where.className = "job-conflict-where";
+    where.textContent = c.dst_path;
+    where.title = c.dst_path;
+    card.appendChild(where);
+
+    const actions = document.createElement("div");
+    actions.className = "job-conflict-actions";
+    const mk = (label: string, choice: string, danger = false) => {
+      const b = document.createElement("button");
+      b.className = "pill-btn job-conflict-btn" + (danger ? " danger" : "");
+      b.textContent = label;
+      b.addEventListener("click", () => {
+        void api
+          .resolveCollision(jobId, c.step_id, choice)
+          .catch(() => undefined);
+        // The next emit/reconcile repaints the truth; drop the
+        // card now so the press feels answered.
+        card.remove();
+      });
+      return b;
+    };
+    actions.append(
+      mk("Replace", "replace", true),
+      mk("Keep both", "keep_both"),
+      mk("Skip", "skip"),
+    );
+    card.appendChild(actions);
+    return card;
+  }
+
+  private conflictSide(
+    label: string,
+    name: string,
+    size: number | null,
+    modified: string | null,
+  ): HTMLDivElement {
+    const side = document.createElement("div");
+    side.className = "job-conflict-side";
+    const head = document.createElement("div");
+    head.className = "job-conflict-side-head";
+    const glyph = fileTypeGlyph(name);
+    if (glyph) head.appendChild(glyph);
+    const lbl = document.createElement("span");
+    lbl.textContent = label;
+    head.appendChild(lbl);
+    const meta = document.createElement("div");
+    meta.className = "job-conflict-side-meta";
+    meta.textContent = [
+      size !== null ? formatBytes(size) : "size unknown",
+      modified ? formatDate(modified) : "date unknown",
+    ].join(" · ");
+    side.append(head, meta);
+    return side;
   }
 
   /** The row's truth line, composed only from numbers the engine
@@ -406,6 +579,7 @@ export class JobsPanel {
             ? (p.steps_done / p.steps_total) * 100
             : 0;
       this.paintRow(row, pct, p.state, JobsPanel.progressDetail(p));
+      this.paintConflicts(row, p.job_id, p.pending_collisions);
       return;
     }
     this.fireTransferDone(p.job_id, p.error);

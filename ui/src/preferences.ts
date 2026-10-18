@@ -71,6 +71,14 @@ export interface PreferencesHooks {
   /** Library Memory: rebuild one connected volume's index from
    *  scratch (the shell owns locations + the index tracker). */
   rebuildVolume(fsUuid: string): Promise<void>;
+  /** Home base (steal 1): the local-only Recent/Frequent learning
+   *  switch + the wipe. */
+  rememberHomeFeed(): boolean;
+  setRememberHomeFeed(on: boolean): void;
+  clearHomeFeed(): Promise<void>;
+  /** Check boxes for selection (steal 8). */
+  checkBoxes(): boolean;
+  setCheckBoxes(on: boolean): void;
   sectionCollapsed(key: string): boolean;
   setSectionCollapsed(key: string, collapsed: boolean): void;
   showShortcuts(): void;
@@ -216,6 +224,14 @@ export class PreferencesDialog {
         () => hooks.stepIconSize(1),
       ),
     );
+    page.appendChild(
+      this.toggleRow(
+        "Check boxes for selection",
+        "A check box on every file, for touch and trackpads alike. Fable turns this on by itself on touch screens.",
+        hooks.checkBoxes(),
+        (on) => hooks.setCheckBoxes(on),
+      ),
+    );
 
     page.appendChild(this.section("Sidebar"));
     page.appendChild(
@@ -291,6 +307,36 @@ export class PreferencesDialog {
     const libHost = document.createElement("div");
     page.appendChild(libHost);
     void new LibraryMemorySection().mount(libHost, hooks);
+
+    // Home base (Grand Pass steal 1): the learning that fills the
+    // Home door's Recent and "You visit these a lot" shelves.
+    // Local-only by doctrine — the copy says so, plainly.
+    page.appendChild(this.section("Home base"));
+    const homeNote = document.createElement("p");
+    homeNote.className = "prefs-note";
+    homeNote.textContent =
+      "Home base learns — on this computer only — which files you open and which folders you visit, so the Home door can offer them back. The list never leaves this machine, and every entry can be forgotten from the Home door itself.";
+    page.appendChild(homeNote);
+    page.appendChild(
+      this.toggleRow(
+        "Remember recent files and frequent folders",
+        null,
+        hooks.rememberHomeFeed(),
+        (on) => hooks.setRememberHomeFeed(on),
+      ),
+    );
+    const clearHome = document.createElement("button");
+    clearHome.className = "pill-btn";
+    clearHome.textContent = "Clear recent & frequent now";
+    clearHome.addEventListener("click", () => {
+      void hooks.clearHomeFeed().then(() => {
+        clearHome.textContent = "Cleared";
+        window.setTimeout(() => {
+          clearHome.textContent = "Clear recent & frequent now";
+        }, 1500);
+      });
+    });
+    page.appendChild(clearHome);
   }
 
   // ---------------------------------------------------------------

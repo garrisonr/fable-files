@@ -1327,6 +1327,9 @@ pub async fn list_dir(
 pub struct CopyRequest {
     pub sources: Vec<ItemId>,
     pub dst_parent: ItemId,
+    /// Steal 6: "ask_me" | "auto_rename" (absent = auto_rename).
+    #[serde(default)]
+    pub collision_policy: Option<String>,
 }
 
 /// Live control block for one job: the shared snapshot the executor
@@ -1428,6 +1431,7 @@ fn emit_job_progress(
             "bytes_total": job.preview.bytes_to_move,
             "packed": job.packed,
             "current": current,
+            "pending_collisions": pending_conflicts(job),
             "done": matches!(
                 job.state,
                 ufm_jobs::JobState::Completed
@@ -1437,6 +1441,207 @@ fn emit_job_progress(
             "error": error,
         }),
     );
+}
+
+/// Steal 6: one parked name collision, described for the jobs
+/// panel's compare card. Built from the job's marks plus LIVE fs
+/// stats — the destination's size/mtime are read when the payload
+/// is built, so the card never quotes planning-time ghosts.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingConflictDto {
+    pub step_id: String,
+    pub name: String,
+    pub src_path: String,
+    pub src_size: Option<u64>,
+    pub src_modified: Option<String>,
+    pub dst_path: String,
+    pub dst_size: Option<u64>,
+    pub dst_modified: Option<String>,
+}
+
+fn file_stat(path: &Path) -> (Option<u64>, Option<String>) {
+    match std::fs::metadata(path) {
+        Ok(md) => {
+            let modified = md
+                .modified()
+                .ok()
+                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+            (Some(md.len()), modified)
+        }
+        Err(_) => (None, None),
+    }
+}
+
+/// Every collision a job is parked on, oldest step first. Only
+/// the WRITING step (Copy/Move) gets a card — its VerifyCopy
+/// companion shares the mark but not the stage.
+pub(crate) fn pending_conflicts(job: &ufm_jobs::Job) -> Vec<PendingConflictDto> {
+    let mut out = Vec::new();
+    for (step_id, mark) in &job.collision_marks {
+        if *mark != ufm_jobs::CollisionMark::Awaiting {
+            continue;
+        }
+        let Some(step) = job.steps.get(step_id) else {
+            continue;
+        };
+        let (src, dst_parent, new_name) = match &step.op {
+            ufm_jobs::StepOp::Copy {
+                src,
+                dst_parent,
+                new_name,
+            } => (src, dst_parent, new_name),
+            ufm_jobs::StepOp::Move {
+                src,
+                dst_parent,
+                new_name,
+            } => (src, dst_parent, new_name),
+            _ => continue,
+        };
+        let Some(src_path) = src.provider_key.clone() else {
+            continue;
+        };
+        let Some(parent) = dst_parent.provider_key.as_deref() else {
+            continue;
+        };
+        let dst_path = Path::new(parent).join(new_name);
+        let (src_size, src_modified) = file_stat(Path::new(&src_path));
+        let (dst_size, dst_modified) = file_stat(&dst_path);
+        out.push(PendingConflictDto {
+            step_id: step_id.clone(),
+            name: new_name.clone(),
+            src_path,
+            src_size,
+            src_modified,
+            dst_path: dst_path.to_string_lossy().into_owned(),
+            dst_size,
+            dst_modified,
+        });
+    }
+    out.sort_by(|a, b| a.step_id.cmp(&b.step_id));
+    out
+}
+
+/// Steal 6 core: apply the user's decision to one parked
+/// collision. Mutates the job in place; Ok(true) when a decision
+/// landed, Ok(false) when the step wasn't waiting (stale card).
+/// Filesystem-pure apart from KeepBoth's free-name probe, so the
+/// planner tests can drive it without a running app.
+fn apply_collision_resolution(
+    job: &mut ufm_jobs::Job,
+    step_id: &str,
+    choice: &str,
+) -> Result<bool, String> {
+    if job.collision_marks.get(step_id)
+        != Some(&ufm_jobs::CollisionMark::Awaiting)
+    {
+        return Ok(false);
+    }
+    // The collision group: the addressed (writing) step + its
+    // marked verify companion, which it depends on.
+    let mut group = vec![step_id.to_string()];
+    if let Some(step) = job.steps.get(step_id) {
+        for d in &step.depends_on {
+            if job.collision_marks.get(d)
+                == Some(&ufm_jobs::CollisionMark::Awaiting)
+            {
+                group.push(d.clone());
+            }
+        }
+    }
+    match choice {
+        "replace" => {
+            for id in &group {
+                job.collision_marks
+                    .insert(id.clone(), ufm_jobs::CollisionMark::Replace);
+            }
+        }
+        "keep_both" => {
+            let (parent, old_name) = match job.steps.get(step_id).map(|s| &s.op) {
+                Some(ufm_jobs::StepOp::Copy {
+                    dst_parent,
+                    new_name,
+                    ..
+                })
+                | Some(ufm_jobs::StepOp::Move {
+                    dst_parent,
+                    new_name,
+                    ..
+                }) => (
+                    dst_parent
+                        .provider_key
+                        .clone()
+                        .ok_or_else(|| "destination has no path".to_string())?,
+                    new_name.clone(),
+                ),
+                _ => return Err("not a copy/move step".into()),
+            };
+            let parent_path = Path::new(&parent);
+            let free = free_dest_name(parent_path, &old_name);
+            let old_full = parent_path.join(&old_name);
+            let new_full = parent_path.join(&free);
+            if let Some(step) = job.steps.get_mut(step_id) {
+                match &mut step.op {
+                    ufm_jobs::StepOp::Copy { new_name, .. }
+                    | ufm_jobs::StepOp::Move { new_name, .. } => {
+                        *new_name = free.clone()
+                    }
+                    _ => {}
+                }
+            }
+            // The verify companion aims at the same new path, and
+            // any outcome recorded against the old full path (a
+            // cross-device move's Delete carries it) follows.
+            for step in job.steps.values_mut() {
+                if let ufm_jobs::StepOp::VerifyCopy { dst, .. } = &mut step.op {
+                    if dst.provider_key.as_deref()
+                        == Some(old_full.to_string_lossy().as_ref())
+                    {
+                        dst.name = free.clone();
+                        dst.provider_key =
+                            Some(new_full.to_string_lossy().into_owned());
+                    }
+                }
+                if step.outcome_path.as_deref()
+                    == Some(old_full.to_string_lossy().as_ref())
+                {
+                    step.outcome_path =
+                        Some(new_full.to_string_lossy().into_owned());
+                }
+            }
+            for id in &group {
+                job.collision_marks.remove(id);
+            }
+        }
+        "skip" => {
+            // Skip the group AND everything that (transitively)
+            // depends on it — above all a move's Delete companion,
+            // which must never run for a copy that never landed.
+            let mut skip: std::collections::HashSet<String> =
+                group.iter().cloned().collect();
+            loop {
+                let mut grew = false;
+                for (id, step) in &job.steps {
+                    if !skip.contains(id)
+                        && step.depends_on.iter().any(|d| skip.contains(d))
+                    {
+                        skip.insert(id.clone());
+                        grew = true;
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            for id in skip {
+                if let Some(step) = job.steps.get_mut(&id) {
+                    step.state = ufm_jobs::StepState::Skipped;
+                }
+                job.collision_marks.remove(&id);
+            }
+        }
+        other => return Err(format!("unknown collision choice: {other}")),
+    }
+    Ok(true)
 }
 
 pub(crate) fn job_item(
@@ -1462,21 +1667,13 @@ pub(crate) fn job_item(
     }
 }
 
-/// Resolve a destination file name inside `dst_dir`. On collision, record
-/// a preview conflict and fall back to the app's paste idiom
-/// (`name`, `name 2`, `name 3`, …) — a job never silently overwrites.
-fn resolve_dest_name(
-    dst_dir: &Path,
-    name: &str,
-    preview: &mut ufm_jobs::JobPreview,
-) -> String {
+/// The first free variant of `name` inside `dst_dir` in the app's
+/// paste idiom (`name`, `name 2`, `name 3`, …) — no preview
+/// bookkeeping. Also the KeepBoth resolution's name picker.
+fn free_dest_name(dst_dir: &Path, name: &str) -> String {
     if !dst_dir.join(name).exists() {
         return name.to_string();
     }
-    preview.conflicts.push(ufm_jobs::Conflict {
-        path: dst_dir.join(name).to_string_lossy().into_owned(),
-        kind: ufm_jobs::ConflictKind::NameCollision,
-    });
     let mut n = 2;
     loop {
         let candidate = format!("{name} {n}");
@@ -1487,12 +1684,51 @@ fn resolve_dest_name(
     }
 }
 
+/// Steal 6: policy-aware destination resolution. Returns the name
+/// to plan with and whether it collided. AutoRename keeps the
+/// founding behavior exactly (auto-renamed, conflict previewed).
+/// AskMe keeps the ORIGINAL name and reports the collision so the
+/// planner can park the step on it (`CollisionMark::Awaiting`) —
+/// the executor then waits for the user's per-item decision.
+fn resolve_dest_name_policy(
+    dst_dir: &Path,
+    name: &str,
+    preview: &mut ufm_jobs::JobPreview,
+    policy: ufm_jobs::CollisionPolicy,
+) -> (String, bool) {
+    if !dst_dir.join(name).exists() {
+        return (name.to_string(), false);
+    }
+    preview.conflicts.push(ufm_jobs::Conflict {
+        path: dst_dir.join(name).to_string_lossy().into_owned(),
+        kind: ufm_jobs::ConflictKind::NameCollision,
+    });
+    match policy {
+        ufm_jobs::CollisionPolicy::AskMe => (name.to_string(), true),
+        ufm_jobs::CollisionPolicy::AutoRename => {
+            (free_dest_name(dst_dir, name), true)
+        }
+    }
+}
+
+/// The UI's collision-policy wire value → the engine enum.
+/// Anything unrecognized is AutoRename: the safe default is the
+/// doctrine, never an overwrite.
+fn parse_collision_policy(raw: Option<&str>) -> ufm_jobs::CollisionPolicy {
+    match raw {
+        Some("ask_me") => ufm_jobs::CollisionPolicy::AskMe,
+        _ => ufm_jobs::CollisionPolicy::AutoRename,
+    }
+}
+
 /// Builds the step DAG for a copy. Deterministic step ids (`s0001`, …)
 /// keep journal rows stable and greppable.
 struct CopyPlanner {
     job: ufm_jobs::Job,
     seq: u32,
     location: LocationId,
+    /// Steal 6: name-collision behavior for this job.
+    policy: ufm_jobs::CollisionPolicy,
 }
 
 impl CopyPlanner {
@@ -1537,6 +1773,7 @@ impl CopyPlanner {
         new_name: &str,
         size: u64,
         mkdir_dep: Option<String>,
+        collided: bool,
     ) {
         let src_item = job_item(
             ItemId::new(),
@@ -1572,7 +1809,7 @@ impl CopyPlanner {
         }
         let copy_id = self.next_id();
         self.job.add_step(ufm_jobs::Step {
-            id: copy_id,
+            id: copy_id.clone(),
             label: format!("copy {}", src_path.display()),
             op: ufm_jobs::StepOp::Copy {
                 src: src_item,
@@ -1591,6 +1828,19 @@ impl CopyPlanner {
             outcome: false,
             outcome_path: None,
         });
+        if collided {
+            // Steal 6 (AskMe): park BOTH steps of the pair — the
+            // executor waits in front of the verify, so nothing
+            // about this file has happened when the user decides.
+            self.job.collision_marks.insert(
+                verify_id,
+                ufm_jobs::CollisionMark::Awaiting,
+            );
+            self.job.collision_marks.insert(
+                copy_id,
+                ufm_jobs::CollisionMark::Awaiting,
+            );
+        }
         self.job.preview.files_affected += 1;
         self.job.preview.bytes_to_move += size;
     }
@@ -1613,12 +1863,31 @@ impl CopyPlanner {
             let ty = entry.file_type().map_err(io_err)?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
+            // Names resolve here too (steal 6): under AutoRename a
+            // fresh subtree never collides, so this is a no-op —
+            // but when a subtree DOES exist at the destination
+            // (an AskMe folder merge above all), inner files get
+            // exactly the top level's treatment instead of the
+            // executor's raw truncate.
+            let (resolved, collided) = resolve_dest_name_policy(
+                dst_dir,
+                &name,
+                &mut self.job.preview,
+                self.policy,
+            );
             if ty.is_dir() {
-                let mid = self.add_mkdir(dst_dir, &name, mkdir_dep.clone());
-                self.plan_dir(&path, &dst_dir.join(&name), Some(mid))?;
+                let mid = self.add_mkdir(dst_dir, &resolved, mkdir_dep.clone());
+                self.plan_dir(&path, &dst_dir.join(&resolved), Some(mid))?;
             } else {
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                self.add_file(&path, dst_dir, &name, size, mkdir_dep.clone());
+                self.add_file(
+                    &path,
+                    dst_dir,
+                    &resolved,
+                    size,
+                    mkdir_dep.clone(),
+                    collided,
+                );
             }
         }
         Ok(())
@@ -1653,7 +1922,12 @@ fn build_copy_job(state: &AppState, req: &CopyRequest) -> Cmd<ufm_jobs::Job> {
         (dst_dir, locs.get(&req.dst_parent).copied(), srcs)
     };
     let location = dst_location.unwrap_or_default();
-    plan_copy_job_paths(&src_paths, &dst_dir, location)
+    plan_copy_job_paths(
+        &src_paths,
+        &dst_dir,
+        location,
+        parse_collision_policy(req.collision_policy.as_deref()),
+    )
 }
 
 /// The paths-based copy core (inc-2 §2.3): `build_copy_job` resolves
@@ -1662,6 +1936,7 @@ fn plan_copy_job_paths(
     srcs: &[PathBuf],
     dst_dir: &Path,
     location: LocationId,
+    policy: ufm_jobs::CollisionPolicy,
 ) -> Cmd<ufm_jobs::Job> {
     if srcs.is_empty() {
         return Err(CommandError::from(UfmError::InvalidInput(
@@ -1686,7 +1961,9 @@ fn plan_copy_job_paths(
         job: ufm_jobs::Job::new(title, ufm_jobs::JobPreview::default()),
         seq: 0,
         location,
+        policy,
     };
+    planner.job.collision_policy = policy;
     for src_path in srcs {
         let meta = std::fs::metadata(src_path).map_err(|e| {
             CommandError::from(UfmError::Internal(format!(
@@ -1700,15 +1977,28 @@ fn plan_copy_job_paths(
             .ok_or_else(|| {
                 CommandError::from(UfmError::InvalidInput("source has no name".into()))
             })?;
+        let (resolved, collided) = resolve_dest_name_policy(
+            dst_dir,
+            &name,
+            &mut planner.job.preview,
+            policy,
+        );
         if meta.is_dir() {
-            let resolved =
-                resolve_dest_name(dst_dir, &name, &mut planner.job.preview);
+            // A colliding folder under AskMe merges (Mkdir is
+            // create_dir_all): its inner files collide — and ask —
+            // one by one in plan_dir. No single card for the
+            // folder itself; declared in the pass receipt.
             let mid = planner.add_mkdir(dst_dir, &resolved, None);
             planner.plan_dir(src_path, &dst_dir.join(&resolved), Some(mid))?;
         } else {
-            let resolved =
-                resolve_dest_name(dst_dir, &name, &mut planner.job.preview);
-            planner.add_file(src_path, dst_dir, &resolved, meta.len(), None);
+            planner.add_file(
+                src_path,
+                dst_dir,
+                &resolved,
+                meta.len(),
+                None,
+                collided,
+            );
         }
     }
     Ok(planner.job)
@@ -1756,6 +2046,9 @@ struct PathPlanner {
     job: ufm_jobs::Job,
     seq: u32,
     location: LocationId,
+    /// Steal 6: name-collision behavior (move planning only;
+    /// delete planning never resolves names and keeps the default).
+    policy: ufm_jobs::CollisionPolicy,
 }
 
 impl PathPlanner {
@@ -1826,6 +2119,7 @@ impl PathPlanner {
         new_name: &str,
         size: u64,
         mkdir_dep: Option<String>,
+        collided: bool,
     ) -> (String, String, String) {
         let src_item = job_item(
             ItemId::new(),
@@ -1882,6 +2176,19 @@ impl PathPlanner {
             false,
             None,
         );
+        if collided {
+            // Steal 6 (AskMe): park the pair — the Delete companion
+            // is NOT marked: it may only ever run after the Copy
+            // resolves and lands (its dependency enforces that).
+            self.job.collision_marks.insert(
+                verify_id.clone(),
+                ufm_jobs::CollisionMark::Awaiting,
+            );
+            self.job.collision_marks.insert(
+                copy_id.clone(),
+                ufm_jobs::CollisionMark::Awaiting,
+            );
+        }
         self.job.preview.files_affected += 1;
         self.job.preview.bytes_to_move += size;
         (verify_id, copy_id, delete_id)
@@ -1910,12 +2217,20 @@ impl PathPlanner {
             let ty = entry.file_type().map_err(io_err)?;
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
+            // Steal 6: inner names resolve like the top level's
+            // (see CopyPlanner::plan_dir for the reasoning).
+            let (resolved, collided) = resolve_dest_name_policy(
+                dst_dir,
+                &name,
+                &mut self.job.preview,
+                self.policy,
+            );
             if ty.is_dir() {
                 let child_mkdir =
-                    self.add_mkdir(dst_dir, &name, Some(mkdir_dep.to_string()));
+                    self.add_mkdir(dst_dir, &resolved, Some(mkdir_dep.to_string()));
                 let mut entry_ids = vec![child_mkdir.clone()];
                 let mut sub =
-                    self.plan_move_dir(&path, &dst_dir.join(&name), &child_mkdir)?;
+                    self.plan_move_dir(&path, &dst_dir.join(&resolved), &child_mkdir)?;
                 entry_ids.append(&mut sub);
                 let del = self.add_step(
                     format!("remove {}", path.display()),
@@ -1942,9 +2257,10 @@ impl PathPlanner {
                 let (verify_id, copy_id, delete_id) = self.add_move_file(
                     &path,
                     dst_dir,
-                    &name,
+                    &resolved,
                     size,
                     Some(mkdir_dep.to_string()),
+                    collided,
                 );
                 ids.extend([verify_id, copy_id, delete_id]);
             }
@@ -2019,8 +2335,9 @@ fn plan_move_job(
     srcs: &[PathBuf],
     dst_dir: &Path,
     location: LocationId,
+    policy: ufm_jobs::CollisionPolicy,
 ) -> Cmd<ufm_jobs::Job> {
-    plan_move_job_with(srcs, dst_dir, location, &same_device)
+    plan_move_job_with(srcs, dst_dir, location, &same_device, policy)
 }
 
 /// `plan_move_job` with the device predicate injected, so tests can
@@ -2030,6 +2347,7 @@ fn plan_move_job_with(
     dst_dir: &Path,
     location: LocationId,
     same_dev: &dyn Fn(&Path, &Path) -> bool,
+    policy: ufm_jobs::CollisionPolicy,
 ) -> Cmd<ufm_jobs::Job> {
     if srcs.is_empty() {
         return Err(CommandError::from(UfmError::InvalidInput(
@@ -2054,7 +2372,9 @@ fn plan_move_job_with(
         job: ufm_jobs::Job::new(title, ufm_jobs::JobPreview::default()),
         seq: 0,
         location,
+        policy,
     };
+    planner.job.collision_policy = policy;
     for src in srcs {
         let name = src
             .file_name()
@@ -2068,7 +2388,12 @@ fn plan_move_job_with(
         if src.parent() == Some(dst_dir) {
             continue;
         }
-        let resolved = resolve_dest_name(dst_dir, &name, &mut planner.job.preview);
+        let (resolved, collided) = resolve_dest_name_policy(
+            dst_dir,
+            &name,
+            &mut planner.job.preview,
+            policy,
+        );
         let is_dir = std::fs::symlink_metadata(src)
             .map(|m| m.is_dir())
             .unwrap_or(false);
@@ -2085,7 +2410,7 @@ fn plan_move_job_with(
             } else {
                 ItemKind::File
             };
-            planner.add_step(
+            let move_id = planner.add_step(
                 format!("move {}", src.display()),
                 ufm_jobs::StepOp::Move {
                     src: job_item(
@@ -2108,6 +2433,16 @@ fn plan_move_job_with(
                 true,
                 None,
             );
+            if collided {
+                // Steal 6 (AskMe): the rename parks for the user's
+                // call. (A same-device DIRECTORY move asks too —
+                // Replace there means the existing tree goes away,
+                // which is exactly why it must be explicit.)
+                planner.job.collision_marks.insert(
+                    move_id,
+                    ufm_jobs::CollisionMark::Awaiting,
+                );
+            }
         } else if is_dir {
             // Cross-device directory: copy walk + source cleanup.
             let mid = planner.add_mkdir(dst_dir, &resolved, None);
@@ -2141,7 +2476,8 @@ fn plan_move_job_with(
                 )))
             })?
             .len();
-            let (_, _, del) = planner.add_move_file(src, dst_dir, &resolved, size, None);
+            let (_, _, del) =
+                planner.add_move_file(src, dst_dir, &resolved, size, None, collided);
             if let Some(s) = planner.job.steps.get_mut(&del) {
                 s.outcome = true;
                 s.outcome_path =
@@ -2174,6 +2510,7 @@ fn plan_delete_job(
         job: ufm_jobs::Job::new(title, ufm_jobs::JobPreview::default()),
         seq: 0,
         location,
+        policy: ufm_jobs::CollisionPolicy::AutoRename,
     };
     for src in srcs {
         // Preview totals: one metadata-only walk per source (spec §6
@@ -3065,6 +3402,14 @@ fn packed_candidates(job: &ufm_jobs::Job) -> Option<Vec<PackedFile>> {
         if !matches!(step.state, ufm_jobs::StepState::Pending) {
             continue;
         }
+        // Steal 6: a collision-parked step never streams packed —
+        // the packed pass bypasses the executor's park by design,
+        // so a marked step disqualifies itself here. (Planned
+        // copies are verify-gated and excluded below anyway; this
+        // is the belt to that suspender.)
+        if job.collision_marks.contains_key(&step.id) {
+            continue;
+        }
         let ufm_jobs::StepOp::Copy {
             src,
             dst_parent,
@@ -3710,6 +4055,94 @@ fn run_job(app: tauri::AppHandle, handle: JobHandle, catalog_path: PathBuf) {
                 continue;
             }
         }
+        // Steal 6 (AskMe): a step marked Awaiting parks the job
+        // BEFORE anything about this item happens. The park rides
+        // the ordinary pause machinery (flag + Paused state), so
+        // cancel-while-parked and crash recovery behave exactly
+        // like a user pause. The resolve command clears the mark;
+        // a bare resume with the mark still set parks again — no
+        // path runs a colliding step undecided.
+        let mut step = step;
+        let mut resolution_skipped = false;
+        let mut park_cancelled = false;
+        loop {
+            let mark = {
+                let j = handle.job.lock().unwrap();
+                j.collision_marks.get(step_id).copied()
+            };
+            if mark != Some(ufm_jobs::CollisionMark::Awaiting) {
+                break;
+            }
+            {
+                let mut j = handle.job.lock().unwrap();
+                if matches!(
+                    j.state,
+                    ufm_jobs::JobState::Running | ufm_jobs::JobState::Queued
+                ) {
+                    j.state = ufm_jobs::JobState::Paused;
+                }
+            }
+            handle
+                .pause
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            emit_from_handle(
+                &app,
+                &handle,
+                bytes_done,
+                Some("waiting: name collision — your call"),
+                None,
+            );
+            if !wait_while_paused(&handle) {
+                park_cancelled = true;
+                break;
+            }
+            // Resolved (or bare-resumed): re-read the step —
+            // resolution may have renamed it, marked it Replace,
+            // or Skipped it outright.
+            let fresh = {
+                let j = handle.job.lock().unwrap();
+                j.steps.get(step_id).cloned()
+            };
+            let Some(fresh) = fresh else { break };
+            if fresh.state == ufm_jobs::StepState::Skipped {
+                resolution_skipped = true;
+                break;
+            }
+            step = fresh;
+        }
+        if park_cancelled {
+            break; // cancelled while parked; finalize below
+        }
+        if resolution_skipped {
+            continue;
+        }
+        // Steal 6: a consented Replace for a Move clears the
+        // existing destination first — exec_move_rename's
+        // never-overwrite guard (§7.2) stays untouched for every
+        // step the user did NOT consent to.
+        let final_mark = {
+            let j = handle.job.lock().unwrap();
+            j.collision_marks.get(step_id).copied()
+        };
+        if final_mark == Some(ufm_jobs::CollisionMark::Replace) {
+            if let ufm_jobs::StepOp::Move {
+                dst_parent,
+                new_name,
+                ..
+            } = &step.op
+            {
+                if let Some(parent) = dst_parent.provider_key.as_deref() {
+                    let dst = Path::new(parent).join(new_name);
+                    if let Ok(md) = std::fs::symlink_metadata(&dst) {
+                        if md.file_type().is_dir() {
+                            let _ = std::fs::remove_dir_all(&dst);
+                        } else {
+                            let _ = std::fs::remove_file(&dst);
+                        }
+                    }
+                }
+            }
+        }
         transition_step(
             &handle,
             &catalog,
@@ -4030,6 +4463,9 @@ pub async fn start_copy(
 pub struct MoveRequest {
     pub sources: Vec<ItemId>,
     pub dst_dir: String,
+    /// Steal 6: "ask_me" | "auto_rename" (absent = auto_rename).
+    #[serde(default)]
+    pub collision_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4037,6 +4473,9 @@ pub struct MoveRequest {
 pub struct MovePathsRequest {
     pub sources: Vec<String>,
     pub dst_dir: String,
+    /// Steal 6: "ask_me" | "auto_rename" (absent = auto_rename).
+    #[serde(default)]
+    pub collision_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4044,6 +4483,9 @@ pub struct MovePathsRequest {
 pub struct CopyPathsRequest {
     pub sources: Vec<String>,
     pub dst_dir: String,
+    /// Steal 6: "ask_me" | "auto_rename" (absent = auto_rename).
+    #[serde(default)]
+    pub collision_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4067,7 +4509,12 @@ pub async fn start_move(
     req: MoveRequest,
 ) -> Cmd<JobStart> {
     let (srcs, location) = resolve_source_paths(&state, &req.sources)?;
-    let job = plan_move_job(&srcs, Path::new(&req.dst_dir), location)?;
+    let job = plan_move_job(
+        &srcs,
+        Path::new(&req.dst_dir),
+        location,
+        parse_collision_policy(req.collision_policy.as_deref()),
+    )?;
     start_job(app, &state, job)
 }
 
@@ -4079,7 +4526,12 @@ pub async fn start_move_from_paths(
 ) -> Cmd<JobStart> {
     let srcs: Vec<PathBuf> = req.sources.iter().map(PathBuf::from).collect();
     let location = location_for_path(&state, Path::new(&req.dst_dir));
-    let job = plan_move_job(&srcs, Path::new(&req.dst_dir), location)?;
+    let job = plan_move_job(
+        &srcs,
+        Path::new(&req.dst_dir),
+        location,
+        parse_collision_policy(req.collision_policy.as_deref()),
+    )?;
     start_job(app, &state, job)
 }
 
@@ -4091,7 +4543,12 @@ pub async fn start_copy_from_paths(
 ) -> Cmd<JobStart> {
     let srcs: Vec<PathBuf> = req.sources.iter().map(PathBuf::from).collect();
     let location = location_for_path(&state, Path::new(&req.dst_dir));
-    let job = plan_copy_job_paths(&srcs, Path::new(&req.dst_dir), location)?;
+    let job = plan_copy_job_paths(
+        &srcs,
+        Path::new(&req.dst_dir),
+        location,
+        parse_collision_policy(req.collision_policy.as_deref()),
+    )?;
     start_job(app, &state, job)
 }
 
@@ -4133,6 +4590,8 @@ pub struct JobSummary {
     pub bytes_total: u64,
     /// UI round (packed transfer): the card's "Packed transfer" label.
     pub packed: bool,
+    /// Steal 6: collisions this job is parked on (compare cards).
+    pub pending_conflicts: Vec<PendingConflictDto>,
 }
 
 #[tauri::command]
@@ -4176,6 +4635,7 @@ pub async fn list_jobs(state: State<'_, AppState>) -> Cmd<Vec<JobSummary>> {
                 bytes_done: job_bytes_done(j),
                 bytes_total: j.preview.bytes_to_move,
                 packed: j.packed,
+                pending_conflicts: pending_conflicts(j),
             }
         })
         .collect())
@@ -4220,6 +4680,52 @@ pub async fn pause_job(
     }
     let bytes = locked_bytes_done(&handle);
     emit_from_handle(&app, &handle, bytes, None, None);
+    Ok(())
+}
+
+/// Steal 6: the user's call on one parked name collision —
+/// "replace" (the app's only overwrite, explicit per item),
+/// "keep_both" (the auto-rename after all), or "skip" (this item
+/// doesn't travel; anything depending on it — a move's Delete
+/// companion above all — is skipped with it). The decision IS the
+/// resume: the park releases and the executor picks the step up
+/// with its new orders.
+#[tauri::command]
+pub async fn resolve_collision(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    job: JobId,
+    step_id: String,
+    choice: String,
+) -> Cmd<()> {
+    let handle = job_handle(&state, job)?;
+    let landed = {
+        let mut j = handle.job.lock().unwrap();
+        apply_collision_resolution(&mut j, &step_id, &choice)
+            .map_err(|e| CommandError::from(UfmError::InvalidInput(e)))?
+    };
+    if !landed {
+        return Ok(()); // stale card — the step wasn't waiting
+    }
+    handle
+        .pause
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    {
+        let mut j = handle.job.lock().unwrap();
+        if j.state == ufm_jobs::JobState::Paused {
+            j.state = ufm_jobs::JobState::Running;
+        }
+    }
+    // Durable before anything moves: a crash between the decision
+    // and the step must never resurrect the question — or worse,
+    // run the step undecided.
+    let catalog = open_catalog(&state)?;
+    checkpoint_handle(&handle, &catalog);
+    let bytes = locked_bytes_done(&handle);
+    emit_from_handle(&app, &handle, bytes, None, None);
+    // If no executor is live (a job recovered at startup, parked
+    // before it ever ran), spawn one — it skips finished steps.
+    spawn_executor(app, &state, job);
     Ok(())
 }
 
@@ -5260,16 +5766,34 @@ pub struct ViewProfileDto {
     /// 1 ascending, -1 descending.
     pub sort_dir: i32,
     pub show_extensions: bool,
+    /// Grand Pass steal 5: group-by bucket ("" | date | type |
+    /// size). Defaulted so profiles written by older builds (and
+    /// older app versions reading newer ones) still parse.
+    #[serde(default)]
+    pub group_by: String,
+    /// Read-side only: true when the profile returned for a folder
+    /// is that folder's OWN row (not the inherited location row) —
+    /// the UI offers "Reset this folder's view" only then. Ignored
+    /// on writes.
+    #[serde(default)]
+    pub folder_override: bool,
 }
 
-/// The remembered view profile for a location, if one was saved.
+/// The remembered view profile for a folder, if one was saved.
+/// Resolution (Grand Pass steal 5): the folder's own row wins;
+/// else the location-level row (where every pre-pass profile
+/// lives); else none and the app default decides. `dir` is the
+/// folder's path inside the location; omit it (or pass "") to
+/// address the location level itself.
 #[tauri::command]
 pub async fn get_view_profile(
     state: State<'_, AppState>,
     location: LocationId,
+    dir: Option<String>,
 ) -> Cmd<Option<ViewProfileDto>> {
-    let row = open_catalog(&state)?
-        .view_profile(&location)
+    let dir_key = dir.unwrap_or_default();
+    let (row, folder_override) = open_catalog(&state)?
+        .view_profile_resolved(&location, &dir_key)
         .map_err(CommandError::from)?;
     Ok(row.map(|r| {
         let sort: serde_json::Value =
@@ -5283,16 +5807,20 @@ pub async fn get_view_profile(
                 .to_string(),
             sort_dir: sort.get("dir").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
             show_extensions: r.show_extensions,
+            group_by: r.group_by,
+            folder_override,
         }
     }))
 }
 
-/// Remember how a location likes to be looked at (per-location view
-/// memory: mode + sort, restored on the next visit).
+/// Remember how a folder likes to be looked at (Grand Pass steal
+/// 5: per-FOLDER view memory — mode + sort + grouping, restored on
+/// the next visit; folders without a row inherit the location's).
 #[tauri::command]
 pub async fn set_view_profile(
     state: State<'_, AppState>,
     location: LocationId,
+    dir: Option<String>,
     profile: ViewProfileDto,
 ) -> Cmd<()> {
     let sort_json = serde_json::json!({ "key": profile.sort_key, "dir": profile.sort_dir })
@@ -5300,12 +5828,175 @@ pub async fn set_view_profile(
     open_catalog(&state)?
         .set_view_profile(
             &location,
+            &dir.unwrap_or_default(),
             &ufm_catalog::ViewProfileRow {
                 view_mode: profile.view_mode,
                 sort_json,
                 show_extensions: profile.show_extensions,
+                group_by: profile.group_by,
             },
         )
+        .map_err(CommandError::from)?;
+    Ok(())
+}
+
+/// Forget a folder's own view row (the Reset). Inheritance resumes:
+/// the folder wears the location's profile, or the app default.
+#[tauri::command]
+pub async fn delete_view_profile(
+    state: State<'_, AppState>,
+    location: LocationId,
+    dir: String,
+) -> Cmd<()> {
+    open_catalog(&state)?
+        .delete_view_profile(&location, &dir)
+        .map_err(CommandError::from)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------
+// Home base (Grand Pass steal 1): Recent + Frequent, learned and
+// kept on this computer only. Recording is event-driven from the
+// shell (opens, previews, navigations) — no timers, no sync.
+// ---------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HomeRecentDto {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub location_id: String,
+    pub item_id: String,
+    pub opened_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HomeVisitDto {
+    pub path: String,
+    pub name: String,
+    pub location_id: String,
+    pub item_id: String,
+    pub visits: i64,
+    pub last_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HomeFeedDto {
+    pub recents: Vec<HomeRecentDto>,
+    pub frequent: Vec<HomeVisitDto>,
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The Home base feed: the 30 newest recents + the 12 most
+/// visited folders.
+#[tauri::command]
+pub async fn get_home_feed(state: State<'_, AppState>) -> Cmd<HomeFeedDto> {
+    let cat = open_catalog(&state)?;
+    let recents = cat
+        .home_recents(30)
+        .map_err(CommandError::from)?
+        .into_iter()
+        .map(|r| HomeRecentDto {
+            path: r.path,
+            name: r.name,
+            kind: r.kind,
+            location_id: r.location_id,
+            item_id: r.item_id,
+            opened_at: r.opened_at,
+        })
+        .collect();
+    let frequent = cat
+        .home_frequent(12)
+        .map_err(CommandError::from)?
+        .into_iter()
+        .map(|r| HomeVisitDto {
+            path: r.path,
+            name: r.name,
+            location_id: r.location_id,
+            item_id: r.item_id,
+            visits: r.visits,
+            last_at: r.last_at,
+        })
+        .collect();
+    Ok(HomeFeedDto { recents, frequent })
+}
+
+/// Note a file opened or previewed (fire-and-forget from the UI).
+#[tauri::command]
+pub async fn record_recent(
+    state: State<'_, AppState>,
+    path: String,
+    name: String,
+    kind: String,
+    location: String,
+    item: String,
+) -> Cmd<()> {
+    open_catalog(&state)?
+        .record_recent(&ufm_catalog::HomeRecentRow {
+            path,
+            name,
+            kind,
+            location_id: location,
+            item_id: item,
+            opened_at: unix_now_secs(),
+        })
+        .map_err(CommandError::from)?;
+    Ok(())
+}
+
+/// Note a folder visited (fire-and-forget from the UI).
+#[tauri::command]
+pub async fn record_folder_visit(
+    state: State<'_, AppState>,
+    path: String,
+    name: String,
+    location: String,
+    item: String,
+) -> Cmd<()> {
+    open_catalog(&state)?
+        .record_folder_visit(&path, &name, &location, &item, unix_now_secs())
+        .map_err(CommandError::from)?;
+    Ok(())
+}
+
+/// Forget one recent file.
+#[tauri::command]
+pub async fn forget_recent(state: State<'_, AppState>, path: String) -> Cmd<()> {
+    open_catalog(&state)?
+        .forget_recent(&path)
+        .map_err(CommandError::from)?;
+    Ok(())
+}
+
+/// Wipe the Recent shelf.
+#[tauri::command]
+pub async fn clear_recents(state: State<'_, AppState>) -> Cmd<()> {
+    open_catalog(&state)?
+        .clear_recents()
+        .map_err(CommandError::from)?;
+    Ok(())
+}
+
+/// Forget one frequent folder.
+#[tauri::command]
+pub async fn forget_frequent(state: State<'_, AppState>, path: String) -> Cmd<()> {
+    open_catalog(&state)?
+        .forget_frequent(&path)
+        .map_err(CommandError::from)?;
+    Ok(())
+}
+
+/// Wipe the frequent shelf.
+#[tauri::command]
+pub async fn clear_frequent(state: State<'_, AppState>) -> Cmd<()> {
+    open_catalog(&state)?
+        .clear_frequent()
         .map_err(CommandError::from)?;
     Ok(())
 }
@@ -14802,6 +15493,7 @@ fn build_organize_job(
         ),
         seq: 0,
         location,
+        policy: ufm_jobs::CollisionPolicy::AutoRename,
     };
     // abs dir -> step id that creates it (None = already on disk)
     let mut dir_steps: std::collections::HashMap<PathBuf, Option<String>> =
@@ -14885,7 +15577,7 @@ fn build_organize_job(
             ));
         } else {
             let (_, _, del) =
-                planner.add_move_file(&src, &dst_parent, &new_name, size, dep);
+                planner.add_move_file(&src, &dst_parent, &new_name, size, dep, false);
             if let Some(s) = planner.job.steps.get_mut(&del) {
                 s.outcome = true;
                 s.outcome_path = Some(action.dst.clone());
@@ -15032,6 +15724,7 @@ fn build_rom_organize_job(
         ),
         seq: 0,
         location,
+        policy: ufm_jobs::CollisionPolicy::AutoRename,
     };
     // abs dir -> step id that creates it (None = already on disk)
     let mut dir_steps: std::collections::HashMap<PathBuf, Option<String>> =
@@ -15103,7 +15796,7 @@ fn build_rom_organize_job(
             );
         } else {
             let (_, _, del) =
-                planner.add_move_file(&src, &dst_parent, &new_name, size, dep);
+                planner.add_move_file(&src, &dst_parent, &new_name, size, dep, false);
             if let Some(s) = planner.job.steps.get_mut(&del) {
                 s.outcome = true;
                 s.outcome_path = Some(action.dst.clone());
@@ -17333,6 +18026,7 @@ mod tests {
             &[file.clone(), tree.clone(), stay.clone()],
             &dst,
             LocationId::default(),
+            ufm_jobs::CollisionPolicy::AutoRename,
         )
         .unwrap();
         // Exactly one Move step per real source; the already-there
@@ -17350,7 +18044,13 @@ mod tests {
             .all(|s| !matches!(s.op, ufm_jobs::StepOp::Delete { .. })));
 
         // Collision: resolved name + a preview NameCollision conflict.
-        let job2 = plan_move_job(&[collide], &dst, LocationId::default()).unwrap();
+        let job2 = plan_move_job(
+            &[collide],
+            &dst,
+            LocationId::default(),
+            ufm_jobs::CollisionPolicy::AutoRename,
+        )
+        .unwrap();
         assert_eq!(job2.steps.len(), 1);
         let only = job2.steps.values().next().unwrap();
         match &only.op {
@@ -17368,6 +18068,204 @@ mod tests {
     }
 
     #[test]
+    fn ask_me_copy_plan_parks_on_collision() {
+        // Steal 6: under AskMe the colliding file keeps its real
+        // name and BOTH its steps park; a non-colliding file in
+        // the same job plans exactly as before.
+        let base = inc2_dir("askme-copy");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        write_file(&dst.join("collide.txt"), b"old");
+        let src_dir = base.join("src");
+        let collide = src_dir.join("collide.txt");
+        write_file(&collide, b"new");
+        let plain = src_dir.join("plain.txt");
+        write_file(&plain, b"plain");
+        let job = plan_copy_job_paths(
+            &[collide, plain],
+            &dst,
+            LocationId::default(),
+            ufm_jobs::CollisionPolicy::AskMe,
+        )
+        .unwrap();
+        assert_eq!(job.collision_policy, ufm_jobs::CollisionPolicy::AskMe);
+        let copies: Vec<_> = job
+            .steps
+            .values()
+            .filter_map(|s| match &s.op {
+                ufm_jobs::StepOp::Copy { new_name, .. } => {
+                    Some((s.id.clone(), new_name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(copies.len(), 2);
+        for (id, new_name) in &copies {
+            let marked = job.collision_marks.contains_key(id);
+            if new_name == "collide.txt" {
+                assert!(marked, "colliding copy step must park");
+            } else {
+                assert_eq!(new_name, "plain.txt");
+                assert!(!marked, "clean copy step must not park");
+            }
+        }
+        // The preview still reports the collision honestly.
+        assert_eq!(job.preview.conflicts.len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ask_me_move_plan_parks_and_autorename_is_unchanged() {
+        // Steal 6: same-device move under AskMe — one rename step,
+        // original name, parked. Under AutoRename the SAME setup
+        // yields the founding behavior: "name 2", no marks.
+        let base = inc2_dir("askme-move");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        write_file(&dst.join("collide.txt"), b"old");
+        let src = base.join("collide.txt");
+        write_file(&src, b"new");
+
+        let ask = plan_move_job(
+            &[src.clone()],
+            &dst,
+            LocationId::default(),
+            ufm_jobs::CollisionPolicy::AskMe,
+        )
+        .unwrap();
+        let only = ask.steps.values().next().unwrap();
+        match &only.op {
+            ufm_jobs::StepOp::Move { new_name, .. } => {
+                assert_eq!(new_name, "collide.txt")
+            }
+            _ => panic!("expected a Move step"),
+        }
+        assert_eq!(
+            ask.collision_marks.get(&only.id),
+            Some(&ufm_jobs::CollisionMark::Awaiting)
+        );
+
+        let auto = plan_move_job(
+            &[src],
+            &dst,
+            LocationId::default(),
+            ufm_jobs::CollisionPolicy::AutoRename,
+        )
+        .unwrap();
+        let only = auto.steps.values().next().unwrap();
+        match &only.op {
+            ufm_jobs::StepOp::Move { new_name, .. } => {
+                assert_eq!(new_name, "collide.txt 2")
+            }
+            _ => panic!("expected a Move step"),
+        }
+        assert!(auto.collision_marks.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn collision_resolutions_land_the_right_orders() {
+        // Steal 6: the resolve core, driven without an app — a
+        // cross-device move (VerifyCopy → Copy → Delete) per choice.
+        let plan = |tag: &str| {
+            let base = inc2_dir(tag);
+            let dst = base.join("dst");
+            std::fs::create_dir_all(&dst).unwrap();
+            write_file(&dst.join("collide.txt"), b"old");
+            let src = base.join("collide.txt");
+            write_file(&src, b"new");
+            let job = plan_move_job_with(
+                &[src],
+                &dst,
+                LocationId::default(),
+                &|_, _| false,
+                ufm_jobs::CollisionPolicy::AskMe,
+            )
+            .unwrap();
+            let copy_id = job
+                .steps
+                .values()
+                .find(|s| matches!(s.op, ufm_jobs::StepOp::Copy { .. }))
+                .unwrap()
+                .id
+                .clone();
+            (base, job, copy_id)
+        };
+
+        // Replace: both parked steps take the Replace mark.
+        let (base, mut job, copy_id) = plan("askme-replace");
+        assert!(apply_collision_resolution(&mut job, &copy_id, "replace").unwrap());
+        assert_eq!(
+            job.collision_marks.get(&copy_id),
+            Some(&ufm_jobs::CollisionMark::Replace)
+        );
+        let verify_id = job
+            .steps
+            .values()
+            .find(|s| matches!(s.op, ufm_jobs::StepOp::VerifyCopy { .. }))
+            .unwrap()
+            .id
+            .clone();
+        assert_eq!(
+            job.collision_marks.get(&verify_id),
+            Some(&ufm_jobs::CollisionMark::Replace)
+        );
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Keep both: the copy (and its verify, and the Delete's
+        // recorded outcome path) move to the free name; marks clear.
+        let (base, mut job, copy_id) = plan("askme-keepboth");
+        assert!(apply_collision_resolution(&mut job, &copy_id, "keep_both").unwrap());
+        assert!(job.collision_marks.is_empty());
+        let copy = job.steps.get(&copy_id).unwrap();
+        match &copy.op {
+            ufm_jobs::StepOp::Copy { new_name, .. } => {
+                assert_eq!(new_name, "collide.txt 2")
+            }
+            _ => panic!("expected a Copy step"),
+        }
+        let verify = job
+            .steps
+            .values()
+            .find(|s| matches!(s.op, ufm_jobs::StepOp::VerifyCopy { .. }))
+            .unwrap();
+        match &verify.op {
+            ufm_jobs::StepOp::VerifyCopy { dst, .. } => {
+                assert!(dst
+                    .provider_key
+                    .as_deref()
+                    .unwrap()
+                    .ends_with("collide.txt 2"))
+            }
+            _ => unreachable!(),
+        }
+        let del = job
+            .steps
+            .values()
+            .find(|s| matches!(s.op, ufm_jobs::StepOp::Delete { .. }))
+            .unwrap();
+        assert!(del
+            .outcome_path
+            .as_deref()
+            .unwrap()
+            .ends_with("collide.txt 2"));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Skip: the whole chain — verify, copy, AND the Delete
+        // companion — is Skipped. The source must survive a skip.
+        let (base, mut job, copy_id) = plan("askme-skip");
+        assert!(apply_collision_resolution(&mut job, &copy_id, "skip").unwrap());
+        assert!(job.collision_marks.is_empty());
+        assert!(job
+            .steps
+            .values()
+            .all(|s| s.state == ufm_jobs::StepState::Skipped));
+        // A stale second decision lands nothing.
+        assert!(!apply_collision_resolution(&mut job, &copy_id, "replace").unwrap());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn move_plan_cross_device_decomposes() {
         let base = inc2_dir("move-cross");
         let dst = base.join("dst");
@@ -17381,6 +18279,7 @@ mod tests {
             &dst,
             LocationId::default(),
             &|_, _| false,
+            ufm_jobs::CollisionPolicy::AutoRename,
         )
         .unwrap();
 
@@ -17435,7 +18334,13 @@ mod tests {
         let lone = base.join("lone.bin");
         write_file(&lone, b"lone");
         let job2 =
-            plan_move_job_with(&[lone], &dst, LocationId::default(), &|_, _| false)
+            plan_move_job_with(
+                &[lone],
+                &dst,
+                LocationId::default(),
+                &|_, _| false,
+                ufm_jobs::CollisionPolicy::AutoRename,
+            )
                 .unwrap();
         assert_eq!(job2.steps.len(), 3);
         let del2 = job2
@@ -18072,6 +18977,7 @@ fn build_sync_job(
         ),
         seq: 0,
         location: loc_a,
+        policy: ufm_jobs::CollisionPolicy::AutoRename,
     };
     let mut effects: std::collections::HashMap<String, crate::sync::StepEffect> =
         std::collections::HashMap::new();

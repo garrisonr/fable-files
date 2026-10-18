@@ -7,6 +7,8 @@ import type { Item, LocationSummary } from "./api";
 export type ViewMode = "grid" | "list" | "columns" | "gallery";
 export type SortKey = "name" | "size" | "modified";
 export type SortDir = 1 | -1;
+/** Grand Pass steal 2: the group-by bucket for the file view. */
+export type GroupBy = "none" | "date" | "type" | "size";
 
 export interface Crumb {
   dirId: string;
@@ -26,6 +28,8 @@ export interface Tab {
   view: ViewMode;
   sort: SortKey;
   sortDir: SortDir;
+  /** Group-by bucket (steal 2); remembered per folder (steal 5). */
+  groupBy: GroupBy;
   items: Item[];
   /** True when the current directory failed to load (moved, deleted,
    * drive unplugged) — the view renders a humane "gone" state instead
@@ -47,6 +51,7 @@ export function makeTab(loc: LocationSummary): Tab {
     view: "grid",
     sort: "name",
     sortDir: 1,
+    groupBy: "none",
     items: [],
     dirGone: false,
     selection: new Set(),
@@ -102,6 +107,21 @@ export function goForward(tab: Tab): boolean {
   tab.selection.clear();
   tab.anchorIndex = -1;
   tab.title = currentDir(tab).crumbs[currentDir(tab).crumbs.length - 1].name;
+  return true;
+}
+
+/** Jump straight to a history entry (the Back/Forward dropdowns,
+ * Grand Pass steal 3). Same hygiene as goBack/goForward: the
+ * selection belongs to the folder you were looking at, not the
+ * one you land in. */
+export function jumpToHistory(tab: Tab, index: number): boolean {
+  if (index < 0 || index >= tab.history.length || index === tab.hIndex)
+    return false;
+  tab.hIndex = index;
+  tab.selection.clear();
+  tab.anchorIndex = -1;
+  const dir = currentDir(tab);
+  tab.title = dir.crumbs[dir.crumbs.length - 1].name;
   return true;
 }
 

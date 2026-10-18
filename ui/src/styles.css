@@ -141,6 +141,29 @@ th[data-sort]:focus-visible {
   transform: scale(0.96);
 }
 
+/* Grand Pass steal 4: the per-segment sibling chevron — quiet at
+   rest, ink on hover, sized to the crumb row. */
+.crumb-chev {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--ufm-text-muted);
+  font: inherit;
+  font-size: 0.62rem;
+  line-height: 1;
+  padding: 0.25rem 0.2rem;
+  margin-left: -0.15rem;
+  border-radius: calc(var(--ufm-radius-md) / 2);
+  cursor: pointer;
+  flex: none;
+  align-self: center;
+}
+
+.crumb-chev:hover {
+  color: var(--ufm-text);
+  background: color-mix(in srgb, var(--ufm-text) 8%, transparent);
+}
+
 .crumb.current {
   font-weight: 600;
 }
@@ -668,6 +691,128 @@ th[data-sort]:focus-visible {
   gap: 0.25rem;
   padding: 0.75rem;
   align-content: start;
+}
+
+/* Grand Pass steal 2: group-by stack heads — quiet shelves, not
+   banners. In grid view the head spans the whole row; in list
+   view it rides a full-width row of its own. */
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--ufm-text-muted);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-align: left;
+  padding: 0.55rem 0.25rem 0.3rem;
+  cursor: pointer;
+}
+
+.group-head:hover {
+  color: var(--ufm-text);
+}
+
+.fileview-scroller.grid .group-head {
+  grid-column: 1 / -1;
+}
+
+.group-chev {
+  font-size: 0.62rem;
+  flex: none;
+}
+
+.group-count {
+  margin-left: auto;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.group-row td {
+  padding: 0 0.25rem;
+}
+
+/* Grand Pass steal 7: the Facts section under the attached
+   preview. Same dl grammar as the card's own meta, one quiet
+   section head, pencil-less editable values (hover underlines
+   the invitation). */
+.ql-facts-btn.on {
+  background: var(--ufm-accent);
+  color: var(--ufm-on-accent, #fff);
+}
+
+.ql-facts {
+  margin-top: 1rem;
+  border-top: 1px solid var(--ufm-border);
+  padding-top: 0.6rem;
+}
+
+.ql-facts-head {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ufm-text-muted);
+  margin-bottom: 0.4rem;
+}
+
+.ql-facts-empty {
+  color: var(--ufm-text-muted);
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+.ql-fact-editable {
+  cursor: text;
+  border-radius: 0.25rem;
+}
+
+.ql-fact-editable:hover {
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+.ql-fact-input {
+  font: inherit;
+  width: 100%;
+  box-sizing: border-box;
+  color: inherit;
+  background: var(--ufm-surface);
+  border: 1px solid var(--ufm-accent);
+  border-radius: 0.3rem;
+  padding: 0.1rem 0.3rem;
+}
+
+/* Grand Pass steal 8: check boxes for selection — a 20 px hit
+   area (the design token), accent-tinted, riding the cell's
+   corner in grid view and leading the name in list view. */
+.fv-check {
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  accent-color: var(--ufm-accent);
+  cursor: pointer;
+  flex: none;
+}
+
+.fileview.fv-checks-on .cell {
+  position: relative;
+}
+
+.fileview-scroller.grid .fv-check {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  z-index: 2;
+}
+
+.list-table .fv-check {
+  margin-right: 0.4rem;
+  vertical-align: middle;
 }
 
 .cell {
@@ -2467,8 +2612,6 @@ body[data-layout="tv"] .cell-icon {
    glyph takes the sidebar's own ink in every theme. */
 .side-glyph svg { width: 1rem; height: 1rem; display: block; }
 .side-item:has(.side-glyph) { align-items: center; }
-.rom-door-glyph { display: inline-flex; align-items: center; }
-.rom-door-glyph svg { width: 1.05rem; height: 1.05rem; display: block; }
 .side-count {
   margin-left: auto; color: var(--ufm-text-muted); font-size: 0.75rem;
   font-variant-numeric: tabular-nums; flex: none;
@@ -2875,7 +3018,23 @@ tr.row[style*="--label-color"] {
   color: var(--ufm-text);
 }
 .jobs-panel[hidden] { display: none; }
-.jobs-head { font-size: 0.6875rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: var(--ufm-text-muted); margin-bottom: 0.35rem; }
+.jobs-head { font-size: 0.6875rem; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: var(--ufm-text-muted); margin-bottom: 0.35rem; display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+
+/* Steal 6: the collision policy picker + the Ask-me cards. */
+.jobs-policy { display: inline-flex; align-items: center; gap: 0.4rem; text-transform: none; letter-spacing: normal; font-weight: 400; }
+.jobs-policy-select { font: inherit; font-size: 0.75rem; color: inherit; background: var(--ufm-surface); border: 1px solid var(--ufm-border); border-radius: 0.4rem; padding: 0.15rem 0.3rem; }
+.job-conflicts { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 0.5rem; }
+.job-conflicts:empty { display: none; }
+.job-conflict { border: 1px solid var(--ufm-border); border-radius: 0.6rem; background: var(--ufm-surface); padding: 0.6rem 0.7rem; display: flex; flex-direction: column; gap: 0.45rem; }
+.job-conflict-title { font-size: 0.85rem; font-weight: 700; }
+.job-conflict-sides { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+.job-conflict-side-head { display: flex; align-items: center; gap: 0.35rem; font-size: 0.78rem; font-weight: 600; }
+.job-conflict-side-head svg { width: 16px; height: 16px; }
+.job-conflict-side-meta { font-size: 0.72rem; color: var(--ufm-text-muted); font-variant-numeric: tabular-nums; margin-top: 0.15rem; }
+.job-conflict-verdict { font-size: 0.8rem; }
+.job-conflict-where { font-size: 0.7rem; color: var(--ufm-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-conflict-actions { display: flex; gap: 0.45rem; }
+.job-conflict-btn.danger { color: var(--ufm-danger, #c0392b); border-color: currentColor; }
 .jobs-list { display: flex; flex-direction: column; gap: 0.5rem; }
 .job-row { display: grid; grid-template-columns: 1fr auto auto; gap: 0.2rem 0.5rem; align-items: center; }
 .job-row-xfer { grid-template-columns: 1fr auto auto auto; }
@@ -4169,23 +4328,10 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 .romhome.rh-tv .rh-tr:focus-visible { outline-width: 3px; }
 .romhome.rh-tv .rh-inspector { width: 380px; }
 
-/* ---- The sidebar door + the Files reverse door ---- */
-.side-head.rom-door {
-  display: flex; align-items: center; gap: 8px;
-  width: calc(100% - 1rem);
-  border: none; background: none; cursor: pointer;
-  padding: 5px 8px; border-radius: var(--ufm-radius-md);
-  font-size: 0.78rem; text-align: left;
-}
-.side-head.rom-door:hover { background: color-mix(in srgb, var(--ufm-text) 7%, transparent); color: var(--ufm-text); }
-.side-head.rom-door.selected {
-  color: var(--ufm-accent-text);
-  background: color-mix(in srgb, var(--ufm-accent) 14%, transparent);
-  box-shadow: inset 3px 0 0 var(--ufm-accent);
-}
-.rom-door-glyph { font-size: 0.95rem; text-transform: none; }
-.rom-door-label { flex: 1; }
-.rom-door-count { color: var(--ufm-text-muted); font-variant-numeric: tabular-nums; letter-spacing: 0; }
+/* ---- Games-row furniture (Grand Pass item 11, 2026-10-18: the
+   Games/Books doors are standard .side-item rows now; the missing-
+   media dot and fleet pill are the only door-era classes left,
+   riding inside the Games row) ---- */
 .rom-door-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ufm-danger); flex: none; }
 .rom-door-pill { font-size: 0.625rem; font-weight: 600; padding: 0.1rem 0.45rem; border-radius: 999px; background: var(--ufm-surface-2, rgba(127,127,127,0.18)); color: var(--ufm-text-muted); flex: none; white-space: nowrap; }
 .rom-door-pill.has-updates { background: color-mix(in srgb, var(--ufm-accent) 22%, transparent); color: var(--ufm-accent); }
@@ -5267,6 +5413,145 @@ body[data-layout="tv"] .w-glyph svg {
   min-height: 0;
   background: var(--ufm-content-canvas);
   color: var(--ufm-text);
+}
+
+/* Grand Pass steal 1: Home base — three calm shelves (Pinned,
+   Recent, You visit these a lot) in the rooms' grammar. */
+.homebase {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: var(--ufm-content-canvas);
+  color: var(--ufm-text);
+}
+
+.homebase-note {
+  color: var(--ufm-text-muted);
+  font-size: 0.82rem;
+}
+
+.homebase-body {
+  overflow-y: auto;
+  padding: 0.5rem 1.25rem 2rem;
+  max-width: 62rem;
+  width: 100%;
+  margin: 0 auto;
+  box-sizing: border-box;
+}
+
+.homebase-section {
+  margin-top: 1.4rem;
+}
+
+.homebase-head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.55rem;
+}
+
+.homebase-h {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.homebase-clear {
+  margin-left: auto;
+}
+
+.homebase-empty {
+  color: var(--ufm-text-muted);
+  font-size: 0.88rem;
+  margin: 0.25rem 0 0;
+}
+
+.homebase-doors {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
+  gap: 0.5rem;
+}
+
+.homebase-door {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--ufm-border);
+  border-radius: 0.6rem;
+  background: var(--ufm-surface);
+  color: inherit;
+  font: inherit;
+  font-size: 0.9rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.homebase-door:hover {
+  background: var(--ufm-hover);
+}
+
+.homebase-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.homebase-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.42rem 0.5rem;
+  border-radius: 0.5rem;
+  cursor: pointer;
+}
+
+.homebase-row:hover,
+.homebase-row:focus-visible {
+  background: var(--ufm-hover);
+}
+
+.homebase-glyph {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+}
+
+.homebase-glyph svg {
+  width: 20px;
+  height: 20px;
+}
+
+.homebase-texts {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.homebase-name {
+  font-size: 0.92rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.homebase-sub {
+  color: var(--ufm-text-muted);
+  font-size: 0.78rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.homebase-forget {
+  margin-left: auto;
+  flex: none;
+  opacity: 0;
+}
+
+.homebase-row:hover .homebase-forget,
+.homebase-row:focus-within .homebase-forget {
+  opacity: 0.75;
 }
 .bh-sub { color: var(--ufm-text-muted); font-size: 0.85rem; }
 .bh-tidy {

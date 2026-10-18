@@ -9,6 +9,7 @@ import {
   formatBytes,
   onEmuFleetChanged,
   onLocationsChanged,
+  type HomeRecent,
   type Item,
   type JobOutcome,
   type JobStart,
@@ -31,6 +32,7 @@ import { showPluginRunDialog } from "./plugins";
 import { SearchView, fmtDay } from "./search";
 import { RomHome } from "./romhome";
 import { BooksHome } from "./bookshome";
+import { HomeView, type PinnedDoor } from "./homeview";
 import { MediaResDialog } from "./mediares";
 import { RomOrganizeDialog } from "./romorg";
 import { AddLocationGate } from "./addlocation";
@@ -45,7 +47,7 @@ import { loadLabelDefs, migrateLabelAssignments, saveLabelDefs } from "./labels"
 import { loadRomSystems, saveRomSystems, romsEnabled, romScopeOf, romSystemKey, isRomPlaceholder, setRomsEnabled, romDivisions, loadRomGrouping, saveRomGrouping, loadOpenDivisions, saveOpenDivisions, romIconSlug, loadRomIconSet, saveRomIconSet, type RomSystem, type OwnedHardware } from "./roms";
 import { ROM_FLAT_ICONS } from "./romicons_flat";
 import { MusicPlayer } from "./music";
-import { sectionGlyph, SECTION_ICON_SVG } from "./sectionicons";
+import { sectionGlyph } from "./sectionicons";
 import { isPlayableName, isVideoName } from "./video";
 import { OpenWithDialog } from "./openwith";
 import type { ArchiveEntry } from "./api";
@@ -65,7 +67,7 @@ import { DiskUtility } from "./disks";
 import { TorrentDialog } from "./torrent";
 import type { MenuItem } from "./contextmenu";
 import { PrintDialog } from "./print";
-import { JobsPanel } from "./jobs";
+import { JobsPanel, loadCollisionPolicy } from "./jobs";
 import { ShortcutOverlay } from "./shortcutoverlay";
 import {
   bindingById,
@@ -85,10 +87,12 @@ import {
   goForward,
   goToCrumb,
   goUp,
+  jumpToHistory,
   makeTab,
   navigate,
   sortedItems,
   type DirState,
+  type GroupBy,
   type Tab,
   type ViewMode,
 } from "./tabs";
@@ -130,11 +134,28 @@ interface SmartFolder {
   rule?: { extensions: string[]; minDurationSecs?: number | null };
 }
 
+/** The seeded built-in rule folders resolve their icon BY NAME
+ * first (Grand Pass item 9, 2026-10-18): the Documents rule itself
+ * carries ods/xls/xlsx, so extension inference below crowned it
+ * with the Spreadsheets glyph — Dickles' "identical icons" filing.
+ * Name-first is deterministic for the seeded set; user-created
+ * folders keep falling through to extension inference. */
+const BUILTIN_FOLDER_ICONS: Record<string, string> = {
+  audiobooks: "audiobooks",
+  music: "music",
+  movies: "movies",
+  documents: "documents",
+  spreadsheets: "spreadsheets",
+  magazines: "magazines",
+};
+
 /** Sidebar icon for a smart folder, by its rule's media kind
  * (sections/README.md mapping; mono adaptive set). Extension sets
  * mirror the seeded rule folders; name and search-type are
  * fallbacks; anything unrecognized wears the plain folder. */
 function smartFolderIcon(sf: SmartFolder): string {
+  const byName = BUILTIN_FOLDER_ICONS[sf.name.trim().toLowerCase()];
+  if (byName) return byName;
   const exts = new Set(
     (sf.rule?.extensions ?? []).map((e) => e.toLowerCase()),
   );
@@ -271,7 +292,13 @@ export class Shell {
   private collectionsCache: import("./api").CollectionInfo[] = [];
   /** Phase 2: last location whose view profile was applied, per tab
    * — a location's profile applies on ENTRY, not on every load. */
-  private profileLocByTab = new Map<number, string>();
+  private profileDirByTab = new Map<number, string>();
+  /** The resolved path key of the folder each tab's profile was
+   * applied for (steal 5) — saves and resets address the same row. */
+  private profileDirKeyByTab = new Map<number, string>();
+  /** Whether the active folder wears its OWN profile row (drives
+   * the "Reset this folder's view" menu item). */
+  private folderOverrideByTab = new Map<number, boolean>();
   private smartList!: HTMLElement;
   private romsHead!: HTMLElement;
   /** ROM Home door tallies (2026-10-15). */
@@ -281,6 +308,12 @@ export class Shell {
    * updates waiting, or the prep pass at work. */
   private romsFleetPill: HTMLElement | null = null;
   private romsList!: HTMLElement;
+  /** Grand Pass steal 1: the Home base surface + its door. */
+  private homeView!: HomeView;
+  private homeDoorEl: HTMLButtonElement | null = null;
+  /** Last dir each tab's visit was recorded for — a refresh of
+   * the same folder is not a new visit. */
+  private lastVisitDirByTab = new Map<number, string>();
   /** Ebook P1: the Books Home room + its sidebar door. */
   private booksHome!: import("./bookshome").BooksHome;
   private booksHead: HTMLElement | null = null;
@@ -721,6 +754,16 @@ export class Shell {
       onExit: () => this.exitBooksHome(),
     });
     void this.refreshBooksDoor();
+    this.homeView = new HomeView({
+      onExit: () => this.exitHomeBase(),
+      pinnedDoors: () => this.homePinnedDoors(),
+      onOpenFolder: (e) => this.openHomeFolder(e),
+      onRevealFile: (e) => void this.revealHomeFile(e),
+      onOpenFile: (e) => void this.openHomeFile(e),
+    });
+    // Quick Look is one of the two doors into Recent (steal 1):
+    // every preview, from every surface, notes the file.
+    this.quickLook.onShowItem = (item) => this.noteRecent(item);
     this.viewport.append(
       this.fileView.el,
       this.columnsView.el,
@@ -728,6 +771,7 @@ export class Shell {
       this.searchView.el,
       this.romHome.el,
       this.booksHome.el,
+      this.homeView.el,
       this.quickLook.el
     );
     // The search field lives in the toolbar; its results panel is in the viewport.
@@ -862,6 +906,7 @@ export class Shell {
           void api.setUiPrefs({ ...this.uiPrefs }).catch(() => undefined);
         }
         this.applyCollapsePrefs();
+        this.applyCheckBoxes();
         // Text size + grid icon size (UI round): durable prefs,
         // hydrated with the rest.
         const fs = this.uiPrefs["ff-font-scale"];
@@ -949,6 +994,11 @@ export class Shell {
     this.backBtn = this.navButton("Back", "←", () => this.goBack());
     this.fwdBtn = this.navButton("Forward", "→", () => this.goForward());
     this.upBtn = this.navButton("Up one level", "↑", () => this.goUp());
+    // Grand Pass steal 3: the history was always in the tab — now
+    // it is visible. Right-click or long-press Back/Forward for
+    // the jump list; plain clicks are untouched.
+    this.wireHistoryButton(this.backBtn, "back");
+    this.wireHistoryButton(this.fwdBtn, "forward");
     const nav = document.createElement("div");
     nav.className = "nav-buttons";
     nav.append(this.backBtn, this.fwdBtn, this.upBtn);
@@ -1155,23 +1205,22 @@ export class Shell {
     smartHead.textContent = "Smart Folders";
     this.smartList = document.createElement("div");
     this.smartList.className = "side-list";
-    // Round 7.1: collapsible, mirroring the Labels section exactly —
-    // chevron, list visibility toggle, persisted ff-roms-collapsed.
-    // The right-click Add-a-System menu is preserved.
-    // ROM Home (2026-10-15): the Roms Collection section is now a
-    // single door into the room — the per-system tree retired. The
-    // right-click Add-a-System menu is preserved on the door.
+    // ROM Home (2026-10-15): the Roms Collection section is a
+    // single entry into the room — the per-system tree retired.
+    // The right-click Add-a-System menu is preserved on the row.
+    // Grand Pass item 11 (2026-10-18): the Games door is now a
+    // standard sidebar ROW — same markup, geometry, glyph size and
+    // state language as every other realm entry (it used to be a
+    // one-off `side-head rom-door` header construct). The missing-
+    // media dot and the fleet pill ride inside the row; the count
+    // wears the shared `.side-count` grammar.
     const romsHead = document.createElement("button");
-    romsHead.className = "side-head rom-door";
+    romsHead.className = "side-item";
     romsHead.setAttribute("aria-label", "Open Games Home");
-    const romsGlyph = document.createElement("span");
-    romsGlyph.className = "rom-door-glyph";
-    romsGlyph.innerHTML = `<svg viewBox="0 0 48 48" aria-hidden="true">${SECTION_ICON_SVG.roms}</svg>`;
     const romsHeadText = document.createElement("span");
-    romsHeadText.className = "rom-door-label";
     romsHeadText.textContent = "Games";
     const romsCount = document.createElement("span");
-    romsCount.className = "rom-door-count";
+    romsCount.className = "side-count";
     const romsDot = document.createElement("span");
     romsDot.className = "rom-door-dot";
     romsDot.title = "Some games are missing media";
@@ -1179,11 +1228,7 @@ export class Shell {
     const romsPill = document.createElement("span");
     romsPill.className = "rom-door-pill";
     romsPill.hidden = true;
-    const romsChev = document.createElement("span");
-    romsChev.className = "side-chev";
-    romsChev.hidden = true;
-    romsHead.append(romsGlyph, romsHeadText, romsCount, romsDot, romsPill, romsChev);
-    this.romsChevEl = romsChev;
+    romsHead.append(sectionGlyph("roms"), romsHeadText, romsDot, romsPill, romsCount);
     this.romsDoorCount = romsCount;
     this.romsDoorDot = romsDot;
     this.romsFleetPill = romsPill;
@@ -1202,25 +1247,19 @@ export class Shell {
     this.romsHead = romsHead;
     this.romsList = document.createElement("div");
     this.romsList.className = "side-list";
-    this.romsList.hidden = true;
-    // Ebook P1 — the Books door, directly below the Games door:
-    // same grammar (glyph, word label, count, chevron), plain
-    // words per the terminology law.
+    this.romsList.appendChild(romsHead);
+    // Ebook P1 — the Books door, directly below the Games door.
+    // Grand Pass item 11: same conversion — a standard sidebar row
+    // in the same grammar as every other realm entry, plain words
+    // per the terminology law.
     const booksHead = document.createElement("button");
-    booksHead.className = "side-head rom-door";
+    booksHead.className = "side-item";
     booksHead.setAttribute("aria-label", "Open Books Home");
-    const booksGlyph = document.createElement("span");
-    booksGlyph.className = "rom-door-glyph";
-    booksGlyph.innerHTML = `<svg viewBox="0 0 48 48" aria-hidden="true">${SECTION_ICON_SVG.books}</svg>`;
     const booksHeadText = document.createElement("span");
-    booksHeadText.className = "rom-door-label";
     booksHeadText.textContent = "Books";
     const booksCount = document.createElement("span");
-    booksCount.className = "rom-door-count";
-    const booksChev = document.createElement("span");
-    booksChev.className = "side-chev";
-    booksChev.textContent = "›";
-    booksHead.append(booksGlyph, booksHeadText, booksCount, booksChev);
+    booksCount.className = "side-count";
+    booksHead.append(sectionGlyph("books"), booksHeadText, booksCount);
     booksHead.title = "Books Home — your library, shelved by series and author";
     booksHead.addEventListener("click", () => this.enterBooksHome());
     this.booksHead = booksHead;
@@ -1228,7 +1267,7 @@ export class Shell {
     void this.refreshBooksDoor();
     this.booksList = document.createElement("div");
     this.booksList.className = "side-list";
-    this.booksList.hidden = true;
+    this.booksList.appendChild(booksHead);
     sidebar.append(
       favHead,
       this.favList,
@@ -1240,9 +1279,7 @@ export class Shell {
       auditorRow,
       smartHead,
       this.smartList,
-      this.romsHead,
       this.romsList,
-      this.booksHead as HTMLElement,
       this.booksList,
       locHead,
       this.sidebarList,
@@ -1375,6 +1412,7 @@ export class Shell {
     const dir = currentDir(tab);
     if (tab === this.activeTab && this.romHome?.active) this.exitRomHome();
     if (tab === this.activeTab && this.booksHome?.active) this.exitBooksHome();
+    if (tab === this.activeTab && this.homeView?.active) this.exitHomeBase();
     // Round 7 (Gemini audit): capture a load token; if a newer load for
     // this tab starts while we await, this result is stale — discard it
     // silently instead of overwriting the current view.
@@ -1416,10 +1454,12 @@ export class Shell {
     tab.dirGone = gone;
     if (!isCurrent()) return; // stale load finished late — discard it
     tab.items = items;
-    // Per-location view memory: entering a location restores its
-    // remembered view mode + sort before anything renders.
+    // Per-folder view memory (steal 5): entering a folder restores
+    // its remembered view mode + sort + grouping before anything
+    // renders (folder row → location row → keep current look).
     await this.applyViewProfile(tab, dir);
     if (!isCurrent()) return;
+    if (!gone) this.noteFolderVisit(tab, dir);
     if (tab === this.activeTab) {
       this.renderActiveView();
       this.renderCrumbs();
@@ -1437,6 +1477,7 @@ export class Shell {
   private navigateTo(dir: { locationId: string; dirId: string; crumbs: { dirId: string; name: string }[] }): void {
     if (this.searchView.active) this.searchView.clear();
     if (this.romHome?.active) this.exitRomHome();
+    if (this.homeView?.active) this.exitHomeBase();
     const tab = this.requireTab();
     this.quickLook.close();
     navigate(tab, dir);
@@ -1457,6 +1498,87 @@ export class Shell {
       this.quickLook.close();
       void this.loadDir(tab);
     }
+  }
+
+  /** Grand Pass steal 3: right-click + long-press wiring for the
+   * nav buttons. A long-press that opened the menu must not also
+   * fire the plain click — the capture-phase guard swallows
+   * exactly that one click. */
+  private wireHistoryButton(
+    btn: HTMLButtonElement,
+    dir: "back" | "forward",
+  ): void {
+    btn.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.openHistoryMenu(btn, dir);
+    });
+    let timer: number | undefined;
+    let fired = false;
+    btn.addEventListener("pointerdown", () => {
+      fired = false;
+      timer = window.setTimeout(() => {
+        fired = true;
+        this.openHistoryMenu(btn, dir);
+      }, 450);
+    });
+    const cancel = (): void => {
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = undefined;
+    };
+    btn.addEventListener("pointerup", cancel);
+    btn.addEventListener("pointerleave", cancel);
+    btn.addEventListener(
+      "click",
+      (e) => {
+        if (fired) {
+          e.stopImmediatePropagation();
+          fired = false;
+        }
+      },
+      true,
+    );
+  }
+
+  /** The jump list for one direction: nearest first, the current
+   * stop checked and inert, each entry labeled by its leaf folder
+   * with the road that led there as the quiet right-hand text. */
+  private openHistoryMenu(
+    btn: HTMLButtonElement,
+    dir: "back" | "forward",
+  ): void {
+    const tab = this.activeTab;
+    if (!tab) return;
+    const items: MenuItem[] = [];
+    const push = (i: number): void => {
+      const d = tab.history[i];
+      const leaf = d.crumbs[d.crumbs.length - 1];
+      const road = d.crumbs
+        .slice(0, -1)
+        .map((c) => c.name)
+        .join(" / ");
+      const current = i === tab.hIndex;
+      items.push({
+        label: leaf ? leaf.name : "(folder)",
+        shortcut: current ? undefined : road || undefined,
+        checked: current,
+        disabled: current,
+        action: () => {
+          if (jumpToHistory(tab, i)) {
+            this.quickLook.close();
+            void this.loadDir(tab);
+          }
+        },
+      });
+    };
+    if (dir === "back") {
+      for (let i = tab.hIndex; i >= 0; i--) push(i);
+    } else {
+      for (let i = tab.hIndex; i < tab.history.length; i++) push(i);
+    }
+    if (items.length <= 1) return; // nowhere to jump — stay silent
+    const rect = btn.getBoundingClientRect();
+    this.ctxMenu.open(rect.left, rect.bottom + 6, items);
   }
 
   private goUp(): void {
@@ -1490,6 +1612,9 @@ export class Shell {
       }
       return;
     }
+    // Home base (steal 1): a real file being opened is a Recent.
+    // Folders record as visits when their load lands instead.
+    if (item.kind !== "folder") this.noteRecent(item);
     if (item.kind === "folder") {
       if (
         dir.dirId.startsWith("label:") ||
@@ -2037,8 +2162,8 @@ export class Shell {
       // suffix idiom now.
       const paths = clip.paths;
       const start = clip.cut
-        ? await api.startMoveFromPaths(paths, destDir)
-        : await api.startCopyFromPaths(paths, destDir);
+        ? await api.startMoveFromPaths(paths, destDir, loadCollisionPolicy())
+        : await api.startCopyFromPaths(paths, destDir, loadCollisionPolicy());
       const jobId = this.acceptJobStart(start, clip.cut ? "move" : "copy");
       if (!jobId) return;
       this.trackTransfer(
@@ -2094,7 +2219,7 @@ export class Shell {
     for (const [parent, paths] of byParent) {
       const count = paths.length;
       try {
-        const start = await api.startCopyFromPaths(paths, parent);
+        const start = await api.startCopyFromPaths(paths, parent, loadCollisionPolicy());
         const jobId = this.acceptJobStart(start, "copy");
         if (!jobId) continue;
         this.trackTransfer(jobId, "Duplicate", async (error) => {
@@ -2144,6 +2269,7 @@ export class Shell {
         const start = await api.startMove(
           items.map((i) => i.id),
           dest,
+          loadCollisionPolicy(),
         );
         const jobId = this.acceptJobStart(start, "move");
         if (!jobId) return;
@@ -2188,7 +2314,7 @@ export class Shell {
           .map((i) => i.provider_key)
           .filter((p): p is string => !!p);
         if (paths.length === 0) return;
-        const start = await api.startCopyFromPaths(paths, dest);
+        const start = await api.startCopyFromPaths(paths, dest, loadCollisionPolicy());
         const jobId = this.acceptJobStart(start, "copy");
         if (!jobId) return;
         this.trackTransfer(jobId, "Copy", async (error) => {
@@ -2421,15 +2547,20 @@ export class Shell {
 
   // ------------------------------------------- Phase 2: view profiles
 
-  /** Apply a location's remembered view profile on ENTRY (once per
-   * location per tab): view mode + sort, restored from the catalog. */
+  /** Apply the remembered view profile for THIS folder (once per
+   * folder per tab): the folder's own row wins, else its
+   * location's, else the tab keeps the look it already wears.
+   * (Grand Pass steal 5 — was per-location before the pass.) */
   private async applyViewProfile(tab: Tab, dir: DirState): Promise<void> {
     if (!dir.locationId || dir.dirId.includes(":")) return;
-    if (this.profileLocByTab.get(tab.id) === dir.locationId) return;
-    this.profileLocByTab.set(tab.id, dir.locationId);
+    if (this.profileDirByTab.get(tab.id) === dir.dirId) return;
+    this.profileDirByTab.set(tab.id, dir.dirId);
+    const path = await api.getItemPath(dir.dirId).catch(() => "");
+    this.profileDirKeyByTab.set(tab.id, path);
     const profile = await api
-      .getViewProfile(dir.locationId)
+      .getViewProfile(dir.locationId, path || undefined)
       .catch(() => null);
+    this.folderOverrideByTab.set(tab.id, !!profile?.folder_override);
     if (!profile) return;
     const modes = ["grid", "list", "columns", "gallery"] as const;
     if ((modes as readonly string[]).includes(profile.view_mode)) {
@@ -2439,24 +2570,96 @@ export class Shell {
       tab.sort = profile.sort_key as Tab["sort"];
     }
     tab.sortDir = profile.sort_dir < 0 ? -1 : 1;
+    tab.groupBy = (["date", "type", "size"] as const).includes(
+      profile.group_by as "date" | "type" | "size",
+    )
+      ? (profile.group_by as Tab["groupBy"])
+      : "none";
   }
 
-  /** Persist the active tab's view state as its location's profile.
-   * Only real location dirs have profiles — pseudo views (labels,
-   * collections, search) never overwrite a location's memory. */
+  /** Persist the active tab's view state as the CURRENT FOLDER's
+   * own profile. Only real location dirs have profiles — pseudo
+   * views (labels, collections, search) never write memory. When
+   * the folder's path can't be resolved the change simply isn't
+   * remembered: a view nicety must never break the view itself. */
   private saveViewProfile(): void {
     const tab = this.activeTab;
     if (!tab) return;
     const dir = currentDir(tab);
     if (!dir.locationId || dir.dirId.includes(":")) return;
+    const dirKey = this.profileDirKeyByTab.get(tab.id) ?? "";
+    if (!dirKey) return;
     void api
-      .setViewProfile(dir.locationId, {
-        view_mode: tab.view,
-        sort_key: tab.sort,
-        sort_dir: tab.sortDir,
-        show_extensions: true,
-      })
+      .setViewProfile(
+        dir.locationId,
+        {
+          view_mode: tab.view,
+          sort_key: tab.sort,
+          sort_dir: tab.sortDir,
+          show_extensions: true,
+          group_by: tab.groupBy === "none" ? "" : tab.groupBy,
+        },
+        dirKey,
+      )
+      .then(() => this.folderOverrideByTab.set(tab.id, true))
       .catch(() => undefined);
+  }
+
+  /** "Reset this folder's view": forget the folder's own row —
+   * the location's profile (or the defaults) takes over at once. */
+  private async resetFolderView(): Promise<void> {
+    const tab = this.activeTab;
+    if (!tab) return;
+    const dir = currentDir(tab);
+    const dirKey = this.profileDirKeyByTab.get(tab.id) ?? "";
+    if (!dir.locationId || !dirKey) return;
+    await api
+      .deleteViewProfile(dir.locationId, dirKey)
+      .catch(() => undefined);
+    this.folderOverrideByTab.set(tab.id, false);
+    this.profileDirByTab.delete(tab.id);
+    await this.applyViewProfile(tab, dir);
+    this.renderActiveView();
+  }
+
+  /** Check-box selection mode (steal 8): the stored preference
+   * wins; with none stored, a coarse-pointer (touch) facet turns
+   * it ON and a fine pointer leaves it OFF. */
+  private checkBoxesOn(): boolean {
+    const v = this.uiPrefs["ff-check-boxes"];
+    if (typeof v === "boolean") return v;
+    try {
+      const ls = localStorage.getItem("ff-check-boxes");
+      if (ls !== null) return ls === "1";
+      return window.matchMedia("(pointer: coarse)").matches;
+    } catch {
+      return false;
+    }
+  }
+
+  private applyCheckBoxes(): void {
+    if (this.fileView) this.fileView.checkboxMode = this.checkBoxesOn();
+  }
+
+  private setCheckBoxes(on: boolean): void {
+    this.uiPrefs["ff-check-boxes"] = on;
+    try {
+      localStorage.setItem("ff-check-boxes", on ? "1" : "0");
+    } catch {
+      // the sidecar below is the durable copy
+    }
+    void api.setUiPrefs({ ...this.uiPrefs }).catch(() => undefined);
+    this.applyCheckBoxes();
+    this.fileView.render();
+  }
+
+  /** Group-by setter (steal 2's menu, steal 5's memory). */
+  private setGroupBy(g: GroupBy): void {
+    const tab = this.activeTab;
+    if (!tab) return;
+    tab.groupBy = g;
+    this.saveViewProfile();
+    this.renderActiveView();
   }
 
   /** Prepopulated rule folders (Dickles, 2026-10-13). Music keeps
@@ -2527,6 +2730,19 @@ export class Shell {
           Shell.saveSmartFolders(list);
         }
         localStorage.setItem("ff-smart-v56", "1");
+      }
+    } catch { /* ignore */ }
+    // Grand Pass item 10 (2026-10-18): Magazines — periodical/comic
+    // containers only in v1; PDFs stay with Books/Documents rather
+    // than letting this list swallow every PDF on the box. Same
+    // merge-once gate as v55/v56: deleted stays deleted.
+    try {
+      if (!localStorage.getItem("ff-smart-v57")) {
+        if (!list.some((f) => f.name === "Magazines")) {
+          list.push({ name: "Magazines", query: "", type: null, rule: { extensions: ["cbz", "cbr", "cb7", "cbt"], minDurationSecs: null } });
+          Shell.saveSmartFolders(list);
+        }
+        localStorage.setItem("ff-smart-v57", "1");
       }
     } catch { /* ignore */ }
     return list;
@@ -3164,6 +3380,19 @@ export class Shell {
         }
       });
       this.crumbBar.appendChild(b);
+      // Grand Pass steal 4: every segment wears a small chevron —
+      // the folders BESIDE this one, one click sideways. The bar's
+      // own right-click menu (Copy/Edit Path) is untouched.
+      const chev = document.createElement("button");
+      chev.className = "crumb-chev";
+      chev.textContent = "▾";
+      chev.title = `Folders beside ${c.name}`;
+      chev.setAttribute("aria-label", `Folders beside ${c.name}`);
+      chev.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void this.openCrumbSiblings(chev, tab, i);
+      });
+      this.crumbBar.appendChild(chev);
     });
     // The selected file appears as the final, current breadcrumb element.
     const selForCrumb = this.activeSelected();
@@ -3190,6 +3419,88 @@ export class Shell {
       if (t.closest(".crumb-copy") || t.closest("button")) return;
       this.editPath();
     });
+  }
+
+  /** Grand Pass steal 4: the sibling folders of crumb segment
+   * `index` — the children of its parent, folders only, the
+   * segment itself checked. The root segment's siblings are the
+   * other locations. Virtual dirs (labels, collections, archives)
+   * have no filesystem siblings and get no menu. */
+  private async openCrumbSiblings(
+    anchor: HTMLElement,
+    tab: Tab,
+    index: number,
+  ): Promise<void> {
+    const dir = currentDir(tab);
+    const crumbs = dir.crumbs;
+    const seg = crumbs[index];
+    if (!seg) return;
+    const rect = anchor.getBoundingClientRect();
+    const openAt = (items: MenuItem[]): void =>
+      this.ctxMenu.open(rect.left, rect.bottom + 4, items);
+    if (index === 0) {
+      const items: MenuItem[] = this.locations.map((loc) => {
+        const current = loc.id === dir.locationId;
+        return {
+          label: loc.display_name,
+          checked: current,
+          disabled: current,
+          action: () =>
+            this.navigateTo({
+              locationId: loc.id,
+              dirId: loc.root_item,
+              crumbs: [{ dirId: loc.root_item, name: loc.display_name }],
+            }),
+        };
+      });
+      if (items.length > 1) openAt(items);
+      return;
+    }
+    const parent = crumbs[index - 1];
+    if (/^(label|collection|archive|starred):/.test(parent.dirId)) return;
+    let entries: Item[];
+    try {
+      entries = await api.listDir(dir.locationId, parent.dirId);
+    } catch {
+      openAt([
+        { label: "Couldn't read that folder", disabled: true, action: () => {} },
+      ]);
+      return;
+    }
+    const folders = entries.filter((it) => it.kind === "folder");
+    const CAP = 40;
+    const items: MenuItem[] = folders.slice(0, CAP).map((f) => {
+      const current = f.id === seg.dirId;
+      return {
+        label: f.name,
+        checked: current,
+        disabled: current,
+        action: () =>
+          this.navigateTo({
+            locationId: dir.locationId,
+            dirId: f.id,
+            crumbs: [
+              ...crumbs.slice(0, index),
+              { dirId: f.id, name: f.name },
+            ],
+          }),
+      };
+    });
+    if (folders.length > CAP) {
+      items.push({
+        label: `… and ${folders.length - CAP} more — open ${parent.name} to see them all`,
+        disabled: true,
+        action: () => {},
+      });
+    }
+    if (items.length === 0) {
+      items.push({
+        label: "No folders beside this one",
+        disabled: true,
+        action: () => {},
+      });
+    }
+    openAt(items);
   }
 
   private displayPath(): string {
@@ -3513,6 +3824,7 @@ export class Shell {
         const start = await api.startCopy(
           items.map((i) => i.id),
           target.dirId,
+          loadCollisionPolicy(),
         );
         const jobId = this.acceptJobStart(start, "copy");
         if (!jobId) return;
@@ -3534,6 +3846,7 @@ export class Shell {
       const start = await api.startMove(
         items.map((i) => i.id),
         dest,
+        loadCollisionPolicy(),
       );
       const jobId = this.acceptJobStart(start, "move");
       if (!jobId) return;
@@ -4625,6 +4938,14 @@ export class Shell {
         this.setCollapsedPref(key, collapsed);
         this.applyCollapsePrefs();
       },
+      rememberHomeFeed: () => this.rememberHomeOn(),
+      setRememberHomeFeed: (on) => this.setRememberHome(on),
+      clearHomeFeed: async () => {
+        await api.clearRecents().catch(() => undefined);
+        await api.clearFrequent().catch(() => undefined);
+      },
+      checkBoxes: () => this.checkBoxesOn(),
+      setCheckBoxes: (on) => this.setCheckBoxes(on),
       showShortcuts: () => this.showShortcuts(),
       replayWelcome: () => playWelcomeTour(),
     }, page);
@@ -4714,6 +5035,11 @@ export class Shell {
         this.renderActiveView();
       },
     });
+    const group = tab?.groupBy ?? "none";
+    const groupItem = (label: string, g: GroupBy) => ({
+      label: check(group === g) + `Group by ${label}`,
+      action: () => this.setGroupBy(g),
+    });
     // The main menu (Dickles, 2026-10-15): named groups as flyout
     // submenus — no "Other"/"Miscellaneous" junk drawer; every
     // group name says what its items do. Every one of the old flat
@@ -4732,12 +5058,33 @@ export class Shell {
           sortItem("Size", "size"),
           sortItem("Date", "modified"),
           { separator: true, label: "", action: () => {} },
+          groupItem("None", "none"),
+          groupItem("Date", "date"),
+          groupItem("Type", "type"),
+          groupItem("Size", "size"),
+          { separator: true, label: "", action: () => {} },
+          {
+            label: check(this.checkBoxesOn()) + "Check boxes for selection",
+            action: () => this.setCheckBoxes(!this.checkBoxesOn()),
+          },
+          { separator: true, label: "", action: () => {} },
           { label: "Larger text", shortcut: "Ctrl +", action: () => this.setFontScale(this.fontScale + 0.1) },
           { label: "Smaller text", shortcut: "Ctrl \u2212", action: () => this.setFontScale(this.fontScale - 0.1) },
           { label: "Larger icons", action: () => this.stepIconSize(1) },
           { label: "Smaller icons", action: () => this.stepIconSize(-1) },
           { separator: true, label: "", action: () => {} },
           { label: "Theme\u2026", action: () => this.themeManager.openMenu(this.menuBtn) },
+          // Steal 5: offered only while this folder wears its OWN
+          // remembered view — otherwise there is nothing to reset.
+          ...(tab && this.folderOverrideByTab.get(tab.id)
+            ? [
+                { separator: true, label: "", action: () => {} },
+                {
+                  label: "Reset this folder's view",
+                  action: () => void this.resetFolderView(),
+                },
+              ]
+            : []),
         ],
       },
       {
@@ -4922,13 +5269,14 @@ export class Shell {
    * §5 — the room is a place you visit, state intact both ways). */
   private enterRomHome(target?: { kind: "system"; name: string }): void {
     if (this.booksHome?.active) this.exitBooksHome();
+    if (this.homeView?.active) this.exitHomeBase();
     if (this.searchView.active) this.searchView.clear();
     this.quickLook.close();
     this.fileView.el.hidden = true;
     this.columnsView.el.hidden = true;
     this.galleryView.el.hidden = true;
     this.searchView.el.hidden = true;
-    this.romsHead?.classList.add("selected");
+    this.romsHead?.setAttribute("aria-current", "true");
     void this.romHome.open(target);
   }
 
@@ -4937,7 +5285,7 @@ export class Shell {
     const wasActive = this.romHome.active;
     this.romHome.close();
     this.romHome.el.hidden = true;
-    this.romsHead?.classList.remove("selected");
+    this.romsHead?.removeAttribute("aria-current");
     if (wasActive) {
       this.showFileView();
       this.renderCrumbs();
@@ -4951,13 +5299,14 @@ export class Shell {
    * browse views hide, the room paints from the catalog alone. */
   private enterBooksHome(): void {
     if (this.romHome?.active) this.exitRomHome();
+    if (this.homeView?.active) this.exitHomeBase();
     if (this.searchView.active) this.searchView.clear();
     this.quickLook.close();
     this.fileView.el.hidden = true;
     this.columnsView.el.hidden = true;
     this.galleryView.el.hidden = true;
     this.searchView.el.hidden = true;
-    this.booksHead?.classList.add("selected");
+    this.booksHead?.setAttribute("aria-current", "true");
     void this.booksHome.open();
   }
 
@@ -4966,12 +5315,220 @@ export class Shell {
     const wasActive = this.booksHome.active;
     this.booksHome.close();
     this.booksHome.el.hidden = true;
-    this.booksHead?.classList.remove("selected");
+    this.booksHead?.removeAttribute("aria-current");
     if (wasActive) {
       this.showFileView();
       this.renderCrumbs();
       void this.refreshBooksDoor();
     }
+  }
+
+  // ------------------------------------------------------------ Home base
+
+  /** Enter Home base (steal 1): same room grammar as the Homes —
+   * the browse views hide, the surface paints from the catalog. */
+  private enterHomeBase(): void {
+    if (this.romHome?.active) this.exitRomHome();
+    if (this.booksHome?.active) this.exitBooksHome();
+    if (this.searchView.active) this.searchView.clear();
+    this.quickLook.close();
+    this.fileView.el.hidden = true;
+    this.columnsView.el.hidden = true;
+    this.galleryView.el.hidden = true;
+    this.searchView.el.hidden = true;
+    this.homeDoorEl?.setAttribute("aria-current", "true");
+    void this.homeView.open();
+  }
+
+  private exitHomeBase(): void {
+    if (!this.homeView) return;
+    const wasActive = this.homeView.active;
+    this.homeView.close();
+    this.homeDoorEl?.removeAttribute("aria-current");
+    if (wasActive) {
+      this.showFileView();
+      this.renderCrumbs();
+    }
+  }
+
+  /** The Pinned shelf IS the sidebar's favorites — one pin
+   * store, two doors onto it (the sovereignty lock's other half:
+   * no second pin system to keep in sync). Assembled exactly as
+   * buildSidebar assembles its rows: same targets, same hidden
+   * set, same saved order, same omissions. */
+  private async homePinnedDoors(): Promise<PinnedDoor[]> {
+    const doors: PinnedDoor[] = [];
+    const targets = await this.resolveFavoriteTargets();
+    const names = ["Home", "Documents", "Downloads", "Videos", "Pictures", "Music", "Trash"];
+    const order = Shell.loadFavOrder();
+    const orderIdx = (n: string): number => {
+      const i = order.indexOf(n);
+      return i < 0 ? 999 : i;
+    };
+    const hiddenFavs = this.loadHiddenFavorites();
+    const pairs = names
+      .map((n, i) => ({ name: n, target: targets[i] }))
+      .filter((p) => p.target && !hiddenFavs.includes(p.name))
+      .sort((a, b) => orderIdx(a.name) - orderIdx(b.name));
+    for (const p of pairs) {
+      const target = p.target!;
+      doors.push({
+        name: p.name,
+        glyphHtml: sectionGlyph(favoriteIcon(p.name)).outerHTML,
+        title: target.display,
+        open: () =>
+          this.navigateTo({
+            locationId: target.locationId,
+            dirId: target.dirId,
+            crumbs: [{ dirId: target.dirId, name: target.display }],
+          }),
+      });
+    }
+    for (const fav of this.loadUserFavorites()) {
+      const target = await this.resolvePathTarget(fav.path);
+      if (!target) continue;
+      doors.push({
+        name: fav.name,
+        glyphHtml: sectionGlyph("folder").outerHTML,
+        title: fav.path,
+        open: () =>
+          this.navigateTo({
+            locationId: target.locationId,
+            dirId: target.dirId,
+            crumbs: [{ dirId: target.dirId, name: fav.name }],
+          }),
+      });
+    }
+    return doors;
+  }
+
+  /** A frequent folder, opened from Home base. */
+  private openHomeFolder(e: {
+    locationId: string;
+    itemId: string;
+    path: string;
+    name: string;
+  }): void {
+    if (e.locationId && e.itemId) {
+      this.navigateTo({
+        locationId: e.locationId,
+        dirId: e.itemId,
+        crumbs: [{ dirId: e.itemId, name: e.name }],
+      });
+      return;
+    }
+    // Older rows without ids: walk the path instead.
+    void (async () => {
+      const loc =
+        this.locations.find((l) => l.provider === "localfs") ??
+        this.locations[0];
+      const tab = this.activeTab;
+      if (!loc || !tab) return;
+      const walked = await this.crumbsForPath(loc, e.path).catch(() => null);
+      if (!walked) return;
+      navigate(tab, {
+        locationId: loc.id,
+        dirId: walked.dirId,
+        crumbs: walked.crumbs,
+      });
+      void this.loadDir(tab);
+    })();
+  }
+
+  /** A recent file, single click: land in its folder with it
+   * selected (the revealRomInFiles pattern). */
+  private async revealHomeFile(entry: HomeRecent): Promise<void> {
+    this.exitHomeBase();
+    const loc =
+      this.locations.find((l) => l.id === entry.location_id) ??
+      this.locations[0];
+    if (!loc || !entry.path) return;
+    const walked = await this.crumbsForPath(loc, dirname(entry.path));
+    if (!walked) {
+      Toast.info(
+        `“${entry.name}” lives at ${entry.path} — that folder isn't reachable right now.`,
+        6000,
+      );
+      return;
+    }
+    const tab = this.requireTab();
+    navigate(tab, {
+      locationId: loc.id,
+      dirId: walked.dirId,
+      crumbs: walked.crumbs,
+    });
+    await this.loadDir(tab);
+    const found = tab.items.find((i) => i.provider_key === entry.path);
+    if (found) {
+      tab.selection.clear();
+      tab.selection.add(found.id);
+      this.renderActiveView();
+      this.renderCrumbs();
+    }
+  }
+
+  /** A recent file, double click: open it with its app. A file
+   * that has vanished forgets itself — the shelf heals. */
+  private async openHomeFile(entry: HomeRecent): Promise<void> {
+    if (!entry.item_id) return;
+    try {
+      await api.openItem(entry.item_id);
+    } catch {
+      await api.forgetRecent(entry.path).catch(() => undefined);
+      Toast.info(
+        `“${entry.name}” isn't there anymore — forgotten from Recent.`,
+      );
+      if (this.homeView.active) void this.homeView.refresh();
+    }
+  }
+
+  /** The Preferences switch: Home base learning on/off (default
+   * on — the feature explains itself in Preferences ▸ Library). */
+  private rememberHomeOn(): boolean {
+    const v = this.uiPrefs["ff-remember-home"];
+    return typeof v === "boolean" ? v : true;
+  }
+
+  private setRememberHome(on: boolean): void {
+    this.uiPrefs["ff-remember-home"] = on;
+    void api.setUiPrefs({ ...this.uiPrefs }).catch(() => undefined);
+  }
+
+  /** Note a file into Recent (steal 1): opens and Quick Looks
+   * land here. Folders aren't recents — they're visits. */
+  private noteRecent(item: Item): void {
+    if (!this.rememberHomeOn()) return;
+    if (item.kind === "folder" || !item.provider_key) return;
+    void api
+      .recordRecent({
+        path: item.provider_key,
+        name: item.name,
+        kind: item.kind,
+        location: item.location ?? "",
+        item: item.id,
+      })
+      .catch(() => undefined);
+  }
+
+  /** Note a folder visit (steal 1) — once per folder per tab;
+   * a refresh of the same folder is not a new visit. */
+  private noteFolderVisit(tab: Tab, dir: DirState): void {
+    if (!this.rememberHomeOn()) return;
+    if (!dir.locationId || dir.dirId.includes(":")) return;
+    if (this.lastVisitDirByTab.get(tab.id) === dir.dirId) return;
+    this.lastVisitDirByTab.set(tab.id, dir.dirId);
+    void (async () => {
+      const path = await api.getItemPath(dir.dirId).catch(() => "");
+      if (!path) return;
+      await api
+        .recordFolderVisit({
+          path,
+          name: dir.crumbs[dir.crumbs.length - 1]?.name ?? path,
+          location: dir.locationId!,
+          item: dir.dirId,
+        })
+        .catch(() => undefined);
+    })();
   }
 
   /** The Books door's number — identified books, from the catalog. */

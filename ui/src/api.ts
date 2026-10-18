@@ -75,6 +75,20 @@ export interface JobSummary {
   bytes_total: number;
   /** UI round (packed transfer): show the card's packed label. */
   packed: boolean;
+  /** Steal 6: collisions this job is parked on. */
+  pending_conflicts: PendingConflict[];
+}
+
+/** Steal 6: one parked name collision, for the compare card. */
+export interface PendingConflict {
+  step_id: string;
+  name: string;
+  src_path: string;
+  src_size: number | null;
+  src_modified: string | null;
+  dst_path: string;
+  dst_size: number | null;
+  dst_modified: string | null;
 }
 
 /** Per-source record of what a finished job actually did — the undo
@@ -187,13 +201,46 @@ export interface CollectionContents {
   missing: string[];
 }
 
-/** Phase 2: per-location remembered view state. */
+/** Phase 2: per-location remembered view state. Grand Pass
+ * steal 5: remembered per FOLDER (with location inheritance) and
+ * carrying the group-by bucket. */
 export interface ViewProfile {
   view_mode: string;
   sort_key: string;
   /** 1 ascending, -1 descending. */
   sort_dir: number;
   show_extensions: boolean;
+  /** "" | date | type | size */
+  group_by: string;
+  /** Read-side: the returned profile is the folder's own row. */
+  folder_override?: boolean;
+}
+
+/** Home base (steal 1): one Recent row. */
+export interface HomeRecent {
+  path: string;
+  name: string;
+  kind: string;
+  location_id: string;
+  item_id: string;
+  /** Unix seconds. */
+  opened_at: number;
+}
+
+/** Home base (steal 1): one "You visit these a lot" row. */
+export interface HomeVisit {
+  path: string;
+  name: string;
+  location_id: string;
+  item_id: string;
+  visits: number;
+  /** Unix seconds. */
+  last_at: number;
+}
+
+export interface HomeFeed {
+  recents: HomeRecent[];
+  frequent: HomeVisit[];
 }
 
 /** One item's volume badge (rule/smart-folder results). */
@@ -659,10 +706,32 @@ export const api = {
     invoke<void>("remove_collection_paths", { id, paths }),
   collectionItems: (id: string) =>
     invoke<CollectionContents>("collection_items", { id }),
-  getViewProfile: (location: string) =>
-    invoke<ViewProfile | null>("get_view_profile", { location }),
-  setViewProfile: (location: string, profile: ViewProfile) =>
-    invoke<void>("set_view_profile", { location, profile }),
+  getViewProfile: (location: string, dir?: string) =>
+    invoke<ViewProfile | null>("get_view_profile", { location, dir }),
+  setViewProfile: (location: string, profile: ViewProfile, dir?: string) =>
+    invoke<void>("set_view_profile", { location, profile, dir }),
+  deleteViewProfile: (location: string, dir: string) =>
+    invoke<void>("delete_view_profile", { location, dir }),
+  // Home base (Grand Pass steal 1): local-only Recent + Frequent.
+  getHomeFeed: () => invoke<HomeFeed>("get_home_feed"),
+  recordRecent: (r: {
+    path: string;
+    name: string;
+    kind: string;
+    location: string;
+    item: string;
+  }) => invoke<void>("record_recent", r),
+  recordFolderVisit: (v: {
+    path: string;
+    name: string;
+    location: string;
+    item: string;
+  }) => invoke<void>("record_folder_visit", v),
+  forgetRecent: (path: string) => invoke<void>("forget_recent", { path }),
+  clearRecents: () => invoke<void>("clear_recents"),
+  forgetFrequent: (path: string) =>
+    invoke<void>("forget_frequent", { path }),
+  clearFrequent: () => invoke<void>("clear_frequent"),
   mediaUrlForPath: (path: string) =>
     invoke<string>("media_url_for_path", { path }),
   ruleItems: (
@@ -753,20 +822,20 @@ export const api = {
   // answers with the EXISTING job's id and alreadyRunning=true
   // (double-submit guard; doors toast + focus instead of tracking
   // a twin).
-  startCopy: (sources: string[], dstParent: string) => {
-    const req: CopyRequest = { sources, dstParent };
+  startCopy: (sources: string[], dstParent: string, collisionPolicy?: string) => {
+    const req: CopyRequest = { sources, dstParent, collisionPolicy };
     return invoke<JobStart>("start_copy", { req });
   },
-  startCopyFromPaths: (sources: string[], dstDir: string) => {
-    const req: CopyPathsRequest = { sources, dstDir };
+  startCopyFromPaths: (sources: string[], dstDir: string, collisionPolicy?: string) => {
+    const req: CopyPathsRequest = { sources, dstDir, collisionPolicy };
     return invoke<JobStart>("start_copy_from_paths", { req });
   },
-  startMove: (sources: string[], dstDir: string) => {
-    const req: MoveRequest = { sources, dstDir };
+  startMove: (sources: string[], dstDir: string, collisionPolicy?: string) => {
+    const req: MoveRequest = { sources, dstDir, collisionPolicy };
     return invoke<JobStart>("start_move", { req });
   },
-  startMoveFromPaths: (sources: string[], dstDir: string) => {
-    const req: MovePathsRequest = { sources, dstDir };
+  startMoveFromPaths: (sources: string[], dstDir: string, collisionPolicy?: string) => {
+    const req: MovePathsRequest = { sources, dstDir, collisionPolicy };
     return invoke<JobStart>("start_move_from_paths", { req });
   },
   startDelete: (sources: string[], useTrash: boolean) => {
@@ -1060,6 +1129,9 @@ export const api = {
     invoke<string[]>("auditor_add_user_word", { word }),
   pauseJob: (job: string) => invoke<void>("pause_job", { job }),
   resumeJob: (job: string) => invoke<void>("resume_job", { job }),
+  /** Steal 6: decide one parked collision: replace | keep_both | skip. */
+  resolveCollision: (job: string, stepId: string, choice: string) =>
+    invoke<void>("resolve_collision", { job, stepId, choice }),
   cancelJob: (job: string) => invoke<void>("cancel_job", { job }),
   listJobs: () => invoke<JobSummary[]>("list_jobs"),
   getJobOutcomes: (job: string) =>
@@ -1339,18 +1411,23 @@ export function onIndexProgress(cb: (s: IndexState) => void): Promise<UnlistenFn
 export interface CopyRequest {
   sources: string[];
   dstParent: string;
+  /** Steal 6: "ask_me" | "auto_rename" (absent = auto_rename). */
+  collisionPolicy?: string;
 }
 export interface MoveRequest {
   sources: string[];
   dstDir: string;
+  collisionPolicy?: string;
 }
 export interface MovePathsRequest {
   sources: string[];
   dstDir: string;
+  collisionPolicy?: string;
 }
 export interface CopyPathsRequest {
   sources: string[];
   dstDir: string;
+  collisionPolicy?: string;
 }
 export interface DeleteRequest {
   sources: string[];

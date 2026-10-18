@@ -90,6 +90,35 @@ pub struct ViewProfileRow {
     pub view_mode: String,
     pub sort_json: String,
     pub show_extensions: bool,
+    /// Grand Pass steal 5: the group-by bucket key ("" | date |
+    /// type | size), remembered with the rest of the view state.
+    pub group_by: String,
+}
+
+/// Grand Pass steal 1: one row of the Home base "Recent" shelf.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HomeRecentRow {
+    pub path: String,
+    pub name: String,
+    /// The catalog item kind ("file", "folder", provider kinds…).
+    pub kind: String,
+    pub location_id: String,
+    pub item_id: String,
+    /// Unix seconds the file was last opened/previewed here.
+    pub opened_at: i64,
+}
+
+/// Grand Pass steal 1: one row of the "You visit these a lot"
+/// shelf — a folder, how often, and when last.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HomeVisitRow {
+    pub path: String,
+    pub name: String,
+    pub location_id: String,
+    pub item_id: String,
+    pub visits: i64,
+    /// Unix seconds of the most recent visit.
+    pub last_at: i64,
 }
 
 /// One persisted MCP audit row (Phase 3): every tool call the MCP
@@ -357,10 +386,13 @@ impl Catalog {
                     PRIMARY KEY (collection_id, item_id)
                 );
                 CREATE TABLE IF NOT EXISTS view_profiles (
-                    location_id TEXT PRIMARY KEY REFERENCES locations(id) ON DELETE CASCADE,
+                    location_id TEXT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+                    dir_key TEXT NOT NULL DEFAULT '',
                     show_extensions INTEGER NOT NULL DEFAULT 1,
                     view_mode TEXT NOT NULL DEFAULT 'list',
-                    sort_json TEXT NOT NULL DEFAULT '{}'
+                    sort_json TEXT NOT NULL DEFAULT '{}',
+                    group_by TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (location_id, dir_key)
                 );
                 CREATE TABLE IF NOT EXISTS media_identities (
                     item_id TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
@@ -770,6 +802,74 @@ impl Catalog {
                 )
                 .map_err(|e| UfmError::Database(e.to_string()))?;
         }
+        // Grand Pass steal 5 (2026-10-18): view_profiles grows from
+        // per-LOCATION rows to per-(location, folder) rows. The old
+        // table's PRIMARY KEY is location_id alone, which SQLite
+        // cannot widen in place — rebuild it: every existing row
+        // becomes the location-level row (dir_key '') for its
+        // location, so nothing remembered is lost; folder overrides
+        // land as their own rows from here on. Feature-detected by
+        // the dir_key column, same discipline as collection_members.
+        let view_profiles_folder_keyed: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('view_profiles') WHERE name = 'dir_key'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+        if !view_profiles_folder_keyed {
+            self.conn
+                .execute_batch(
+                    "CREATE TABLE view_profiles_new (
+                        location_id TEXT NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+                        dir_key TEXT NOT NULL DEFAULT '',
+                        show_extensions INTEGER NOT NULL DEFAULT 1,
+                        view_mode TEXT NOT NULL DEFAULT 'list',
+                        sort_json TEXT NOT NULL DEFAULT '{}',
+                        group_by TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY (location_id, dir_key)
+                    );
+                    INSERT OR IGNORE INTO view_profiles_new
+                        (location_id, dir_key, show_extensions, view_mode, sort_json, group_by)
+                    SELECT location_id, '', show_extensions, view_mode, sort_json, ''
+                    FROM view_profiles;
+                    DROP TABLE view_profiles;
+                    ALTER TABLE view_profiles_new RENAME TO view_profiles;",
+                )
+                .map_err(|e| UfmError::Database(e.to_string()))?;
+        }
+        // Grand Pass steal 1 (Home base): what this computer has
+        // seen its owner touch — recent files and visited folders.
+        // LOCAL-ONLY by doctrine: these tables never leave the
+        // catalog, nothing syncs them, and the Preferences switch
+        // can stop the recording and wipe both tables.
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS home_recents (
+                     path TEXT PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     kind TEXT NOT NULL DEFAULT '',
+                     location_id TEXT NOT NULL DEFAULT '',
+                     item_id TEXT NOT NULL DEFAULT '',
+                     opened_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_home_recents_opened
+                     ON home_recents(opened_at DESC);
+                 CREATE TABLE IF NOT EXISTS home_visits (
+                     path TEXT PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     location_id TEXT NOT NULL DEFAULT '',
+                     item_id TEXT NOT NULL DEFAULT '',
+                     visits INTEGER NOT NULL DEFAULT 0,
+                     last_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_home_visits_rank
+                     ON home_visits(visits DESC, last_at DESC);",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+
         // Phase 3: the MCP audit chain (docs/MCP_API.md item 5 —
         // append-only, queryable in the app). One row per tool call.
         self.conn
@@ -2385,18 +2485,32 @@ impl Catalog {
     }
 
     // -- View profiles ------------------------------------------------
+    //
+    // Grand Pass steal 5: profiles are keyed by (location, folder).
+    // dir_key is the folder's path inside the location; the empty
+    // key is the location-level row — every pre-pass profile lives
+    // there (the migration carried them over untouched) and acts as
+    // the inheritance base for folders without their own row.
+    // Resolution order: folder row → location row → nothing (the
+    // app default decides).
 
-    pub fn view_profile(&self, location: &LocationId) -> Result<Option<ViewProfileRow>> {
+    /// The exact row for (location, dir_key), if one was saved.
+    pub fn view_profile(
+        &self,
+        location: &LocationId,
+        dir_key: &str,
+    ) -> Result<Option<ViewProfileRow>> {
         use rusqlite::OptionalExtension;
         self.conn
             .query_row(
-                "SELECT view_mode, sort_json, show_extensions FROM view_profiles WHERE location_id = ?1",
-                params![location.to_string()],
+                "SELECT view_mode, sort_json, show_extensions, group_by FROM view_profiles WHERE location_id = ?1 AND dir_key = ?2",
+                params![location.to_string(), dir_key],
                 |r| {
                     Ok(ViewProfileRow {
                         view_mode: r.get(0)?,
                         sort_json: r.get(1)?,
                         show_extensions: r.get::<_, i64>(2)? != 0,
+                        group_by: r.get(3)?,
                     })
                 },
             )
@@ -2404,9 +2518,27 @@ impl Catalog {
             .map_err(|e| UfmError::Database(e.to_string()))
     }
 
+    /// The profile a folder should wear: its own row when one
+    /// exists, else the location-level row. The bool reports
+    /// whether the winning row is the folder's own (the UI only
+    /// offers "Reset this folder's view" when it is).
+    pub fn view_profile_resolved(
+        &self,
+        location: &LocationId,
+        dir_key: &str,
+    ) -> Result<(Option<ViewProfileRow>, bool)> {
+        if !dir_key.is_empty() {
+            if let Some(row) = self.view_profile(location, dir_key)? {
+                return Ok((Some(row), true));
+            }
+        }
+        Ok((self.view_profile(location, "")?, false))
+    }
+
     pub fn set_view_profile(
         &self,
         location: &LocationId,
+        dir_key: &str,
         profile: &ViewProfileRow,
     ) -> Result<()> {
         // view_profiles.location_id is an FK to locations; profile keys
@@ -2422,15 +2554,192 @@ impl Catalog {
             .map_err(|e| UfmError::Database(e.to_string()))?;
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO view_profiles (location_id, show_extensions, view_mode, sort_json)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR REPLACE INTO view_profiles (location_id, dir_key, show_extensions, view_mode, sort_json, group_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     location.to_string(),
+                    dir_key,
                     profile.show_extensions as i64,
                     profile.view_mode,
-                    profile.sort_json
+                    profile.sort_json,
+                    profile.group_by
                 ],
             )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Forget one row (the folder Reset). The location-level row is
+    /// never deleted through here — only a folder's own override.
+    pub fn delete_view_profile(&self, location: &LocationId, dir_key: &str) -> Result<()> {
+        if dir_key.is_empty() {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "DELETE FROM view_profiles WHERE location_id = ?1 AND dir_key = ?2",
+                params![location.to_string(), dir_key],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    // ----------------------------------------------------------
+    // Home base (Grand Pass steal 1): recent files + frequent
+    // folders, learned locally, forgotten on request. `now` is
+    // unix seconds, stamped by the caller so tests stay
+    // deterministic. Recents are capped at the newest 200 rows;
+    // the shelves read far fewer.
+    // ----------------------------------------------------------
+
+    /// Note a file being opened or previewed. Re-opening refreshes
+    /// the row's clock instead of duplicating it.
+    pub fn record_recent(&self, row: &HomeRecentRow) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO home_recents
+                     (path, name, kind, location_id, item_id, opened_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(path) DO UPDATE SET
+                     name = excluded.name,
+                     kind = excluded.kind,
+                     location_id = excluded.location_id,
+                     item_id = excluded.item_id,
+                     opened_at = excluded.opened_at",
+                params![
+                    row.path,
+                    row.name,
+                    row.kind,
+                    row.location_id,
+                    row.item_id,
+                    row.opened_at
+                ],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        self.conn
+            .execute(
+                "DELETE FROM home_recents WHERE path NOT IN
+                     (SELECT path FROM home_recents
+                      ORDER BY opened_at DESC LIMIT 200)",
+                [],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// The Recent shelf, newest first.
+    pub fn home_recents(&self, limit: i64) -> Result<Vec<HomeRecentRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT path, name, kind, location_id, item_id, opened_at
+                 FROM home_recents ORDER BY opened_at DESC LIMIT ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit], |r| {
+                Ok(HomeRecentRow {
+                    path: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: r.get(2)?,
+                    location_id: r.get(3)?,
+                    item_id: r.get(4)?,
+                    opened_at: r.get(5)?,
+                })
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// Forget one recent ("Forget this").
+    pub fn forget_recent(&self, path: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM home_recents WHERE path = ?1", params![path])
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Wipe the whole Recent shelf (the Clear button).
+    pub fn clear_recents(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM home_recents", [])
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Note a folder being visited: first visit inserts, later
+    /// visits count up and refresh the clock.
+    pub fn record_folder_visit(
+        &self,
+        path: &str,
+        name: &str,
+        location_id: &str,
+        item_id: &str,
+        now: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO home_visits
+                     (path, name, location_id, item_id, visits, last_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5)
+                 ON CONFLICT(path) DO UPDATE SET
+                     name = excluded.name,
+                     location_id = excluded.location_id,
+                     item_id = excluded.item_id,
+                     visits = home_visits.visits + 1,
+                     last_at = excluded.last_at",
+                params![path, name, location_id, item_id, now],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// The frequent shelf: most-visited first, recency breaks
+    /// ties.
+    pub fn home_frequent(&self, limit: i64) -> Result<Vec<HomeVisitRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT path, name, location_id, item_id, visits, last_at
+                 FROM home_visits
+                 ORDER BY visits DESC, last_at DESC LIMIT ?1",
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![limit], |r| {
+                Ok(HomeVisitRow {
+                    path: r.get(0)?,
+                    name: r.get(1)?,
+                    location_id: r.get(2)?,
+                    item_id: r.get(3)?,
+                    visits: r.get(4)?,
+                    last_at: r.get(5)?,
+                })
+            })
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| UfmError::Database(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// Forget one frequent folder ("Forget this").
+    pub fn forget_frequent(&self, path: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM home_visits WHERE path = ?1", params![path])
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Wipe the whole frequent shelf (the Clear button).
+    pub fn clear_frequent(&self) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM home_visits", [])
             .map_err(|e| UfmError::Database(e.to_string()))?;
         Ok(())
     }
@@ -10276,14 +10585,15 @@ mod phase2_tests {
     fn view_profile_roundtrip() {
         let cat = Catalog::open_in_memory().unwrap();
         let loc = LocationId::new();
-        assert!(cat.view_profile(&loc).unwrap().is_none());
+        assert!(cat.view_profile(&loc, "").unwrap().is_none());
         let profile = ViewProfileRow {
             view_mode: "list".into(),
             sort_json: "{\"key\":\"modified\",\"dir\":-1}".into(),
             show_extensions: false,
+            group_by: String::new(),
         };
-        cat.set_view_profile(&loc, &profile).unwrap();
-        let got = cat.view_profile(&loc).unwrap().unwrap();
+        cat.set_view_profile(&loc, "", &profile).unwrap();
+        let got = cat.view_profile(&loc, "").unwrap().unwrap();
         assert_eq!(got.view_mode, "list");
         assert_eq!(got.sort_json, profile.sort_json);
         assert!(!got.show_extensions);
@@ -10292,8 +10602,155 @@ mod phase2_tests {
             view_mode: "grid".into(),
             ..profile
         };
-        cat.set_view_profile(&loc, &p2).unwrap();
-        assert_eq!(cat.view_profile(&loc).unwrap().unwrap().view_mode, "grid");
+        cat.set_view_profile(&loc, "", &p2).unwrap();
+        assert_eq!(cat.view_profile(&loc, "").unwrap().unwrap().view_mode, "grid");
+    }
+
+    #[test]
+    fn view_profile_folder_inheritance() {
+        // Grand Pass steal 5: folder rows inherit from the
+        // location row, override it when present, and reset back.
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        let base = ViewProfileRow {
+            view_mode: "list".into(),
+            sort_json: "{\"key\":\"name\",\"dir\":1}".into(),
+            show_extensions: true,
+            group_by: String::new(),
+        };
+        cat.set_view_profile(&loc, "", &base).unwrap();
+        // A folder with no row of its own inherits the location's.
+        let (row, own) = cat
+            .view_profile_resolved(&loc, "/media/films")
+            .unwrap();
+        assert_eq!(row.unwrap().view_mode, "list");
+        assert!(!own);
+        // A folder row wins outright, group_by and all.
+        let folder = ViewProfileRow {
+            view_mode: "gallery".into(),
+            sort_json: "{\"key\":\"size\",\"dir\":-1}".into(),
+            show_extensions: false,
+            group_by: "type".into(),
+        };
+        cat.set_view_profile(&loc, "/media/films", &folder).unwrap();
+        let (row, own) = cat
+            .view_profile_resolved(&loc, "/media/films")
+            .unwrap();
+        let row = row.unwrap();
+        assert!(own);
+        assert_eq!(row.view_mode, "gallery");
+        assert_eq!(row.group_by, "type");
+        // ...without disturbing the location row or other folders.
+        let (row, own) = cat.view_profile_resolved(&loc, "/media").unwrap();
+        assert_eq!(row.unwrap().view_mode, "list");
+        assert!(!own);
+        // Reset deletes only the folder's own row.
+        cat.delete_view_profile(&loc, "/media/films").unwrap();
+        let (row, own) = cat
+            .view_profile_resolved(&loc, "/media/films")
+            .unwrap();
+        assert_eq!(row.unwrap().view_mode, "list");
+        assert!(!own);
+        // The location row itself is undeletable through this door.
+        cat.delete_view_profile(&loc, "").unwrap();
+        assert!(cat.view_profile(&loc, "").unwrap().is_some());
+    }
+
+    #[test]
+    fn view_profile_migration_carries_location_rows() {
+        // Grand Pass steal 5: a pre-pass database (location_id was
+        // the whole primary key) keeps its remembered profile as
+        // the location-level row after the rebuild — no data loss.
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.conn
+            .execute_batch(
+                "DROP TABLE view_profiles;
+                 CREATE TABLE view_profiles (
+                     location_id TEXT PRIMARY KEY REFERENCES locations(id) ON DELETE CASCADE,
+                     show_extensions INTEGER NOT NULL DEFAULT 1,
+                     view_mode TEXT NOT NULL DEFAULT 'list',
+                     sort_json TEXT NOT NULL DEFAULT '{}'
+                 );",
+            )
+            .unwrap();
+        cat.conn
+            .execute(
+                "INSERT OR IGNORE INTO locations (id, provider, display_name, capabilities_json)
+                 VALUES (?1, 'view-profile', ?1, '{}')",
+                rusqlite::params![loc.to_string()],
+            )
+            .unwrap();
+        cat.conn
+            .execute(
+                "INSERT INTO view_profiles (location_id, show_extensions, view_mode, sort_json)
+                 VALUES (?1, 0, 'columns', '{\"key\":\"size\",\"dir\":-1}')",
+                rusqlite::params![loc.to_string()],
+            )
+            .unwrap();
+        cat.migrate().unwrap();
+        let got = cat.view_profile(&loc, "").unwrap().unwrap();
+        assert_eq!(got.view_mode, "columns");
+        assert!(!got.show_extensions);
+        assert_eq!(got.group_by, "");
+        // And the rebuilt table accepts folder rows.
+        let folder = ViewProfileRow {
+            view_mode: "grid".into(),
+            sort_json: "{}".into(),
+            show_extensions: true,
+            group_by: "date".into(),
+        };
+        cat.set_view_profile(&loc, "/somewhere", &folder).unwrap();
+        assert_eq!(
+            cat.view_profile(&loc, "/somewhere").unwrap().unwrap().group_by,
+            "date"
+        );
+    }
+
+    #[test]
+    fn home_feed_learns_and_forgets() {
+        // Grand Pass steal 1: recents order newest-first and
+        // refresh in place; visits count up; forget + clear work
+        // per shelf without touching the other.
+        let cat = Catalog::open_in_memory().unwrap();
+        let recent = |path: &str, at: i64| HomeRecentRow {
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap().into(),
+            kind: "file".into(),
+            location_id: String::new(),
+            item_id: String::new(),
+            opened_at: at,
+        };
+        cat.record_recent(&recent("/docs/a.txt", 100)).unwrap();
+        cat.record_recent(&recent("/docs/b.txt", 200)).unwrap();
+        // Re-opening a.txt moves it to the top, no duplicate.
+        cat.record_recent(&recent("/docs/a.txt", 300)).unwrap();
+        let recents = cat.home_recents(30).unwrap();
+        assert_eq!(recents.len(), 2);
+        assert_eq!(recents[0].path, "/docs/a.txt");
+        assert_eq!(recents[0].opened_at, 300);
+        assert_eq!(recents[1].path, "/docs/b.txt");
+
+        cat.record_folder_visit("/docs", "docs", "", "", 100).unwrap();
+        cat.record_folder_visit("/docs", "docs", "", "", 400).unwrap();
+        cat.record_folder_visit("/pics", "pics", "", "", 500).unwrap();
+        let frequent = cat.home_frequent(12).unwrap();
+        assert_eq!(frequent.len(), 2);
+        assert_eq!(frequent[0].path, "/docs");
+        assert_eq!(frequent[0].visits, 2);
+        assert_eq!(frequent[0].last_at, 400);
+        assert_eq!(frequent[1].path, "/pics");
+
+        cat.forget_recent("/docs/a.txt").unwrap();
+        assert_eq!(cat.home_recents(30).unwrap().len(), 1);
+        cat.forget_frequent("/docs").unwrap();
+        assert_eq!(cat.home_frequent(12).unwrap().len(), 1);
+        cat.clear_recents().unwrap();
+        assert!(cat.home_recents(30).unwrap().is_empty());
+        // Clearing one shelf leaves the other standing.
+        assert_eq!(cat.home_frequent(12).unwrap().len(), 1);
+        cat.clear_frequent().unwrap();
+        assert!(cat.home_frequent(12).unwrap().is_empty());
     }
 
     #[test]

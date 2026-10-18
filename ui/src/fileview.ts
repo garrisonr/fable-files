@@ -5,7 +5,7 @@
  */
 import { api, formatBytes, formatDate, type Item } from "./api";
 import { animateFromLive, liveOpacity, reducedMotion, fadeTo, rubberBand, springTo, cancelSpring } from "./motion";
-import { currentDir, sortedItems, type SortDir, type SortKey, type Tab, type ViewMode } from "./tabs";
+import { currentDir, sortedItems, type GroupBy, type SortDir, type SortKey, type Tab, type ViewMode } from "./tabs";
 import { ContextMenu, type MenuItem } from "./contextmenu";
 import { OpenWithDialog } from "./openwith";
 import { labelColor, loadLabelDefs } from "./labels";
@@ -17,6 +17,149 @@ import {
   ROM_SYSTEM_KEYS,
 } from "./roms";
 import { isAudioName } from "./music";
+
+/** —— Grand Pass steal 2: group-by buckets ————————————————————
+ * The sorted list, partitioned into headed stacks. Bucket keys
+ * are stable strings; labels are the plain-talk shelf names. */
+
+export interface ItemGroup {
+  key: string;
+  label: string;
+  entries: { item: Item; index: number }[];
+}
+
+function dateGroupKey(modified: string | null): string {
+  if (!modified) return "earlier";
+  const t = Date.parse(modified);
+  if (Number.isNaN(t)) return "earlier";
+  const now = new Date();
+  const day = 86_400_000;
+  const startToday = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+  ).getTime();
+  if (t >= startToday) return "today";
+  if (t >= startToday - day) return "yesterday";
+  if (t >= startToday - 6 * day) return "week";
+  if (t >= startToday - 29 * day) return "month";
+  return "earlier";
+}
+
+function typeGroupKey(item: Item): string {
+  if (item.kind === "folder") return "folders";
+  const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
+  // Spreadsheets before Documents: the sheet extensions live in
+  // both families' sets (the sidebar's lesson, item 9).
+  if (["xls", "xlsx", "ods", "csv", "tsv", "numbers"].includes(ext))
+    return "spreadsheets";
+  if (
+    ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif", "heic", "tif", "tiff", "ico"].includes(ext)
+  )
+    return "images";
+  if (["mkv", "mp4", "avi", "mov", "m4v", "webm", "mpg", "mpeg", "wmv"].includes(ext))
+    return "video";
+  if (
+    ["mp3", "aac", "flac", "ogg", "oga", "opus", "wav", "m4a", "aif", "aiff", "m4b"].includes(ext)
+  )
+    return "audio";
+  if (["epub", "mobi", "azw3", "cbz", "cbr", "cb7", "cbt"].includes(ext))
+    return "books";
+  if (["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst", "iso", "dmg"].includes(ext))
+    return "archives";
+  if (["doc", "docx", "odt", "pdf", "rtf", "ppt", "pptx", "txt", "md"].includes(ext))
+    return "documents";
+  return "other";
+}
+
+function sizeGroupKey(item: Item): string {
+  if (item.kind === "folder") return "folders";
+  const s = item.size_bytes;
+  if (s == null) return "unknown";
+  if (s < 100_000) return "tiny";
+  if (s < 1_000_000) return "small";
+  if (s < 10_000_000) return "medium";
+  if (s < 100_000_000) return "large";
+  return "huge";
+}
+
+const GROUP_DEFS: Record<
+  Exclude<GroupBy, "none">,
+  { order: string[]; labels: Record<string, string>; key: (it: Item) => string }
+> = {
+  date: {
+    order: ["today", "yesterday", "week", "month", "earlier"],
+    labels: {
+      today: "Today",
+      yesterday: "Yesterday",
+      week: "Last week",
+      month: "Last month",
+      earlier: "Earlier",
+    },
+    key: (it) => dateGroupKey(it.modified),
+  },
+  type: {
+    order: [
+      "folders",
+      "images",
+      "video",
+      "audio",
+      "documents",
+      "spreadsheets",
+      "archives",
+      "books",
+      "other",
+    ],
+    labels: {
+      folders: "Folders",
+      images: "Images",
+      video: "Video",
+      audio: "Audio",
+      documents: "Documents",
+      spreadsheets: "Spreadsheets",
+      archives: "Archives",
+      books: "Books",
+      other: "Other",
+    },
+    key: typeGroupKey,
+  },
+  size: {
+    order: ["folders", "tiny", "small", "medium", "large", "huge", "unknown"],
+    labels: {
+      folders: "Folders",
+      tiny: "Tiny — under 100 KB",
+      small: "Small — under 1 MB",
+      medium: "Medium — under 10 MB",
+      large: "Large — under 100 MB",
+      huge: "Huge — 100 MB and up",
+      unknown: "Unknown size",
+    },
+    key: sizeGroupKey,
+  },
+};
+
+/** Partition the sorted items into stacks, or null when grouping
+ * is off — or when everything would land in ONE stack, where a
+ * lone header is noise, not information. Entries keep their
+ * sorted indexes: selection ranges never notice the stacks. */
+export function partitionItemGroups(
+  groupBy: GroupBy,
+  items: Item[],
+): ItemGroup[] | null {
+  if (groupBy === "none" || items.length === 0) return null;
+  const def = GROUP_DEFS[groupBy];
+  const buckets = new Map<string, { item: Item; index: number }[]>();
+  items.forEach((item, index) => {
+    const k = def.key(item);
+    const arr = buckets.get(k);
+    if (arr) arr.push({ item, index });
+    else buckets.set(k, [{ item, index }]);
+  });
+  const groups = def.order
+    .filter((k) => buckets.has(k))
+    .map((k) => ({ key: k, label: def.labels[k], entries: buckets.get(k)! }));
+  return groups.length > 1 ? groups : null;
+}
 
 export interface FileViewHooks {
   onOpen(item: Item): void; // Enter / double-click on a folder (or file)
@@ -639,6 +782,12 @@ export function alternativeToUrl(item: Item): string {
 
 export class FileView {
   readonly el: HTMLElement;
+  /** Steal 8: check-box selection mode. When on, every cell/row
+   * wears a checkbox that reflects and drives the EXISTING
+   * selection set — a second door onto the same state, never a
+   * fork of it. The shell owns the mode (View menu + Preferences
+   * + the touch default); this view just renders it. */
+  checkboxMode = false;
   private scroller: HTMLElement;
   private overscroll = 0;
   private wheelEndTimer = 0;
@@ -770,6 +919,7 @@ export class FileView {
     }
     const tab = this.tab();
     this.el.dataset.view = tab.view;
+    this.el.classList.toggle("fv-checks-on", this.checkboxMode);
     // A re-render rebuilds every cell: any press state from the old
     // cell generation is meaningless now.
     this.pressDeferred = null;
@@ -923,17 +1073,98 @@ export class FileView {
     this.scroller.insertBefore(banner, this.scroller.firstChild);
   }
 
+  /** Steal 2: collapsed stacks persist per folder (context =
+   * location + dir), namespaced by bucket key so a Date collapse
+   * never hides a Type stack of the same name. */
+  private groupCollapseStore(): Record<string, string[]> {
+    try {
+      const raw = localStorage.getItem("ff-group-collapsed");
+      if (raw) return JSON.parse(raw) as Record<string, string[]>;
+    } catch {
+      // storage unavailable — stacks just won't persist
+    }
+    return {};
+  }
+
+  private groupContext(tab: Tab): string {
+    const d = currentDir(tab);
+    return `${d.locationId}|${d.dirId}`;
+  }
+
+  private isGroupCollapsed(tab: Tab, key: string): boolean {
+    const ids = this.groupCollapseStore()[this.groupContext(tab)] ?? [];
+    return ids.includes(`${tab.groupBy}:${key}`);
+  }
+
+  private toggleGroup(tab: Tab, key: string): void {
+    const store = this.groupCollapseStore();
+    const ctx = this.groupContext(tab);
+    const id = `${tab.groupBy}:${key}`;
+    const cur = new Set(store[ctx] ?? []);
+    if (cur.has(id)) cur.delete(id);
+    else cur.add(id);
+    store[ctx] = [...cur];
+    try {
+      localStorage.setItem("ff-group-collapsed", JSON.stringify(store));
+    } catch {
+      // ignore — session-only collapse is an acceptable fallback
+    }
+    this.render();
+  }
+
+  private groupHeaderEl(tab: Tab, g: ItemGroup): HTMLButtonElement {
+    const h = document.createElement("button");
+    h.type = "button";
+    h.className = "group-head";
+    const collapsed = this.isGroupCollapsed(tab, g.key);
+    const chev = document.createElement("span");
+    chev.className = "group-chev";
+    chev.textContent = collapsed ? "▸" : "▾";
+    const label = document.createElement("span");
+    label.className = "group-label";
+    label.textContent = g.label;
+    const count = document.createElement("span");
+    count.className = "group-count";
+    count.textContent = String(g.entries.length);
+    h.append(chev, label, count);
+    h.setAttribute("aria-expanded", String(!collapsed));
+    h.addEventListener("click", () => this.toggleGroup(tab, g.key));
+    return h;
+  }
+
+  /** Steal 2 dispatch: flat (one emit per item, in sorted order)
+   * or stacked (a header per bucket; a collapsed bucket emits
+   * only its header). */
+  private emitGrouped(
+    tab: Tab,
+    emitHeader: (g: ItemGroup) => void,
+    emitItem: (item: Item, index: number) => void,
+  ): void {
+    const items = sortedItems(tab);
+    const groups = partitionItemGroups(tab.groupBy, items);
+    if (!groups) {
+      items.forEach((item, i) => emitItem(item, i));
+      return;
+    }
+    for (const g of groups) {
+      emitHeader(g);
+      if (this.isGroupCollapsed(tab, g.key)) continue;
+      for (const e of g.entries) emitItem(e.item, e.index);
+    }
+  }
+
   private renderGrid(tab: Tab): void {
     this.scroller.className = "fileview-scroller grid";
     this.scroller.innerHTML = "";
     const frag = document.createDocumentFragment();
-    sortedItems(tab).forEach((item, i) => {
+    const emitCell = (item: Item, i: number) => {
       const cell = document.createElement("div");
       cell.className = "cell";
       cell.dataset.id = item.id;
       cell.dataset.index = String(i);
       cell.setAttribute("role", "gridcell");
       cell.innerHTML = `${icon(item.kind, "cell-icon")}<span class="cell-name"></span>`;
+      if (this.checkboxMode) cell.appendChild(this.makeCheck(item));
       cell.querySelector(".cell-name")!.textContent = item.name;
       cell.title = item.name;
       applyLabelGrade(cell, item);
@@ -959,7 +1190,12 @@ export class FileView {
             // No thumbnail — the kind icon stays.
           });
       }
-    });
+    };
+    this.emitGrouped(
+      tab,
+      (g) => frag.appendChild(this.groupHeaderEl(tab, g)),
+      emitCell,
+    );
     this.scroller.appendChild(frag);
   }
 
@@ -1035,7 +1271,7 @@ export class FileView {
     });
     table.appendChild(thead);
     const tbody = document.createElement("tbody");
-    sortedItems(tab).forEach((item, i) => {
+    const emitRow = (item: Item, i: number) => {
       const tr = document.createElement("tr");
       tr.className = "row";
       tr.dataset.id = item.id;
@@ -1043,6 +1279,7 @@ export class FileView {
       const nameTd = document.createElement("td");
       nameTd.className = "row-name";
       nameTd.innerHTML = icon(item.kind, "row-icon");
+      if (this.checkboxMode) nameTd.prepend(this.makeCheck(item));
       const label = document.createElement("span");
       label.textContent = item.name;
       nameTd.appendChild(label);
@@ -1068,7 +1305,20 @@ export class FileView {
       tr.appendChild(kindTd);
       this.bindCell(tr, item, i);
       tbody.appendChild(tr);
-    });
+    };
+    this.emitGrouped(
+      tab,
+      (g) => {
+        const tr = document.createElement("tr");
+        tr.className = "group-row";
+        const td = document.createElement("td");
+        td.colSpan = 4;
+        td.appendChild(this.groupHeaderEl(tab, g));
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+      },
+      emitRow,
+    );
     table.appendChild(tbody);
     this.scroller.appendChild(table);
   }
@@ -1367,7 +1617,32 @@ export class FileView {
         const on = tab.selection.has(el.dataset.id!);
         el.setAttribute("aria-selected", String(on));
         el.classList.toggle("selected", on);
+        // Steal 8: check boxes mirror the same set.
+        const box = el.querySelector<HTMLInputElement>(".fv-check");
+        if (box) box.checked = on;
       });
+  }
+
+  /** Steal 8: one item's check box. Its events stop at the box —
+   * a press on it is a selection toggle, never a cell press (no
+   * drag, no open, no deferred collapse). */
+  private makeCheck(item: Item): HTMLInputElement {
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.className = "fv-check";
+    box.checked = this.tab().selection.has(item.id);
+    box.setAttribute("aria-label", `Select ${item.name}`);
+    box.addEventListener("mousedown", (e) => e.stopPropagation());
+    box.addEventListener("click", (e) => e.stopPropagation());
+    box.addEventListener("dblclick", (e) => e.stopPropagation());
+    box.addEventListener("change", () => {
+      const tab = this.tab();
+      if (box.checked) tab.selection.add(item.id);
+      else tab.selection.delete(item.id);
+      this.updateSelection();
+      this.hooks.onSelect(item);
+    });
+    return box;
   }
 
   private scrollIntoView(index: number): void {

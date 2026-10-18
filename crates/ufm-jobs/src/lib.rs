@@ -211,6 +211,17 @@ pub struct Job {
     /// loads unfinished jobs, and unfinished jobs are never slimmed.
     #[serde(default)]
     pub steps_slimmed: bool,
+    /// Grand Pass steal 6: this job's name-collision policy, chosen
+    /// at start. `serde(default)` = AutoRename for older snapshots.
+    #[serde(default)]
+    pub collision_policy: CollisionPolicy,
+    /// Grand Pass steal 6: per-step collision marks by step id —
+    /// Awaiting (the executor parks before this step until the
+    /// user decides) / Replace (the user consented to this step
+    /// taking the existing name). Lives on the job, not the step,
+    /// so every existing step literal and journal row is untouched.
+    #[serde(default)]
+    pub collision_marks: std::collections::HashMap<String, CollisionMark>,
 }
 
 /// Tallies of a job's steps by state, recorded at slimming time so a
@@ -276,6 +287,31 @@ pub enum ConflictKind {
     InsufficientSpace,
 }
 
+/// Grand Pass steal 6: what a job does when a destination name is
+/// already taken. `AutoRename` is the founding doctrine — a job
+/// NEVER silently overwrites; the incoming file lands as
+/// "name 2" — and it stays the default. `AskMe` instead parks the
+/// job on the colliding item and lets the user choose per item:
+/// Replace (the app's only overwrite, always explicit), KeepBoth
+/// (the auto-rename), or Skip.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollisionPolicy {
+    #[default]
+    AutoRename,
+    AskMe,
+}
+
+/// One step's collision state (steal 6), keyed by step id in
+/// `Job::collision_marks`: the step is parked awaiting the user's
+/// call, or the user said Replace and the step may take the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollisionMark {
+    Awaiting,
+    Replace,
+}
+
 impl Job {
     pub fn new(title: impl Into<String>, preview: JobPreview) -> Self {
         Self {
@@ -289,6 +325,8 @@ impl Job {
             packed: false,
             step_counts: None,
             steps_slimmed: false,
+            collision_policy: CollisionPolicy::AutoRename,
+            collision_marks: std::collections::HashMap::new(),
         }
     }
 
@@ -828,5 +866,36 @@ mod tests {
         restored.add_step(mk());
         replayed.replay_into(&mut restored);
         assert_eq!(restored.steps["s1"].state, StepState::Pending);
+    }
+
+    #[test]
+    fn collision_policy_defaults_and_roundtrips() {
+        // Steal 6: a pre-pass snapshot (no collision fields at all)
+        // loads as AutoRename with no marks — the doctrine default.
+        let mut job = Job::new("legacy", JobPreview::default());
+        job.add_step(step("s1", StepOp::Mkdir {
+            parent: item("dst", ItemKind::Folder),
+            name: "x".into(),
+        }, &[]));
+        let mut json = serde_json::to_value(&job).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("collision_policy");
+        obj.remove("collision_marks");
+        let restored: Job = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.collision_policy, CollisionPolicy::AutoRename);
+        assert!(restored.collision_marks.is_empty());
+
+        // And an AskMe job with a parked step round-trips intact.
+        let mut job2 = Job::new("ask", JobPreview::default());
+        job2.collision_policy = CollisionPolicy::AskMe;
+        job2.collision_marks
+            .insert("s0007".into(), CollisionMark::Awaiting);
+        let back: Job =
+            serde_json::from_str(&serde_json::to_string(&job2).unwrap()).unwrap();
+        assert_eq!(back.collision_policy, CollisionPolicy::AskMe);
+        assert_eq!(
+            back.collision_marks.get("s0007"),
+            Some(&CollisionMark::Awaiting)
+        );
     }
 }

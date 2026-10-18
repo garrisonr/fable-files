@@ -1,4 +1,4 @@
-import { errText } from "./toast";
+import { errText, Toast } from "./toast";
 /**
  * Quick Look: Space (or double-click on a file) opens a preview pane anchored
  * to the right of the selected file. The pane slides in from the right and
@@ -20,6 +20,7 @@ import {
   mediaSrc,
   PREVIEW_LABELS,
   type Item,
+  type MetaTag,
   type PreviewKind,
 } from "./api";
 import { onPlayerClosed, onPlayerReturn, onPlayerState } from "./api";
@@ -31,6 +32,19 @@ import { parseLrcLines } from "./musiccomplete";
 import { fadeTo, reducedMotion, springTo } from "./motion";
 
 const FALLBACK_PANEL_WIDTH = 340;
+
+/** Steal 7: facts a file commonly carries that are safe to edit
+ * inline — a subset of the Metadata dialog's writable set (the
+ * same exiftool-backed edit_metadata door serves both). */
+const FACTS_EDITABLE = new Set([
+  "Title",
+  "Author",
+  "Creator",
+  "Artist",
+  "Comment",
+  "Description",
+  "ImageDescription",
+]);
 
 export class QuickLook {
   readonly el: HTMLElement;
@@ -170,10 +184,26 @@ export class QuickLook {
 
   /** Set by the shell: cast the previewed media item. */
   onCast: ((item: Item) => void) | null = null;
+  /** Grand Pass steal 1: told about every item Quick Look shows,
+   * from every surface — the shell notes files into Home base's
+   * Recent shelf through here. */
+  onShowItem: ((item: Item) => void) | null = null;
   /** Set by the shell (Player round): the player's own Cast
    * button picks through the shell's shared CastDialog. */
   castPicker: ((name: string, video: boolean) => Promise<CastDeviceLike | null>) | null = null;
   private castBtn: HTMLButtonElement | null = null;
+  /** Steal 7: the Facts section's mode + per-item tag cache. The
+   * mode is a pane preference (persisted); tags are re-read only
+   * after an edit through the section itself. */
+  private factsOn = (() => {
+    try {
+      return localStorage.getItem("ff-ql-facts") === "1";
+    } catch {
+      return false;
+    }
+  })();
+  private factsBtn: HTMLButtonElement | null = null;
+  private factsCache = new Map<string, MetaTag[]>();
 
   constructor(private onDismiss: () => void) {
     this.el = document.createElement("aside");
@@ -183,10 +213,27 @@ export class QuickLook {
     this.el.innerHTML = `
       <div class="ql-head">
         <span class="ql-title">Preview</span>
+        <button class="ql-facts-btn pill-btn" aria-label="Toggle the Facts section" title="Facts — the details stored inside the file">Facts</button>
         <button class="ql-cast icon-btn" aria-label="Cast to device" title="Cast to…" hidden>📡</button>
         <button class="ql-close icon-btn" aria-label="Close preview">✕</button>
       </div>
       <div class="ql-body"></div>`;
+    this.factsBtn = this.el.querySelector(".ql-facts-btn");
+    this.factsBtn?.setAttribute("aria-pressed", String(this.factsOn));
+    this.factsBtn?.classList.toggle("on", this.factsOn);
+    this.factsBtn?.addEventListener("click", () => {
+      this.factsOn = !this.factsOn;
+      try {
+        localStorage.setItem("ff-ql-facts", this.factsOn ? "1" : "0");
+      } catch {
+        // session-only mode is fine
+      }
+      this.factsBtn?.setAttribute("aria-pressed", String(this.factsOn));
+      this.factsBtn?.classList.toggle("on", this.factsOn);
+      if (this.openItem) {
+        void this.renderCard(this.openItem, this.currentKind);
+      }
+    });
     this.castBtn = this.el.querySelector(".ql-cast");
     this.castBtn?.addEventListener("click", () => {
       if (this.openItem && this.onCast) this.onCast(this.openItem);
@@ -457,6 +504,7 @@ export class QuickLook {
   async open(item: Item): Promise<void> {
     const token = ++this.requestToken;
     this.openItem = item;
+    this.onShowItem?.(item);
     if (this.castBtn) {
       const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
       const AUDIO = ["mp3", "flac", "ogg", "oga", "wav", "m4a", "opus", "aac", "aif", "aiff"];
@@ -926,5 +974,182 @@ export class QuickLook {
         }
       }
     }
+    // Facts (steal 7): the details stored INSIDE the file, under
+    // everything else in the same pane — only in Facts mode, and
+    // only for files (a folder stores no embedded facts to read).
+    if (this.factsOn && item.kind !== "folder") {
+      void this.appendFacts(item, card);
+    }
+  }
+
+  /** Steal 7: fetch (once per item per session) and append the
+   * Facts section. Guarded like every async card append: a card
+   * the user has already moved past never grows a late section. */
+  private async appendFacts(item: Item, card: HTMLElement): Promise<void> {
+    let tags = this.factsCache.get(item.id);
+    if (!tags) {
+      tags = await api.readMetadata(item.id).catch(() => [] as MetaTag[]);
+      this.factsCache.set(item.id, tags);
+    }
+    if (this.cardItemId !== item.id || !card.isConnected) return;
+    card.appendChild(this.buildFactsSection(item, tags));
+  }
+
+  /** The Facts section for one item: kind-appropriate fields out
+   * of the file's own embedded metadata (the read_metadata
+   * plumbing the Metadata dialog uses — no second engine).
+   * Fields the file doesn't carry are omitted, never faked; an
+   * all-empty file gets the honest one-liner. Common fields that
+   * ARE present are inline-editable through edit_metadata. */
+  private buildFactsSection(item: Item, tags: MetaTag[]): HTMLElement {
+    const byTag = new Map<string, MetaTag>();
+    for (const t of tags) {
+      if (!byTag.has(t.tag)) byTag.set(t.tag, t);
+    }
+    const get = (name: string): string => byTag.get(name)?.value ?? "";
+    const rows: { label: string; value: string; tag?: string }[] = [];
+    const push = (label: string, value: string, tag?: string) => {
+      if (value) rows.push({ label, value, tag });
+    };
+    const firstOf = (names: string[]): { value: string; tag?: string } => {
+      for (const n of names) {
+        const v = get(n);
+        if (v) return { value: v, tag: n };
+      }
+      return { value: "" };
+    };
+    const dimensions = (): string => {
+      const size = get("ImageSize");
+      if (size) return size;
+      const w = get("ImageWidth") || get("SourceImageWidth");
+      const h = get("ImageHeight") || get("SourceImageHeight");
+      return w && h ? `${w} × ${h}` : "";
+    };
+    const camera = (): string => {
+      const make = get("Make");
+      const model = get("Model");
+      if (make && model && !model.startsWith(make)) return `${make} ${model}`;
+      return model || make;
+    };
+
+    const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
+    const imageExts = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "ico"];
+    const audioExts = ["mp3", "flac", "ogg", "oga", "wav", "m4a", "m4b", "opus", "aac", "aif", "aiff", "wma", "dsf", "dff"];
+    const docExts = ["pdf", "epub", "docx", "odt", "ods", "odp", "doc"];
+    if (imageExts.includes(ext)) {
+      push("Dimensions", dimensions());
+      const taken = firstOf(["DateTimeOriginal", "CreateDate"]);
+      push("Date taken", taken.value);
+      push("Camera", camera());
+      push("Lens", get("LensModel") || get("Lens"));
+    } else if (isVideoName(item.name)) {
+      push("Dimensions", dimensions());
+      push("Duration", get("Duration"));
+      const rec = firstOf(["DateTimeOriginal", "CreateDate"]);
+      push("Recorded", rec.value);
+    } else if (audioExts.includes(ext)) {
+      const title = firstOf(["Title"]);
+      push("Title", title.value, title.tag);
+      const artist = firstOf(["Artist"]);
+      push("Artist", artist.value, artist.tag);
+      push("Album", get("Album"));
+      push("Track", get("Track"));
+      push("Duration", get("Duration"));
+    } else if (docExts.includes(ext)) {
+      const title = firstOf(["Title"]);
+      push("Title", title.value, title.tag);
+      const author = firstOf(["Author", "Creator"]);
+      push("Author", author.value, author.tag);
+      push("Pages", get("PageCount") || get("Pages"));
+      push("Words", get("WordCount"));
+      const created = firstOf(["CreateDate", "CreationDate"]);
+      push("Created", created.value);
+    }
+    const comment = firstOf(["Comment", "ImageDescription", "Description"]);
+    push("Comment", comment.value, comment.tag);
+
+    const section = document.createElement("section");
+    section.className = "ql-facts";
+    const head = document.createElement("div");
+    head.className = "ql-facts-head";
+    head.textContent = "Facts";
+    section.appendChild(head);
+    if (rows.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "ql-facts-empty";
+      empty.textContent = "No extra facts are stored inside this file.";
+      section.appendChild(empty);
+      return section;
+    }
+    const dl = document.createElement("dl");
+    dl.className = "ql-meta ql-facts-list";
+    for (const row of rows) {
+      const dt = document.createElement("dt");
+      dt.textContent = row.label;
+      const dd = document.createElement("dd");
+      dd.textContent = row.value;
+      if (row.tag && FACTS_EDITABLE.has(row.tag)) {
+        dd.classList.add("ql-fact-editable");
+        dd.title = `Click to edit ${row.tag}`;
+        dd.addEventListener("click", () =>
+          this.editFact(item, section, row.tag!, dd),
+        );
+      }
+      dl.appendChild(dt);
+      dl.appendChild(dd);
+    }
+    section.appendChild(dl);
+    return section;
+  }
+
+  /** Inline-edit one fact: the value becomes an input; Enter (or
+   * blur) saves through edit_metadata, Esc cancels. The section
+   * rebuilds from the updated cache either way, so a failed save
+   * shows the file's real value again, never the rejected edit. */
+  private editFact(
+    item: Item,
+    section: HTMLElement,
+    tag: string,
+    dd: HTMLElement,
+  ): void {
+    const current = dd.textContent ?? "";
+    const input = document.createElement("input");
+    input.className = "ql-fact-input";
+    input.value = current;
+    input.setAttribute("aria-label", `Edit ${tag}`);
+    dd.replaceChildren(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = async (save: boolean): Promise<void> => {
+      if (done) return;
+      done = true;
+      const value = input.value.trim();
+      if (save && value !== current) {
+        try {
+          await api.editMetadata(item.id, [[tag, value]]);
+          const cached = this.factsCache.get(item.id);
+          const hit = cached?.find((t) => t.tag === tag);
+          if (hit) hit.value = value;
+          Toast.success(`Saved ${tag}.`);
+        } catch (err) {
+          Toast.error(`Could not save ${tag}: ${errText(err)}`);
+        }
+      }
+      if (section.isConnected) {
+        section.replaceWith(
+          this.buildFactsSection(item, this.factsCache.get(item.id) ?? []),
+        );
+      }
+    };
+    input.addEventListener("keydown", (e) => {
+      // The pane's keys (Space = Quick Look, arrows = selection)
+      // must never fire while a fact is being typed.
+      e.stopPropagation();
+      if (e.key === "Enter") void finish(true);
+      if (e.key === "Escape") void finish(false);
+    });
+    input.addEventListener("click", (e) => e.stopPropagation());
+    input.addEventListener("blur", () => void finish(true));
   }
 }
