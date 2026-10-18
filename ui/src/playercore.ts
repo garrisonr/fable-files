@@ -432,6 +432,29 @@ export class OwnerEngine {
       await this.cast.toggle();
       return;
     }
+    // Handoff rescue: after a claim hands playback to a window the
+    // user hasn't touched yet, the webview's autoplay policy refuses
+    // the element's play() while the Rust core — correctly — keeps
+    // its Playing state and clock. The element sits silent and the
+    // bar's first tap would toggle the CORE to paused, reading as
+    // "the handoff killed my music". When the core says Playing but
+    // this element never made sound, the tap means "make it play":
+    // start the element inside this genuine user gesture instead.
+    const s = this.client.snap;
+    if (
+      s &&
+      s.state === "playing" &&
+      this.client.isOwner(this.kind) &&
+      this.loadedPath !== null &&
+      this.el.paused
+    ) {
+      try {
+        await this.el.play();
+      } catch {
+        // still refused — fall through to the core toggle
+      }
+      if (!this.el.paused) return;
+    }
     await this.client.toggle();
   }
 
