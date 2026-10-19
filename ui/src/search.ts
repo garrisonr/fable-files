@@ -1060,9 +1060,10 @@ export class SearchView {
       this.mountRomMediaBar(name, systemKey);
       if (items.length === 0) {
         // An empty shelf should POINT somewhere (Dickles,
-        // 2026-10-15): the honest membership line, then a real
-        // link to the system's Internet Archive shelf, then the
-        // standing legal routes in one breath. Warm and brief.
+        // 2026-10-15): the honest membership line, then — where
+        // a verified set exists (Game Warden, 2026-10-18) — a
+        // real link to the system's Internet Archive shelf, then
+        // the standing legal routes in one breath. Warm and brief.
         const help = document.createElement("div");
         help.className = "rom-empty-help";
         const note = document.createElement("p");
@@ -1073,20 +1074,26 @@ export class SearchView {
         const pointer = document.createElement("p");
         pointer.className = "search-hint";
         pointer.append("Looking to fill this shelf? ");
+        // Game Warden (2026-10-18): link only a verified per-system
+        // set — no general Software Library fallback. Without one,
+        // the classic routes stand alone.
         const shelf = romArchiveLink(systemKey);
-        const link = document.createElement("a");
-        link.className = "guide-link";
-        link.href = shelf.url;
-        link.textContent = shelf.perSystem
-          ? `The Internet Archive keeps a ${name} collection`
-          : "The Internet Archive's Software Library";
-        link.addEventListener("click", (e) => {
-          e.preventDefault();
-          openGuideLink(shelf.url);
-        });
-        pointer.appendChild(link);
+        if (shelf) {
+          const link = document.createElement("a");
+          link.className = "guide-link";
+          link.href = shelf;
+          link.textContent = `the ${name} sets at the Internet Archive`;
+          link.addEventListener("click", (e) => {
+            e.preventDefault();
+            openGuideLink(shelf);
+          });
+          pointer.appendChild(link);
+          pointer.append(" — and the classic routes never close: ");
+        } else {
+          pointer.append("The classic routes never close: ");
+        }
         pointer.append(
-          " — and the classic routes never close: dump cartridges you own, homebrew, and public-domain releases are all fair game.",
+          "dump cartridges you own, homebrew, and public-domain releases are all fair game.",
         );
         help.appendChild(pointer);
         this.resultsEl.appendChild(help);

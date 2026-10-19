@@ -239,7 +239,7 @@ export class AuditorPanel {
 
   private renderLatestSummary(): HTMLElement {
     const block = el("div", "mr-tmdb");
-    block.appendChild(el("h4", "mc-h", "Summary of alerts"));
+    block.appendChild(el("h4", "mc-h", "Latest audit"));
     const run = this.runs[0];
     if (!run) {
       block.appendChild(

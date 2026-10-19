@@ -680,3 +680,52 @@ fn typo_ignores_release_vocabulary() {
     assert!(cands[0].path.ends_with("The Richrd Story [YTS.MX].mkv"));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ------------------------------------------------------------------
+// Red Pen (2026-10-18): an orphaned "running" row is closed out as
+// "interrupted"; a genuinely in-flight run is untouchable.
+// ------------------------------------------------------------------
+
+#[test]
+fn stale_running_runs_are_interrupted_unless_in_flight() {
+    let cat = Catalog::open_in_memory().unwrap();
+    let mk = |id: &str, status: &str| AuditorRunRow {
+        id: id.into(),
+        schedule_id: None,
+        schedule_name: "Manual audit".into(),
+        target: "/nowhere".into(),
+        started: "2026-10-18T03:00:00".into(),
+        finished: None,
+        was_late: false,
+        status: status.into(),
+        summary_json: "{}".into(),
+    };
+    cat.upsert_auditor_run(&mk("zombie", "running")).unwrap();
+    cat.upsert_auditor_run(&mk("live", "running")).unwrap();
+    cat.upsert_auditor_run(&mk("done", "completed")).unwrap();
+
+    let flipped = cat
+        .mark_stale_auditor_runs_interrupted(&["live".to_string()])
+        .unwrap();
+    assert_eq!(flipped, 1);
+    let runs = cat.recent_auditor_runs(10).unwrap();
+    let status_of = |id: &str| {
+        runs.iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .status
+            .clone()
+    };
+    assert_eq!(status_of("zombie"), "interrupted");
+    assert_eq!(status_of("live"), "running");
+    assert_eq!(status_of("done"), "completed");
+
+    // With nothing in flight, the remaining runner closes too.
+    let flipped = cat.mark_stale_auditor_runs_interrupted(&[]).unwrap();
+    assert_eq!(flipped, 1);
+    let runs = cat.recent_auditor_runs(10).unwrap();
+    assert_eq!(
+        runs.iter().find(|r| r.id == "live").unwrap().status,
+        "interrupted"
+    );
+}

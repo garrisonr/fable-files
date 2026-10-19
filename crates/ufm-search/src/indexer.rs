@@ -106,6 +106,25 @@ const CHECKPOINT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// stats on checkpoint cadence. Must be cheap — it runs on the indexing thread.
 pub type ProgressCallback = Box<dyn Fn(IndexStats) + Send + 'static>;
 
+/// Index scope law (2026-10-18, crew Dewey): the walker never
+/// descends into a hidden (dot) directory INSIDE a location. A
+/// location ROOTED at a dot-directory still indexes its root —
+/// depth 0 is the root itself and is never pruned — but a
+/// dot-directory below the root prunes wherever it sits. Files are
+/// never judged by this predicate (a dot-FILE in a visible folder
+/// stays indexed); directories only. The census behind the rule
+/// (fresh backup-API copies of both live catalogs, 2026-10-18):
+/// ~80% of the Dell's 444k rows lived under dot-directories —
+/// `.local` 154k, `.cache` 77k, `.cargo` 42k, plus build-tree
+/// `.fingerprint` rows — caches, registries, and fingerprints,
+/// not library. Shared by the indexer and the safety-gate census
+/// (`census_root`) so the two can never disagree about what a
+/// walk covers: the gate's folder picks are built from the
+/// census, so a pick can never name a tree the walk would prune.
+pub fn prunes_hidden_dir(depth: usize, dir_name: &str) -> bool {
+    depth >= 1 && dir_name.len() > 1 && dir_name.starts_with('.')
+}
+
 pub struct Indexer {
     catalog: ufm_catalog::Catalog,
     checkpoint_path: PathBuf,
@@ -358,6 +377,17 @@ impl Indexer {
                 }
                 if !e.file_type().is_dir() {
                     return true; // files are filtered in the loop
+                }
+                // Index scope law (see prunes_hidden_dir): hidden
+                // directories inside the location are never
+                // descended into. Ahead of the safety-gate check on
+                // purpose — the census applies the same rule, so a
+                // folder pick can never name a pruned tree.
+                if prunes_hidden_dir(
+                    e.depth(),
+                    &e.file_name().to_string_lossy(),
+                ) {
+                    return false;
                 }
                 // Safety gate: prune top-level subtrees the folder
                 // pick excluded — never descend into them at all.
@@ -891,5 +921,97 @@ mod tests {
         assert!(third.contains("\"/c\""));
         assert!(third.contains("\"run_complete\":true"));
         std::fs::remove_dir_all(&work).ok();
+    }
+
+    /// Builds: root/{visible/{f.txt, .nested/deep.txt}, .hidden/secret.txt,
+    /// .dotfile (a FILE), top.txt}
+    fn hidden_fixture_tree() -> PathBuf {
+        let root = scratch_dir("hidden-tree");
+        std::fs::create_dir_all(root.join("visible").join(".nested")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join("visible").join("f.txt"), b"vis").unwrap();
+        std::fs::write(
+            root.join("visible").join(".nested").join("deep.txt"),
+            b"deep",
+        )
+        .unwrap();
+        std::fs::write(root.join(".hidden").join("secret.txt"), b"shh").unwrap();
+        std::fs::write(root.join(".dotfile"), b"dot").unwrap();
+        std::fs::write(root.join("top.txt"), b"top").unwrap();
+        root
+    }
+
+    /// Index scope law (2026-10-18): hidden directories inside a
+    /// location are never descended into — at ANY depth — while
+    /// dot-FILES in visible folders stay indexed. Regression pin
+    /// for the Dell/G9 catalogs carrying hundreds of thousands of
+    /// cache/registry rows under .local/.cache/.cargo.
+    #[test]
+    fn hidden_dirs_are_never_descended() {
+        let work = scratch_dir("hidden");
+        let root = hidden_fixture_tree();
+        let catalog_path = work.join("catalog.db");
+        let checkpoint_path = work.join("checkpoint.json");
+        let location = test_location();
+
+        let mut ix = Indexer::open(&catalog_path, &checkpoint_path).unwrap();
+        let stats = ix.index_root(&root, &location).unwrap();
+        assert_eq!(stats.dirs_done, 2, "root + visible only");
+        assert_eq!(
+            stats.files_done, 3,
+            "f.txt + .dotfile + top.txt; nothing from .hidden or .nested"
+        );
+
+        let cat = ufm_catalog::Catalog::open(&catalog_path).unwrap();
+        let manifest = cat.manifest_for_location(&location.id).unwrap();
+        assert_eq!(manifest.len(), 5, "2 dirs + 3 files");
+        for key in manifest.keys() {
+            assert!(
+                !key.contains("/.hidden/") && !key.contains("/.nested/"),
+                "pruned subtree leaked into the catalog: {key}"
+            );
+        }
+        assert!(
+            manifest.keys().any(|k| k.ends_with("/.dotfile")),
+            "a dot-FILE in a visible folder stays indexed"
+        );
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The root exemption: a location ROOTED at a dot-directory
+    /// indexes its root (and its visible children) — the rule
+    /// judges directories INSIDE the location, never the root
+    /// itself — while dot-dirs below that root still prune.
+    #[test]
+    fn location_rooted_at_hidden_dir_indexes_its_root() {
+        let work = scratch_dir("hidden-root");
+        let outer = scratch_dir("hidden-outer");
+        let root = outer.join(".vault");
+        std::fs::create_dir_all(root.join(".inner")).unwrap();
+        std::fs::write(root.join("kept.txt"), b"kept").unwrap();
+        std::fs::write(root.join(".inner").join("gone.txt"), b"gone").unwrap();
+        let catalog_path = work.join("catalog.db");
+        let checkpoint_path = work.join("checkpoint.json");
+        let location = test_location();
+
+        let mut ix = Indexer::open(&catalog_path, &checkpoint_path).unwrap();
+        let stats = ix.index_root(&root, &location).unwrap();
+        assert_eq!(stats.dirs_done, 1, "the dot-dir root itself, nothing below");
+        assert_eq!(stats.files_done, 1, "kept.txt only");
+
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::remove_dir_all(&outer).ok();
+    }
+
+    #[test]
+    fn hidden_dir_predicate_edges() {
+        assert!(prunes_hidden_dir(1, ".cargo"));
+        assert!(prunes_hidden_dir(7, ".fingerprint"));
+        assert!(!prunes_hidden_dir(0, ".cargo"), "depth 0 is the root: exempt");
+        assert!(!prunes_hidden_dir(1, "visible"));
+        assert!(!prunes_hidden_dir(1, "."), "a bare dot is not a directory name");
+        assert!(!prunes_hidden_dir(3, "x.hidden"));
     }
 }

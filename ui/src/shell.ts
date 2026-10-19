@@ -30,6 +30,11 @@ import { Toast, confirmDialog, promptDialog, errText} from "./toast";
 import { openConnectDialog } from "./network";
 import { showPluginRunDialog } from "./plugins";
 import { SearchView, fmtDay } from "./search";
+import {
+  roomsToExitForFileNavigation,
+  roomsToExitForSearchResults,
+  suppressPinnedFavorites,
+} from "./roomnav";
 import { RomHome } from "./romhome";
 import { BooksHome } from "./bookshome";
 import { mountNowPlaying } from "./nowplaying";
@@ -41,6 +46,7 @@ import { partitionReindex } from "./addscope";
 import { MusicCompleteDialog } from "./musiccomplete";
 import { PropertiesDialog } from "./properties";
 import { AuditorPanel } from "./auditor";
+import { auditorEntryState } from "./auditorentry";
 import { FolderPicker, type PickerShortcut } from "./picker";
 import { RenameDialog } from "./rename";
 import { LabelManager, saveLabelRules } from "./labels";
@@ -272,6 +278,9 @@ export class Shell {
   private propertiesDialog = new PropertiesDialog();
   private auditorPanel = new AuditorPanel();
   private auditorBadgeEl: HTMLElement | null = null;
+  private auditorLabelEl: HTMLElement | null = null;
+  private auditorRowEl: HTMLElement | null = null;
+  private auditorPollTimer: number | null = null;
   private fontScale = 1.0;
   private picker = new FolderPicker();
   private renameDialog = new RenameDialog();
@@ -694,6 +703,10 @@ export class Shell {
         );
       },
       onResults: () => {
+        // Search results replace any room too (roomnav law): a
+        // smart folder click while the Books room was up used to
+        // paint results UNDER the room (2026-10-18).
+        this.exitAllRooms(roomsToExitForSearchResults());
         this.fileView.el.hidden = true;
         this.columnsView.el.hidden = true;
         this.galleryView.el.hidden = true;
@@ -1214,14 +1227,20 @@ export class Shell {
     auditorRow.className = "side-item";
     const auditorGlyph = sectionGlyph("auditor");
     const auditorLabel = document.createElement("span");
-    auditorLabel.textContent = "Review findings";
+    // Red Pen (2026-10-18): the label is STATE, refreshed from the
+    // auditor's persisted runs + open count by refreshAuditorBadge
+    // (auditorentry.ts) — never a hardcoded claim. Until the first
+    // refresh lands the row wears the section's plain name, which
+    // claims nothing.
+    auditorLabel.textContent = "File audit";
     const auditorBadge = document.createElement("span");
     auditorBadge.className = "side-count";
     auditorBadge.textContent = "";
     this.auditorBadgeEl = auditorBadge;
+    this.auditorLabelEl = auditorLabel;
+    this.auditorRowEl = auditorRow;
     auditorRow.append(auditorGlyph, auditorLabel, auditorBadge);
-    auditorRow.title =
-      "Audit folders and drives for typos, pattern breaks, corruption, duplicates, junk and drift — findings wait here for your verdict";
+    auditorRow.title = "File Auditor";
     auditorRow.addEventListener("click", () => this.openAuditor());
     const smartHead = document.createElement("h2");
     smartHead.className = "side-head";
@@ -1515,8 +1534,11 @@ export class Shell {
 
   private navigateTo(dir: { locationId: string; dirId: string; crumbs: { dirId: string; name: string }[] }): void {
     if (this.searchView.active) this.searchView.clear();
-    if (this.romHome?.active) this.exitRomHome();
-    if (this.homeView?.active) this.exitHomeBase();
+    // Room eviction is NOT hand-listed here anymore: the Books
+    // room was missing from this list, so Books → Movies left the
+    // room on screen (Dickles, 2026-10-18). The roomnav module
+    // owns the set; every navigation path exits through it.
+    this.exitAllRooms(roomsToExitForFileNavigation());
     const tab = this.requireTab();
     this.quickLook.close();
     navigate(tab, dir);
@@ -1526,6 +1548,7 @@ export class Shell {
   private goBack(): void {
     const tab = this.requireTab();
     if (goBack(tab)) {
+      this.exitAllRooms(roomsToExitForFileNavigation());
       this.quickLook.close();
       void this.loadDir(tab);
     }
@@ -1534,6 +1557,7 @@ export class Shell {
   private goForward(): void {
     const tab = this.requireTab();
     if (goForward(tab)) {
+      this.exitAllRooms(roomsToExitForFileNavigation());
       this.quickLook.close();
       void this.loadDir(tab);
     }
@@ -3950,15 +3974,48 @@ export class Shell {
     // menu reads its Add/Remove state from these, rebuilt each pass.
     this.builtinFavNames.clear();
     this.favoritePathSet.clear();
+    const pathByName = new Map<string, string>();
     for (const p of allPairs) {
       const path = await api.getItemPath(p.target!.dirId).catch(() => "");
-      if (path) this.builtinFavNames.set(normFavPath(path), p.name);
+      if (path) {
+        const norm = normFavPath(path);
+        this.builtinFavNames.set(norm, p.name);
+        pathByName.set(p.name, norm);
+      }
     }
     for (const p of pairs) {
-      const path = await api.getItemPath(p.target!.dirId).catch(() => "");
-      if (path) this.favoritePathSet.add(normFavPath(path));
+      const norm = pathByName.get(p.name);
+      if (norm) this.favoritePathSet.add(norm);
     }
-    for (const pair of pairs) {
+    // Sidebar law (Dickles, 2026-10-18): each location appears
+    // exactly once in the sidebar. The pinned section wins — and
+    // the pinned section is TWO things: the Home door above
+    // FAVORITES, and every user-pinned favorite (the PINNED
+    // section below it). A location rendered in either is
+    // suppressed from FAVORITES by location identity (roomnav's
+    // suppressPinnedFavorites). Dickles' Dell showed why the set
+    // must be the union: Files · Videos · Pictures · Music sat
+    // in BOTH sections — they are built-in favorites AND user
+    // pins, and the two lists were composed without ever being
+    // deduped against each other (his first report caught only
+    // the Home instance of the same defect). The door's identity
+    // comes from the same target resolution the favorite uses,
+    // so the two can never drift. Bookkeeping above is
+    // deliberately untouched: a suppressed favorite still
+    // exists, it just isn't rendered twice.
+    const doorPaths = new Set<string>();
+    const pinnedHome = pathByName.get("Home");
+    if (pinnedHome) doorPaths.add(pinnedHome);
+    const pinnedPaths = new Set<string>(doorPaths);
+    for (const fav of this.loadUserFavorites()) {
+      pinnedPaths.add(normFavPath(fav.path));
+    }
+    const renderPairs = suppressPinnedFavorites(
+      pairs,
+      (p) => pathByName.get(p.name),
+      pinnedPaths
+    );
+    for (const pair of renderPairs) {
       const name = pair.name;
       const target = pair.target!;
       const b = document.createElement("button");
@@ -4109,10 +4166,19 @@ export class Shell {
     // or by the item context menu. One whose folder can't be resolved
     // right now (drive not mounted) is OMITTED, never shown disabled
     // — the same rule as the built-ins above.
+    const seenPinPaths = new Set<string>();
     for (const fav of this.loadUserFavorites()) {
       const target = await this.resolvePathTarget(fav.path);
       if (!target) continue;
       this.favoritePathSet.add(normFavPath(fav.path));
+      // Sidebar law for the PINNED section itself: the Home door
+      // outranks a user pin of the Home location (the door IS
+      // that location's pinned entry), and the same location
+      // pinned twice renders once. Everything else here renders
+      // — this section is where pinned locations live.
+      const favNorm = normFavPath(fav.path);
+      if (doorPaths.has(favNorm) || seenPinPaths.has(favNorm)) continue;
+      seenPinPaths.add(favNorm);
       const b = document.createElement("button");
       b.className = "side-item";
       const pinLabel = document.createElement("span");
@@ -4911,18 +4977,46 @@ export class Shell {
     })();
   }
 
-  /** File Auditor: the sidebar badge carries the open-flag count
-   * (proactive, calm — a number, never a red alert). Refreshed when
-   * the sidebar builds, when the panel closes, and whenever the
-   * panel reports a change. */
+  /** File Auditor: the sidebar entry tells the truth about the
+   * auditor's state. The badge carries the open-flag count
+   * (proactive, calm — a number, never a red alert); the label and
+   * hover title derive from the persisted run history
+   * (auditorentry.ts): never run → an invitation, running →
+   * "Auditing…", findings open → "Review findings", a clean or
+   * settled history → "All clear". Refreshed when the sidebar
+   * builds, when the panel closes, whenever the panel reports a
+   * change — and, while an audit runs, on a slow cosmetic poll so
+   * the label catches up on its own when the run lands. */
   private async refreshAuditorBadge(): Promise<void> {
     try {
-      const n = await api.auditorOpenCount();
-      if (this.auditorBadgeEl) {
-        this.auditorBadgeEl.textContent = n > 0 ? String(n) : "";
-      }
+      const [n, runs] = await Promise.all([
+        api.auditorOpenCount(),
+        api.auditorListRuns(),
+      ]);
+      const st = auditorEntryState(runs, n);
+      if (this.auditorBadgeEl) this.auditorBadgeEl.textContent = st.badge;
+      if (this.auditorLabelEl) this.auditorLabelEl.textContent = st.label;
+      if (this.auditorRowEl) this.auditorRowEl.title = st.title;
+      this.watchAuditorRun(st.state === "running");
     } catch {
-      // The badge is a courtesy — a failed count stays blank.
+      // The entry is a courtesy — a failed read keeps the last
+      // state it could prove rather than inventing a new one.
+    }
+  }
+
+  /** While an audit is in flight, re-read the entry every 30s.
+   * Cosmetic freshness only: the persisted state is the truth and
+   * this merely re-reads it; the poll dies with the run. */
+  private watchAuditorRun(running: boolean): void {
+    if (this.auditorPollTimer !== null) {
+      window.clearTimeout(this.auditorPollTimer);
+      this.auditorPollTimer = null;
+    }
+    if (running) {
+      this.auditorPollTimer = window.setTimeout(() => {
+        this.auditorPollTimer = null;
+        void this.refreshAuditorBadge();
+      }, 30_000);
     }
   }
 
@@ -5325,6 +5419,20 @@ export class Shell {
     this.searchView.el.hidden = true;
     this.romsHead?.setAttribute("aria-current", "true");
     void this.romHome.open(target);
+  }
+
+  /** Evict every room layer the given roomnav set names. The
+   * single choke point for "navigation replaces whatever room is
+   * up": each exit is a safe no-op when its room isn't active, and
+   * the room that WAS active repaints the file view on its way
+   * out. Never hand-list room exits at a call site again — that
+   * is exactly how Books was forgotten (2026-10-18). */
+  private exitAllRooms(rooms: readonly string[]): void {
+    for (const room of rooms) {
+      if (room === "books") this.exitBooksHome();
+      else if (room === "rom") this.exitRomHome();
+      else if (room === "homeBase") this.exitHomeBase();
+    }
   }
 
   private exitRomHome(): void {

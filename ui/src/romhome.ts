@@ -47,6 +47,7 @@ import {
   romIconSlug,
   loadRomIconSet,
   romArchiveLink,
+  romShelfTruth,
   OWNED_HARDWARE,
   type RomSystem,
   type OwnedHardware,
@@ -2028,14 +2029,27 @@ export class RomHome {
           el("h3", "", rs ? `No ${rs.name} games yet` : "No games yet"),
         );
         const p = el("p", "");
+        // Game Warden addendum (2026-10-19): the second sentence
+        // speaks THIS system's truth — ROM_SHELF_TRUTH overrides
+        // the default DAT sentence for the systems where that
+        // sentence would be a lie (OUYA's APKs, PC's library
+        // import, the extension-only shelves).
         p.append(
-          document.createTextNode("Games come from your own dumps, homebrew, and public-domain releases. Add a folder of ROMs and they'll be identified against the DAT sets. You can also hunt the sets at "),
+          document.createTextNode(
+            "Games come from your own dumps, homebrew, and public-domain releases. " +
+              ((rs && romShelfTruth(rs.name)) ?? "Add a folder of ROMs and they'll be identified against the DAT sets."),
+          ),
         );
-        const link = el("button", "linklike", "archive.org");
-        link.addEventListener("click", () => {
-          if (rs) openGuideLink(romArchiveLink(rs.key ?? "").url);
-        });
-        p.append(link, document.createTextNode("."));
+        // Game Warden (2026-10-18): the hunt sentence exists ONLY
+        // for a system with a verified archive.org set. No generic
+        // fallback — a system without one points nowhere.
+        const hunt = rs ? romArchiveLink(rs.key ?? "") : null;
+        if (hunt) {
+          p.append(document.createTextNode(" You can also hunt the sets at "));
+          const link = el("button", "linklike", "Internet Archive");
+          link.addEventListener("click", () => openGuideLink(hunt));
+          p.append(link, document.createTextNode("."));
+        }
         note.appendChild(p);
         const btn = el("button", "pill-btn rh-empty-action", "Add a game folder…") as HTMLButtonElement;
         btn.addEventListener("click", () => this.hooks.onAddRomFolder());
