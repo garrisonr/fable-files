@@ -9238,18 +9238,60 @@ impl Catalog {
         Ok(items)
     }
 
+    /// Withdraw a book identification (2026-10-18, crew Dewey):
+    /// the file failed content validation on a re-judge, so its
+    /// derived metadata goes away — the book_metadata row, its
+    /// authors, and the 'ebook' media identity the upsert wrote.
+    /// The ITEM row stays (the file is still a plain file in its
+    /// location) and reading state is untouched: book_state is
+    /// keyed by provider_key and is the reader's own record, not
+    /// identification output. Returns whether a row existed.
+    pub fn delete_book_metadata(&self, item_id: &str) -> Result<bool> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        let n = tx
+            .execute(
+                "DELETE FROM book_metadata WHERE item_id = ?1",
+                params![item_id],
+            )
+            .map_err(|e| UfmError::Database(e.to_string()))?;
+        tx.execute(
+            "DELETE FROM book_authors WHERE item_id = ?1",
+            params![item_id],
+        )
+        .map_err(|e| UfmError::Database(e.to_string()))?;
+        tx.execute(
+            "DELETE FROM media_identities WHERE item_id = ?1 AND media_kind = 'ebook'",
+            params![item_id],
+        )
+        .map_err(|e| UfmError::Database(e.to_string()))?;
+        tx.commit().map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(n > 0)
+    }
+
     /// Book files (EPUB/PDF by name) that still owe an identify:
     /// no metadata row, or the file's size/mtime moved since the
     /// stored snapshot. Optionally scoped to one location (the
     /// post-index hook identifies only what the walk just touched).
     pub fn book_candidates(&self, location_id: Option<&str>) -> Result<Vec<ufm_vfs::Item>> {
+        // The pdf/page_count clause (2026-10-18, crew Dewey): a PDF
+        // that passed content validation ALWAYS has a page count,
+        // so a stored PDF row without one was shelved by the old
+        // extension-trusting rules (the paper-100k fixture) and
+        // owes a re-judge under the content gate — after which it
+        // either gains a real page count or its row is withdrawn.
+        // EPUB rows legitimately carry page_count NULL (they store
+        // spine_count instead), so the clause names format 'pdf'.
         let base = "SELECT i.id, i.location_id, i.name, i.kind, i.size_bytes, i.modified, i.provider_key
              FROM items i LEFT JOIN book_metadata bm ON bm.item_id = i.id
              WHERE i.provider_key IS NOT NULL
                AND (lower(i.name) LIKE '%.epub' OR lower(i.name) LIKE '%.pdf')
                AND (bm.item_id IS NULL
                     OR bm.size_bytes IS NOT i.size_bytes
-                    OR bm.modified IS NOT i.modified)";
+                    OR bm.modified IS NOT i.modified
+                    OR (bm.format = 'pdf' AND bm.page_count IS NULL))";
         match location_id {
             Some(loc) => self.query_items(&format!("{base} AND i.location_id = ?1 ORDER BY i.name"), Some(loc)),
             None => self.query_items(&format!("{base} ORDER BY i.name"), None),
@@ -13778,6 +13820,63 @@ mod rom_home_tests {
         let cands = cat.book_candidates(None).unwrap();
         assert_eq!(cands.len(), 2, "stale epub + untouched pdf");
         assert!(cands.iter().any(|i| i.name == "A.epub"));
+    }
+
+    #[test]
+    fn book_candidates_rejudge_pageless_pdf_rows() {
+        // The paper-100k scar (2026-10-18, crew Dewey): a PDF row
+        // with NO page count was shelved by the old
+        // extension-trusting rules and — its size/mtime still
+        // matched — would never be judged again. A validated PDF
+        // always has a page count, so the row owes a re-judge; a
+        // validated one (page count present) stays fresh; an EPUB
+        // row (spine_count instead of pages) is never swept up.
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let fake = seed_book(&cat, loc, "paper-100k.pdf");
+        let real = seed_book(&cat, loc, "Real Book.pdf");
+        let epub = seed_book(&cat, loc, "Novel.epub");
+        let mut fake_meta = book_meta(&fake, "paper-100k");
+        fake_meta.format = "pdf".into();
+        fake_meta.page_count = None;
+        fake_meta.spine_count = None;
+        cat.upsert_book_metadata(&fake_meta).unwrap();
+        let mut real_meta = book_meta(&real, "Real Book");
+        real_meta.format = "pdf".into();
+        real_meta.page_count = Some(212);
+        real_meta.spine_count = None;
+        cat.upsert_book_metadata(&real_meta).unwrap();
+        cat.upsert_book_metadata(&book_meta(&epub, "Novel")).unwrap();
+        let cands = cat.book_candidates(None).unwrap();
+        let names: Vec<&str> = cands.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["paper-100k.pdf"], "only the page-less PDF row re-judges");
+    }
+
+    #[test]
+    fn delete_book_metadata_withdraws_the_identification() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let loc = LocationId::new();
+        cat.insert_location(&sample_location(loc)).unwrap();
+        let item = seed_book(&cat, loc, "paper-100k.pdf");
+        let mut meta = book_meta(&item, "paper-100k");
+        meta.format = "pdf".into();
+        cat.upsert_book_metadata(&meta).unwrap();
+        assert!(cat.book_metadata_for(&item.id.to_string()).unwrap().is_some());
+        assert!(cat.delete_book_metadata(&item.id.to_string()).unwrap());
+        assert!(cat.book_metadata_for(&item.id.to_string()).unwrap().is_none());
+        assert!(
+            cat.media_identity_for(&item.id).unwrap().is_none(),
+            "the 'ebook' media identity is withdrawn with the row"
+        );
+        // The item itself survives as a plain file, a candidate again.
+        assert!(cat
+            .book_candidates(None)
+            .unwrap()
+            .iter()
+            .any(|i| i.name == "paper-100k.pdf"));
+        // Withdrawing twice is a no-op, not an error.
+        assert!(!cat.delete_book_metadata(&item.id.to_string()).unwrap());
     }
 
     #[test]

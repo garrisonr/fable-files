@@ -122,6 +122,31 @@ pub fn decode_pdf_metadata(path: &Path, file_size: u64) -> PdfPreview {
     decode_inner(path, file_size, 0, true, false)
 }
 
+/// How far into the file the `%PDF-` header may sit. The PDF spec
+/// lets the header be preceded by up to 1024 bytes of other data
+/// (files that passed through systems that prepended something),
+/// and the poppler tools scan the same window — so the content
+/// gate accepts exactly what the reader stack accepts.
+const PDF_MAGIC_WINDOW: usize = 1024;
+
+/// Does this file actually carry the PDF header? A cheap CONTENT
+/// gate for callers that must not trust the `.pdf` in a name:
+/// book identification shelved a zlib-rs test fixture named
+/// `paper-100k.pdf` (102,400 bytes of RDF/XML) as a book on
+/// extension alone (2026-10, crew Dewey) because the "isn't a
+/// readable PDF" note from the metadata pass was never treated
+/// as a verdict. Read errors answer false: unreadable is not
+/// a PDF.
+pub fn has_pdf_magic(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; PDF_MAGIC_WINDOW];
+    let n = f.read(&mut buf).unwrap_or(0);
+    buf[..n].windows(5).any(|w| w == b"%PDF-")
+}
+
 fn decode_inner(
     path: &Path,
     file_size: u64,
@@ -580,6 +605,38 @@ mod tests {
         ));
         std::fs::write(&p, bytes).unwrap();
         p
+    }
+
+    #[test]
+    fn pdf_magic_judges_content_not_the_name() {
+        // The regression at the heart of the paper-100k incident:
+        // RDF/XML bytes wearing a .pdf name must fail the gate.
+        let rdf = br#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"></rdf:RDF>"#;
+        let fake = write_temp("paper-100k.pdf", rdf);
+        assert!(
+            !has_pdf_magic(&fake),
+            "RDF bytes in a .pdf costume must not pass as a PDF"
+        );
+        let _ = std::fs::remove_file(&fake);
+
+        let bytes = fixture_pdf();
+        let real = write_temp("real.pdf", &bytes);
+        assert!(has_pdf_magic(&real));
+        let _ = std::fs::remove_file(&real);
+
+        // The spec window: a header pushed a few hundred bytes in
+        // by prepended data still counts (poppler reads it too).
+        let mut padded = vec![b'x'; 300];
+        padded.extend_from_slice(&bytes);
+        let p2 = write_temp("padded.pdf", &padded);
+        assert!(has_pdf_magic(&p2));
+        let _ = std::fs::remove_file(&p2);
+
+        // Missing files and empty files are not PDFs.
+        assert!(!has_pdf_magic(Path::new("/definitely/not/here.pdf")));
+        let empty = write_temp("empty.pdf", b"");
+        assert!(!has_pdf_magic(&empty));
+        let _ = std::fs::remove_file(&empty);
     }
 
     #[test]

@@ -30,6 +30,11 @@ import { Toast, confirmDialog, promptDialog, errText} from "./toast";
 import { openConnectDialog } from "./network";
 import { showPluginRunDialog } from "./plugins";
 import { SearchView, fmtDay } from "./search";
+import {
+  roomsToExitForFileNavigation,
+  roomsToExitForSearchResults,
+  suppressPinnedFavorites,
+} from "./roomnav";
 import { RomHome } from "./romhome";
 import { BooksHome } from "./bookshome";
 import { mountNowPlaying } from "./nowplaying";
@@ -694,6 +699,10 @@ export class Shell {
         );
       },
       onResults: () => {
+        // Search results replace any room too (roomnav law): a
+        // smart folder click while the Books room was up used to
+        // paint results UNDER the room (2026-10-18).
+        this.exitAllRooms(roomsToExitForSearchResults());
         this.fileView.el.hidden = true;
         this.columnsView.el.hidden = true;
         this.galleryView.el.hidden = true;
@@ -1498,8 +1507,11 @@ export class Shell {
 
   private navigateTo(dir: { locationId: string; dirId: string; crumbs: { dirId: string; name: string }[] }): void {
     if (this.searchView.active) this.searchView.clear();
-    if (this.romHome?.active) this.exitRomHome();
-    if (this.homeView?.active) this.exitHomeBase();
+    // Room eviction is NOT hand-listed here anymore: the Books
+    // room was missing from this list, so Books → Movies left the
+    // room on screen (Dickles, 2026-10-18). The roomnav module
+    // owns the set; every navigation path exits through it.
+    this.exitAllRooms(roomsToExitForFileNavigation());
     const tab = this.requireTab();
     this.quickLook.close();
     navigate(tab, dir);
@@ -1509,6 +1521,7 @@ export class Shell {
   private goBack(): void {
     const tab = this.requireTab();
     if (goBack(tab)) {
+      this.exitAllRooms(roomsToExitForFileNavigation());
       this.quickLook.close();
       void this.loadDir(tab);
     }
@@ -1517,6 +1530,7 @@ export class Shell {
   private goForward(): void {
     const tab = this.requireTab();
     if (goForward(tab)) {
+      this.exitAllRooms(roomsToExitForFileNavigation());
       this.quickLook.close();
       void this.loadDir(tab);
     }
@@ -3933,15 +3947,48 @@ export class Shell {
     // menu reads its Add/Remove state from these, rebuilt each pass.
     this.builtinFavNames.clear();
     this.favoritePathSet.clear();
+    const pathByName = new Map<string, string>();
     for (const p of allPairs) {
       const path = await api.getItemPath(p.target!.dirId).catch(() => "");
-      if (path) this.builtinFavNames.set(normFavPath(path), p.name);
+      if (path) {
+        const norm = normFavPath(path);
+        this.builtinFavNames.set(norm, p.name);
+        pathByName.set(p.name, norm);
+      }
     }
     for (const p of pairs) {
-      const path = await api.getItemPath(p.target!.dirId).catch(() => "");
-      if (path) this.favoritePathSet.add(normFavPath(path));
+      const norm = pathByName.get(p.name);
+      if (norm) this.favoritePathSet.add(norm);
     }
-    for (const pair of pairs) {
+    // Sidebar law (Dickles, 2026-10-18): each location appears
+    // exactly once in the sidebar. The pinned section wins — and
+    // the pinned section is TWO things: the Home door above
+    // FAVORITES, and every user-pinned favorite (the PINNED
+    // section below it). A location rendered in either is
+    // suppressed from FAVORITES by location identity (roomnav's
+    // suppressPinnedFavorites). Dickles' Dell showed why the set
+    // must be the union: Files · Videos · Pictures · Music sat
+    // in BOTH sections — they are built-in favorites AND user
+    // pins, and the two lists were composed without ever being
+    // deduped against each other (his first report caught only
+    // the Home instance of the same defect). The door's identity
+    // comes from the same target resolution the favorite uses,
+    // so the two can never drift. Bookkeeping above is
+    // deliberately untouched: a suppressed favorite still
+    // exists, it just isn't rendered twice.
+    const doorPaths = new Set<string>();
+    const pinnedHome = pathByName.get("Home");
+    if (pinnedHome) doorPaths.add(pinnedHome);
+    const pinnedPaths = new Set<string>(doorPaths);
+    for (const fav of this.loadUserFavorites()) {
+      pinnedPaths.add(normFavPath(fav.path));
+    }
+    const renderPairs = suppressPinnedFavorites(
+      pairs,
+      (p) => pathByName.get(p.name),
+      pinnedPaths
+    );
+    for (const pair of renderPairs) {
       const name = pair.name;
       const target = pair.target!;
       const b = document.createElement("button");
@@ -4092,10 +4139,19 @@ export class Shell {
     // or by the item context menu. One whose folder can't be resolved
     // right now (drive not mounted) is OMITTED, never shown disabled
     // — the same rule as the built-ins above.
+    const seenPinPaths = new Set<string>();
     for (const fav of this.loadUserFavorites()) {
       const target = await this.resolvePathTarget(fav.path);
       if (!target) continue;
       this.favoritePathSet.add(normFavPath(fav.path));
+      // Sidebar law for the PINNED section itself: the Home door
+      // outranks a user pin of the Home location (the door IS
+      // that location's pinned entry), and the same location
+      // pinned twice renders once. Everything else here renders
+      // — this section is where pinned locations live.
+      const favNorm = normFavPath(fav.path);
+      if (doorPaths.has(favNorm) || seenPinPaths.has(favNorm)) continue;
+      seenPinPaths.add(favNorm);
       const b = document.createElement("button");
       b.className = "side-item";
       const pinLabel = document.createElement("span");
@@ -5303,6 +5359,20 @@ export class Shell {
     this.searchView.el.hidden = true;
     this.romsHead?.setAttribute("aria-current", "true");
     void this.romHome.open(target);
+  }
+
+  /** Evict every room layer the given roomnav set names. The
+   * single choke point for "navigation replaces whatever room is
+   * up": each exit is a safe no-op when its room isn't active, and
+   * the room that WAS active repaints the file view on its way
+   * out. Never hand-list room exits at a call site again — that
+   * is exactly how Books was forgotten (2026-10-18). */
+  private exitAllRooms(rooms: readonly string[]): void {
+    for (const room of rooms) {
+      if (room === "books") this.exitBooksHome();
+      else if (room === "rom") this.exitRomHome();
+      else if (room === "homeBase") this.exitHomeBase();
+    }
   }
 
   private exitRomHome(): void {
