@@ -417,6 +417,10 @@ pub fn systems_for_extension(ext: &str) -> &'static [&'static str] {
             "genesis", "segacd", "saturn", "psx", "tg16", "dreamcast", "odyssey2", "channelf",
             "studio2", "arcadia2001", "scv", "pv1000", "superacan", "gamecom", "cdi", "pcfx",
             "neogeocd", "amigacd32",
+            // Console completion pass (2026-10-18): the .bin DAT
+            // systems (Loopy, Cassette Vision, V.Smile, Leapster)
+            // and the split CD systems' track files.
+            "loopy", "cassettevision", "vsmile", "leapster", "tgcd", "jaguarcd", "cdtv",
         ],
         "ccd" => &[],
         "chd" => &[],
@@ -433,31 +437,32 @@ pub fn systems_for_extension(ext: &str) -> &'static [&'static str] {
         "prg" => &["c64", "vic20"],
         "dsk" => &["msx"],
         "fds" => &[],
-        "fig" | "sfc" | "smc" | "swc" => &["snes"],
+        "fig" | "sfc" | "smc" | "swc" => &["snes", "gp32"],
         "gb" | "sgb" => &["gb", "gbc"],
         "gba" => &["gba"],
         "gbc" => &["gbc"],
         "gc" | "gcm" => &["gamecube"],
         "gdi" | "cdi" => &["dreamcast"],
-        "gen" | "md" => &["genesis"],
+        "gen" | "md" => &["genesis", "pico"],
         "gg" => &["gamegear"],
         "img" => &["psx", "saturn", "segacd", "neogeocd"],
         "int" => &["intellivision"],
         "iso" => &[
             "psx", "ps2", "saturn", "segacd", "dreamcast", "psp", "gamecube", "wii", "xbox",
-            "xbox360", "ps3", "cdi", "pcfx", "neogeocd", "amigacd32", "jaguar",
+            "xbox360", "ps3", "cdi", "pcfx", "neogeocd", "amigacd32", "jaguar", "jaguarcd",
+            "tgcd", "cdtv",
         ],
         "j64" | "jag" => &["jaguar"],
         "lnx" => &["lynx"],
         "mdf" => &["psx", "ps2", "saturn", "segacd"],
         "mx1" | "mx2" => &["msx"],
-        "n64" | "v64" | "z64" => &["n64"],
+        "n64" | "v64" | "z64" => &["n64", "n64dd"],
         "nds" => &["nds"],
         "neo" => &["neogeo"],
         "nes" | "unh" => &["nes"],
         "ngc" | "ngp" => &["neogeopocket"],
         "pbp" => &["psp", "psx"],
-        "pce" => &["tg16"],
+        "pce" => &["tg16", "supergrafx"],
         "pkg" => &["ps3", "psp"],
         "rom" => &["atari8bit", "msx", "intellivision"],
         "rpx" | "wua" | "wux" => &["wiiu"],
@@ -473,6 +478,12 @@ pub fn systems_for_extension(ext: &str) -> &'static [&'static str] {
         "vec" => &["vectrex"],
         "ws" | "wsc" => &["wonderswan"],
         "xbe" | "xiso" => &["xbox"],
+        // Console completion pass (2026-10-18): new DAT systems'
+        // own extensions (from the DATs' rom names).
+        "min" => &["pokemonmini"],
+        "ndd" => &["n64dd"],
+        "sgx" => &["supergrafx"],
+        "sv" => &["supervision"],
         _ => &[],
     }
 }
@@ -495,6 +506,7 @@ pub fn candidate_extensions() -> Vec<&'static str> {
         "pkg", "prg", "rar", "rom", "rpx", "sfc", "sg", "sgb", "smc", "smd", "sms", "sna", "swc",
         "szx", "t64", "tap", "tgc", "tzx", "unh", "v64", "vb", "vboy", "vec", "vpk", "wad", "wbfs",
         "ws", "wsc", "wua", "wux", "xbe", "xci", "xex", "xfd", "xiso", "z64", "z80", "zip",
+        "min", "ndd", "sgx", "sv",
     ]
 }
 
@@ -508,6 +520,9 @@ fn cartridge_systems() -> &'static [&'static str] {
         "vectrex", "virtualboy", "wonderswan", "zxspectrum", "amiga", "odyssey2", "channelf",
         "studio2", "arcadia2001", "scv", "pv1000", "superacan", "sg1000", "vic20", "gamecom",
         "gx4000",
+        // Console completion pass (2026-10-18).
+        "cassettevision", "loopy", "pokemonmini", "supervision", "gp32", "vsmile", "leapster",
+        "pico", "supergrafx", "n64dd",
     ]
 }
 
@@ -550,7 +565,7 @@ fn transforms(sys: &str, ext: &str, probe: &[u8], size: u64) -> Vec<Transform> {
                 vec![Transform::Raw]
             }
         }
-        "snes" | "tg16" => {
+        "snes" | "tg16" | "supergrafx" => {
             if size % 1024 == 512 {
                 vec![Transform::Raw, Transform::Skip(512)]
             } else {
@@ -1424,7 +1439,7 @@ fn parse_cue(text: &str) -> Vec<CueSheet> {
 fn cd_pref(ds: &RomDataset) -> (Vec<&str>, Vec<u8>, Vec<u8>) {
     const CD_KEYS: &[&str] = &[
         "neogeocd", "psx", "saturn", "segacd", "dreamcast", "amigacd32", "cdi", "pcfx", "3do",
-        "jaguar", "tg16",
+        "jaguar", "jaguarcd", "tg16", "tgcd", "cdtv",
     ];
     let mut pref: Vec<&str> = Vec::new();
     let mut cd_syses: Vec<u8> = Vec::new();

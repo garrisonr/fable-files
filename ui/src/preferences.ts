@@ -22,7 +22,16 @@ import type { ThemeInfo } from "./api";
 import { DISTRO_ENGINES } from "./themes";
 import { RomMediaSection } from "./rommedia";
 import { EmuSection } from "./emu";
-import { ROM_ICON_SET_INFO, type RomIconSet } from "./roms";
+import {
+  ROM_ICON_SET_INFO,
+  loadRomSystems,
+  romSystemKey,
+  romSystemMeta,
+  isRomHidden,
+  setRomSystemHidden,
+  type RomIconSet,
+} from "./roms";
+import { api } from "./api";
 import { MediaResSection } from "./mediares";
 import { MediaCompleteSection } from "./mediacomplete";
 import { MusicCompleteSection } from "./musiccomplete";
@@ -85,6 +94,9 @@ export interface PreferencesHooks {
   /** Replay the first-run welcome (it plays by itself; the seen
    * flag is untouched — replay is a visit, not a reset). */
   replayWelcome(): void;
+  /** A console's visibility changed (Consoles section): the shell
+   * re-renders the sidebar, the Games room and the door count. */
+  consolesChanged(): void;
 }
 
 export class PreferencesDialog {
@@ -360,6 +372,18 @@ export class PreferencesDialog {
       "Games collection scope — which drives a system draws from — is set per system in the Games system editor (sidebar ▸ Games).";
     page.appendChild(scopeNote);
 
+    // Consoles: the full roster with visibility switches — where
+    // hidden consoles live, and where they come back from.
+    page.appendChild(this.section("Consoles"));
+    const consolesNote = document.createElement("p");
+    consolesNote.className = "prefs-note";
+    consolesNote.textContent =
+      "Every console on the roster. Hide one and it leaves the sidebar, Games Home, All Games and every count — for good, until you switch it back on here. Its games stay identified in the background, so a console you unhide is already up to date.";
+    page.appendChild(consolesNote);
+    const consolesHost = document.createElement("div");
+    page.appendChild(consolesHost);
+    this.buildConsoles(consolesHost, hooks);
+
     // Game Media (ROM media enrichment): mounted from its own
     // backend state; its provider accounts live under Metadata
     // Accounts.
@@ -409,6 +433,156 @@ export class PreferencesDialog {
     const templatesHost = document.createElement("div");
     page.appendChild(templatesHost);
     void new TemplatesSection().mount(templatesHost, hooks);
+  }
+
+
+  /** The Consoles section (Dickles, 2026-10-18): the full roster
+   * with one visibility switch per system — the resurrect path for
+   * hidden consoles — plus search and the bulk presets. Counts come
+   * from the catalog's per-system split (list-governed systems);
+   * extension-rule systems can't be proven empty from here, and the
+   * "no games" preset says so instead of guessing. */
+  private buildConsoles(page: HTMLElement, hooks: PreferencesHooks): void {
+    let query = "";
+    let counts = new Map<string, number>();
+    const listHost = document.createElement("div");
+
+    const search = document.createElement("input");
+    search.className = "smart-in consoles-search";
+    search.type = "search";
+    search.placeholder = "Search consoles…";
+    search.setAttribute("aria-label", "Search consoles");
+    page.appendChild(search);
+
+    const presets = document.createElement("div");
+    presets.className = "consoles-presets";
+    const showAll = document.createElement("button");
+    showAll.className = "pill-btn";
+    showAll.textContent = "Show everything";
+    showAll.addEventListener("click", () => {
+      for (const s of loadRomSystems()) {
+        if (isRomHidden(s)) setRomSystemHidden(s.name, false);
+      }
+      hooks.consolesChanged();
+      renderList();
+    });
+    const hideEmpty = document.createElement("button");
+    hideEmpty.className = "pill-btn";
+    hideEmpty.textContent = "Hide systems with no games";
+    hideEmpty.title =
+      "Hides the consoles Fable can prove empty: list-governed systems with no identified games, and placeholders. Extension-rule systems stay — they can't be proven empty from here.";
+    hideEmpty.addEventListener("click", () => {
+      for (const s of loadRomSystems()) {
+        const key = romSystemKey(s);
+        if (key) {
+          if ((counts.get(key) ?? 0) === 0) setRomSystemHidden(s.name, true);
+        } else if (s.kind === "placeholder") {
+          setRomSystemHidden(s.name, true);
+        }
+      }
+      hooks.consolesChanged();
+      renderList();
+    });
+    const makerSel = document.createElement("select");
+    makerSel.className = "smart-in consoles-maker";
+    makerSel.setAttribute("aria-label", "Maker for Show only");
+    const makers = [
+      ...new Set(loadRomSystems().map((s) => romSystemMeta(s.name).maker)),
+    ].sort((a, b) => a.localeCompare(b));
+    for (const m of makers) {
+      const opt = document.createElement("option");
+      opt.value = m;
+      opt.textContent = m;
+      makerSel.appendChild(opt);
+    }
+    const showOnly = document.createElement("button");
+    showOnly.className = "pill-btn";
+    showOnly.textContent = "Show only…";
+    showOnly.title = "Show only the picked maker's consoles; hide all the rest.";
+    showOnly.addEventListener("click", () => {
+      const maker = makerSel.value;
+      for (const s of loadRomSystems()) {
+        setRomSystemHidden(s.name, romSystemMeta(s.name).maker !== maker);
+      }
+      hooks.consolesChanged();
+      renderList();
+    });
+    const onlyLabel = document.createElement("span");
+    onlyLabel.className = "prefs-note";
+    onlyLabel.textContent = "Show only:";
+    presets.append(showAll, hideEmpty, onlyLabel, makerSel, showOnly);
+    page.appendChild(presets);
+    page.appendChild(listHost);
+
+    const renderList = (): void => {
+      listHost.innerHTML = "";
+      const systems = loadRomSystems().filter((s) => {
+        if (!query) return true;
+        return (
+          s.name.toLowerCase().includes(query) ||
+          romSystemMeta(s.name).maker.toLowerCase().includes(query)
+        );
+      });
+      if (systems.length === 0) {
+        const none = document.createElement("p");
+        none.className = "prefs-note";
+        none.textContent = "No console matches that search.";
+        listHost.appendChild(none);
+        return;
+      }
+      for (const s of systems) {
+        const meta = romSystemMeta(s.name);
+        const key = romSystemKey(s);
+        const row = document.createElement("label");
+        row.className = "prefs-row prefs-toggle";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.checked = !isRomHidden(s);
+        box.setAttribute("aria-label", `Show ${s.name}`);
+        box.addEventListener("change", () => {
+          setRomSystemHidden(s.name, !box.checked);
+          hooks.consolesChanged();
+        });
+        const text = document.createElement("span");
+        text.className = "prefs-row-label";
+        text.textContent = s.name;
+        const sub = document.createElement("span");
+        sub.className = "prefs-note prefs-toggle-note";
+        const bits = [meta.maker];
+        if (meta.gen) bits.push(`Generation ${meta.gen}`);
+        if (key) {
+          const n = counts.get(key);
+          bits.push(
+            n === undefined
+              ? "Counting…"
+              : n > 0
+                ? `${n.toLocaleString()} games`
+                : "No games yet",
+          );
+        } else if (s.kind === "placeholder") {
+          bits.push("Placeholder — gathers nothing yet");
+        } else {
+          bits.push("File rules");
+        }
+        sub.textContent = bits.join(" · ");
+        row.append(box, text, sub);
+        listHost.appendChild(row);
+      }
+    };
+    search.addEventListener("input", () => {
+      query = search.value.trim().toLowerCase();
+      renderList();
+    });
+    renderList();
+    void api
+      .romHomeCounts([])
+      .then((c) => {
+        counts = new Map(
+          c.perSystem.map(([k, g]) => [k, g] as [string, number]),
+        );
+        renderList();
+      })
+      .catch(() => undefined);
   }
 
   private section(title: string): HTMLElement {

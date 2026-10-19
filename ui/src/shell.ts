@@ -45,7 +45,7 @@ import { FolderPicker, type PickerShortcut } from "./picker";
 import { RenameDialog } from "./rename";
 import { LabelManager, saveLabelRules } from "./labels";
 import { loadLabelDefs, migrateLabelAssignments, saveLabelDefs } from "./labels";
-import { loadRomSystems, saveRomSystems, romsEnabled, romScopeOf, romSystemKey, isRomPlaceholder, setRomsEnabled, romDivisions, loadRomGrouping, saveRomGrouping, loadOpenDivisions, saveOpenDivisions, romIconSlug, loadRomIconSet, saveRomIconSet, type RomSystem, type OwnedHardware } from "./roms";
+import { loadRomSystems, saveRomSystems, romsEnabled, romScopeOf, romSystemKey, isRomPlaceholder, isRomHidden, setRomSystemHidden, hiddenRomKeys, setRomsEnabled, romDivisions, loadRomGrouping, saveRomGrouping, loadOpenDivisions, saveOpenDivisions, romIconSlug, loadRomIconSet, saveRomIconSet, type RomSystem, type OwnedHardware } from "./roms";
 import { ROM_FLAT_ICONS } from "./romicons_flat";
 import { MusicPlayer } from "./music";
 import { sectionGlyph } from "./sectionicons";
@@ -728,6 +728,23 @@ export class Shell {
           {
             label: `Manage "${sys.name}"…`,
             action: () => this.openRomEditor(sys),
+          },
+          {
+            label: `Hide "${sys.name}"`,
+            action: () => {
+              setRomSystemHidden(sys.name, true);
+              void this.buildSidebar();
+              this.romHome.invalidate();
+              Toast.action(
+                `"${sys.name}" is hidden — its games stay identified, and it comes back in Preferences → ROMs (Games) → Consoles.`,
+                "Undo",
+                () => {
+                  setRomSystemHidden(sys.name, false);
+                  void this.buildSidebar();
+                  this.romHome.invalidate();
+                },
+              );
+            },
           },
           {
             label: `Delete "${sys.name}"`,
@@ -4973,6 +4990,11 @@ export class Shell {
       setCheckBoxes: (on) => this.setCheckBoxes(on),
       showShortcuts: () => this.showShortcuts(),
       replayWelcome: () => playWelcomeTour(),
+      consolesChanged: () => {
+        void this.buildSidebar();
+        this.romHome.invalidate();
+        void this.refreshRomDoor();
+      },
     }, page);
   }
 
@@ -5565,7 +5587,7 @@ export class Shell {
 
   /** The door's numbers — straight from the catalog, never a scan. */
   private async refreshRomDoor(): Promise<void> {
-    const counts = await api.romHomeCounts().catch(() => null);
+    const counts = await api.romHomeCounts(hiddenRomKeys()).catch(() => null);
     if (!counts) return;
     if (this.romsDoorCount) {
       this.romsDoorCount.textContent =
@@ -5704,6 +5726,10 @@ export class Shell {
             <option value="drives">Choose drives…</option>
           </select>
         </label>
+        <label class="smart-lab rom-hidden-lab">
+          <input type="checkbox" class="rom-hidden" />
+          Hidden — no shelf, no sidebar entry, left out of every count; identification keeps running
+        </label>
         <div class="rom-drives"></div>
         <div class="picker-actions">
           <button class="rom-cancel">Cancel</button>
@@ -5739,6 +5765,7 @@ export class Shell {
       q<HTMLInputElement>(".rom-name").value = sys.name;
       q<HTMLInputElement>(".rom-exts").value = sys.extensions.join(", ");
       scopeSel.value = sys.scope?.mode ?? "all";
+      q<HTMLInputElement>(".rom-hidden").checked = !!sys.hidden;
     }
     if (isDat) {
       // The name is the dataset key — renaming would orphan the system.
@@ -5795,6 +5822,7 @@ export class Shell {
         return;
       }
       const scope = { mode, drives };
+      const hiddenNow = q<HTMLInputElement>(".rom-hidden").checked;
       const list = loadRomSystems();
       if (sys) {
         const idx = list.findIndex((s) => s.name === sys.name);
@@ -5806,17 +5834,19 @@ export class Shell {
             // The kind is identity, not an edit — saving the system
             // never silently standardizes a placeholder.
             ...(sys.kind ? { kind: sys.kind } : {}),
+            ...(hiddenNow ? { hidden: true } : {}),
           };
       } else {
         if (list.some((s) => s.name === name)) {
           Toast.error(`"${name}" is already in the collection.`);
           return;
         }
-        list.push({ name, extensions: exts, scope });
+        list.push({ name, extensions: exts, scope, ...(hiddenNow ? { hidden: true } : {}) });
         list.sort((a, b) => a.name.localeCompare(b.name));
       }
       saveRomSystems(list);
       void this.buildSidebar();
+      this.romHome.invalidate();
       overlay.remove();
       Toast.success(`Saved system \u201c${name}\u201d.`);
     });

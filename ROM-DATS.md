@@ -23,7 +23,6 @@ Compiled by datc from DAT files redistributed by the libretro-database project (
 | Genesis | genesis | Sega - Mega Drive - Genesis.dat | No-Intro (via libretro-database) | 2656 | 2656 |
 | Intellivision | intellivision | Mattel - Intellivision.dat | No-Intro (via libretro-database) | 246 | 246 |
 | Atari Jaguar | jaguar | Atari - Jaguar.dat | No-Intro (via libretro-database) | 460 | 460 |
-| Atari Jaguar | jaguar | Atari - Jaguar CD.dat | Redump (via libretro-database) | 27 | 27 |
 | Master System | mastersystem | Sega - Master System - Mark III.dat | No-Intro (via libretro-database) | 1057 | 1057 |
 | MSX | msx | Microsoft - MSX.dat | No-Intro (via libretro-database) | 899 | 899 |
 | MSX | msx | Microsoft - MSX2.dat | No-Intro (via libretro-database) | 195 | 195 |
@@ -43,7 +42,6 @@ Compiled by datc from DAT files redistributed by the libretro-database project (
 | Sega CD | segacd | Sega - Mega-CD - Sega CD.dat | Redump (via libretro-database) | 528 | 528 |
 | Super Nintendo Entertainment System | snes | Nintendo - Super Nintendo Entertainment System.dat | No-Intro (via libretro-database) | 3730 | 3730 |
 | TurboGrafx-16 | tg16 | NEC - PC Engine - TurboGrafx 16.dat | No-Intro (via libretro-database) | 491 | 491 |
-| TurboGrafx-16 | tg16 | NEC - PC Engine CD - TurboGrafx-CD.dat | Redump (via libretro-database) | 502 | 502 |
 | Vectrex | vectrex | GCE - Vectrex.dat | No-Intro (via libretro-database) | 45 | 45 |
 | Virtual Boy | virtualboy | Nintendo - Virtual Boy.dat | No-Intro (via libretro-database) | 64 | 64 |
 | Wii | wii | Nintendo - Wii.dat | Redump (via libretro-database) | 3817 | 3817 |
@@ -70,16 +68,39 @@ Compiled by datc from DAT files redistributed by the libretro-database project (
 | Neo Geo CD | neogeocd | SNK - Neo Geo CD.dat | Redump (via libretro-database) | 145 | 145 |
 | Amiga CD32 | amigacd32 | Commodore - CD32.dat | Redump (via libretro-database) | 204 | 204 |
 | GX4000 | gx4000 | Amstrad - GX4000.dat | TOSEC (via libretro-database) | 67 | 67 |
+| Cassette Vision | cassettevision | Epoch - Cassette Vision.dat | TOSEC (via libretro-database) | 11 | 11 |
+| Casio Loopy | loopy | Casio - Loopy.dat | No-Intro (via libretro-database) | 19 | 19 |
+| Commodore CDTV | cdtv | Commodore - CDTV.dat | Redump (via libretro-database) | 61 | 61 |
+| Pokémon Mini | pokemonmini | Nintendo - Pokemon Mini.dat | No-Intro (via libretro-database) | 42 | 42 |
+| Supervision | supervision | Watara - Supervision.dat | No-Intro (via libretro-database) | 73 | 73 |
+| GP32 | gp32 | GamePark - GP32.dat | No-Intro (via libretro-database) | 28 | 28 |
+| V.Smile | vsmile | VTech - V.Smile.dat | No-Intro (via libretro-database) | 456 | 456 |
+| Leapster | leapster | LeapFrog - Leapster Learning Game System.dat | No-Intro (via libretro-database) | 112 | 112 |
+| Sega Pico | pico | Sega - PICO.dat | No-Intro (via libretro-database) | 339 | 339 |
+| SuperGrafx | supergrafx | NEC - PC Engine SuperGrafx.dat | No-Intro (via libretro-database) | 5 | 5 |
+| Nintendo 64DD | n64dd | Nintendo - Nintendo 64DD.dat | No-Intro (via libretro-database) | 10 | 10 |
+| TurboGrafx-CD | tgcd | NEC - PC Engine CD - TurboGrafx-CD.dat | Redump (via libretro-database) | 502 | 502 |
+| Jaguar CD | jaguarcd | Atari - Jaguar CD.dat | Redump (via libretro-database) | 27 | 27 |
+| Atari ST | atarist | Atari - ST.dat | No-Intro (via libretro-database) | 404 | 404 |
+| Apple II | apple2 | Apple - II.dat | TOSEC (via libretro-database) | 9227 | 9227 |
+| Amstrad CPC | cpc | Amstrad - CPC.dat | TOSEC (via libretro-database) | 5058 | 5058 |
+| PC-88 | pc88 | NEC - PC-88.dat | TOSEC (via libretro-database) | 4138 | 4138 |
+| PC-98 | pc98 | NEC - PC-98.dat | TOSEC (via libretro-database) | 5316 | 5316 |
+| PC-98 | pc98 | NEC - PC-98.dat | Redump (via libretro-database) | 110 | 110 |
+| Sharp X68000 | x68000 | Sharp - X68000.dat | No-Intro (via libretro-database) | 1 | 1 |
+| Sharp X68000 | x68000 | Sharp - X68000.dat | TOSEC (via libretro-database) | 3150 | 3150 |
+| Sharp X1 | x1 | Sharp - X1.dat | No-Intro (via libretro-database) | 8 | 8 |
+| Sharp X1 | x1 | Sharp - X1.dat | TOSEC (via libretro-database) | 243 | 243 |
 | Arcade (MAME) sets | arcade | MAME 2016 XML (Arcade Only).xml | MAME listxml (via libretro-database) | 30999 | — |
 | Neo Geo sets | neogeo | (same XML, romof=neogeo family) | MAME listxml (via libretro-database) | 258 | — |
 
 ## Totals
 
-- file rows (deduped): 139309
-- rows in ambiguous (crc,size) groups (hashes kept): 4642
-- md5 side entries: 4642
-- sha1 side entries: 4642
-- unique names: 122898
-- name blob: 4850727 bytes
+- file rows (deduped): 168115
+- rows in ambiguous (crc,size) groups (hashes kept): 4660
+- md5 side entries: 4660
+- sha1 side entries: 4660
+- unique names: 143016
+- name blob: 5572582 bytes
 - sets: 31257 (set-rom entries: 259564)
-- **rom-dats.bin: 12947834 bytes**
+- **rom-dats.bin: 14477265 bytes**

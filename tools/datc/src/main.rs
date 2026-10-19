@@ -115,6 +115,37 @@ fn systems() -> Vec<SysDef> {
         SysDef { key: "neogeocd", display: "Neo Geo CD", files: &[RD] },
         SysDef { key: "amigacd32", display: "Amiga CD32", files: &[RD] },
         SysDef { key: "gx4000", display: "GX4000", files: &[TS] },
+        // Console completion pass (2026-10-18, Projectionist): the
+        // retail-roster gaps whose hashed DATs already sit in
+        // libretro-database. Appended so existing system indices never
+        // move. TurboGrafx-CD and Jaguar CD split OUT of tg16/jaguar:
+        // their DAT files move to their own keys (see dat_files), so
+        // the parent keys lose those files in the same pass.
+        SysDef { key: "cassettevision", display: "Cassette Vision", files: &[TS] },
+        SysDef { key: "loopy", display: "Casio Loopy", files: &[NI] },
+        SysDef { key: "cdtv", display: "Commodore CDTV", files: &[RD] },
+        SysDef { key: "pokemonmini", display: "Pokémon Mini", files: &[NI] },
+        SysDef { key: "supervision", display: "Supervision", files: &[NI] },
+        SysDef { key: "gp32", display: "GP32", files: &[NI] },
+        SysDef { key: "vsmile", display: "V.Smile", files: &[NI] },
+        SysDef { key: "leapster", display: "Leapster", files: &[NI] },
+        SysDef { key: "pico", display: "Sega Pico", files: &[NI] },
+        SysDef { key: "supergrafx", display: "SuperGrafx", files: &[NI] },
+        SysDef { key: "n64dd", display: "Nintendo 64DD", files: &[NI] },
+        SysDef { key: "tgcd", display: "TurboGrafx-CD", files: &[RD] },
+        SysDef { key: "jaguarcd", display: "Jaguar CD", files: &[RD] },
+        // Computer completion pass (2026-10-19, Projectionist landing):
+        // the gaming-computer roster, DAT-verified against this same
+        // libretro-database checkout. Appended — indices never move.
+        // BBC Micro / TI-99/4A / TRS-80 CoCo have NO DAT in the
+        // checkout and stay extension-rule systems (no SysDef here).
+        SysDef { key: "atarist", display: "Atari ST", files: &[NI] },
+        SysDef { key: "apple2", display: "Apple II", files: &[TS] },
+        SysDef { key: "cpc", display: "Amstrad CPC", files: &[TS] },
+        SysDef { key: "pc88", display: "PC-88", files: &[TS] },
+        SysDef { key: "pc98", display: "PC-98", files: &[TS, RD] },
+        SysDef { key: "x68000", display: "Sharp X68000", files: &[NI, TS] },
+        SysDef { key: "x1", display: "Sharp X1", files: &[NI, TS] },
     ]
 }
 
@@ -145,7 +176,7 @@ fn dat_files(key: &str) -> Vec<(String, &'static str)> {
         "gamecube" => vec![rd("Nintendo - GameCube.dat")],
         "genesis" => vec![ni("Sega - Mega Drive - Genesis.dat")],
         "intellivision" => vec![ni("Mattel - Intellivision.dat")],
-        "jaguar" => vec![ni("Atari - Jaguar.dat"), rd("Atari - Jaguar CD.dat")],
+        "jaguar" => vec![ni("Atari - Jaguar.dat")],
         "mastersystem" => vec![ni("Sega - Master System - Mark III.dat")],
         "msx" => vec![ni("Microsoft - MSX.dat"), ni("Microsoft - MSX2.dat")],
         "neogeo" => vec![],
@@ -168,10 +199,7 @@ fn dat_files(key: &str) -> Vec<(String, &'static str)> {
         "sega32x" => vec![ni("Sega - 32X.dat")],
         "segacd" => vec![rd("Sega - Mega-CD - Sega CD.dat")],
         "snes" => vec![ni("Nintendo - Super Nintendo Entertainment System.dat")],
-        "tg16" => vec![
-            ni("NEC - PC Engine - TurboGrafx 16.dat"),
-            rd("NEC - PC Engine CD - TurboGrafx-CD.dat"),
-        ],
+        "tg16" => vec![ni("NEC - PC Engine - TurboGrafx 16.dat")],
         "vectrex" => vec![ni("GCE - Vectrex.dat")],
         "virtualboy" => vec![ni("Nintendo - Virtual Boy.dat")],
         "wii" => vec![rd("Nintendo - Wii.dat")],
@@ -204,6 +232,26 @@ fn dat_files(key: &str) -> Vec<(String, &'static str)> {
         "neogeocd" => vec![rd("SNK - Neo Geo CD.dat")],
         "amigacd32" => vec![rd("Commodore - CD32.dat")],
         "gx4000" => vec![ts("Amstrad - GX4000.dat")],
+        "cassettevision" => vec![ts("Epoch - Cassette Vision.dat")],
+        "loopy" => vec![ni("Casio - Loopy.dat")],
+        "cdtv" => vec![rd("Commodore - CDTV.dat")],
+        "pokemonmini" => vec![ni("Nintendo - Pokemon Mini.dat")],
+        "supervision" => vec![ni("Watara - Supervision.dat")],
+        "gp32" => vec![ni("GamePark - GP32.dat")],
+        "vsmile" => vec![ni("VTech - V.Smile.dat")],
+        "leapster" => vec![ni("LeapFrog - Leapster Learning Game System.dat")],
+        "pico" => vec![ni("Sega - PICO.dat")],
+        "supergrafx" => vec![ni("NEC - PC Engine SuperGrafx.dat")],
+        "n64dd" => vec![ni("Nintendo - Nintendo 64DD.dat")],
+        "tgcd" => vec![rd("NEC - PC Engine CD - TurboGrafx-CD.dat")],
+        "jaguarcd" => vec![rd("Atari - Jaguar CD.dat")],
+        "atarist" => vec![ni("Atari - ST.dat")],
+        "apple2" => vec![ts("Apple - II.dat")],
+        "cpc" => vec![ts("Amstrad - CPC.dat")],
+        "pc88" => vec![ts("NEC - PC-88.dat")],
+        "pc98" => vec![ts("NEC - PC-98.dat"), rd("NEC - PC-98.dat")],
+        "x68000" => vec![ni("Sharp - X68000.dat"), ts("Sharp - X68000.dat")],
+        "x1" => vec![ni("Sharp - X1.dat"), ts("Sharp - X1.dat")],
         _ => vec![],
     }
 }

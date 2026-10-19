@@ -37,8 +37,13 @@ import {
   soleClaimExtensions,
   romScopeOf,
   isRomPlaceholder,
-  romDivisions,
+  isRomHidden,
+  hiddenRomKeys,
+  romSections,
   romSystemMeta,
+  romSystemBlurb,
+  romSystemNote,
+  romSystemWiki,
   romIconSlug,
   loadRomIconSet,
   romArchiveLink,
@@ -574,7 +579,7 @@ export class RomHome {
       .identifyRoms()
       .then(async () => {
         if (!this.active) return;
-        const c = await api.romHomeCounts().catch(() => null);
+        const c = await api.romHomeCounts(hiddenRomKeys()).catch(() => null);
         if (c && c.total !== before) await this.softRefresh();
       })
       .catch(() => undefined);
@@ -611,7 +616,7 @@ export class RomHome {
     const seq = ++this.loadSeq;
     const [counts, collections, smartLists, settings, needs, facets] =
       await Promise.all([
-        api.romHomeCounts().catch(() => null),
+        api.romHomeCounts(hiddenRomKeys()).catch(() => null),
         api.listCollections().catch(() => []),
         api.romHomeSmartLists().catch(() => []),
         api.getRomMediaSettings().catch(() => null),
@@ -633,6 +638,7 @@ export class RomHome {
     this.datMembers = [];
     this.rebuildIndex();
     this.loaded = true;
+    void this.loadExtSystems();
   }
 
   /** Tallies from the catalog (Hyperbase #4: group counts for
@@ -670,7 +676,7 @@ export class RomHome {
   }
 
   private rebuildSystems(): void {
-    this.systems = loadRomSystems().map((sys) => {
+    this.systems = loadRomSystems().filter((sys) => !isRomHidden(sys)).map((sys) => {
       const key = romSystemKey(sys);
       const tally = key ? this.perSystemTallies.get(key) : undefined;
       const extra = key ? this.countsExtra.get(key) : undefined;
@@ -692,6 +698,16 @@ export class RomHome {
         s.sizeBytes = mine.reduce((a, g) => a + (g.item.size_bytes ?? 0), 0);
       }
     }
+    // A system hidden since the last rebuild left the roster
+    // above; its extension games leave with it (and re-load on
+    // unhide — extLoaded forgets the system too).
+    const visibleNames = new Set(this.systems.map((x) => x.name));
+    if (this.extGames.some((g) => !visibleNames.has(g.systemName))) {
+      this.extGames = this.extGames.filter((g) => visibleNames.has(g.systemName));
+    }
+    for (const name of [...this.extLoaded]) {
+      if (!visibleNames.has(name)) this.extLoaded.delete(name);
+    }
   }
 
   /** Quiet tally refresh after a state write (a favorite lands,
@@ -699,7 +715,7 @@ export class RomHome {
    * never the loaded windows, which are a sample by design. */
   private async refreshTallies(): Promise<void> {
     const [counts, facets] = await Promise.all([
-      api.romHomeCounts().catch(() => null),
+      api.romHomeCounts(hiddenRomKeys()).catch(() => null),
       api.romHomeGenreFacets().catch(() => null),
     ]);
     if (counts) {
@@ -740,6 +756,7 @@ export class RomHome {
       platform: null,
       query: null,
       searchPlatforms: [],
+      excludePlatforms: hiddenRomKeys(),
       memberKeys: null,
       pcSource:
         ref.kind === "system" && ref.name === "PC" ? this.pcLibrary : null,
@@ -778,7 +795,7 @@ export class RomHome {
         const q = ref.query.toLowerCase();
         for (const s of loadRomSystems()) {
           const key = romSystemKey(s);
-          if (key && (s.name.toLowerCase().includes(q) || key.toLowerCase().includes(q))) {
+          if (key && !isRomHidden(s) && (s.name.toLowerCase().includes(q) || key.toLowerCase().includes(q))) {
             spec.searchPlatforms.push(key);
           }
         }
@@ -1128,7 +1145,15 @@ export class RomHome {
     }
     const chain: string[] = [];
     for (const set of [chosen, "photo", "art"]) {
-      if (!chain.includes(set)) chain.push(set);
+      if (chain.includes(set)) continue;
+      // The photo set wears the house grade (Dickles, 2026-10-19:
+      // "color graded photos — GORGEOUS and calm"): graded twins
+      // ship beside the untouched originals and are tried first;
+      // a missing twin falls through to the original photo, then
+      // art, then flat. The grade is presentation only — the
+      // source photos are never modified.
+      if (set === "photo") chain.push("graded");
+      chain.push(set);
     }
     const img = document.createElement("img");
     img.alt = "";
@@ -1192,7 +1217,13 @@ export class RomHome {
     rail.appendChild(sysHead);
 
     const systemsByName = new Map(this.systems.map((s) => [s.name, s]));
-    const divisions = romDivisions(
+    // The collection in its three divisions (Dickles, 2026-10-19):
+    // Consoles and Computers get a quiet section label over their
+    // generation/maker groups; Odds & Ends is one flat drawer whose
+    // own header is its label. Collapse state keys carry the
+    // section id — "NEC" the console group and "NEC" the computer
+    // group are different drawers.
+    const sections = romSections(
       this.systems.map((s) => s.sys),
       this.grouping,
     );
@@ -1202,36 +1233,42 @@ export class RomHome {
         : this.shelf.kind === "hardware"
           ? this.shelf.name
           : null;
-    for (const div of divisions) {
-      const containsCurrent =
-        currentSystem !== null &&
-        (div.systems.some((s) => s.name === currentSystem) ||
-          div.hardware.some((h) => h.name === currentSystem));
-      const dEl = el("div", "rh-div");
-      const head = el("button", "rh-div-head") as HTMLButtonElement;
-      const isOpen = containsCurrent || !this.closedDivs().has(div.title);
-      head.setAttribute("aria-expanded", String(isOpen));
-      head.append(el("span", "side-chev", isOpen ? "▾" : "▸"), el("span", "rh-div-title", div.title));
-      head.addEventListener("click", () => {
-        const closed = this.closedDivs();
-        if (closed.has(div.title)) closed.delete(div.title);
-        else closed.add(div.title);
-        this.saveClosedDivs(closed);
-        this.renderRail();
-      });
-      dEl.appendChild(head);
-      if (isOpen) {
-        const box = el("div", "rh-div-body");
-        for (const sys of div.systems) {
-          const rs = systemsByName.get(sys.name);
-          box.appendChild(this.systemRow(sys, rs));
-        }
-        for (const hw of div.hardware) {
-          box.appendChild(this.hardwareRow(hw));
-        }
-        dEl.appendChild(box);
+    for (const sec of sections) {
+      if (sec.id !== "odds") {
+        rail.appendChild(el("div", "rh-section-head", sec.title));
       }
-      rail.appendChild(dEl);
+      for (const div of sec.divisions) {
+        const divKey = `${sec.id}:${div.title}`;
+        const containsCurrent =
+          currentSystem !== null &&
+          (div.systems.some((s) => s.name === currentSystem) ||
+            div.hardware.some((h) => h.name === currentSystem));
+        const dEl = el("div", "rh-div");
+        const head = el("button", "rh-div-head") as HTMLButtonElement;
+        const isOpen = containsCurrent || !this.closedDivs().has(divKey);
+        head.setAttribute("aria-expanded", String(isOpen));
+        head.append(el("span", "side-chev", isOpen ? "▾" : "▸"), el("span", "rh-div-title", div.title));
+        head.addEventListener("click", () => {
+          const closed = this.closedDivs();
+          if (closed.has(divKey)) closed.delete(divKey);
+          else closed.add(divKey);
+          this.saveClosedDivs(closed);
+          this.renderRail();
+        });
+        dEl.appendChild(head);
+        if (isOpen) {
+          const box = el("div", "rh-div-body");
+          for (const sys of div.systems) {
+            const rs = systemsByName.get(sys.name);
+            box.appendChild(this.systemRow(sys, rs));
+          }
+          for (const hw of div.hardware) {
+            box.appendChild(this.hardwareRow(hw));
+          }
+          dEl.appendChild(box);
+        }
+        rail.appendChild(dEl);
+      }
     }
 
     // Lists: manual ROM Lists (Phase-2 collections) + Smart Lists.
@@ -1940,12 +1977,25 @@ export class RomHome {
       this.iconEl(rs.name, 96),
       el("h3", "", rs.name),
       el("p", "rh-empty-sub", `${meta.gen !== null ? `${ordinal(meta.gen)} Generation · ` : ""}${meta.maker}`),
+    );
+    const blurb = romSystemBlurb(rs.name);
+    if (blurb) note.appendChild(el("p", "rh-head-blurb", blurb));
+    note.appendChild(
       el(
         "p",
         "",
-        "A placeholder for what's coming. When the emulators arrive, this shelf wakes up.",
+        romSystemNote(rs.name) ??
+          "A placeholder for what's coming. When the emulators arrive, this shelf wakes up.",
       ),
     );
+    const wiki = romSystemWiki(rs.name);
+    if (wiki) {
+      const links = el("p", "rh-head-links");
+      const w = el("button", "linklike", "Wikipedia");
+      w.addEventListener("click", () => openGuideLink(wiki));
+      links.appendChild(w);
+      note.appendChild(links);
+    }
     return note;
   }
 
@@ -2057,6 +2107,21 @@ export class RomHome {
     const sub = el("p", "rh-head-sub", this.shelfSubText());
     this.headSubEl = sub;
     texts.append(el("h2", "rh-head-title", title), sub);
+    // The museum label (Dickles, 2026-10-19): a couple of calm,
+    // true lines about the unit, and its Wikipedia article where
+    // one is staged — on console and computer pages alike.
+    if (ref.kind === "system" || ref.kind === "hardware") {
+      const blurb = romSystemBlurb(ref.name);
+      if (blurb) texts.appendChild(el("p", "rh-head-blurb", blurb));
+      const wiki = romSystemWiki(ref.name);
+      if (wiki) {
+        const links = el("p", "rh-head-links");
+        const w = el("button", "linklike", "Wikipedia");
+        w.addEventListener("click", () => openGuideLink(wiki));
+        links.appendChild(w);
+        texts.appendChild(links);
+      }
+    }
     head.appendChild(texts);
     const actions = el("div", "rh-head-actions");
     this.headActionsEl = actions;
@@ -3580,7 +3645,10 @@ export class RomHome {
     const data = this.ccData;
     const body = this.ccBody;
     body.replaceChildren();
-    const scored = data.systems.filter((s) => s.hasReference);
+    const hiddenKeys = new Set(hiddenRomKeys());
+    const scored = data.systems.filter(
+      (s) => s.hasReference && !hiddenKeys.has(s.key),
+    );
     const collecting = scored
       .filter((s) => s.ownedGroups > 0)
       .sort(
@@ -3859,6 +3927,7 @@ export class RomHome {
             platform: null,
             query: null,
             searchPlatforms: [],
+            excludePlatforms: hiddenRomKeys(),
             memberKeys: null,
             filters: {
               systems: [],

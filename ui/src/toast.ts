@@ -59,6 +59,41 @@ export class Toast {
   static success(msg: string, duration?: number): void { this.show(msg, 'success', duration); }
   static error(msg: string, duration?: number): void { this.show(msg, 'error', duration); }
   static info(msg: string, duration?: number): void { this.show(msg, 'info', duration); }
+
+  /** A toast with one action button (Undo, typically): the button
+   * runs the callback and dismisses; untouched, the toast fades on
+   * its timer like any other. */
+  static action(
+    message: string,
+    actionLabel: string,
+    onAction: () => void,
+    duration = 6000,
+  ): void {
+    const container = this.ensureContainer();
+    const el = document.createElement("div");
+    el.className = "toast toast-info toast-action";
+    const text = document.createElement("span");
+    text.textContent = message;
+    const btn = document.createElement("button");
+    btn.className = "toast-action-btn";
+    btn.textContent = actionLabel;
+    let dismissed = false;
+    const dismiss = (): void => {
+      if (dismissed) return;
+      dismissed = true;
+      el.classList.remove("toast-show");
+      el.classList.add("toast-hide");
+      setTimeout(() => el.remove(), 300);
+    };
+    btn.addEventListener("click", () => {
+      onAction();
+      dismiss();
+    });
+    el.append(text, btn);
+    container.appendChild(el);
+    requestAnimationFrame(() => el.classList.add("toast-show"));
+    setTimeout(dismiss, duration);
+  }
 }
 
 /**

@@ -845,7 +845,7 @@ pub async fn emu_prefs(app: tauri::AppHandle) -> Cmd<EmuPrefsWire> {
         let settings = load_settings(&state.data_base);
         let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
             .map_err(CommandError::from)?;
-        let counts = catalog.rom_home_counts().map_err(CommandError::from)?;
+        let counts = catalog.rom_home_counts(&[]).map_err(CommandError::from)?;
         let (env, layout) = probe_env();
         let mut systems = Vec::new();
         for (platform, games, _missing) in &counts.per_system {

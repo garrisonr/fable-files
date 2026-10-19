@@ -120,7 +120,7 @@ pub fn compute_fleet(
 /// the only membership source — the unified view is never read).
 fn systems_with_games(catalog_path: &Path) -> Result<BTreeSet<String>, String> {
     let catalog = ufm_catalog::Catalog::open(catalog_path).map_err(|e| e.to_string())?;
-    let counts = catalog.rom_home_counts().map_err(|e| e.to_string())?;
+    let counts = catalog.rom_home_counts(&[]).map_err(|e| e.to_string())?;
     let mut out = BTreeSet::new();
     for (platform, games, _missing) in &counts.per_system {
         if *games > 0 {

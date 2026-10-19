@@ -5099,6 +5099,12 @@ pub struct RomHomeShelfSpec {
     /// "nintendo" still finds the NES shelf's games.
     #[serde(default)]
     pub search_platforms: Vec<String>,
+    /// Platform keys the UI has hidden (Preferences ▸ Consoles):
+    /// groups whose PRIMARY platform is listed never match any
+    /// shelf window. View state only — identification is untouched,
+    /// so unhiding restores the shelf exactly as it was.
+    #[serde(default)]
+    pub exclude_platforms: Vec<String>,
     /// List shelf: the list items' provider keys / item ids.
     #[serde(default)]
     pub member_keys: Option<Vec<String>>,
@@ -5560,6 +5566,12 @@ fn shelf_group_matches(
     spec: &RomHomeShelfSpec,
     scan: &ShelfScan,
 ) -> bool {
+    // Hidden systems (UI view state): a group whose primary
+    // platform is hidden matches NO shelf — not All Games, not
+    // Favorites, not search. Its rows stay in the catalog.
+    if spec.exclude_platforms.iter().any(|p| p == &g.platform) {
+        return false;
+    }
     match spec.kind.as_str() {
         "favorites" => {
             if !shelf_group_favorite(g) {
@@ -6776,26 +6788,34 @@ impl Catalog {
     /// Hyperbase #4: computed from the shared group scan, which
     /// also yields the rail's Favorites / Recently Played group
     /// counts under the same definitions the shelves use.
-    pub fn rom_home_counts(&self) -> Result<RomHomeCounts> {
+    pub fn rom_home_counts(&self, exclude_platforms: &[String]) -> Result<RomHomeCounts> {
         let scan = self.rom_home_scan_mode(false, true)?;
         let mut counts = RomHomeCounts::default();
-        counts.total = scan.groups.len() as i64;
         let mut per: std::collections::HashMap<String, (i64, i64)> =
             std::collections::HashMap::new();
         let mut pc_libs: std::collections::HashMap<String, i64> =
             std::collections::HashMap::new();
         for g in &scan.groups {
-            if !g.has_boxart {
-                counts.missing_media += 1;
-            }
-            if shelf_group_favorite(g) {
-                counts.favorite_groups += 1;
-            }
-            if g.play_last.is_some() {
-                counts.recent_groups += 1;
-            }
-            for lib in &g.pc_sources {
-                *pc_libs.entry(lib.clone()).or_default() += 1;
+            // Hidden systems (the UI passes its hidden dataset
+            // keys): their groups leave every headline count but
+            // STAY in the per-system split below — the split is
+            // full data, the UI filters what it displays, and
+            // unhiding restores exact numbers with no rescan.
+            let excluded = exclude_platforms.iter().any(|p| p == &g.platform);
+            if !excluded {
+                counts.total += 1;
+                if !g.has_boxart {
+                    counts.missing_media += 1;
+                }
+                if shelf_group_favorite(g) {
+                    counts.favorite_groups += 1;
+                }
+                if g.play_last.is_some() {
+                    counts.recent_groups += 1;
+                }
+                for lib in &g.pc_sources {
+                    *pc_libs.entry(lib.clone()).or_default() += 1;
+                }
             }
             for shelf in std::iter::once(&g.platform).chain(g.also.iter()) {
                 let e = per.entry(shelf.clone()).or_default();
@@ -11713,7 +11733,7 @@ mod rom_home_tests {
     fn rom_home_counts_split_per_system_and_missing() {
         let cat = Catalog::open_in_memory().unwrap();
         seed_library(&cat);
-        let counts = cat.rom_home_counts().unwrap();
+        let counts = cat.rom_home_counts(&[]).unwrap();
         assert_eq!(counts.total, 3);
         // SNES (missing row) + MAME (no row at all) lack box art.
         assert_eq!(counts.missing_media, 2);
@@ -11727,6 +11747,52 @@ mod rom_home_tests {
         assert_eq!(per["arcade"], (1, 1));
         // The cross-listed set counts on the Neo Geo shelf too.
         assert_eq!(per["neogeo"], (1, 1));
+    }
+
+    #[test]
+    fn rom_home_counts_exclude_hidden_platforms() {
+        // Hiding (Projectionist, 2026-10-18): hidden systems leave
+        // every headline count but stay in the per-system split —
+        // the split is full data, the UI filters display, and
+        // unhiding restores exact numbers with no rescan.
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_library(&cat);
+        let counts = cat.rom_home_counts(&["snes".to_string()]).unwrap();
+        assert_eq!(counts.total, 2);
+        // SNES was one of the two missing-media groups.
+        assert_eq!(counts.missing_media, 1);
+        let per: std::collections::HashMap<&str, (i64, i64)> = counts
+            .per_system
+            .iter()
+            .map(|(p, g, m)| (p.as_str(), (*g, *m)))
+            .collect();
+        assert_eq!(per["snes"], (1, 1));
+        assert_eq!(per["nes"], (1, 0));
+        // Hiding everything empties the headlines, not the split.
+        let counts = cat
+            .rom_home_counts(&[
+                "nes".to_string(),
+                "snes".to_string(),
+                "arcade".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(counts.total, 0);
+        assert_eq!(counts.per_system.len(), 4);
+    }
+
+    #[test]
+    fn rom_home_shelf_window_excludes_hidden_platforms() {
+        // A hidden system's groups match no shelf window — the
+        // All Games shelf is the case that matters most.
+        let cat = Catalog::open_in_memory().unwrap();
+        seed_library(&cat);
+        let mut spec = shelf_spec("all");
+        let page = cat.rom_home_shelf_window(&spec).unwrap();
+        assert_eq!(page.total, 3);
+        spec.exclude_platforms = vec!["nes".to_string()];
+        let page = cat.rom_home_shelf_window(&spec).unwrap();
+        assert_eq!(page.total, 2);
+        assert!(page.games.iter().all(|g| g.platform != "nes"));
     }
 
     #[test]
@@ -11764,7 +11830,7 @@ mod rom_home_tests {
         // that a platform with games never vanishes from the split.
         let cat = Catalog::open_in_memory().unwrap();
         seed_library(&cat);
-        let counts = cat.rom_home_counts().unwrap();
+        let counts = cat.rom_home_counts(&[]).unwrap();
         let names: Vec<&str> = counts.per_system.iter().map(|(p, _, _)| p.as_str()).collect();
         assert!(names.contains(&"nes"));
         assert!(names.contains(&"snes"));
@@ -11947,7 +12013,7 @@ mod rom_home_tests {
             "USA vs Japan variants differ"
         );
         // Counts speak in games now: 2 files, 1 group.
-        let counts = cat.rom_home_counts().unwrap();
+        let counts = cat.rom_home_counts(&[]).unwrap();
         assert_eq!(counts.total, 1);
         assert_eq!(counts.per_system, vec![("nes".to_string(), 1, 1)]);
     }
@@ -12581,7 +12647,7 @@ mod rom_home_tests {
         assert_eq!(n("SELECT COUNT(*) FROM pc_metadata"), 3);
         assert_eq!(n("SELECT COUNT(*) FROM pc_game_state"), 3);
         assert_eq!(n("SELECT COUNT(*) FROM items"), 3);
-        let counts = cat.rom_home_counts().unwrap();
+        let counts = cat.rom_home_counts(&[]).unwrap();
         assert_eq!(counts.total, 3);
         assert_eq!(counts.per_system, vec![("pc".to_string(), 3, 3)]);
         assert_eq!(counts.pc_libraries, vec![("Playnite".to_string(), 3)]);
@@ -12700,7 +12766,7 @@ mod rom_home_tests {
         let facets = cat.rom_home_genre_facets().unwrap();
         assert!(facets.contains(&("Action".to_string(), 2)), "{facets:?}");
         assert!(facets.contains(&("RPG".to_string(), 1)), "{facets:?}");
-        let counts = cat.rom_home_counts().unwrap();
+        let counts = cat.rom_home_counts(&[]).unwrap();
         assert_eq!(counts.missing_media, 2, "cover counts as art");
         assert_eq!(
             counts.pc_libraries,
@@ -12731,7 +12797,7 @@ mod rom_home_tests {
         // Personal state routes to the group for pc paths exactly
         // like ROM paths (one game-state model).
         cat.rom_game_set_favorite("/games/Alpha", true).unwrap();
-        let counts = cat.rom_home_counts().unwrap();
+        let counts = cat.rom_home_counts(&[]).unwrap();
         assert_eq!(counts.favorite_groups, 1);
         // Badge starts at not-checked, moves only through its door,
         // and a re-import (presence refresh) never resets it.
@@ -12796,6 +12862,7 @@ mod rom_home_tests {
             platform: None,
             query: None,
             search_platforms: vec![],
+            exclude_platforms: vec![],
             member_keys: None,
             pc_source: None,
             filters: RomHomeShelfFilters::default(),
@@ -13058,7 +13125,7 @@ mod rom_home_tests {
         assert_eq!(page.total, 1);
         assert!(page.games.iter().all(|g| g.title.starts_with("Klax")));
         // The tallies speak the same definitions.
-        let counts = cat.rom_home_counts().unwrap();
+        let counts = cat.rom_home_counts(&[]).unwrap();
         assert_eq!(counts.total, 5);
         assert_eq!(counts.missing_media, 3);
         assert_eq!(counts.favorite_groups, 1);
@@ -13536,7 +13603,7 @@ mod rom_home_tests {
             .collect();
 
         let t = Instant::now();
-        let counts = cat.rom_home_counts().unwrap();
+        let counts = cat.rom_home_counts(&[]).unwrap();
         let counts_ms = t.elapsed().as_millis();
         assert_eq!(counts.total as usize, before_groups.len());
 
@@ -13546,6 +13613,7 @@ mod rom_home_tests {
             platform: None,
             query: None,
             search_platforms: vec![],
+            exclude_platforms: vec![],
             member_keys: None,
             pc_source: None,
             filters: RomHomeShelfFilters::default(),

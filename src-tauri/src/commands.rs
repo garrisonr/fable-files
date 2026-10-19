@@ -9960,10 +9960,13 @@ pub struct RomHomeCountsWire {
 #[tauri::command]
 pub fn rom_home_counts(
     state: State<'_, AppState>,
+    exclude_platforms: Vec<String>,
 ) -> Cmd<RomHomeCountsWire> {
     let catalog = ufm_catalog::Catalog::open(&state.catalog_path)
         .map_err(CommandError::from)?;
-    let counts = catalog.rom_home_counts().map_err(CommandError::from)?;
+    let counts = catalog
+        .rom_home_counts(&exclude_platforms)
+        .map_err(CommandError::from)?;
     // Per-system extras: lean file rows + the badge machinery the
     // games query already uses. Best-effort — the tallies above
     // stand even if a row set can't be read.

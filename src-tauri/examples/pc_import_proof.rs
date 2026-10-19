@@ -57,7 +57,7 @@ fn main() {
         }
         "counts" => {
             let cat = catalog.lock().unwrap();
-            let counts = cat.rom_home_counts().expect("counts");
+            let counts = cat.rom_home_counts(&[]).expect("counts");
             println!(
                 "{}",
                 serde_json::to_string_pretty(&counts).expect("json")
@@ -69,6 +69,7 @@ fn main() {
                 platform: Some("pc".to_string()),
                 query: None,
                 search_platforms: vec![],
+                exclude_platforms: vec![],
                 member_keys: None,
                 pc_source: None,
                 filters: ufm_catalog::RomHomeShelfFilters::default(),

@@ -1024,7 +1024,8 @@ export const api = {
   // are catalog-only; writes are path-keyed so they survive re-index.
   romHomeGames: (platform?: string | null) =>
     invoke<RomHomeGame[]>("rom_home_games", { platform: platform ?? null }),
-  romHomeCounts: () => invoke<RomHomeCounts>("rom_home_counts"),
+  romHomeCounts: (excludePlatforms: string[]) =>
+    invoke<RomHomeCounts>("rom_home_counts", { excludePlatforms }),
   romHomeShelfWindow: (spec: RomHomeShelfSpec) =>
     invoke<RomHomeShelfPage>("rom_home_shelf_window", { spec }),
   romHomeMissingPairs: (spec: RomHomeShelfSpec) =>
@@ -2719,6 +2720,9 @@ export interface RomHomeShelfSpec {
   platform?: string | null;
   query?: string | null;
   searchPlatforms: string[];
+  /** Dataset keys hidden in Preferences ▸ Consoles: their groups
+   * match no shelf window (All Games included). */
+  excludePlatforms: string[];
   memberKeys?: string[] | null;
   /** PC Games P1: library sub-shelf (groups claimed by this
    * library, any member). */
