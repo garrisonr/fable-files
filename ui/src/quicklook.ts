@@ -4,7 +4,8 @@ import { errText, Toast } from "./toast";
  * to the right of the selected file. The pane slides in from the right and
  * dismisses back to the right — enter and exit along the same path.
  *
- * Interruptibility: the pane's X offset is driven by a single spring keyed
+ * Interruptibility: the pane's footprint offset (margin-right, so the layout
+ * reflows around it) is driven by a single spring keyed
  * "quicklook-x". Re-opening mid-close simply re-targets the live spring, so
  * the pane reverses from its on-screen position — it never finishes closing
  * first. Esc or Space again dismisses.
@@ -584,7 +585,7 @@ export class QuickLook {
       // must not hide a pane that is open again.
       if (this.openItem) return;
       this.el.hidden = true;
-      this.el.style.transform = "";
+      this.el.style.marginRight = "";
     });
     this.onDismiss();
   }
@@ -599,8 +600,10 @@ export class QuickLook {
 
   private slideTo(x: number, onDone?: () => void): void {
     if (reducedMotion()) {
-      // Reduced motion: 120ms opacity fade, no travel.
+      // Reduced motion: 120ms opacity fade, no travel. The footprint
+      // still changes (layout is not motion), it just changes instantly.
       if (x === 0) {
+        this.el.style.marginRight = "0px";
         this.el.style.opacity = "0";
         fadeTo(this.el, 1, onDone);
       } else {
@@ -609,11 +612,18 @@ export class QuickLook {
       return;
     }
     const from = this.liveX();
+    // The spring drives margin-right, not transform: the pane is a flex
+    // child of the viewport, so a negative right margin shrinks its
+    // layout footprint in step with the slide and the content reflows
+    // around it — the pane never paints over the file list. (In the
+    // narrow overlay mode the same negative margin parks the drawer
+    // off-canvas.)
+    this.el.style.marginRight = `${-from}px`;
     springTo(
       "quicklook-x",
       x,
       (v) => {
-        this.el.style.transform = `translateX(${v}px)`;
+        this.el.style.marginRight = `${-v}px`;
       },
       { from, onDone },
     );
@@ -624,10 +634,11 @@ export class QuickLook {
     return this.el.offsetWidth > 0 ? this.el.offsetWidth : FALLBACK_PANEL_WIDTH;
   }
 
+  /** The live closed-offset: the spring drives margin-right, so the
+   * current offset is the negated margin. Unset margin = fully closed. */
   private liveX(): number {
-    const t = this.el.style.transform;
-    const m = t.match(/translateX\((-?[\d.]+)px\)/);
-    return m ? parseFloat(m[1]) : this.closedX();
+    const mr = parseFloat(this.el.style.marginRight || "");
+    return isNaN(mr) ? this.closedX() : -mr;
   }
 
   /** Phase 4 rich document preview: a PDF's rendered first page or

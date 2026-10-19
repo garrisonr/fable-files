@@ -1033,12 +1033,20 @@ td.muted {
  * the reduced-transparency treatment below is simply the law here.
  */
 .quicklook {
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
+  /* Tailor (2026-10-19): the pane is a citizen of the layout — a flex
+     child of .viewport, never an overlay at desktop widths. The content
+     reflows around it (every view carries min-width: 0), so nothing
+     renders under the pane, ever. The open/close spring drives
+     margin-right instead of transform (quicklook.ts), so the pane's box
+     keeps its full width while its layout footprint grows and shrinks
+     in sync with the content beside it. Below the fit breakpoint (the
+     media rule further down) the pane returns to a deliberate overlay
+     drawer; the handheld layout rule does the same. */
+  position: relative;
+  flex: 0 0 auto;
   width: 21.25rem;
   max-width: 85%;
+  min-width: 0;
   z-index: 20;
   background: var(--ufm-surface-elevated, var(--ufm-surface));
   background: rgb(from var(--ufm-surface-elevated, var(--ufm-surface)) r g b / 1);
@@ -1046,7 +1054,6 @@ td.muted {
   box-shadow: -1rem 0 2rem color-mix(in srgb, var(--ufm-text) 12%, transparent);
   display: flex;
   flex-direction: column;
-  will-change: transform;
 }
 
 .quicklook[hidden] {
@@ -1068,7 +1075,14 @@ td.muted {
 }
 
 .ql-title {
-  flex: 0 0 auto;
+  /* The head must fit its own width: the title is the one element that
+     can give, so it shrinks and ellipsizes instead of pushing the
+     buttons out of the pane. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 0.6875rem;
   font-weight: 700;
   letter-spacing: 0.04em;
@@ -1253,7 +1267,25 @@ body[data-layout="handheld"] .search-wrap {
   flex-basis: 10rem;
 }
 
+/* Tailor (2026-10-19): below this width the sidebar + pane + an honest
+   content column no longer fit side by side, so the pane becomes an
+   overlay drawer BY DESIGN instead of crushing the content. The
+   margin-right spring in quicklook.ts drives both modes unchanged:
+   at right: 0 a negative margin-right parks the drawer off-canvas. */
+@media (max-width: 64rem) {
+  .quicklook {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+  }
+}
+
 body[data-layout="handheld"] .quicklook {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
   width: 100%;
   max-width: 100%;
   border-left: none;
@@ -3693,10 +3725,10 @@ tr.row[style*="--label-color"] {
 .toast { max-width: 36rem; white-space: normal; overflow-wrap: anywhere; line-height: 1.4; }
 /* Themed native selects: closed control + option colors follow the
    active theme instead of leaking the OS palette. */
-select { appearance: none; -webkit-appearance: none; height: var(--ufm-control-h, 2rem); border-radius: 9px; border: 1px solid var(--ufm-border); background-color: var(--ufm-surface); color: var(--ufm-text); padding: 0 2rem 0 .75rem; font: inherit; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23888' stroke-width='1.6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right .7rem center; cursor: pointer; }
+select { appearance: none; -webkit-appearance: none; height: var(--ufm-control-h, 1.875rem); border-radius: 9px; border: 1px solid var(--ufm-border); background-color: var(--ufm-surface); color: var(--ufm-text); padding: 0 2rem 0 .75rem; font: inherit; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23888' stroke-width='1.6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right .7rem center; cursor: pointer; }
 select option { background-color: var(--ufm-surface); color: var(--ufm-text); }
 /* The app-styled Dropdown (dropdown.ts). */
-.dropdown-btn { height: var(--ufm-control-h, 2rem); padding: 0 .8rem; border-radius: 9px; border: 1px solid var(--ufm-border); background: var(--ufm-surface); color: var(--ufm-text); font: inherit; cursor: pointer; white-space: nowrap; }
+.dropdown-btn { height: var(--ufm-control-h, 1.875rem); padding: 0 .8rem; border-radius: 9px; border: 1px solid var(--ufm-border); background: var(--ufm-surface); color: var(--ufm-text); font: inherit; cursor: pointer; white-space: nowrap; }
 .burn-targetrow .dropdown-btn { min-width: 11rem; text-align: left; }
 /* Search: opaque full-cover panel + stronger selection + filter bar. */
 .searchview { flex: 1 1 auto; min-width: 0; background: var(--ufm-content-canvas); }
@@ -3715,14 +3747,14 @@ select option { background-color: var(--ufm-surface); color: var(--ufm-text); }
 .search-facet-hint { font-size: 0.75rem; color: var(--ufm-text-muted); padding: 0.25rem 0.5rem; max-width: 11rem; }
 .search-facet-done { align-self: flex-end; font-weight: 600; }
 .search-filter-field { display: inline-flex; gap: .45rem; align-items: center; color: var(--ufm-text-muted); font-size: .85rem; }
-.search-date { height: var(--ufm-control-h, 2rem); border-radius: 9px; border: 1px solid var(--ufm-border); background: var(--ufm-surface); color: var(--ufm-text); padding: 0 .5rem; font: inherit; }
+.search-date { height: var(--ufm-control-h, 1.875rem); border-radius: 9px; border: 1px solid var(--ufm-border); background: var(--ufm-surface); color: var(--ufm-text); padding: 0 .5rem; font: inherit; }
 /* Smart folder editor. */
 .smart-lab { display: block; margin: .65rem 0; color: var(--ufm-text-muted); font-size: .85rem; }
-.smart-in { display: block; width: 100%; margin-top: .3rem; height: var(--ufm-control-h, 2rem); border-radius: 9px; border: 1px solid var(--ufm-border); background: var(--ufm-content-canvas); color: var(--ufm-text); padding: 0 .6rem; font: inherit; box-sizing: border-box; }
+.smart-in { display: block; width: 100%; margin-top: .3rem; height: var(--ufm-control-h, 1.875rem); border-radius: 9px; border: 1px solid var(--ufm-border); background: var(--ufm-content-canvas); color: var(--ufm-text); padding: 0 .6rem; font: inherit; box-sizing: border-box; }
 .smart-hint { color: var(--ufm-text-muted); font-size: .82rem; line-height: 1.45; }
 /* Label manager: delete-all row + readable rule form. */
 .labels-danger-row { display: flex; align-items: center; gap: .7rem; margin-top: 1rem; }
-.labels-delete-all { height: var(--ufm-control-h, 2rem); padding: 0 .9rem; border-radius: 999px; border: 1px solid var(--ufm-danger); color: var(--ufm-danger); background: transparent; font: inherit; cursor: pointer; white-space: nowrap; }
+.labels-delete-all { height: var(--ufm-control-h, 1.875rem); padding: 0 .9rem; border-radius: 999px; border: 1px solid var(--ufm-danger); color: var(--ufm-danger); background: transparent; font: inherit; cursor: pointer; white-space: nowrap; }
 .labels-danger-hint { color: var(--ufm-text-muted); font-size: .8rem; }
 .labels-rule-add { flex-wrap: wrap; }
 .labels-rule-exts { flex: 1 1 12rem; min-width: 10rem; }
@@ -3735,7 +3767,7 @@ select option { background-color: var(--ufm-surface); color: var(--ufm-text); }
 .mr-list { max-height: 36vh; overflow: auto; }
 .mr-row { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; align-items: center; margin: .35rem 0; }
 .mr-old { color: var(--ufm-text-muted); font-size: .8rem; overflow-wrap: anywhere; }
-.mr-in { height: var(--ufm-control-h, 2rem); border-radius: 9px; border: 1px solid var(--ufm-border); background: var(--ufm-content-canvas); color: var(--ufm-text); padding: 0 .6rem; font: inherit; width: 100%; box-sizing: border-box; }
+.mr-in { height: var(--ufm-control-h, 1.875rem); border-radius: 9px; border: 1px solid var(--ufm-border); background: var(--ufm-content-canvas); color: var(--ufm-text); padding: 0 .6rem; font: inherit; width: 100%; box-sizing: border-box; }
 .mr-tmdb { margin-top: .8rem; border-top: 1px solid var(--ufm-border); padding-top: .6rem; }
 .mr-tmdb p { color: var(--ufm-text-muted); font-size: .82rem; line-height: 1.55; }
 .mr-mono { font-family: ui-monospace, monospace; color: var(--ufm-text); }
@@ -4128,6 +4160,7 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
   flex-direction: column;
   flex: 1;
   min-height: 0;
+  min-width: 0;
   background: var(--ufm-content-canvas);
   color: var(--ufm-text);
 }
@@ -4146,8 +4179,14 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 .rh-search { flex: 1; min-width: 140px; max-width: 460px; }
 .rh-search-in {
   width: 100%;
-  height: var(--ufm-control-h);
-  border-radius: var(--ufm-radius-md);
+  /* Style Guide 6.1: one row = one geometry. The fallback-less var()
+     made this height invalid on every theme that doesn't define the
+     token — the input collapsed to ~18px beside 30px pill buttons
+     (measured, Games toolbar, 2026-10-19). The chassis fallback keeps
+     the whole row at one height, and the radius joins the row's 999px
+     chassis as well. */
+  height: var(--ufm-control-h, 1.875rem);
+  border-radius: 999px;
   border: 1px solid var(--ufm-border);
   background: var(--ufm-content-canvas);
   color: var(--ufm-text);
@@ -4804,7 +4843,7 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
   font: inherit;
   font-size: 0.82rem;
   padding: 0.45rem 0.9rem;
-  min-height: var(--ufm-control-h);
+  min-height: var(--ufm-control-h, 1.875rem);
   border-radius: var(--ufm-radius-md);
   border: 1px solid var(--ufm-border);
   background: var(--ufm-surface);
@@ -4866,7 +4905,7 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 .emu-sys-select {
   font: inherit;
   font-size: 0.82rem;
-  min-height: var(--ufm-control-h);
+  min-height: var(--ufm-control-h, 1.875rem);
   border-radius: var(--ufm-radius-md);
   border: 1px solid var(--ufm-border);
   background: var(--ufm-surface-alt);
@@ -5419,7 +5458,7 @@ a.guide-link:hover { text-decoration-thickness: 2px; }
 }
 .mr-keyrow .pill-btn {
   flex: 0 0 auto;
-  height: var(--ufm-control-h, 2rem);
+  height: var(--ufm-control-h, 1.875rem);
   padding-top: 0;
   padding-bottom: 0;
   display: inline-flex;
@@ -5647,6 +5686,7 @@ body[data-layout="tv"] .w-glyph svg {
   flex-direction: column;
   flex: 1;
   min-height: 0;
+  min-width: 0;
   background: var(--ufm-content-canvas);
   color: var(--ufm-text);
 }
@@ -5658,6 +5698,7 @@ body[data-layout="tv"] .w-glyph svg {
   flex-direction: column;
   flex: 1;
   min-height: 0;
+  min-width: 0;
   background: var(--ufm-content-canvas);
   color: var(--ufm-text);
 }
@@ -5797,7 +5838,7 @@ body[data-layout="tv"] .w-glyph svg {
   color: var(--ufm-accent-text);
   border-radius: 999px; padding: 4px 14px; cursor: pointer;
   font: inherit; font-size: 0.85rem; font-weight: 600;
-  height: var(--ufm-control-h);
+  height: var(--ufm-control-h, 1.875rem);
 }
 .bh-tidy:hover { background: color-mix(in srgb, var(--ufm-accent) 20%, transparent); }
 .bh-chips {
