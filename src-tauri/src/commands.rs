@@ -16748,6 +16748,12 @@ pub async fn auditor_run_now(
 #[tauri::command]
 pub fn auditor_list_runs(state: State<'_, AppState>) -> Cmd<Vec<AuditorRunView>> {
     let catalog = auditor_catalog(&state)?;
+    // Red Pen (2026-10-18): close out runs orphaned by a dead
+    // process before anyone reads the history — a "running" row
+    // this process is not executing is a corpse, not live work.
+    // Best-effort: a failed reap must never break the listing.
+    let _ = catalog
+        .mark_stale_auditor_runs_interrupted(&crate::auditor::in_flight_run_ids());
     let rows = catalog
         .recent_auditor_runs(20)
         .map_err(|e| CommandError::from(UfmError::Internal(e.to_string())))?;

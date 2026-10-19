@@ -41,6 +41,7 @@ import { partitionReindex } from "./addscope";
 import { MusicCompleteDialog } from "./musiccomplete";
 import { PropertiesDialog } from "./properties";
 import { AuditorPanel } from "./auditor";
+import { auditorEntryState } from "./auditorentry";
 import { FolderPicker, type PickerShortcut } from "./picker";
 import { RenameDialog } from "./rename";
 import { LabelManager, saveLabelRules } from "./labels";
@@ -272,6 +273,9 @@ export class Shell {
   private propertiesDialog = new PropertiesDialog();
   private auditorPanel = new AuditorPanel();
   private auditorBadgeEl: HTMLElement | null = null;
+  private auditorLabelEl: HTMLElement | null = null;
+  private auditorRowEl: HTMLElement | null = null;
+  private auditorPollTimer: number | null = null;
   private fontScale = 1.0;
   private picker = new FolderPicker();
   private renameDialog = new RenameDialog();
@@ -1197,14 +1201,20 @@ export class Shell {
     auditorRow.className = "side-item";
     const auditorGlyph = sectionGlyph("auditor");
     const auditorLabel = document.createElement("span");
-    auditorLabel.textContent = "Review findings";
+    // Red Pen (2026-10-18): the label is STATE, refreshed from the
+    // auditor's persisted runs + open count by refreshAuditorBadge
+    // (auditorentry.ts) — never a hardcoded claim. Until the first
+    // refresh lands the row wears the section's plain name, which
+    // claims nothing.
+    auditorLabel.textContent = "File audit";
     const auditorBadge = document.createElement("span");
     auditorBadge.className = "side-count";
     auditorBadge.textContent = "";
     this.auditorBadgeEl = auditorBadge;
+    this.auditorLabelEl = auditorLabel;
+    this.auditorRowEl = auditorRow;
     auditorRow.append(auditorGlyph, auditorLabel, auditorBadge);
-    auditorRow.title =
-      "Audit folders and drives for typos, pattern breaks, corruption, duplicates, junk and drift — findings wait here for your verdict";
+    auditorRow.title = "File Auditor";
     auditorRow.addEventListener("click", () => this.openAuditor());
     const smartHead = document.createElement("h2");
     smartHead.className = "side-head";
@@ -4894,18 +4904,46 @@ export class Shell {
     })();
   }
 
-  /** File Auditor: the sidebar badge carries the open-flag count
-   * (proactive, calm — a number, never a red alert). Refreshed when
-   * the sidebar builds, when the panel closes, and whenever the
-   * panel reports a change. */
+  /** File Auditor: the sidebar entry tells the truth about the
+   * auditor's state. The badge carries the open-flag count
+   * (proactive, calm — a number, never a red alert); the label and
+   * hover title derive from the persisted run history
+   * (auditorentry.ts): never run → an invitation, running →
+   * "Auditing…", findings open → "Review findings", a clean or
+   * settled history → "All clear". Refreshed when the sidebar
+   * builds, when the panel closes, whenever the panel reports a
+   * change — and, while an audit runs, on a slow cosmetic poll so
+   * the label catches up on its own when the run lands. */
   private async refreshAuditorBadge(): Promise<void> {
     try {
-      const n = await api.auditorOpenCount();
-      if (this.auditorBadgeEl) {
-        this.auditorBadgeEl.textContent = n > 0 ? String(n) : "";
-      }
+      const [n, runs] = await Promise.all([
+        api.auditorOpenCount(),
+        api.auditorListRuns(),
+      ]);
+      const st = auditorEntryState(runs, n);
+      if (this.auditorBadgeEl) this.auditorBadgeEl.textContent = st.badge;
+      if (this.auditorLabelEl) this.auditorLabelEl.textContent = st.label;
+      if (this.auditorRowEl) this.auditorRowEl.title = st.title;
+      this.watchAuditorRun(st.state === "running");
     } catch {
-      // The badge is a courtesy — a failed count stays blank.
+      // The entry is a courtesy — a failed read keeps the last
+      // state it could prove rather than inventing a new one.
+    }
+  }
+
+  /** While an audit is in flight, re-read the entry every 30s.
+   * Cosmetic freshness only: the persisted state is the truth and
+   * this merely re-reads it; the poll dies with the run. */
+  private watchAuditorRun(running: boolean): void {
+    if (this.auditorPollTimer !== null) {
+      window.clearTimeout(this.auditorPollTimer);
+      this.auditorPollTimer = null;
+    }
+    if (running) {
+      this.auditorPollTimer = window.setTimeout(() => {
+        this.auditorPollTimer = null;
+        void this.refreshAuditorBadge();
+      }, 30_000);
     }
   }
 
