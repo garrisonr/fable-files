@@ -657,47 +657,119 @@ export function setRomsEnabled(on: boolean): void {
 
 /** Internet Archive destinations for the empty-system pointer
  * (Dickles, 2026-10-15: an empty shelf should POINT somewhere).
- * Verified 2026-10-15 against archive.org's own metadata service —
- * every identifier below is a live collection carrying that
- * system's library ("Software Library: NES", "…: Sega Game Gear",
- * and so on). The /details/ pages bot-wall scripted fetchers, so
- * the metadata service is the verification of record; systems
- * without a collection of their own fall back to the general
- * Software Library, which loads everywhere. */
-export const ROM_ARCHIVE_GENERAL =
-  "https://archive.org/details/softwarelibrary";
-
+ *
+ * REBUILT 2026-10-18 by crew Game Warden, on Dickles' order: "each
+ * system is different and don't make shit up... if a system has no
+ * roms there don't lie and put bullshit links." The previous table
+ * was audited identifier by identifier against archive.org's own
+ * metadata service: 14 of its 17 identifiers DO NOT EXIST (empty
+ * metadata records), and every other system silently fell back to
+ * the general Software Library — a generic link wearing a
+ * per-system costume. That fallback is gone.
+ *
+ * Every entry below was verified the same way: the item's metadata
+ * record was OPENED and its title/contents plainly match the
+ * system (a recognized set — No-Intro / TOSEC / Redump — or an
+ * Internet Archive library collection). Systems with no verified
+ * set are ABSENT from this table, and an absent system shows NO
+ * hunt link: the empty shelf keeps its honest copy (your dumps,
+ * homebrew, public-domain) and points nowhere. Full audit table
+ * with per-system evidence: Game Warden RECEIPT, 2026-10-19. */
 const ROM_ARCHIVE_LINKS: Record<string, string> = {
-  amiga: "https://archive.org/details/softwarelibrary_amiga",
-  arcade: "https://archive.org/details/softwarelibrary_arcade",
-  atari2600: "https://archive.org/details/softwarelibrary_atari2600",
-  atari7800: "https://archive.org/details/softwarelibrary_atari7800",
-  atari8bit: "https://archive.org/details/softwarelibrary_atari800",
-  lynx: "https://archive.org/details/softwarelibrary_lynx",
-  c64: "https://archive.org/details/softwarelibrary_c64",
-  gb: "https://archive.org/details/softwarelibrary_gameboy",
-  gbc: "https://archive.org/details/softwarelibrary_gameboy",
-  gamegear: "https://archive.org/details/softwarelibrary_gamegear",
-  genesis: "https://archive.org/details/softwarelibrary_genesis",
-  mastersystem: "https://archive.org/details/softwarelibrary_sms",
-  nes: "https://archive.org/details/softwarelibrary_nes",
-  snes: "https://archive.org/details/softwarelibrary_snes",
-  tg16: "https://archive.org/details/softwarelibrary_turbografx",
-  jaguar: "https://archive.org/details/softwarelibrary_jaguar",
-  zxspectrum: "https://archive.org/details/softwarelibrary_zx_spectrum",
+  "3do": "https://archive.org/details/redump.panasonic_3do", // 3DO — Redump Panasonic 3DO Interactive Multiplayer
+  amiga: "https://archive.org/details/softwarelibrary_amiga", // Amiga — Internet Archive collection "Software Library: Amiga"
+  amigacd32: "https://archive.org/details/RedumpAmigaCD32", // Amiga CD32 — Redump set item "Redump - Commodore - Amiga CD32"
+  apfmp1000: "https://archive.org/details/No-Intro_AM1", // APF-MP1000 — No-Intro set item "[No-Intro] APF - MP-1000"
+  apple2: "https://archive.org/details/Apple_2_TOSEC_2012_04_23", // Apple II — TOSEC set item
+  arcade: "https://archive.org/details/internetarcade", // Arcade — Internet Archive's own arcade library
+  arcadia2001: "https://archive.org/details/No-Intro_EA-2001", // Arcadia 2001 — No-Intro set item "[No-Intro] Emerson - Arcadia 2001"
+  astrocade: "https://archive.org/details/No-Intro_BA", // Bally Astrocade — No-Intro set item "[No-Intro] Bally - Astrocade"
+  atari2600: "https://archive.org/details/nointro.atari-2600", // Atari 2600 — No-Intro set item "[No-Intro] Atari - 2600"
+  atari5200: "https://archive.org/details/nointro.atari-5200", // Atari 5200 — No-Intro set item "[No-Intro] Atari - 5200"
+  atari7800: "https://archive.org/details/nointro.atari-7800", // Atari 7800 — No-Intro set item "[No-Intro] Atari - 7800
+  atarist: "https://archive.org/details/No-Intro_AAS", // Atari ST — No-Intro set item
+  c64: "https://archive.org/details/softwarelibrary_c64", // Commodore 64 — Internet Archive collection "Software Library: C64"
+  cassettevision: "https://archive.org/details/epoch-cassette-vision-roms-and-emulator", // Cassette Vision — Complete retail-library preservation pack
+  cdi: "https://archive.org/details/redumpPhilipsCdi", // CD-i — Redump set item "Redump - Philips - CD-i"
+  cdtv: "https://archive.org/details/RedumpCommodoreAmigaCDTV", // Commodore CDTV — Redump set item "Redump - Commodore - Amiga CDTV"
+  channelf: "https://archive.org/details/No-Intro_F-CF", // Channel F — No-Intro set item "[No-Intro] Fairchild - Channel F"
+  colecovision: "https://archive.org/details/No-Intro_CC", // ColecoVision — No-Intro set item "[No-Intro] Coleco - ColecoVision"
+  cpc: "https://archive.org/details/Amstrad_CPC_TOSEC_2012_04_23", // Amstrad CPC — TOSEC set item
+  dreamcast: "https://archive.org/details/redump.sega_dreamcast", // Dreamcast — Redump Sega Dreamcast
+  fmtowns: "https://archive.org/details/noaen-redump-fujitsu-fm-towns", // FM Towns — Redump set item "[Noaen] Redump - Fujitsu - FM-Towns"
+  gamecom: "https://archive.org/details/Tiger-Electronics-Game.com", // Game.com — Myrient mirror item of the No-Intro "Tiger - Game.com" set
+  gamecube: "https://archive.org/details/GameCube-Redump-2024-Individual-Games-Part1", // GameCube — Redump set item "GameCube Redump 2024 Individual Games
+  gamegear: "https://archive.org/details/nointro.gg", // Game Gear — No-Intro set item "[No-Intro] Sega - Game Gear"
+  gb: "https://archive.org/details/No-Intro_GB", // Game Boy — No-Intro set item "No-Intro - Nintendo Game Boy"
+  gba: "https://archive.org/details/No-Intro_GBA", // Game Boy Advance — No-Intro set item "No-Intro - Nintendo Game Boy Advance"
+  gbc: "https://archive.org/details/No-Intro_GBC", // Game Boy Color — No-Intro set item "No-Intro - Nintendo Game Boy Color"
+  genesis: "https://archive.org/details/nointro.md", // Genesis — No-Intro set item "[No-Intro] Sega - Mega Drive - Genesis"
+  gp32: "https://archive.org/details/No-Intro_G-GP32", // GP32 — No-Intro set item "[No-Intro] GamePark - GP32"
+  gx4000: "https://archive.org/details/Amstrad_GX4000_TOSEC_2012_04_23", // Amstrad GX4000 — TOSEC set item "TOSEC: Amstrad GX4000
+  hyperscan: "https://archive.org/details/mattel_hyperscan", // HyperScan — Redump set item "Mattel Hyperscan - Redump.info"
+  intellivision: "https://archive.org/details/No-Intro_M-I", // Intellivision — No-Intro set item "[No-Intro] Mattel - Intellivision"
+  jaguar: "https://archive.org/details/atari-jaguar-no-intro_unzipped", // Atari Jaguar — No-Intro set item "atari-jaguar-no-intro_unzipped"
+  jaguarcd: "https://archive.org/details/noaen-redump-atari-jaguar-cd-interactive-multimedia-system", // Jaguar CD — [Noaen] Redump - Atari - Jaguar CD Interactive Multimedia System
+  leapster: "https://archive.org/details/No-Intro_L-LLGS", // Leapster — No-Intro set item "[No-Intro] LeapFrog - Leapster Learning Ga…
+  loopy: "https://archive.org/details/No-Intro_CL-B", // Casio Loopy — No-Intro set item "[No-Intro] Casio - Loopy
+  lynx: "https://archive.org/details/lynx-library", // Atari Lynx — Internet Archive collection "Console Living Room: Atari Lynx"
+  mastersystem: "https://archive.org/details/nointro.ms-mkiii", // Master System — [No-Intro] Sega - Master System - Mark III
+  megaduck: "https://archive.org/details/Creatronic_Mega_Duck_and_Cougar_Boy_TOSEC_2012_04_23", // Mega Duck — TOSEC set item
+  msx: "https://archive.org/details/No-Intro_M-MSX", // MSX — No-Intro set item "[No-Intro] Microsoft - MSX"
+  n3ds: "https://archive.org/details/3DS-Redump-2024-Individual-Games-Part1", // Nintendo 3DS — No-Intro 2024 set item "3DS No-Intro 2024 Individual Games
+  n64: "https://archive.org/details/no-intro-nintendo-nintendo-64-bigendian-RAR", // Nintendo 64 — No-Intro set item "No-Intro - Nintendo - Nintendo 64
+  n64dd: "https://archive.org/details/no-intro-nintendo-nintendo-64-dd", // Nintendo 64DD — No-Intro set item "No-Intro Nintendo Nintendo 64 DD"
+  nds: "https://archive.org/details/ni-n-ds-dec_202401", // Nintendo DS — No-Intro set item "[No-Intro] Nintendo DS
+  neogeocd: "https://archive.org/details/noaen-redump-snk-neo-geo-cd", // Neo Geo CD — [Noaen] Redump - SNK - Neo Geo CD
+  neogeopocket: "https://archive.org/details/ef_snk_neogeo_Pocket_neogeo_pocket_color_no-intro_2024", // Neo Geo Pocket — SNK NeoGeo Pocket & NeoGeo Pocket Color No-Intro 2024
+  nes: "https://archive.org/details/No-Intro_NES", // NES — No-Intro set item "No-Intro - Nintendo Entertainment System"
+  ngage: "https://archive.org/details/ngagecrackedgamescollection", // N-Gage — Community full romset item
+  nuon: "https://archive.org/details/vm_labs_nuon", // Nuon — Redump set item "VM Labs NUON - Redump.info"
+  odyssey2: "https://archive.org/details/Magnavox_Odyssey_2_TOSEC_2012_04_23", // Odyssey² — TOSEC set item "TOSEC: Magnavox Odyssey 2
+  ouya: "https://archive.org/details/Ouya_Compilation_2019_09", // OUYA — OUYA game library compilation item
+  pc88: "https://archive.org/details/Neo_Kobe_NEC_PC-8801_2016-02-25", // PC-88 — Neo Kobe collection
+  pc98: "https://archive.org/details/nec_pc-98_series", // PC-98 — Redump series item
+  pcfx: "https://archive.org/details/noaen-redump-nec-pc-fx-pc-fxga", // PC-FX — [Noaen] Redump - NEC - PC-FX & PC-FXGA
+  pico: "https://archive.org/details/ni-se-pico", // Sega Pico — [No-Intro] Sega PICO
+  pippin: "https://archive.org/details/bandai_pippin", // Apple Pippin — Redump set item "Bandai Pippin - Redump.info"
+  playdia: "https://archive.org/details/bandai_playdia_quick_interactive_system", // Playdia — Redump set item "Bandai Playdia Quick Interactive System - Re…
+  pokemonmini: "https://archive.org/details/pokemon-mini-myrient", // Pokémon Mini — No-Intro set via Myrient mirror "Myrient No-Intro Pokémon Mini"
+  psp: "https://archive.org/details/non-redump_sony_playstation_portable", // PlayStation Portable — Sony PlayStation Portable - No-Intro Non-Redump
+  psvita: "https://archive.org/details/sony-playstation-vita-usa-full-set-nonpdrm-format", // PlayStation Vita — Sony Playstation Vita
+  psx: "https://archive.org/details/redumpSonyPlaystationAmericaGames08Feburary2020", // PlayStation — Redump - Sony - PlayStation
+  pv1000: "https://archive.org/details/No-Intro_C-PV-1000", // Casio PV-1000 — No-Intro set item "[No-Intro] Casio - PV-1000"
+  saturn: "https://archive.org/details/redump.sega_saturn", // Saturn — Redump Sega Saturn
+  scv: "https://archive.org/details/No-Intro_E-SCV", // Super Cassette Vision — No-Intro set item "[No-Intro] Epoch - Super Cassette Vision"
+  sega32x: "https://archive.org/details/nointro.32x", // Sega 32X — [No-Intro] Sega - 32X
+  segacd: "https://archive.org/details/redump.sega_megacd-segacd", // Sega CD — Redump Sega Mega CD & Sega CD
+  sg1000: "https://archive.org/details/ni-se-sg1000", // SG-1000 — [No-Intro] Sega SG-1000
+  snes: "https://archive.org/details/No-Intro_Super_Nintendo_SNES", // SNES — No-Intro set item "No-Intro - Super Nintendo Entertainment Sy…
+  studio2: "https://archive.org/details/RCA_Studio_2_TOSEC_2012_04_23", // RCA Studio II — TOSEC set item "TOSEC: RCA Studio 2
+  superacan: "https://archive.org/details/No-Intro_F-SA", // Super A'can — No-Intro set item "[No-Intro] Funtech - Super Acan"
+  supergrafx: "https://archive.org/details/nointro.sg", // SuperGrafx — [No-Intro] NEC - PC Engine SuperGrafx
+  supervision: "https://archive.org/details/Watara_Supervision_TOSEC_2012_04_23", // Watara Supervision — TOSEC set item "TOSEC: Watara Supervision
+  tg16: "https://archive.org/details/nointro.tg-16", // TurboGrafx-16 — [No-Intro] NEC - PC Engine - TurboGrafx 16
+  tgcd: "https://archive.org/details/redump.nec_pcecd-tgcd", // TurboGrafx-CD — Redump NEC PC Engine CD & TurboGrafx CD
+  vectrex: "https://archive.org/details/No-Intro_GCE-V", // Vectrex — No-Intro set item "[No-Intro] GCE - Vectrex"
+  vic20: "https://archive.org/details/Commodore_VIC20_TOSEC_2012_04_23", // Commodore VIC-20 — TOSEC set item "TOSEC: Commodore VIC-20
+  virtualboy: "https://archive.org/details/ni-n-vb", // Virtual Boy — No-Intro set item "[No-Intro] Virtual Boy"
+  vsmile: "https://archive.org/details/vtech-v.smile-no-intro-rom-collection", // V.Smile — No-Intro V.Smile ROM collection item
+  wii: "https://archive.org/details/Wii-Redump-2024-Individual-Games-Part1", // Wii — Redump set item "Wii Redump 2024 Individual Games
+  wiiu: "https://archive.org/details/nointro_wiiu_cdn_nov_2020", // Wii U — No-Intro set item "
+  wonderswan: "https://archive.org/details/wonderswan-library", // WonderSwan — Internet Archive collection "Console Living Room: Bandai Wond…
+  x1: "https://archive.org/details/Sharp_X1_TOSEC_2012_04_23", // Sharp X1 — TOSEC set item
+  x68000: "https://archive.org/details/Sharp_X68000_TOSEC_2012_04_23", // Sharp X68000 — TOSEC set item
+  xbox: "https://archive.org/details/xboxcds", // Xbox — XBox CD-ROM Collection
+  zxspectrum: "https://archive.org/details/softwarelibrary_zx_spectrum", // ZX Spectrum — Internet Archive collection "The Software Library: ZX Spectrum"
 };
 
-/** The archive.org shelf for a system key — its own collection
- * where one exists, the general Software Library otherwise. */
-export function romArchiveLink(systemKey: string): {
-  url: string;
-  perSystem: boolean;
-} {
-  const url = ROM_ARCHIVE_LINKS[systemKey];
-  return url
-    ? { url, perSystem: true }
-    : { url: ROM_ARCHIVE_GENERAL, perSystem: false };
+/** The verified archive.org destination for a system key, or
+ * null when archive.org holds no verified set for that system —
+ * in which case the shelf shows no hunt link at all. */
+export function romArchiveLink(systemKey: string): string | null {
+  return ROM_ARCHIVE_LINKS[systemKey] ?? null;
 }
+
 
 // ---------------------------------------------------------------------------
 // ROM SYSTEM ICON SETS (Dickles, 2026-10-15 — DESIGN.md "ROM SYSTEM ICON

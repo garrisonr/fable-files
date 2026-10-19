@@ -202,7 +202,22 @@ pub fn census_root(root: &Path, candidates: &HashSet<String>) -> Result<Census> 
         i
     };
 
-    for entry in walkdir::WalkDir::new(&canon).follow_links(false) {
+    // Index scope law (2026-10-18, indexer::prunes_hidden_dir):
+    // the census applies the SAME hidden-directory prune as the
+    // indexer, so the counts it shows the safety gate are the
+    // counts a walk would actually catalog — and the folder pick
+    // it feeds can never offer a tree the walk would skip.
+    let walker = walkdir::WalkDir::new(&canon)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            !(e.file_type().is_dir()
+                && crate::indexer::prunes_hidden_dir(
+                    e.depth(),
+                    &e.file_name().to_string_lossy(),
+                ))
+        });
+    for entry in walker {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => {
@@ -345,6 +360,37 @@ mod tests {
         let root_files = c.top.iter().find(|t| t.name == "").unwrap();
         assert_eq!((root_files.files, root_files.dirs), (1, 0));
         assert_eq!(c.total_items(), 6);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Index scope law agreement (2026-10-18): the census prunes
+    /// hidden directories exactly like the indexer, so its counts
+    /// (and the folder pick built from them) describe the walk
+    /// that will actually happen. root/{visible/f.txt,
+    /// .hidden/secret.txt, visible/.nested/deep.txt, top.txt} →
+    /// only f.txt + top.txt count; no ".hidden" top entry exists
+    /// to be picked.
+    #[test]
+    fn census_prunes_hidden_dirs_like_the_indexer() {
+        let root = scratch("hidden");
+        std::fs::create_dir_all(root.join("visible").join(".nested")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join("visible").join("f.txt"), vec![0u8; 3]).unwrap();
+        std::fs::write(
+            root.join("visible").join(".nested").join("deep.txt"),
+            vec![0u8; 4],
+        )
+        .unwrap();
+        std::fs::write(root.join(".hidden").join("secret.txt"), vec![0u8; 3]).unwrap();
+        std::fs::write(root.join("top.txt"), vec![0u8; 3]).unwrap();
+
+        let c = census_root(&root, &candidates()).unwrap();
+        assert_eq!(c.files, 2, "f.txt + top.txt only");
+        assert_eq!(c.dirs, 1, "visible only — .nested is pruned too");
+        assert!(
+            c.top.iter().all(|t| t.name != ".hidden"),
+            "a pruned tree must never appear as a pickable top entry"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }

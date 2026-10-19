@@ -289,12 +289,34 @@ fn identify_one(state: &AppState, item: &ufm_vfs::Item) -> Identified {
             return finish_write(state, row, series, has_cover);
         }
         "pdf" => {
+            // Content gate (2026-10-18, crew Dewey): the extension
+            // is a claim, not evidence. A zlib-rs test fixture named
+            // paper-100k.pdf (102,400 bytes of RDF/XML) was shelved
+            // as this library's only "book" on the Dell because this
+            // arm wrote a row whenever pdfinfo didn't say
+            // "encrypted". Two checks now, mirroring the EPUB arm's
+            // decode-or-fail discipline: the file must carry the PDF
+            // header, and the info pass must yield a page count
+            // (decode reports a non-PDF as a note + no pages).
+            if !ufm_preview::pdf::has_pdf_magic(path) {
+                return Identified::Failed(
+                    "this file isn't a readable PDF (its contents don't carry the PDF header)"
+                        .into(),
+                );
+            }
             let preview = ufm_preview::pdf::decode_pdf_metadata(path, size);
             if preview.encrypted {
                 return Identified::Failed(
                     "this PDF is password-protected, so the library pass can't read its details"
                         .into(),
                 );
+            }
+            if preview.page_count.is_none() {
+                return Identified::Failed(match preview.note.clone() {
+                    Some(note) => note,
+                    None => "this file isn't a readable PDF (the reader couldn't count its pages)"
+                        .into(),
+                });
             }
             BookMetadataRow {
                 item_id: item.id.to_string(),
@@ -366,6 +388,18 @@ fn run_identify(
                 report.failed += 1;
                 if report.failures.len() < 20 {
                     report.failures.push((item.name.clone(), reason));
+                }
+                // Withdraw-on-fail (2026-10-18, crew Dewey): a
+                // candidate that HAD a metadata row was re-judged
+                // (stale snapshot, or a page-less PDF row from the
+                // extension-trusting era) and failed validation —
+                // the old identification is withdrawn so the shelf
+                // stops claiming a book that isn't one. The file
+                // itself stays a plain catalog item; reading state
+                // (book_state, keyed by provider_key) is untouched.
+                {
+                    let catalog = state.catalog.lock().unwrap();
+                    let _ = catalog.delete_book_metadata(&item.id.to_string());
                 }
             }
         }
