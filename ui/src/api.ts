@@ -427,6 +427,17 @@ export const PREVIEW_LABELS: Record<PreviewKind, string> = {
   hex: "Hex",
 };
 
+/** MediaClass from the media_class command (Usher): what a media
+ * file IS by its streams — an audiobook in an .mp4 coat reports
+ * media "audio" (its only "video" stream is the cover art).
+ * "unknown" = not probed; callers fall back to the filename. */
+export interface MediaClass {
+  media: "audio" | "video" | "none" | "unknown";
+  videoCodec: string | null;
+  audioCodec: string | null;
+  hasCover: boolean;
+}
+
 /**
  * Root-dir addressing: the backend mints a real ItemId for each location root
  * and ships it as `LocationSummary.root_item`. The shell must use that value
@@ -711,6 +722,7 @@ export const api = {
   listThemes: () => invoke<ThemeInfo[]>("list_themes"),
   applyTheme: (theme: string) => invoke<string>("apply_theme", { theme }),
   preview: (item: string) => invoke<PreviewKind>("preview", { item }),
+  mediaClass: (item: string) => invoke<MediaClass>("media_class", { item }),
   trashPath: () => invoke<string>("trash_path"),
   trashItem: (item: string) => invoke<string>("trash_item", { item }),
   untrashItem: (trashName: string) => invoke<string>("untrash_item", { trashName }),

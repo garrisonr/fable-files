@@ -20,12 +20,13 @@ import {
   mediaSrc,
   PREVIEW_LABELS,
   type Item,
+  type MediaClass,
   type MetaTag,
   type PreviewKind,
 } from "./api";
 import { onPlayerClosed, onPlayerReturn, onPlayerState } from "./api";
 import { attachStep, type AttachSnapshot } from "./qlattach";
-import { VideoPlayer, isVideoName } from "./video";
+import { VideoPlayer, isPlayableName, isVideoName, mediaRouteFor } from "./video";
 import type { CastDeviceLike } from "./castsession";
 import { audioBadge, audioProps, audioTags, folderArtUrl } from "./audiometa";
 import {
@@ -70,6 +71,12 @@ export class QuickLook {
    * the pane adopts this item (see qlattach.ts). */
   private followPending: Item | null = null;
   private currentKind: PreviewKind | null = null;
+  /** Stream-truth for the open item (Usher): what the file IS, by
+   * its streams — outranks the filename in mediaRouteFor. */
+  private mediaClass: MediaClass | null = null;
+  /** True while the media_class probe is in flight: the media
+   * branches wait rather than mount the wrong player. */
+  private mediaClassPending = false;
   /** The shared transport core, Quick Look arrangement (Music
    * Glow-Up Phase 2): this pane's client + engine + transport.
    * The engine sounds only while the core's owner is
@@ -344,7 +351,14 @@ export class QuickLook {
         playing: s?.state === "playing",
       });
     }
-    if (isVideoName(item.name)) {
+    // The flag follows the player that actually held the path —
+    // an audiobook in an .mp4 coat detaches as AUDIO (Usher); only
+    // when neither player holds it does the route decide.
+    const heldByVideo =
+      (this.videoPlayer !== null && this.videoPlayer.sourcePath === path) ||
+      (this.audioPath !== path &&
+        mediaRouteFor(item.name, this.mediaClass, false) === "video");
+    if (heldByVideo) {
       if (this.detachedFor === path) return;
       this.detachedFor = path;
     } else {
@@ -507,6 +521,10 @@ export class QuickLook {
     const token = ++this.requestToken;
     this.openItem = item;
     this.onShowItem?.(item);
+    // Stream-truth reset (Usher): a stale class from the previous
+    // item must never route this one — the probe below re-asks.
+    this.mediaClass = null;
+    this.mediaClassPending = isPlayableName(item.name);
     if (this.castBtn) {
       const ext = item.name.split(".").pop()?.toLowerCase() ?? "";
       const AUDIO = ["mp3", "flac", "ogg", "oga", "wav", "m4a", "opus", "aac", "aif", "aiff"];
@@ -520,6 +538,27 @@ export class QuickLook {
     this.renderCard(item, null);
     // Slide in from the right — from the LIVE offset (interruptible).
     this.slideTo(0);
+    // Stream-truth (Usher): ask what the file actually IS before
+    // any player mounts. The metadata card is already on screen;
+    // when the class lands, the card re-renders onto the right
+    // branch (see mediaRouteFor).
+    if (this.mediaClassPending) {
+      void api
+        .mediaClass(item.id)
+        .then((mc) => {
+          if (token === this.requestToken && this.openItem === item) {
+            this.mediaClass = mc;
+            this.mediaClassPending = false;
+            void this.renderCard(item, this.currentKind);
+          }
+        })
+        .catch(() => {
+          if (token === this.requestToken && this.openItem === item) {
+            this.mediaClassPending = false;
+            void this.renderCard(item, this.currentKind);
+          }
+        });
+    }
     try {
       const kind = await api.preview(item.id);
       if (token === this.requestToken && this.openItem === item) {
@@ -812,7 +851,12 @@ export class QuickLook {
       // the card, as large as the pane allows (full image, not a thumb).
       // Video: the full player lives at the top of the card —
       // transport controls on hover, pop-out, fullscreen.
-      if (isVideoName(item.name) && item.provider_key) {
+      // Stream-truth routing (Usher): the branch is chosen by what
+      // the file IS (mediaRouteFor over the probed class), not by
+      // its name — and while the probe is in flight, no player
+      // mounts at all.
+      const route = mediaRouteFor(item.name, this.mediaClass, this.mediaClassPending);
+      if (route === "video" && item.provider_key) {
         const vpath = item.provider_key;
         if (this.detachedFor === vpath) {
           card.insertBefore(this.buildDetachedPlaceholder(item, vpath), dl);
@@ -832,6 +876,7 @@ export class QuickLook {
               : carry
                 ? carry.playing
                 : true,
+            codecName: this.mediaClass?.videoCodec ?? null,
             onDetach: () => this.detachVideo(item, player),
           });
           if (this.castPicker) player.setCastPicker(this.castPicker);
@@ -857,11 +902,7 @@ export class QuickLook {
       // whatever played before, on every surface — and renders
       // the shared compact transport plus the synced lyrics.
       // Art comes from the shared folder/embedded chain.
-      const audioExts = [
-        "mp3", "flac", "ogg", "oga", "wav", "m4a", "m4b", "opus", "aac",
-        "aif", "aiff", "wma", "dsf", "dff",
-      ];
-      if (audioExts.includes(ext) && item.provider_key) {
+      if (route === "audio" && item.provider_key) {
         const apath = item.provider_key;
         this.audioPath = apath;
         const snap0 = this.core.snap;
@@ -1108,12 +1149,12 @@ export class QuickLook {
       push("Date taken", taken.value);
       push("Camera", camera());
       push("Lens", get("LensModel") || get("Lens"));
-    } else if (isVideoName(item.name)) {
+    } else if (isVideoName(item.name) && this.mediaClass?.media !== "audio") {
       push("Dimensions", dimensions());
       push("Duration", get("Duration"));
       const rec = firstOf(["DateTimeOriginal", "CreateDate"]);
       push("Recorded", rec.value);
-    } else if (audioExts.includes(ext)) {
+    } else if (audioExts.includes(ext) || this.mediaClass?.media === "audio") {
       const title = firstOf(["Title"]);
       push("Title", title.value, title.tag);
       const artist = firstOf(["Artist"]);

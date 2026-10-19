@@ -12718,6 +12718,201 @@ fn probe_video_dims(path: &std::path::Path) -> Option<(u32, u32)> {
     None
 }
 
+// ── Stream-truth preview classification (Usher, 2026-10-18) ──────
+//
+// Dickles' audiobook arrived as an .mp4 whose only "video" stream
+// is the cover art (an MJPEG still, flagged attached_pic by the
+// container itself). Routed by extension, the preview mounted the
+// video player, which cannot play a still picture for 7.5 hours —
+// dead end, and the note blamed the file. The router now asks the
+// streams: a file is VIDEO only if it owns a video stream that is
+// not cover art; an audio-bearing file with no real video stream
+// is AUDIO, whatever its name claims.
+
+/// One stream of a media file, as ffprobe reports it.
+#[derive(Debug, Clone, PartialEq)]
+struct StreamFacts {
+    codec_type: String,
+    codec_name: String,
+    /// The container flags this stream as an attached picture
+    /// (embedded cover art), not a picture track.
+    attached_pic: bool,
+    /// avg_frame_rate numerator; 0 = the stream carries no real
+    /// frame rate (a still, not a movie).
+    frame_rate_num: u64,
+}
+
+/// What a media file actually IS, by its streams — the preview
+/// router's truth, replacing the extension guess.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaClass {
+    /// "audio" | "video" | "none" (no playable stream) | "unknown"
+    /// (not probed — the caller falls back to the extension guess).
+    pub media: String,
+    /// First real (non-cover) video codec, when one exists — named
+    /// in the honest fallback note when playback fails.
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    /// A cover-art stream rides along (the audio card shows it via
+    /// the existing embedded-art chain).
+    pub has_cover: bool,
+}
+
+impl MediaClass {
+    fn unknown() -> Self {
+        MediaClass {
+            media: "unknown".into(),
+            video_codec: None,
+            audio_codec: None,
+            has_cover: false,
+        }
+    }
+}
+
+/// Still-image codecs: a "video" stream in one of these, carrying
+/// no frame rate, is a picture — not a movie. (A camera's MJPEG
+/// movie has a real frame rate and is NOT cover art.)
+const STILL_IMAGE_CODECS: [&str; 5] = ["mjpeg", "png", "bmp", "webp", "gif"];
+
+/// A video stream is cover art when the container flags it as an
+/// attached picture, or when it is a still-image codec with no
+/// frame rate (muxers that never set the flag).
+fn stream_is_cover_art(s: &StreamFacts) -> bool {
+    if s.codec_type != "video" {
+        return false;
+    }
+    if s.attached_pic {
+        return true;
+    }
+    STILL_IMAGE_CODECS.contains(&s.codec_name.as_str()) && s.frame_rate_num == 0
+}
+
+/// The classification rule, pure over probed facts (unit-tested):
+/// real video beats audio; audio with only cover art for company
+/// is audio; no playable stream at all is "none".
+fn classify_streams(streams: &[StreamFacts]) -> MediaClass {
+    let mut video_codec: Option<String> = None;
+    let mut audio_codec: Option<String> = None;
+    let mut has_cover = false;
+    for s in streams {
+        match s.codec_type.as_str() {
+            "video" => {
+                if stream_is_cover_art(s) {
+                    has_cover = true;
+                } else if video_codec.is_none() {
+                    video_codec = Some(s.codec_name.clone());
+                }
+            }
+            "audio" => {
+                if audio_codec.is_none() {
+                    audio_codec = Some(s.codec_name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    let media = if video_codec.is_some() {
+        "video"
+    } else if audio_codec.is_some() {
+        "audio"
+    } else {
+        "none"
+    };
+    MediaClass {
+        media: media.into(),
+        video_codec,
+        audio_codec,
+        has_cover,
+    }
+}
+
+/// Parse ffprobe's JSON stream list into facts. Defensive per
+/// stream: one odd stream never sinks the whole probe.
+fn parse_stream_facts(json: &str) -> Option<Vec<StreamFacts>> {
+    let root: serde_json::Value = serde_json::from_str(json).ok()?;
+    let arr = root.get("streams")?.as_array()?;
+    let mut out = Vec::new();
+    for s in arr {
+        let codec_type = s.get("codec_type").and_then(|v| v.as_str()).unwrap_or("");
+        if codec_type.is_empty() {
+            continue;
+        }
+        let codec_name = s
+            .get("codec_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let attached_pic = s
+            .get("disposition")
+            .and_then(|d| d.get("attached_pic"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            != 0;
+        let frame_rate_num = s
+            .get("avg_frame_rate")
+            .and_then(|v| v.as_str())
+            .and_then(|r| r.split('/').next())
+            .and_then(|n| n.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        out.push(StreamFacts {
+            codec_type: codec_type.to_string(),
+            codec_name,
+            attached_pic,
+            frame_rate_num,
+        });
+    }
+    Some(out)
+}
+
+/// Probe one file's streams with ffprobe and classify. Any probe
+/// failure is "unknown" — routing falls back to the extension
+/// guess, never to a dead preview.
+fn probe_media_class(path: &Path) -> MediaClass {
+    if !path.is_file() {
+        return MediaClass::unknown();
+    }
+    let path_str = path.to_string_lossy().into_owned();
+    let out = match run_with_timeout(
+        "ffprobe",
+        &[
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,avg_frame_rate:stream_disposition=attached_pic",
+            "-of",
+            "json",
+            &path_str,
+        ],
+        15,
+    ) {
+        Ok(o) => o,
+        Err(_) => return MediaClass::unknown(),
+    };
+    match parse_stream_facts(&out) {
+        Some(streams) => classify_streams(&streams),
+        None => MediaClass::unknown(),
+    }
+}
+
+/// Stream-truth for the preview router (Usher): what a media file
+/// IS, by its streams — not what its filename claims.
+#[tauri::command]
+pub async fn media_class(state: State<'_, AppState>, item: ItemId) -> Cmd<MediaClass> {
+    let path = {
+        let paths = state.item_paths.lock().unwrap();
+        match paths.get(&item) {
+            Some(p) => p.clone(),
+            None => {
+                return Err(CommandError::from(UfmError::NotFound(format!(
+                    "unknown item {item}"
+                ))))
+            }
+        }
+    };
+    Ok(probe_media_class(&path))
+}
+
 /// Detach-player window size for a video of `vw`x`vh` (Player
 /// round): width starts at the mini-player's 640, height is exactly
 /// what the picture needs at that width. Absurd aspects clamp to a
@@ -17263,6 +17458,95 @@ pub fn auditor_add_user_word(
 
 #[cfg(test)]
 mod tests {
+    // ── Usher: stream-truth classification ──────────────────────
+    fn sf(
+        codec_type: &str,
+        codec_name: &str,
+        attached_pic: bool,
+        fps_num: u64,
+    ) -> super::StreamFacts {
+        super::StreamFacts {
+            codec_type: codec_type.into(),
+            codec_name: codec_name.into(),
+            attached_pic,
+            frame_rate_num: fps_num,
+        }
+    }
+
+    #[test]
+    fn usher_audiobook_in_mp4_coat_is_audio() {
+        // Dickles' Sedaris file, exactly as ffprobe reported it:
+        // AAC audio + a data track + an MJPEG cover the container
+        // itself flags as an attached picture.
+        let streams = vec![
+            sf("audio", "aac", false, 0),
+            sf("data", "bin_data", false, 0),
+            sf("video", "mjpeg", true, 0),
+        ];
+        let class = super::classify_streams(&streams);
+        assert_eq!(class.media, "audio");
+        assert_eq!(class.audio_codec.as_deref(), Some("aac"));
+        assert_eq!(class.video_codec, None);
+        assert!(class.has_cover);
+    }
+
+    #[test]
+    fn usher_real_movie_stays_video() {
+        // The Arrival control: h264 feature + DTS audio + subs.
+        let streams = vec![
+            sf("video", "h264", false, 24),
+            sf("audio", "dts", false, 0),
+            sf("subtitle", "subrip", false, 0),
+        ];
+        let class = super::classify_streams(&streams);
+        assert_eq!(class.media, "video");
+        assert_eq!(class.video_codec.as_deref(), Some("h264"));
+        assert!(!class.has_cover);
+    }
+
+    #[test]
+    fn usher_camera_mjpeg_with_real_fps_is_video() {
+        // A digicam's MJPEG movie is a movie: still-image codec,
+        // but a real frame rate and no attached-pic flag.
+        let streams = vec![
+            sf("video", "mjpeg", false, 30),
+            sf("audio", "pcm_s16le", false, 0),
+        ];
+        let class = super::classify_streams(&streams);
+        assert_eq!(class.media, "video");
+        assert_eq!(class.video_codec.as_deref(), Some("mjpeg"));
+    }
+
+    #[test]
+    fn usher_unflagged_still_with_audio_is_audio() {
+        // A muxer that never set attached_pic: a PNG "video"
+        // stream with no frame rate, riding with real audio.
+        let streams = vec![sf("audio", "mp3", false, 0), sf("video", "png", false, 0)];
+        let class = super::classify_streams(&streams);
+        assert_eq!(class.media, "audio");
+        assert!(class.has_cover);
+    }
+
+    #[test]
+    fn usher_no_playable_stream_is_none() {
+        let streams = vec![sf("data", "bin_data", false, 0)];
+        assert_eq!(super::classify_streams(&streams).media, "none");
+        assert_eq!(super::classify_streams(&[]).media, "none");
+    }
+
+    #[test]
+    fn usher_parse_reads_ffprobe_json() {
+        let json = r#"{"streams":[
+          {"codec_name":"aac","codec_type":"audio","avg_frame_rate":"0/0","disposition":{"attached_pic":0}},
+          {"codec_name":"mjpeg","codec_type":"video","avg_frame_rate":"0/0","disposition":{"attached_pic":1}}
+        ]}"#;
+        let facts = super::parse_stream_facts(json).expect("parse");
+        assert_eq!(facts.len(), 2);
+        assert!(facts[1].attached_pic);
+        assert_eq!(super::classify_streams(&facts).media, "audio");
+        assert!(super::parse_stream_facts("not json").is_none());
+    }
+
     #[test]
     fn executor_follow_carries_catalog_on_completed_moves() {
         // The Border incident (2026-10-16) at the executor seam: an

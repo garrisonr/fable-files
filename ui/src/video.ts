@@ -42,6 +42,44 @@ export function isPlayableName(name: string): boolean {
   return isVideoName(name) || isAudioName(name);
 }
 
+/** Stream-truth routing for previews (Usher, 2026-10-18): the
+ * probed class outranks the filename. An .mp4 whose streams are
+ * audio + cover art routes to the AUDIO card; a genuine video
+ * routes to the player; while the probe is in flight the route is
+ * "wait" and no player mounts; an unprobeable file falls back to
+ * the extension guess it has always had. */
+export type MediaRoute = "video" | "audio" | "wait" | "none";
+
+export function mediaRouteFor(
+  name: string,
+  mc: MediaClass | null,
+  pending: boolean,
+): MediaRoute {
+  if (pending) return "wait";
+  if (mc?.media === "audio") return "audio";
+  if (mc?.media === "video") return "video";
+  if (isVideoName(name)) return "video";
+  if (isAudioName(name)) return "audio";
+  return "none";
+}
+
+/** Human names for the codecs the fallback note can blame. */
+const CODEC_NAMES: Record<string, string> = {
+  h264: "H.264",
+  hevc: "HEVC",
+  av1: "AV1",
+  vp9: "VP9",
+  vp8: "VP8",
+  mpeg4: "MPEG-4",
+  mpeg2video: "MPEG-2",
+  theora: "Theora",
+  wmv3: "WMV",
+};
+
+function codecDisplayName(codec: string): string {
+  return CODEC_NAMES[codec.toLowerCase()] ?? codec.toUpperCase();
+}
+
 function fmtTime(sec: number): string {
   if (!isFinite(sec) || sec < 0) sec = 0;
   const m = Math.floor(sec / 60);
@@ -58,6 +96,9 @@ export interface VideoPlayerOpts {
   onDetach?: () => void;
   /** Show a "back to preview" button; called when clicked. */
   onReturn?: () => void;
+  /** Stream-probed video codec (Usher): named in the fallback
+   * note when playback fails, so the dead end says WHY. */
+  codecName?: string | null;
   /** Detach handoff (UI round item 5): start position in seconds —
    * a detached player continues from where the inline one was, and
    * an inline player resuming from a detach starts where the mini
@@ -76,7 +117,7 @@ export interface VideoPlayerOpts {
  * type (castsession.ts), re-exported for existing importers. */
 export type { CastDeviceLike } from "./castsession";
 import { CastSession, type CastDeviceLike } from "./castsession";
-import type { CastMirror } from "./api";
+import type { CastMirror, MediaClass } from "./api";
 
 export class VideoPlayer {
   readonly el: HTMLDivElement;
@@ -89,6 +130,8 @@ export class VideoPlayer {
   private failed = false;
   /** Source path (for the transcode fallback). */
   private path: string;
+  /** Probed video codec for the honest fallback note. */
+  private codecName: string | null = null;
   /** A real frame reached the screen (Round 7.1 watchdog). */
   private frameSeen = false;
   private watchdog: number | null = null;
@@ -213,6 +256,7 @@ export class VideoPlayer {
 
   constructor(opts: VideoPlayerOpts) {
     this.path = opts.path;
+    this.codecName = opts.codecName ?? null;
     this.onStateCb = opts.onState ?? null;
     if (opts.startAt && opts.startAt > 0) this.pendingSeek = opts.startAt;
     this.wantPlay = opts.autoPlay ?? false;
@@ -890,8 +934,9 @@ export class VideoPlayer {
     // full-card notice is gone by Dickles' order.
     const note = document.createElement("div");
     note.className = "vp-note";
-    note.textContent =
-      "🎬 Can't play this video here — double-click to open it in your video player.";
+    note.textContent = this.codecName
+      ? `🎬 Can't play this video here — the built-in player doesn't support its ${codecDisplayName(this.codecName)} video. Double-click to open it in your video player.`
+      : "🎬 Can't play this video here — double-click to open it in your video player.";
     this.el.appendChild(note);
   }
 }

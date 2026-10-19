@@ -618,6 +618,7 @@ pub fn run() {
             commands::forget_frequent,
             commands::clear_frequent,
             commands::preview,
+            commands::media_class,
             commands::open_item,
             commands::set_executable,
             commands::preview_text,
