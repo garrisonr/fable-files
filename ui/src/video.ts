@@ -94,6 +94,12 @@ export interface VideoPlayerOpts {
   standalone?: boolean;
   /** Show the detach (pop-out) button; called when clicked. */
   onDetach?: () => void;
+  /** Embedded in the Quick Look pane: the pane provides Cast (its
+   *  header button) and Detach (its always-visible card button)
+   *  itself, so the bar omits its duplicates — at the pane's width
+   *  the full roster overflows the bar and the tail buttons clip
+   *  (measured: fullscreen/cast pushed past the player's edge). */
+  preview?: boolean;
   /** Show a "back to preview" button; called when clicked. */
   onReturn?: () => void;
   /** Stream-probed video codec (Usher): named in the fallback
@@ -352,7 +358,7 @@ export class VideoPlayer {
 
     this.bar.append(this.playBtn, this.seek, this.timeLabel, muteBtn);
 
-    if (opts.onDetach) {
+    if (opts.onDetach && !opts.preview) {
       const detachBtn = document.createElement("button");
       detachBtn.className = "vp-btn";
       detachBtn.textContent = "⧉";
@@ -391,7 +397,7 @@ export class VideoPlayer {
     castBtn.title = "Cast to a device…";
     castBtn.setAttribute("aria-label", "Cast to a device");
     castBtn.addEventListener("click", () => void this.openCastPicker());
-    this.bar.appendChild(castBtn);
+    if (!opts.preview) this.bar.appendChild(castBtn);
     this.castBtn = castBtn;
 
     this.el.appendChild(this.bar);

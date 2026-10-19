@@ -881,6 +881,7 @@ export class QuickLook {
           if (fromDetach) this.detachedState.delete(vpath);
           const player = new VideoPlayer({
             path: vpath,
+            preview: true,
             startAt: fromDetach?.t ?? carry?.t ?? 0,
             autoPlay: fromDetach
               ? fromDetach.playing

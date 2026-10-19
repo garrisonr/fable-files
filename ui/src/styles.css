@@ -3062,7 +3062,7 @@ tr.row[style*="--label-color"] {
   display: inline-flex; align-items: center; justify-content: center;
 }
 .vp-btn:hover { background: rgb(255 255 255 / 0.28); }
-.vp-seek { flex: 1; accent-color: var(--ufm-accent, #f5c518); cursor: pointer; min-height: 2rem; }
+.vp-seek { flex: 1; min-width: 0; accent-color: var(--ufm-accent, #f5c518); cursor: pointer; min-height: 2rem; }
 .vp-time { color: #fff; font-size: 0.75rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .vp-fallback {
   color: #eee; padding: 2rem 1.25rem; text-align: center; font-size: 0.9rem; line-height: 1.5;
