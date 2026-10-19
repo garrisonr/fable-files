@@ -37,17 +37,22 @@ fn projectionist_systems_resolve_with_rows() {
         assert!(!rows.is_empty(), "system {key} must carry DAT rows");
         assert!(!rows[0].name.is_empty(), "system {key} rows carry names");
     }
-    // Exact manifest counts (DAT-MANIFEST.md / ROM-DATS.md).
+    // Exact OWNED counts. The manifest (ROM-DATS.md) counts DAT
+    // rows; the loaded dataset partitions a file whose (crc,size)
+    // appears under two systems to exactly one of them (the
+    // sole-claim rule), so owned counts can sit a few below the DAT
+    // counts: tgcd 498 of 502 (4 shared with TurboGrafx-16),
+    // pc98 5425 of 5426, x1 247 of 251. Measured on this bin.
     let exact = [
-        ("tgcd", 502usize),     // the TurboGrafx-CD split
+        ("tgcd", 498usize),     // the TurboGrafx-CD split (502 in DAT)
         ("jaguarcd", 27usize),  // the Jaguar CD split
         ("atarist", 404usize),  // No-Intro
         ("apple2", 9227usize),  // TOSEC
         ("cpc", 5058usize),     // TOSEC
         ("pc88", 4138usize),    // TOSEC
-        ("pc98", 5426usize),    // TOSEC 5316 + Redump 110
+        ("pc98", 5425usize),    // TOSEC 5316 + Redump 110 (5426 in DAT)
         ("x68000", 3151usize),  // No-Intro 1 + TOSEC 3150
-        ("x1", 251usize),       // No-Intro 8 + TOSEC 243
+        ("x1", 247usize),       // No-Intro 8 + TOSEC 243 (251 in DAT)
     ];
     for (key, want) in exact {
         let idx = ds.sys_index(key).unwrap();
