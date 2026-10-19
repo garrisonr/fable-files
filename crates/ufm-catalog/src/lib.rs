@@ -3450,6 +3450,37 @@ impl Catalog {
         Ok(n as u64)
     }
 
+    /// Close out runs a dead process left behind (Red Pen,
+    /// 2026-10-18): a row still marked "running" whose id is not
+    /// in the caller's in-flight set belongs to a process that
+    /// died mid-audit — mark it "interrupted" so no surface can
+    /// present the corpse as live work forever. Returns the
+    /// number of rows flipped.
+    pub fn mark_stale_auditor_runs_interrupted(
+        &self,
+        except_ids: &[String],
+    ) -> Result<usize> {
+        let n = if except_ids.is_empty() {
+            self.conn.execute(
+                "UPDATE auditor_runs SET status = 'interrupted' WHERE status = 'running'",
+                [],
+            )
+        } else {
+            let marks = except_ids
+                .iter()
+                .map(|_| "?")
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "UPDATE auditor_runs SET status = 'interrupted'                  WHERE status = 'running' AND id NOT IN ({marks})"
+            );
+            self.conn
+                .execute(&sql, rusqlite::params_from_iter(except_ids.iter()))
+        }
+        .map_err(|e| UfmError::Database(e.to_string()))?;
+        Ok(n)
+    }
+
     pub fn insert_auditor_flag(&self, row: &AuditorFlagRow) -> Result<()> {
         self.conn
             .execute(

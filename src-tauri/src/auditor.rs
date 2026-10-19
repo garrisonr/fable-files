@@ -25,10 +25,52 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 use ufm_catalog::{AuditorFlagRow, AuditorRunRow, Catalog};
 
 pub use crate::mediacomplete::data_base;
+
+// ---------------------------------------------------------------------------
+// In-flight runs (Red Pen, 2026-10-18): every audit executes inside
+// this one process — the GUI command and the scheduler's agent loop
+// alike — so the ids registered here ARE the runs that can honestly
+// be called "running". A persisted "running" row whose id is absent
+// was orphaned by a dead process; auditor_list_runs closes those
+// out as "interrupted" before anyone reads them, so no state label
+// can present a corpse as live work.
+// ---------------------------------------------------------------------------
+
+static IN_FLIGHT_RUNS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The run ids this process is executing right now.
+pub fn in_flight_run_ids() -> Vec<String> {
+    IN_FLIGHT_RUNS
+        .lock()
+        .map(|ids| ids.clone())
+        .unwrap_or_default()
+}
+
+/// RAII registration: the id is in flight from construction to
+/// drop — completion, error and unwind all unregister.
+struct InFlightRun(String);
+
+impl InFlightRun {
+    fn register(id: String) -> Self {
+        if let Ok(mut ids) = IN_FLIGHT_RUNS.lock() {
+            ids.push(id.clone());
+        }
+        InFlightRun(id)
+    }
+}
+
+impl Drop for InFlightRun {
+    fn drop(&mut self) {
+        if let Ok(mut ids) = IN_FLIGHT_RUNS.lock() {
+            ids.retain(|x| x != &self.0);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Settings + schedules (JSON sidecar, atomic writes — house pattern)
@@ -2132,6 +2174,9 @@ pub fn run_audit(
     catalog
         .upsert_auditor_run(&row)
         .map_err(|e| format!("audit run could not be recorded: {e}"))?;
+    // In flight from here to every exit — the reap in
+    // auditor_list_runs spares exactly the registered ids.
+    let _in_flight = InFlightRun::register(row.id.clone());
 
     let tree = walk(&root);
     let by_parent = children_by_parent(&tree);
